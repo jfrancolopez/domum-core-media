@@ -1,0 +1,80 @@
+# domum-core-media host config
+#
+# Copy to config/domum-media.conf and edit to taste. The CLI sources this
+# file with bash, so keep it shell-clean (no spaces around `=`, quote values
+# with characters that need escaping).
+#
+# Never commit the live config — only this example.
+
+# --- Identity --------------------------------------------------------------
+
+# Base domain (Cloudflare zone with a DNS-01 token in secrets/cloudflare_api_token)
+DOMUM_DOMAIN="ladomum.com"
+
+# ACME notification email (Let's Encrypt)
+DOMUM_EMAIL="you@example.com"
+
+# Optional — used by docs/dynamic routes for split DNS notes
+DOMUM_LAN_IP=""
+DOMUM_TS_IP=""
+
+# --- Data + log locations --------------------------------------------------
+
+# btrfs mount root. Subvolumes are mounted under here. See docs/SETUP-N100.md.
+DOMUM_DATA_ROOT="/srv/data"
+DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
+DOMUM_LOG_DIR="/var/log/domum-media"
+
+# --- Service toggles -------------------------------------------------------
+
+# Proxy + remote access — keep both on; everything else funnels through Traefik
+ENABLE_TRAEFIK=1
+ENABLE_TAILSCALE=0     # operator typically runs tailscale on the host, not in a container
+
+# Photos (the whole reason this box exists)
+ENABLE_IMMICH=1
+
+# Monitoring
+ENABLE_UPTIME_KUMA=1
+
+# Optional: restic REST server. Only enable if the NAS itself is hosted on
+# this box. Default OFF — usually the NAS lives elsewhere.
+ENABLE_RESTIC_REST_SERVER=0
+
+# --- Immich version pin ----------------------------------------------------
+
+# Pin to a specific release tag. NEVER `latest` — Immich has had breaking
+# DB migrations. Bump deliberately, after reading release notes and taking
+# a pre-upgrade snapshot + restic backup.
+IMMICH_VERSION="v1.118.2"
+
+# pgvecto.rs image tag for Immich's Postgres. Must match what the pinned
+# Immich version ships in its upstream compose file — verify before bumping.
+IMMICH_PG_IMAGE="tensorchord/pgvecto-rs:pg14-v0.2.0"
+
+# Immich Postgres credentials. Real values live in
+# /etc/domum-core-media/secrets/{immich_db_password,immich_jwt_secret}
+IMMICH_DB_USERNAME="postgres"
+IMMICH_DB_DATABASE_NAME="immich"
+
+# --- Backup schedule -------------------------------------------------------
+
+# These are read by the systemd timer install step but the actual cadence
+# is hard-coded in the .timer units (OnCalendar). Documented here for the
+# operator's convenience.
+BACKUP_DAILY_AT="02:30"
+CHECK_WEEKLY_AT="Sun 03:30"
+SNAPSHOT_PRUNE_WEEKLY_AT="Sun 04:30"
+
+# restic retention policy applied to the NAS repo on every daily run, and
+# to the cloud repo weekly (cloud forget is expensive in B2 API calls).
+RESTIC_KEEP_DAILY=7
+RESTIC_KEEP_WEEKLY=5
+RESTIC_KEEP_MONTHLY=12
+RESTIC_KEEP_YEARLY=3
+
+# btrfs snapshot retention. Pruner keeps the most recent N per subvolume.
+SNAPSHOT_KEEP_PER_SUBVOL=14
+
+# Uptime Kuma push URL for backup heartbeat. Optional; leave empty to skip.
+BACKUP_HEARTBEAT_URL=""

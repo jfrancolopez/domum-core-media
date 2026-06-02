@@ -1,0 +1,19 @@
+services:
+  tailscale:
+    # NB: typically you run tailscale on the *host* (apt package), not in a
+    # container. This fragment is kept for parity with domum-core and for
+    # operators who prefer the container approach. Default is ENABLE_TAILSCALE=0.
+    image: tailscale/tailscale:stable
+    container_name: tailscale
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+    volumes:
+      - /srv/data/tailscale:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun

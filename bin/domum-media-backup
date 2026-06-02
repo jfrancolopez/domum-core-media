@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# domum-media-backup — restic wrapper invoked by systemd timers and the CLI.
+#
+# Order of operations (daily):
+#   1. Quiesce Immich Postgres via pg_dump streamed into a fresh btrfs
+#      snapshot directory. Photo library files are immutable once written,
+#      so they're safe to back up live alongside the dump.
+#   2. restic backup /srv/data -> NAS repo (rest-server, append-only mode)
+#   3. restic forget --prune (daily policy) on NAS
+#   4. restic backup /srv/data -> cloud repo (B2)
+#   5. restic forget --prune on cloud (only on weekly runs to limit API spend)
+#   6. Write a one-line status log and (optional) heartbeat ping
+#
+# Modes:
+#   (no args)         — full daily backup
+#   --check           — restic check on both repos (metadata only)
+#   --check-deep      — restic check --read-data-subset=10% on NAS
+#   --check-cloud-deep — full --read-data on cloud (quarterly drill)
+#   --restore <snap> <target> [--repo nas|cloud]
+#                     — restic restore from chosen repo (default NAS)
+#   --weekly-cloud-forget — run cloud retention policy (called by separate timer)
+
+DOMUM_DIR="${DOMUM_DIR:-/opt/domum-core-media}"
+CFG_FILE="${CFG_FILE:-$DOMUM_DIR/config/domum-media.conf}"
+SECRETS_DIR="${SECRETS_DIR:-/etc/domum-core-media/secrets}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE" >&2; }
+
+need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."; }
+
+load_cfg() {
+  [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE"
+  # shellcheck disable=SC1090
+  source "$CFG_FILE"
+  DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-/srv/data}"
+  DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"
+  DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-/var/log/domum-media}"
+  RESTIC_KEEP_DAILY="${RESTIC_KEEP_DAILY:-7}"
+  RESTIC_KEEP_WEEKLY="${RESTIC_KEEP_WEEKLY:-5}"
+  RESTIC_KEEP_MONTHLY="${RESTIC_KEEP_MONTHLY:-12}"
+  RESTIC_KEEP_YEARLY="${RESTIC_KEEP_YEARLY:-3}"
+}
+
+ensure_dirs() {
+  mkdir -p "$DOMUM_LOG_DIR"
+  LOG_FILE="$DOMUM_LOG_DIR/backup.log"
+  HEARTBEAT_FILE="$DOMUM_LOG_DIR/last-success"
+  touch "$LOG_FILE"
+}
+
+require_files() {
+  local missing=()
+  for f in "$@"; do
+    [[ -f "$f" ]] || missing+=("$f")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    die "Missing required files: ${missing[*]}"
+  fi
+}
+
+# Quiesce Immich Postgres: take a btrfs snapshot of the postgres data dir,
+# then run pg_dump from inside the postgres container into the staging
+# location alongside the photo library.
+quiesce_immich_postgres() {
+  local pg_subvol="$DOMUM_DATA_ROOT/immich/postgres"
+  local stage_dir="$DOMUM_DATA_ROOT/immich/backup-staging"
+  mkdir -p "$stage_dir"
+
+  if [[ ! -d "$pg_subvol" ]]; then
+    log "Skipping Immich quiesce: $pg_subvol absent."
+    return 0
+  fi
+
+  # Snapshot of pg data — kept as belt-and-braces alongside the logical dump.
+  if command -v btrfs >/dev/null 2>&1 && btrfs subvolume show "$pg_subvol" >/dev/null 2>&1; then
+    local snap="$DOMUM_SNAPSHOT_ROOT/immich-postgres-prebackup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$DOMUM_SNAPSHOT_ROOT"
+    log "btrfs snapshot: $pg_subvol -> $snap"
+    btrfs subvolume snapshot -r "$pg_subvol" "$snap" >/dev/null
+  fi
+
+  # Logical pg_dump — this is what restore actually uses for consistency.
+  local dump_file="$stage_dir/immich-postgres.dump.sql.gz"
+  local pg_user="${IMMICH_DB_USERNAME:-postgres}"
+  local pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
+  log "pg_dump immich -> $dump_file"
+  if docker compose -f "$DOMUM_DIR/compose/photos/immich.yml" ps immich_postgres >/dev/null 2>&1; then
+    docker compose -f "$DOMUM_DIR/compose/photos/immich.yml" exec -T immich_postgres \
+      pg_dump -U "$pg_user" -d "$pg_db" | gzip -9 > "$dump_file"
+  else
+    log "Immich postgres container not running — skipping pg_dump."
+  fi
+}
+
+# Run restic for a given repo. Sources the env file (RESTIC_REPOSITORY +
+# transport creds) and pulls the password from the matching file.
+restic_for_repo() {
+  local repo_name="$1"; shift
+  local env_file="$SECRETS_DIR/restic_${repo_name}_env"
+  local pw_file="$SECRETS_DIR/restic_password_${repo_name}"
+  require_files "$env_file" "$pw_file"
+
+  ( set +u
+    # shellcheck disable=SC1090
+    source "$env_file"
+    export RESTIC_PASSWORD_FILE="$pw_file"
+    restic "$@"
+  )
+}
+
+restic_backup_to() {
+  local repo_name="$1"
+  log "restic backup -> $repo_name"
+  restic_for_repo "$repo_name" backup \
+    --tag "$(date +%Y-%m-%d)" \
+    --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
+    "$DOMUM_DATA_ROOT"
+}
+
+restic_forget_for() {
+  local repo_name="$1"
+  log "restic forget --prune on $repo_name"
+  restic_for_repo "$repo_name" forget --prune \
+    --keep-daily   "$RESTIC_KEEP_DAILY" \
+    --keep-weekly  "$RESTIC_KEEP_WEEKLY" \
+    --keep-monthly "$RESTIC_KEEP_MONTHLY" \
+    --keep-yearly  "$RESTIC_KEEP_YEARLY"
+}
+
+restic_check_for() {
+  local repo_name="$1"; shift
+  log "restic check on $repo_name $*"
+  restic_for_repo "$repo_name" check "$@"
+}
+
+heartbeat() {
+  date -Iseconds > "$HEARTBEAT_FILE"
+  if [[ -n "${BACKUP_HEARTBEAT_URL:-}" ]]; then
+    curl -fsS --max-time 10 -o /dev/null "$BACKUP_HEARTBEAT_URL" || true
+  fi
+}
+
+do_daily_backup() {
+  log "=== daily backup start ==="
+  quiesce_immich_postgres
+
+  restic_backup_to nas
+  restic_forget_for nas
+
+  restic_backup_to cloud
+  # cloud forget runs on weekly timer to limit B2 API calls
+
+  heartbeat
+  log "=== daily backup ok ==="
+}
+
+do_weekly_cloud_forget() {
+  log "weekly cloud forget"
+  restic_forget_for cloud
+}
+
+do_check() {
+  restic_check_for nas
+  restic_check_for cloud
+}
+
+do_check_deep() {
+  restic_check_for nas --read-data-subset=10%
+}
+
+do_check_cloud_deep() {
+  restic_check_for cloud --read-data
+}
+
+do_restore() {
+  local snap="${1:-}"; local target="${2:-}"; local repo="nas"
+  shift 2 || true
+  while (( $# )); do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      *) die "Unknown restore arg: $1" ;;
+    esac
+  done
+  [[ -n "$snap" && -n "$target" ]] || die "Usage: --restore <snapshot> <target> [--repo nas|cloud]"
+  log "restic restore $snap -> $target (from $repo)"
+  mkdir -p "$target"
+  restic_for_repo "$repo" restore "$snap" --target "$target"
+}
+
+main() {
+  need_root
+  load_cfg
+  ensure_dirs
+
+  case "${1:-}" in
+    "")                    do_daily_backup ;;
+    --check)               do_check ;;
+    --check-deep)          do_check_deep ;;
+    --check-cloud-deep)    do_check_cloud_deep ;;
+    --weekly-cloud-forget) do_weekly_cloud_forget ;;
+    --restore)             shift; do_restore "$@" ;;
+    -h|--help)
+      cat <<EOF
+domum-media-backup — restic wrapper
+
+Usage:
+  domum-media-backup                       Daily backup (NAS + cloud)
+  domum-media-backup --check               Metadata check on both repos
+  domum-media-backup --check-deep          NAS read-data-subset=10%
+  domum-media-backup --check-cloud-deep    Full cloud --read-data
+  domum-media-backup --weekly-cloud-forget Cloud retention policy
+  domum-media-backup --restore <snap> <target> [--repo nas|cloud]
+EOF
+      ;;
+    *) die "Unknown command: $1 (try --help)" ;;
+  esac
+}
+
+main "$@"

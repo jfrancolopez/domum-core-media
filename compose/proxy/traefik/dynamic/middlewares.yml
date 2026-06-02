@@ -1,0 +1,23 @@
+http:
+  middlewares:
+    securityHeaders:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "no-referrer"
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+
+    forwardedHeaders:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+          X-Forwarded-Port: "443"
+
+    # Immich needs websocket upgrades + raises the body size limit for uploads
+    immich-uploads:
+      buffering:
+        maxRequestBodyBytes: 0
+        memRequestBodyBytes: 33554432

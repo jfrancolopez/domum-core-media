@@ -1,0 +1,46 @@
+name: compose-validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax check
+        run: bash -n bin/domum-media bin/domum-media-backup install.sh
+
+      - name: shellcheck
+        run: shellcheck bin/domum-media bin/domum-media-backup install.sh
+
+      - name: docker compose config (every fragment layered on base)
+        env:
+          # Provide harmless defaults so envsubst-style variables don't break
+          # `compose config`. Real values come from the host at runtime.
+          CF_DNS_API_TOKEN: dummy
+          DOMUM_DOMAIN: example.com
+          DOMUM_EMAIL: ci@example.com
+          DOMUM_LAN_IP: 10.0.0.1
+          DOMUM_TS_IP: 100.64.0.1
+          IMMICH_VERSION: v1.118.2
+          IMMICH_PG_IMAGE: tensorchord/pgvecto-rs:pg14-v0.2.0
+          IMMICH_DB_USERNAME: postgres
+          IMMICH_DB_PASSWORD: dummy
+          IMMICH_DB_DATABASE_NAME: immich
+          IMMICH_JWT_SECRET: dummy
+          TS_AUTHKEY: dummy
+        run: |
+          set -euo pipefail
+          args=(-f compose/base.yml)
+          while IFS= read -r f; do
+            args+=(-f "$f")
+          done < <(find compose -name '*.yml' -not -path 'compose/base.yml' -not -path '*/traefik/*' | sort)
+          echo "Running: docker compose ${args[*]} config -q"
+          docker compose "${args[@]}" config -q

@@ -1,0 +1,18 @@
+[Unit]
+Description=domum-media: restic repository integrity check
+Documentation=file:///opt/domum-core-media/docs/SETUP-RESTIC.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/domum-media-backup
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Weekly: metadata check on both repos.
+# Monthly: --read-data-subset=10% on NAS. The timer calls this service with
+# different ExecStart overrides via drop-ins, or you can split into a second
+# service. Default ExecStart is the cheap metadata check.
+ExecStart=/usr/local/bin/domum-media-backup --check
+TimeoutStartSec=4h

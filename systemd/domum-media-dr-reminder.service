@@ -1,0 +1,9 @@
+[Unit]
+Description=domum-media: quarterly disaster-recovery drill reminder
+Documentation=file:///opt/domum-core-media/docs/disaster-recovery.md
+
+[Service]
+Type=oneshot
+# The reminder writes a logged note. Wire it to your notification channel of
+# choice by editing this ExecStart (e.g., curl to ntfy.sh or Uptime Kuma push).
+ExecStart=/bin/sh -c 'echo "[$(date -Iseconds)] DR DRILL REMINDER — run docs/disaster-recovery.md end-to-end on a scratch VM" >> /var/log/domum-media/dr-reminder.log'

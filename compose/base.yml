@@ -1,0 +1,16 @@
+name: domum-media
+
+networks:
+  domum-proxy:
+    name: domum-proxy
+    driver: bridge
+  domum-internal:
+    name: domum-internal
+    driver: bridge
+    internal: false
+
+volumes:
+  traefik-letsencrypt:
+  uptime-kuma-data:
+  immich-model-cache:
+  restic-rest-data:

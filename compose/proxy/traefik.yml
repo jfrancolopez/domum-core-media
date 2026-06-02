@@ -1,0 +1,36 @@
+services:
+  traefik:
+    image: traefik:v3.2
+    container_name: traefik
+    restart: unless-stopped
+
+    networks:
+      - domum-proxy
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    environment:
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+      - DOMUM_DOMAIN=${DOMUM_DOMAIN}
+      - DOMUM_LAN_IP=${DOMUM_LAN_IP}
+      - DOMUM_EMAIL=${DOMUM_EMAIL}
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-letsencrypt:/letsencrypt
+      - /opt/domum-core-media/compose/proxy/traefik:/etc/traefik:ro
+
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  domum-proxy:
+    external: true
+
+volumes:
+  traefik-letsencrypt:

@@ -1,0 +1,12 @@
+[Unit]
+Description=domum-media: schedule weekly restic check
+
+[Timer]
+# Weekly metadata check on both repos
+OnCalendar=Sun *-*-* 03:30:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=domum-media-check.service
+
+[Install]
+WantedBy=timers.target

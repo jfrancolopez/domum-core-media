@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# domum-media — host CLI for domum-core-media.
+# Mirrors bin/domum from domum-core, with btrfs snapshot + restic glue and
+# an Immich-aware service list.
+
+DOMUM_DIR="${DOMUM_DIR:-/opt/domum-core-media}"
+CFG_FILE="${CFG_FILE:-$DOMUM_DIR/config/domum-media.conf}"
+SECRETS_DIR="${SECRETS_DIR:-/etc/domum-core-media/secrets}"
+DATA_ROOT_DEFAULT="/srv/data"
+SNAPSHOT_ROOT_DEFAULT="/srv/snapshots"
+LOG_DIR_DEFAULT="/var/log/domum-media"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+need_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."
+}
+
+load_cfg() {
+  [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE (copy domum-media.conf.example)"
+  # shellcheck disable=SC1090
+  source "$CFG_FILE"
+  DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
+  DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-$SNAPSHOT_ROOT_DEFAULT}"
+  DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
+}
+
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- compose layering ------------------------------------------------------
+
+compose_files_for_enabled_services() {
+  local files=()
+  files+=("$DOMUM_DIR/compose/base.yml")
+
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/proxy/traefik.yml")
+  fi
+  if [[ "${ENABLE_TAILSCALE:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/security/tailscale.yml")
+  fi
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/photos/immich.yml")
+  fi
+  if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/monitoring/uptime-kuma.yml")
+  fi
+  if [[ "${ENABLE_RESTIC_REST_SERVER:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/backups/restic-rest-server.yml")
+  fi
+
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || die "Missing compose file: $f"
+    echo "-f"
+    echo "$f"
+  done
+}
+
+export_env_for_compose() {
+  export DOMUM_DOMAIN="${DOMUM_DOMAIN:-ladomum.com}"
+  export DOMUM_EMAIL="${DOMUM_EMAIL:-admin@${DOMUM_DOMAIN}}"
+  export DOMUM_LAN_IP="${DOMUM_LAN_IP:-}"
+  export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
+  export DOMUM_DATA_ROOT
+  export IMMICH_VERSION="${IMMICH_VERSION:-release}"
+  export IMMICH_PG_IMAGE="${IMMICH_PG_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
+  export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
+  export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
+
+  if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
+    CF_DNS_API_TOKEN="$(cat "$SECRETS_DIR/cloudflare_api_token")"
+    export CF_DNS_API_TOKEN
+  fi
+  if [[ -f "$SECRETS_DIR/immich_db_password" ]]; then
+    IMMICH_DB_PASSWORD="$(cat "$SECRETS_DIR/immich_db_password")"
+    export IMMICH_DB_PASSWORD
+  fi
+  if [[ -f "$SECRETS_DIR/immich_jwt_secret" ]]; then
+    IMMICH_JWT_SECRET="$(cat "$SECRETS_DIR/immich_jwt_secret")"
+    export IMMICH_JWT_SECRET
+  fi
+}
+
+ensure_networks() {
+  local nets=("domum-proxy" "domum-internal")
+  for n in "${nets[@]}"; do
+    if ! docker network inspect "$n" >/dev/null 2>&1; then
+      echo "[domum-media] Creating docker network: $n"
+      docker network create "$n" >/dev/null
+    fi
+  done
+}
+
+ensure_dirs() {
+  mkdir -p "$DOMUM_LOG_DIR"
+  mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT"
+}
+
+compose_cmd() {
+  local -a args
+  mapfile -t args < <(compose_files_for_enabled_services)
+  cd "$DOMUM_DIR"
+  docker compose "${args[@]}" "$@"
+}
+
+# ---- btrfs snapshots ------------------------------------------------------
+
+is_btrfs_subvol() {
+  # Returns 0 if the path is a btrfs subvolume root.
+  btrfs subvolume show "$1" >/dev/null 2>&1
+}
+
+snapshot_subvolumes() {
+  # Returns subvolumes under $DOMUM_DATA_ROOT that we should snapshot.
+  # We snapshot per-service to keep restore granular.
+  local candidates=()
+  candidates+=("$DOMUM_DATA_ROOT/immich")
+  candidates+=("$DOMUM_DATA_ROOT/uptime-kuma")
+  candidates+=("$DOMUM_DATA_ROOT/traefik")
+  for c in "${candidates[@]}"; do
+    [[ -d "$c" ]] && echo "$c"
+  done
+}
+
+snapshot_create() {
+  local tag="${1:-manual}"
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$DOMUM_SNAPSHOT_ROOT"
+  while IFS= read -r subvol; do
+    local name
+    name="$(basename "$subvol")"
+    local target="$DOMUM_SNAPSHOT_ROOT/${name}-${stamp}-${tag}"
+    if is_btrfs_subvol "$subvol"; then
+      echo "[domum-media] Snapshot: $subvol -> $target"
+      btrfs subvolume snapshot -r "$subvol" "$target"
+    else
+      echo "[domum-media] Skipping non-subvolume path: $subvol"
+    fi
+  done < <(snapshot_subvolumes)
+}
+
+snapshot_list() {
+  if [[ ! -d "$DOMUM_SNAPSHOT_ROOT" ]]; then
+    echo "[domum-media] No snapshot root at $DOMUM_SNAPSHOT_ROOT"
+    return 0
+  fi
+  ls -1tr "$DOMUM_SNAPSHOT_ROOT"
+}
+
+snapshot_prune() {
+  local keep="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
+  [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
+  # Group by base subvolume name (everything before the first '-YYYYMMDD-')
+  local names
+  names="$(ls -1 "$DOMUM_SNAPSHOT_ROOT" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
+  while IFS= read -r base; do
+    [[ -n "$base" ]] || continue
+    # newest last, so we delete from the top until only $keep remain
+    local snaps
+    mapfile -t snaps < <(ls -1tr "$DOMUM_SNAPSHOT_ROOT" | grep -E "^${base}-[0-9]{8}-[0-9]{6}-")
+    local total="${#snaps[@]}"
+    local drop=$(( total - keep ))
+    if (( drop > 0 )); then
+      local i
+      for (( i = 0; i < drop; i++ )); do
+        local victim="$DOMUM_SNAPSHOT_ROOT/${snaps[$i]}"
+        echo "[domum-media] Pruning snapshot: $victim"
+        btrfs subvolume delete "$victim" || true
+      done
+    fi
+  done <<< "$names"
+}
+
+# ---- commands -------------------------------------------------------------
+
+init_host() {
+  need_root
+  load_cfg
+  ensure_dirs
+
+  local missing=()
+  for s in cloudflare_api_token immich_db_password immich_jwt_secret \
+           restic_password_nas restic_password_cloud \
+           restic_nas_env restic_cloud_env; do
+    [[ -f "$SECRETS_DIR/$s" ]] || missing+=("$s")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    echo "[domum-media] WARNING: missing secrets under $SECRETS_DIR:"
+    for m in "${missing[@]}"; do echo "    $m"; done
+    echo "    Place them before 'apply'. See docs/SETUP-RESTIC.md + SETUP-CLOUDFLARE.md."
+  fi
+
+  if ! cmd_exists btrfs; then
+    die "btrfs-progs not installed — rerun install.sh"
+  fi
+  if ! mountpoint -q "$DOMUM_DATA_ROOT"; then
+    echo "[domum-media] WARNING: $DOMUM_DATA_ROOT is not a mount point."
+    echo "    Did you complete docs/SETUP-N100.md? Snapshots will fail otherwise."
+  fi
+
+  echo "[domum-media] init complete."
+}
+
+apply() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+  ensure_networks
+
+  echo "[domum-media] Pre-apply btrfs snapshot..."
+  snapshot_create "pre-apply" || echo "[domum-media] Snapshot step failed (continuing)."
+
+  echo "[domum-media] Applying desired state..."
+  compose_cmd up -d --remove-orphans
+  echo "[domum-media] apply done."
+}
+
+status() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_networks
+
+  echo "=== compose ps ==="
+  compose_cmd ps || true
+
+  echo
+  echo "=== restic last snapshots ==="
+  if cmd_exists restic; then
+    for env_file in "$SECRETS_DIR/restic_nas_env" "$SECRETS_DIR/restic_cloud_env"; do
+      [[ -f "$env_file" ]] || continue
+      echo "-- ${env_file##*/} --"
+      ( set +u
+        # shellcheck disable=SC1090
+        source "$env_file"
+        local pw_file="$SECRETS_DIR/restic_password_nas"
+        [[ "$env_file" == *_cloud_env ]] && pw_file="$SECRETS_DIR/restic_password_cloud"
+        if [[ -f "$pw_file" ]]; then
+          RESTIC_PASSWORD_FILE="$pw_file" restic snapshots --latest 1 2>&1 | tail -n +1 || true
+        else
+          echo "(missing password file: $pw_file)"
+        fi
+      )
+    done
+  else
+    echo "(restic not installed)"
+  fi
+
+  echo
+  echo "=== btrfs snapshots (${DOMUM_SNAPSHOT_ROOT}) ==="
+  snapshot_list
+}
+
+repo_update() {
+  need_root
+  echo "[domum-media] git fetch + reset --hard origin/main in $DOMUM_DIR..."
+  [[ -d "$DOMUM_DIR/.git" ]] || die "$DOMUM_DIR is not a git repo — reinstall via install.sh"
+  git -C "$DOMUM_DIR" fetch --all --prune
+  git -C "$DOMUM_DIR" reset --hard origin/main
+  apply
+}
+
+logs_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  local svc="${1:-}"
+  [[ -n "$svc" ]] || die "Usage: domum-media logs <service>"
+  compose_cmd logs -f --tail=200 "$svc"
+}
+
+backup_cmd() {
+  need_root
+  shift || true
+  exec /usr/local/bin/domum-media-backup "$@"
+}
+
+snapshot_cmd() {
+  need_root
+  load_cfg
+  local sub="${1:-}"
+  case "$sub" in
+    create) shift; snapshot_create "${1:-manual}" ;;
+    list)   snapshot_list ;;
+    prune)  snapshot_prune ;;
+    *) die "Usage: domum-media snapshot {create [tag]|list|prune}" ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+domum-media (domum-core-media)
+
+Usage:
+  domum-media init
+  domum-media apply
+  domum-media status
+  domum-media update
+  domum-media logs <service>
+  domum-media backup [--check|--restore <snapshot> <target>]
+  domum-media snapshot {create [tag]|list|prune}
+
+Config:  $CFG_FILE
+Secrets: $SECRETS_DIR
+Env:     DOMUM_DIR=$DOMUM_DIR
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    init)     shift; init_host "$@" ;;
+    apply)    shift; apply "$@" ;;
+    status)   shift; status "$@" ;;
+    update)   shift; repo_update "$@" ;;
+    logs)     shift; logs_cmd "$@" ;;
+    backup)   backup_cmd "$@" ;;
+    snapshot) shift; snapshot_cmd "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

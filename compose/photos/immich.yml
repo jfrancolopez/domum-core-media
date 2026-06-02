@@ -1,0 +1,100 @@
+services:
+  immich_server:
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION}
+    container_name: immich_server
+    restart: unless-stopped
+    depends_on:
+      immich_redis:
+        condition: service_started
+      immich_postgres:
+        condition: service_healthy
+    networks:
+      - domum-proxy
+      - domum-internal
+    volumes:
+      - /srv/data/immich/library:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      UPLOAD_LOCATION: /usr/src/app/upload
+      IMMICH_VERSION: ${IMMICH_VERSION}
+      DB_HOSTNAME: immich_postgres
+      DB_USERNAME: ${IMMICH_DB_USERNAME}
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD}
+      DB_DATABASE_NAME: ${IMMICH_DB_DATABASE_NAME}
+      REDIS_HOSTNAME: immich_redis
+      JWT_SECRET: ${IMMICH_JWT_SECRET}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=domum-proxy
+      - traefik.http.routers.immich.rule=Host(`photos.${DOMUM_DOMAIN}`)
+      - traefik.http.routers.immich.entrypoints=websecure
+      - traefik.http.routers.immich.tls=true
+      - traefik.http.routers.immich.tls.certresolver=cf
+      - traefik.http.routers.immich.middlewares=securityHeaders@file,immich-uploads@file
+      - traefik.http.services.immich.loadbalancer.server.port=2283
+
+  immich_machine_learning:
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION}
+    container_name: immich_machine_learning
+    restart: unless-stopped
+    networks:
+      - domum-internal
+    volumes:
+      - immich-model-cache:/cache
+    environment:
+      IMMICH_VERSION: ${IMMICH_VERSION}
+
+  immich_redis:
+    image: docker.io/redis:6.2-alpine
+    container_name: immich_redis
+    restart: unless-stopped
+    networks:
+      - domum-internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping || exit 1"]
+
+  immich_postgres:
+    image: ${IMMICH_PG_IMAGE}
+    container_name: immich_postgres
+    restart: unless-stopped
+    networks:
+      - domum-internal
+    environment:
+      POSTGRES_USER: ${IMMICH_DB_USERNAME}
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD}
+      POSTGRES_DB: ${IMMICH_DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - /srv/data/immich/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD
+        - pg_isready
+        - -U
+        - ${IMMICH_DB_USERNAME}
+        - -d
+        - ${IMMICH_DB_DATABASE_NAME}
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=vectors.so
+      - -c
+      - search_path="$$user", public, vectors
+      - -c
+      - logging_collector=on
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - shared_buffers=512MB
+
+networks:
+  domum-proxy:
+    external: true
+  domum-internal:
+    external: true
+
+volumes:
+  immich-model-cache:

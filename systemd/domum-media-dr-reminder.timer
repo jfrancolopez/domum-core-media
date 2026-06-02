@@ -1,0 +1,12 @@
+[Unit]
+Description=domum-media: schedule quarterly DR drill reminder
+
+[Timer]
+# First day of Jan, Apr, Jul, Oct at 09:00 local — automation is the reminder,
+# the drill itself is manual and documented in docs/disaster-recovery.md.
+OnCalendar=*-01,04,07,10-01 09:00:00
+Persistent=true
+Unit=domum-media-dr-reminder.service
+
+[Install]
+WantedBy=timers.target

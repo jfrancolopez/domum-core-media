@@ -1,0 +1,9 @@
+[Unit]
+Description=domum-media: btrfs snapshot prune (weekly)
+Documentation=file:///opt/domum-core-media/docs/SETUP-N100.md
+ConditionPathExists=/usr/local/bin/domum-media
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/domum-media snapshot prune
+TimeoutStartSec=1h

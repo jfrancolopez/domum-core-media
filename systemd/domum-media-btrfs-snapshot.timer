@@ -1,0 +1,11 @@
+[Unit]
+Description=domum-media: schedule weekly btrfs snapshot prune
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=domum-media-btrfs-snapshot.service
+
+[Install]
+WantedBy=timers.target

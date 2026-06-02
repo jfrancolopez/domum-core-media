@@ -1,0 +1,15 @@
+[Unit]
+Description=domum-media: daily restic backup (NAS + cloud)
+Documentation=file:///opt/domum-core-media/docs/SETUP-RESTIC.md
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+ConditionPathExists=/usr/local/bin/domum-media-backup
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/bin/domum-media-backup
+TimeoutStartSec=6h
