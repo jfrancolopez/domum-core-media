@@ -1,0 +1,31 @@
+# Local environment files (real values live outside the repo)
+*.env
+.env
+.env.*
+!.env.example
+
+# Anything containing real secrets
+secrets/
+*.key
+*.pem
+*.crt
+acme.json
+
+# Live data (lives under /srv/data on the host)
+data/
+/srv/
+
+# Logs
+*.log
+logs/
+
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local-only Nimbalyst session state
+nimbalyst-local/
