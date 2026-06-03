@@ -9,7 +9,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -36,6 +36,12 @@ jobs:
           IMMICH_DB_DATABASE_NAME: immich
           IMMICH_JWT_SECRET: dummy
           TS_AUTHKEY: dummy
+          # Jellyfin defaults mirror config/domum-media.conf.example so the
+          # volume specs resolve to real paths instead of `:/config`.
+          JELLYFIN_VERSION: "10.10.7"
+          JELLYFIN_CONFIG_DIR: /srv/data/jellyfin/config
+          JELLYFIN_CACHE_DIR: /srv/data/jellyfin/cache
+          JELLYFIN_MEDIA_ROOT: /srv/media
         run: |
           set -euo pipefail
           args=(-f compose/base.yml)
