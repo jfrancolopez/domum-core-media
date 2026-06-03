@@ -34,6 +34,9 @@ ENABLE_TAILSCALE=0     # operator typically runs tailscale on the host, not in a
 # Photos (the whole reason this box exists)
 ENABLE_IMMICH=1
 
+# Media streaming
+ENABLE_JELLYFIN=0
+
 # Monitoring
 ENABLE_UPTIME_KUMA=1
 
@@ -57,11 +60,21 @@ IMMICH_PG_IMAGE="tensorchord/pgvecto-rs:pg14-v0.2.0"
 IMMICH_DB_USERNAME="postgres"
 IMMICH_DB_DATABASE_NAME="immich"
 
+# --- Jellyfin --------------------------------------------------------------
+
+# Pin Jellyfin deliberately. Do not use `latest`.
+JELLYFIN_VERSION="10.10.7"
+
+# Jellyfin state lives on the btrfs data tier; the media library can live
+# elsewhere and is mounted read-only into the container.
+JELLYFIN_CONFIG_DIR="/srv/data/jellyfin/config"
+JELLYFIN_CACHE_DIR="/srv/data/jellyfin/cache"
+JELLYFIN_MEDIA_ROOT="/srv/media"
+
 # --- Backup schedule -------------------------------------------------------
 
-# These are read by the systemd timer install step but the actual cadence
-# is hard-coded in the .timer units (OnCalendar). Documented here for the
-# operator's convenience.
+# `domum-media configure` and `domum-media apply` sync these into systemd
+# timer overrides, so the values here are the actual live cadence.
 BACKUP_DAILY_AT="02:30"
 CHECK_WEEKLY_AT="Sun 03:30"
 SNAPSHOT_PRUNE_WEEKLY_AT="Sun 04:30"
@@ -75,6 +88,49 @@ RESTIC_KEEP_YEARLY=3
 
 # btrfs snapshot retention. Pruner keeps the most recent N per subvolume.
 SNAPSHOT_KEEP_PER_SUBVOL=14
+
+# Which configured targets should be used. The CLI wizard manages the three
+# slots below, but you can add more names manually if needed.
+BACKUP_TARGETS="nas cloud archive"
+
+# Shared deep-check subset for `domum-media backup --check-deep`.
+BACKUP_DEEP_CHECK_PERCENT="10%"
+
+# Target: NAS / rest-server / SFTP / any other restic repository string.
+BACKUP_TARGET_NAS_ENABLED=1
+BACKUP_TARGET_NAS_TYPE="repository"     # repository | nfs | ftp
+BACKUP_TARGET_NAS_REPOSITORY="rest:http://nas-host:8000/domum-media"
+BACKUP_TARGET_NAS_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_nas"
+BACKUP_TARGET_NAS_ENV_FILE=""
+BACKUP_TARGET_NAS_RETENTION="daily"     # daily | weekly | none
+
+# Target: cloud / B2 / S3 / rclone / any other restic repository string.
+BACKUP_TARGET_CLOUD_ENABLED=1
+BACKUP_TARGET_CLOUD_TYPE="repository"
+BACKUP_TARGET_CLOUD_REPOSITORY="b2:your-bucket-name:/domum-media"
+BACKUP_TARGET_CLOUD_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_cloud"
+BACKUP_TARGET_CLOUD_ENV_FILE="/etc/domum-core-media/secrets/restic_cloud_env"
+BACKUP_TARGET_CLOUD_RETENTION="weekly"
+
+# Optional third target. Useful for an NFS share or FTP archive.
+BACKUP_TARGET_ARCHIVE_ENABLED=0
+BACKUP_TARGET_ARCHIVE_TYPE="nfs"
+BACKUP_TARGET_ARCHIVE_REPOSITORY="/mnt/domum-media-archive/restic"
+BACKUP_TARGET_ARCHIVE_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_archive"
+BACKUP_TARGET_ARCHIVE_RETENTION="none"
+
+# NFS-specific fields. The wrapper mounts the share before running restic.
+BACKUP_TARGET_ARCHIVE_NFS_REMOTE="nas.example:/exports/domum-media"
+BACKUP_TARGET_ARCHIVE_NFS_MOUNT_POINT="/mnt/domum-media-archive"
+
+# FTP-specific fields. The wrapper generates a temporary rclone config and
+# uses a `rclone:` restic repository under the hood.
+BACKUP_TARGET_ARCHIVE_FTP_HOST="ftp.example.com"
+BACKUP_TARGET_ARCHIVE_FTP_PORT="21"
+BACKUP_TARGET_ARCHIVE_FTP_REMOTE_NAME="archive-ftp"
+BACKUP_TARGET_ARCHIVE_FTP_PATH="/domum-media"
+BACKUP_TARGET_ARCHIVE_FTP_USERNAME_FILE="/etc/domum-core-media/secrets/archive_ftp_username"
+BACKUP_TARGET_ARCHIVE_FTP_PASSWORD_FILE="/etc/domum-core-media/secrets/archive_ftp_password"
 
 # Uptime Kuma push URL for backup heartbeat. Optional; leave empty to skip.
 BACKUP_HEARTBEAT_URL=""

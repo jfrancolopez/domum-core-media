@@ -10,9 +10,8 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-# Weekly: metadata check on both repos.
-# Monthly: --read-data-subset=10% on NAS. The timer calls this service with
-# different ExecStart overrides via drop-ins, or you can split into a second
-# service. Default ExecStart is the cheap metadata check.
+# Weekly metadata check on all enabled targets, then run retention for any
+# target configured with BACKUP_TARGET_*_RETENTION=weekly.
 ExecStart=/usr/local/bin/domum-media-backup --check
+ExecStart=/usr/local/bin/domum-media-backup --weekly-retention
 TimeoutStartSec=4h

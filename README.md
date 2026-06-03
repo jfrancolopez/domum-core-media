@@ -25,10 +25,10 @@ It deliberately does **not** format the data SSD — see `docs/SETUP-N100.md`.
 - Git = source of truth (`/opt/domum-core-media` is `git reset --hard`-managed)
 - Host config in `/opt/domum-core-media/config/domum-media.conf`
 - Secrets in `/etc/domum-core-media/secrets/` (plain files, `chmod 600`, root)
-- Per-service compose fragments + `ENABLE_*` toggles
+- Per-service compose fragments + an interactive `domum-media configure` wizard
 - Single host Traefik with Cloudflare DNS-01 — no inbound ports
 - Tailscale for remote access
-- restic to NAS (append-only REST server) **and** Backblaze B2 cloud
+- restic to multiple targets (REST/B2/NFS/FTP via rclone), with at least two copies
 - btrfs subvolumes on the live tier — atomic snapshots before each `apply`,
   checksums surface bitrot loudly. Snapshots are *not* a substitute for restic;
   they protect against operator error, not disk death.
@@ -56,6 +56,7 @@ Secrets:
 Live data (btrfs, one subvolume per service):
 
     /srv/data/immich/{library,postgres}
+    /srv/data/jellyfin/
     /srv/data/uptime-kuma/
     /srv/data/traefik/
 
@@ -84,8 +85,12 @@ one-shots that are too destructive to retry safely.
 
        curl -fsSL https://raw.githubusercontent.com/jfrancolopez/domum-core-media/main/install.sh | sudo bash
 
-4. **Configure.** Copy `config/domum-media.conf.example` to
-   `config/domum-media.conf` and flip the `ENABLE_*` toggles you want.
+4. **Configure.** Run the interactive wizard to toggle services, choose backup
+   schedules, and define backup targets:
+
+       sudo domum-media configure
+
+   You can still hand-edit `config/domum-media.conf` if you prefer.
 5. **Bring up the host.**
 
        sudo domum-media init
@@ -105,11 +110,12 @@ Re-running the same curl command updates everything.
 | Command | What it does |
 | --- | --- |
 | `domum-media init` | Verify host state, create dirs, validate secrets |
+| `domum-media configure` | Interactive wizard for service toggles, backup targets, and schedule overrides |
 | `domum-media apply` | btrfs pre-apply snapshot then `docker compose up -d --remove-orphans` |
 | `domum-media status` | `docker compose ps`, last restic snapshot, btrfs snapshot list |
 | `domum-media update` | `git fetch && git reset --hard origin/main && apply` |
 | `domum-media logs <svc>` | `docker compose logs -f <svc>` |
-| `domum-media backup [--check\ | --restore]` | Ad-hoc backup, integrity check, or restore |
+| `domum-media backup [--check\| --check-deep [target] \| --restore]` | Ad-hoc backup, integrity check, or restore |
 | `domum-media snapshot {create\ | list\ | prune}` | btrfs subvolume snapshot management |
 
 ---
@@ -125,6 +131,8 @@ Re-running the same curl command updates everything.
 - `compose/photos/immich.yml` — Immich server, microservices, machine-learning,
   Redis, Postgres (pgvecto.rs). Pinned via `IMMICH_VERSION`. Library and
   Postgres data bind-mount to `/srv/data/immich/`.
+- `compose/media/jellyfin.yml` — Jellyfin, pinned via `JELLYFIN_VERSION`, with
+  config/cache on `/srv/data/jellyfin/` and a read-only media mount.
 - `compose/monitoring/uptime-kuma.yml` — status board
 - `compose/backups/restic-rest-server.yml` — **optional**; only enable if the
   NAS lives on this box. Default off.
@@ -136,12 +144,12 @@ Re-running the same curl command updates everything.
 `domum-media-backup` (a) takes a fresh btrfs snapshot of
 `/srv/data/immich/postgres`, (b) `pg_dump`s Immich's Postgres into a staging
 file alongside the immutable photo library, (c) runs `restic backup
-/srv/data` to the **NAS repo**, (d) applies the retention policy
-(`--keep-daily 7 --keep-weekly 5 --keep-monthly 12 --keep-yearly 3`), (e)
-repeats for the **cloud repo** (cloud forget runs weekly, not daily, to limit
-B2 API spend), (f) writes a one-line status to `/var/log/domum-media/backup.log`
-and pings Uptime Kuma. `domum-media-check.timer` does `restic check` weekly and
-`restic check --read-data-subset=10%` monthly on the NAS repo.
+/srv/data` to every enabled backup target, whether that target is a plain
+restic repo string, an NFS-mounted repo, or an FTP archive via rclone, (d)
+applies retention according to each target's configured cadence, (e) writes a
+one-line status to `/var/log/domum-media/backup.log` and pings Uptime Kuma.
+`domum-media-check.timer` does the weekly metadata checks and weekly-retention
+pass; deep checks remain manual via `domum-media backup --check-deep`.
 
 Restic password escrow is **not optional**: see `docs/SETUP-RESTIC.md`.
 

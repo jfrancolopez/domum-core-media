@@ -44,6 +44,7 @@ btrfs subvolume create /mnt/@snapshots
 btrfs subvolume create /mnt/@data/immich
 btrfs subvolume create /mnt/@data/immich/library
 btrfs subvolume create /mnt/@data/immich/postgres
+btrfs subvolume create /mnt/@data/jellyfin
 btrfs subvolume create /mnt/@data/uptime-kuma
 btrfs subvolume create /mnt/@data/traefik
 umount /mnt

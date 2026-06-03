@@ -3,24 +3,9 @@ set -euo pipefail
 
 # domum-media-backup — restic wrapper invoked by systemd timers and the CLI.
 #
-# Order of operations (daily):
-#   1. Quiesce Immich Postgres via pg_dump streamed into a fresh btrfs
-#      snapshot directory. Photo library files are immutable once written,
-#      so they're safe to back up live alongside the dump.
-#   2. restic backup /srv/data -> NAS repo (rest-server, append-only mode)
-#   3. restic forget --prune (daily policy) on NAS
-#   4. restic backup /srv/data -> cloud repo (B2)
-#   5. restic forget --prune on cloud (only on weekly runs to limit API spend)
-#   6. Write a one-line status log and (optional) heartbeat ping
-#
-# Modes:
-#   (no args)         — full daily backup
-#   --check           — restic check on both repos (metadata only)
-#   --check-deep      — restic check --read-data-subset=10% on NAS
-#   --check-cloud-deep — full --read-data on cloud (quarterly drill)
-#   --restore <snap> <target> [--repo nas|cloud]
-#                     — restic restore from chosen repo (default NAS)
-#   --weekly-cloud-forget — run cloud retention policy (called by separate timer)
+# Backups are now driven by BACKUP_TARGET_* entries in config/domum-media.conf.
+# Each enabled target can be a plain restic repository string, an NFS-mounted
+# repo, or an FTP target reached via restic's rclone backend.
 
 DOMUM_DIR="${DOMUM_DIR:-/opt/domum-core-media}"
 CFG_FILE="${CFG_FILE:-$DOMUM_DIR/config/domum-media.conf}"
@@ -30,6 +15,11 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE" >&2; }
 
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."; }
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+uppercase_token() {
+  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_' | tr -c 'A-Z0-9_' '_'
+}
 
 load_cfg() {
   [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE"
@@ -42,6 +32,25 @@ load_cfg() {
   RESTIC_KEEP_WEEKLY="${RESTIC_KEEP_WEEKLY:-5}"
   RESTIC_KEEP_MONTHLY="${RESTIC_KEEP_MONTHLY:-12}"
   RESTIC_KEEP_YEARLY="${RESTIC_KEEP_YEARLY:-3}"
+  BACKUP_DEEP_CHECK_PERCENT="${BACKUP_DEEP_CHECK_PERCENT:-10%}"
+}
+
+export_compose_env() {
+  export DOMUM_DOMAIN="${DOMUM_DOMAIN:-ladomum.com}"
+  export DOMUM_DATA_ROOT
+  export IMMICH_VERSION="${IMMICH_VERSION:-release}"
+  export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
+  export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
+  export IMMICH_PG_IMAGE="${IMMICH_PG_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
+
+  if [[ -f "$SECRETS_DIR/immich_db_password" ]]; then
+    IMMICH_DB_PASSWORD="$(cat "$SECRETS_DIR/immich_db_password")"
+    export IMMICH_DB_PASSWORD
+  fi
+  if [[ -f "$SECRETS_DIR/immich_jwt_secret" ]]; then
+    IMMICH_JWT_SECRET="$(cat "$SECRETS_DIR/immich_jwt_secret")"
+    export IMMICH_JWT_SECRET
+  fi
 }
 
 ensure_dirs() {
@@ -61,6 +70,81 @@ require_files() {
   fi
 }
 
+backup_target_names() {
+  local names="${BACKUP_TARGETS:-nas cloud}"
+  for name in $names; do
+    [[ -n "$name" ]] && echo "$name"
+  done
+}
+
+backup_target_default_enabled() {
+  case "$1" in
+    nas|cloud) echo "1" ;;
+    *)         echo "0" ;;
+  esac
+}
+
+backup_target_value() {
+  local target="$1"
+  local field="$2"
+  local fallback="${3:-}"
+  local key="BACKUP_TARGET_$(uppercase_token "$target")_${field}"
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s' "${!key}"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+backup_target_enabled() {
+  [[ "$(backup_target_value "$1" ENABLED "$(backup_target_default_enabled "$1")")" == "1" ]]
+}
+
+backup_target_password_file() {
+  backup_target_value "$1" PASSWORD_FILE "$SECRETS_DIR/restic_password_$1"
+}
+
+backup_target_retention() {
+  case "$1" in
+    nas)   backup_target_value "$1" RETENTION "daily" ;;
+    cloud) backup_target_value "$1" RETENTION "weekly" ;;
+    *)     backup_target_value "$1" RETENTION "none" ;;
+  esac
+}
+
+backup_target_legacy_env_file() {
+  printf '%s/restic_%s_env' "$SECRETS_DIR" "$1"
+}
+
+backup_target_exists() {
+  local target="$1"
+  while IFS= read -r name; do
+    [[ "$name" == "$target" ]] && return 0
+  done < <(backup_target_names)
+  return 1
+}
+
+default_restore_target() {
+  if backup_target_exists nas && backup_target_enabled nas; then
+    echo "nas"
+    return 0
+  fi
+  while IFS= read -r name; do
+    backup_target_enabled "$name" || continue
+    echo "$name"
+    return 0
+  done < <(backup_target_names)
+  die "No enabled backup targets found."
+}
+
+default_full_check_target() {
+  if backup_target_exists cloud && backup_target_enabled cloud; then
+    echo "cloud"
+    return 0
+  fi
+  default_restore_target
+}
+
 # Quiesce Immich Postgres: take a btrfs snapshot of the postgres data dir,
 # then run pg_dump from inside the postgres container into the staging
 # location alongside the photo library.
@@ -74,7 +158,6 @@ quiesce_immich_postgres() {
     return 0
   fi
 
-  # Snapshot of pg data — kept as belt-and-braces alongside the logical dump.
   if command -v btrfs >/dev/null 2>&1 && btrfs subvolume show "$pg_subvol" >/dev/null 2>&1; then
     local snap="$DOMUM_SNAPSHOT_ROOT/immich-postgres-prebackup-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$DOMUM_SNAPSHOT_ROOT"
@@ -82,48 +165,152 @@ quiesce_immich_postgres() {
     btrfs subvolume snapshot -r "$pg_subvol" "$snap" >/dev/null
   fi
 
-  # Logical pg_dump — this is what restore actually uses for consistency.
   local dump_file="$stage_dir/immich-postgres.dump.sql.gz"
   local pg_user="${IMMICH_DB_USERNAME:-postgres}"
   local pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
   log "pg_dump immich -> $dump_file"
-  if docker compose -f "$DOMUM_DIR/compose/photos/immich.yml" ps immich_postgres >/dev/null 2>&1; then
-    docker compose -f "$DOMUM_DIR/compose/photos/immich.yml" exec -T immich_postgres \
+  if docker compose -f "$DOMUM_DIR/compose/base.yml" -f "$DOMUM_DIR/compose/photos/immich.yml" ps immich_postgres >/dev/null 2>&1; then
+    docker compose -f "$DOMUM_DIR/compose/base.yml" -f "$DOMUM_DIR/compose/photos/immich.yml" exec -T immich_postgres \
       pg_dump -U "$pg_user" -d "$pg_db" | gzip -9 > "$dump_file"
   else
     log "Immich postgres container not running — skipping pg_dump."
   fi
 }
 
-# Run restic for a given repo. Sources the env file (RESTIC_REPOSITORY +
-# transport creds) and pulls the password from the matching file.
-restic_for_repo() {
-  local repo_name="$1"; shift
-  local env_file="$SECRETS_DIR/restic_${repo_name}_env"
-  local pw_file="$SECRETS_DIR/restic_password_${repo_name}"
-  require_files "$env_file" "$pw_file"
+restic_with_env() {
+  local pw_file="$1"
+  local repository="$2"
+  local env_file="${3:-}"
+  local rclone_config="${4:-}"
+  shift 4
+  require_files "$pw_file"
 
-  ( set +u
-    # shellcheck disable=SC1090
-    source "$env_file"
+  (
+    if [[ -n "$env_file" ]]; then
+      require_files "$env_file"
+      set +u
+      # shellcheck disable=SC1090
+      source "$env_file"
+      set -u
+    fi
     export RESTIC_PASSWORD_FILE="$pw_file"
+    export RESTIC_REPOSITORY="$repository"
+    if [[ -n "$rclone_config" ]]; then
+      export RCLONE_CONFIG="$rclone_config"
+    fi
     restic "$@"
   )
 }
 
+restic_for_target() {
+  local target="$1"
+  shift
+
+  local target_type pw_file
+  target_type="$(backup_target_value "$target" TYPE repository)"
+  pw_file="$(backup_target_password_file "$target")"
+
+  case "$target_type" in
+    repository)
+      local repository env_file extra_env_file
+      repository="$(backup_target_value "$target" REPOSITORY)"
+      env_file="$(backup_target_legacy_env_file "$target")"
+      extra_env_file="$(backup_target_value "$target" ENV_FILE)"
+      if [[ -n "$repository" ]]; then
+        restic_with_env "$pw_file" "$repository" "$extra_env_file" "" "$@"
+        return 0
+      fi
+      require_files "$env_file" "$pw_file"
+      (
+        set +u
+        # shellcheck disable=SC1090
+        source "$env_file"
+        export RESTIC_PASSWORD_FILE="$pw_file"
+        restic "$@"
+      )
+      ;;
+    nfs)
+      local remote mount_point repository mounted_here=0 rc
+      remote="$(backup_target_value "$target" NFS_REMOTE)"
+      mount_point="$(backup_target_value "$target" NFS_MOUNT_POINT)"
+      repository="$(backup_target_value "$target" REPOSITORY)"
+      [[ -n "$remote" && -n "$mount_point" && -n "$repository" ]] || die "Incomplete NFS config for target '$target'"
+      mkdir -p "$mount_point"
+      if ! mountpoint -q "$mount_point"; then
+        mount -t nfs "$remote" "$mount_point"
+        mounted_here=1
+      fi
+      set +e
+      restic_with_env "$pw_file" "$repository" "" "" "$@"
+      rc=$?
+      set -e
+      if (( mounted_here )); then
+        umount "$mount_point"
+      fi
+      return "$rc"
+      ;;
+    ftp)
+      local host port remote_name path user_file pass_file tmp_cfg obscured_pass rc
+      host="$(backup_target_value "$target" FTP_HOST)"
+      port="$(backup_target_value "$target" FTP_PORT 21)"
+      remote_name="$(backup_target_value "$target" FTP_REMOTE_NAME "$target")"
+      path="$(backup_target_value "$target" FTP_PATH "/domum-media")"
+      user_file="$(backup_target_value "$target" FTP_USERNAME_FILE "$SECRETS_DIR/${target}_ftp_username")"
+      pass_file="$(backup_target_value "$target" FTP_PASSWORD_FILE "$SECRETS_DIR/${target}_ftp_password")"
+      [[ -n "$host" ]] || die "Missing FTP host for target '$target'"
+      require_files "$pw_file" "$user_file" "$pass_file"
+      cmd_exists rclone || die "rclone is required for FTP backup targets."
+      obscured_pass="$(rclone obscure "$(cat "$pass_file")")"
+      tmp_cfg="$(mktemp)"
+      cat > "$tmp_cfg" <<EOF
+[${remote_name}]
+type = ftp
+host = ${host}
+port = ${port}
+user = $(cat "$user_file")
+pass = ${obscured_pass}
+EOF
+      set +e
+      restic_with_env "$pw_file" "rclone:${remote_name}:${path}" "" "$tmp_cfg" "$@"
+      rc=$?
+      set -e
+      rm -f "$tmp_cfg"
+      return "$rc"
+      ;;
+    *)
+      die "Unknown backup target type '$target_type' for '$target'"
+      ;;
+  esac
+}
+
+enabled_backup_targets() {
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    echo "$target"
+  done < <(backup_target_names)
+}
+
+retention_targets() {
+  local cadence="$1"
+  while IFS= read -r target; do
+    [[ "$(backup_target_retention "$target")" == "$cadence" ]] || continue
+    echo "$target"
+  done < <(enabled_backup_targets)
+}
+
 restic_backup_to() {
-  local repo_name="$1"
-  log "restic backup -> $repo_name"
-  restic_for_repo "$repo_name" backup \
+  local target="$1"
+  log "restic backup -> $target"
+  restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
     --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
     "$DOMUM_DATA_ROOT"
 }
 
 restic_forget_for() {
-  local repo_name="$1"
-  log "restic forget --prune on $repo_name"
-  restic_for_repo "$repo_name" forget --prune \
+  local target="$1"
+  log "restic forget --prune on $target"
+  restic_for_target "$target" forget --prune \
     --keep-daily   "$RESTIC_KEEP_DAILY" \
     --keep-weekly  "$RESTIC_KEEP_WEEKLY" \
     --keep-monthly "$RESTIC_KEEP_MONTHLY" \
@@ -131,9 +318,22 @@ restic_forget_for() {
 }
 
 restic_check_for() {
-  local repo_name="$1"; shift
-  log "restic check on $repo_name $*"
-  restic_for_repo "$repo_name" check "$@"
+  local target="$1"
+  shift
+  log "restic check on $target $*"
+  restic_for_target "$target" check "$@"
+}
+
+list_latest_snapshots() {
+  local any=0
+  while IFS= read -r target; do
+    any=1
+    echo "-- $target --"
+    if ! restic_for_target "$target" snapshots --latest 1 2>&1; then
+      echo "(failed to query snapshots for $target)"
+    fi
+  done < <(enabled_backup_targets)
+  (( any == 1 )) || echo "(no enabled backup targets)"
 }
 
 heartbeat() {
@@ -144,78 +344,106 @@ heartbeat() {
 }
 
 do_daily_backup() {
+  local ran_any=0
   log "=== daily backup start ==="
   quiesce_immich_postgres
 
-  restic_backup_to nas
-  restic_forget_for nas
+  while IFS= read -r target; do
+    ran_any=1
+    restic_backup_to "$target"
+  done < <(enabled_backup_targets)
 
-  restic_backup_to cloud
-  # cloud forget runs on weekly timer to limit B2 API calls
+  while IFS= read -r target; do
+    restic_forget_for "$target"
+  done < <(retention_targets daily)
+
+  (( ran_any == 1 )) || die "No enabled backup targets configured."
 
   heartbeat
   log "=== daily backup ok ==="
 }
 
-do_weekly_cloud_forget() {
-  log "weekly cloud forget"
-  restic_forget_for cloud
+do_weekly_retention() {
+  local ran_any=0
+  while IFS= read -r target; do
+    ran_any=1
+    restic_forget_for "$target"
+  done < <(retention_targets weekly)
+  (( ran_any == 1 )) || log "No weekly-retention targets configured."
 }
 
 do_check() {
-  restic_check_for nas
-  restic_check_for cloud
+  while IFS= read -r target; do
+    restic_check_for "$target"
+  done < <(enabled_backup_targets)
 }
 
 do_check_deep() {
-  restic_check_for nas --read-data-subset=10%
+  local target="${1:-$(default_restore_target)}"
+  restic_check_for "$target" --read-data-subset="$BACKUP_DEEP_CHECK_PERCENT"
 }
 
-do_check_cloud_deep() {
-  restic_check_for cloud --read-data
+do_check_full() {
+  local target="${1:-$(default_full_check_target)}"
+  restic_check_for "$target" --read-data
 }
 
 do_restore() {
-  local snap="${1:-}"; local target="${2:-}"; local repo="nas"
+  local snap="${1:-}"
+  local target_dir="${2:-}"
+  local repo
+  repo="$(default_restore_target)"
   shift 2 || true
   while (( $# )); do
     case "$1" in
-      --repo) repo="$2"; shift 2 ;;
-      *) die "Unknown restore arg: $1" ;;
+      --repo)
+        repo="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown restore arg: $1"
+        ;;
     esac
   done
-  [[ -n "$snap" && -n "$target" ]] || die "Usage: --restore <snapshot> <target> [--repo nas|cloud]"
-  log "restic restore $snap -> $target (from $repo)"
-  mkdir -p "$target"
-  restic_for_repo "$repo" restore "$snap" --target "$target"
+  [[ -n "$snap" && -n "$target_dir" ]] || die "Usage: --restore <snapshot> <target> [--repo target-name]"
+  log "restic restore $snap -> $target_dir (from $repo)"
+  mkdir -p "$target_dir"
+  restic_for_target "$repo" restore "$snap" --target "$target_dir"
 }
 
 main() {
   need_root
   load_cfg
+  export_compose_env
   ensure_dirs
 
   case "${1:-}" in
-    "")                    do_daily_backup ;;
-    --check)               do_check ;;
-    --check-deep)          do_check_deep ;;
-    --check-cloud-deep)    do_check_cloud_deep ;;
-    --weekly-cloud-forget) do_weekly_cloud_forget ;;
-    --restore)             shift; do_restore "$@" ;;
+    "")                   do_daily_backup ;;
+    --check)              do_check ;;
+    --check-deep)         shift; do_check_deep "${1:-}" ;;
+    --check-cloud-deep)   shift; do_check_full "${1:-}" ;;
+    --weekly-retention)   do_weekly_retention ;;
+    --weekly-cloud-forget) do_weekly_retention ;;
+    --restore)            shift; do_restore "$@" ;;
+    --snapshots)          list_latest_snapshots ;;
     -h|--help)
       cat <<EOF
 domum-media-backup — restic wrapper
 
 Usage:
-  domum-media-backup                       Daily backup (NAS + cloud)
-  domum-media-backup --check               Metadata check on both repos
-  domum-media-backup --check-deep          NAS read-data-subset=10%
-  domum-media-backup --check-cloud-deep    Full cloud --read-data
-  domum-media-backup --weekly-cloud-forget Cloud retention policy
-  domum-media-backup --restore <snap> <target> [--repo nas|cloud]
+  domum-media-backup                         Daily backup for all enabled targets
+  domum-media-backup --check                Metadata check on all enabled targets
+  domum-media-backup --check-deep [target]  Read-data-subset check on one target
+  domum-media-backup --check-cloud-deep [target]
+                                            Full read-data check on one target
+  domum-media-backup --weekly-retention     Run weekly retention targets
+  domum-media-backup --restore <snap> <target> [--repo target-name]
+  domum-media-backup --snapshots            Show latest snapshot per target
 EOF
       ;;
-    *) die "Unknown command: $1 (try --help)" ;;
+    *)
+      die "Unknown command: $1 (try --help)"
+      ;;
   esac
 }
 

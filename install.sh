@@ -48,12 +48,12 @@ require_network() {
 }
 
 install_prereqs() {
-  echo "[domum-media] Installing prereqs (curl, git, gnupg, btrfs-progs, jq, apparmor)..."
+  echo "[domum-media] Installing prereqs (curl, git, gnupg, btrfs-progs, jq, apparmor, nfs-common, rclone)..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y --no-install-recommends \
     ca-certificates curl git gnupg lsb-release \
-    btrfs-progs jq apparmor
+    btrfs-progs jq apparmor nfs-common rclone
 }
 
 install_docker() {
@@ -160,17 +160,24 @@ print_next_steps() {
 
   1. Place secrets in ${CONFIG_DIR}/secrets/ (chmod 600, root-owned):
        cloudflare_api_token
-       restic_password_nas
-       restic_password_cloud
-       restic_nas_env       # RESTIC_REPOSITORY=rest:... + creds
-       restic_cloud_env     # RESTIC_REPOSITORY=b2:bucket:/path + B2_ACCOUNT_ID/KEY
        immich_db_password
        immich_jwt_secret
+       restic_password_nas
+       restic_password_cloud
+       # optional, if you keep the legacy env-file flow:
+       restic_nas_env       # RESTIC_REPOSITORY=rest:... + creds
+       restic_cloud_env     # RESTIC_REPOSITORY=b2:bucket:/path + B2_ACCOUNT_ID/KEY
+       # optional, if you enable FTP or extra targets in the wizard:
+       restic_password_archive
+       archive_ftp_username
+       archive_ftp_password
 
   2. Bring up Tailscale (operator step — not auto-run by install.sh):
        sudo tailscale up --ssh
 
-  3. Copy config example and edit toggles:
+  3. Run the interactive config wizard (or edit the file manually):
+       sudo domum-media configure
+       # or:
        cp ${INSTALL_DIR}/config/domum-media.conf.example ${INSTALL_DIR}/config/domum-media.conf
        \$EDITOR ${INSTALL_DIR}/config/domum-media.conf
 

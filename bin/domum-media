@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # domum-media — host CLI for domum-core-media.
-# Mirrors bin/domum from domum-core, with btrfs snapshot + restic glue and
-# an Immich-aware service list.
+# Adds config-driven service toggles, timer schedule syncing, and a simple
+# interactive configuration flow on top of the compose + restic wrappers.
 
 DOMUM_DIR="${DOMUM_DIR:-/opt/domum-core-media}"
 CFG_FILE="${CFG_FILE:-$DOMUM_DIR/config/domum-media.conf}"
@@ -18,8 +18,14 @@ need_root() {
   [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."
 }
 
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+uppercase_token() {
+  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_' | tr -c 'A-Z0-9_' '_'
+}
+
 load_cfg() {
-  [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE (copy domum-media.conf.example)"
+  [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE (copy domum-media.conf.example or run 'domum-media configure')"
   # shellcheck disable=SC1090
   source "$CFG_FILE"
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
@@ -27,7 +33,62 @@ load_cfg() {
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
 }
 
-cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+ensure_cfg_file() {
+  if [[ ! -f "$CFG_FILE" ]]; then
+    echo "[domum-media] Creating config from example at $CFG_FILE"
+    install -D -m 0644 "$DOMUM_DIR/config/domum-media.conf.example" "$CFG_FILE"
+  fi
+}
+
+backup_target_names() {
+  local names="${BACKUP_TARGETS:-nas cloud archive}"
+  for name in $names; do
+    [[ -n "$name" ]] && echo "$name"
+  done
+}
+
+backup_target_default_enabled() {
+  case "$1" in
+    nas|cloud) echo "1" ;;
+    *)         echo "0" ;;
+  esac
+}
+
+backup_target_value() {
+  local target="$1"
+  local field="$2"
+  local fallback="${3:-}"
+  local key="BACKUP_TARGET_$(uppercase_token "$target")_${field}"
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s' "${!key}"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+backup_target_enabled() {
+  [[ "$(backup_target_value "$1" ENABLED "$(backup_target_default_enabled "$1")")" == "1" ]]
+}
+
+backup_target_password_file() {
+  backup_target_value "$1" PASSWORD_FILE "$SECRETS_DIR/restic_password_$1"
+}
+
+backup_target_legacy_env_file() {
+  printf '%s/restic_%s_env' "$SECRETS_DIR" "$1"
+}
+
+backup_target_has_repository_source() {
+  local target="$1"
+  [[ -n "$(backup_target_value "$target" REPOSITORY)" ]] && return 0
+  [[ -f "$(backup_target_legacy_env_file "$target")" ]]
+}
+
+missing_if_absent() {
+  local path="$1"
+  local label="$2"
+  [[ -f "$path" ]] || echo "$label"
+}
 
 # ---- compose layering ------------------------------------------------------
 
@@ -43,6 +104,9 @@ compose_files_for_enabled_services() {
   fi
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/photos/immich.yml")
+  fi
+  if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/media/jellyfin.yml")
   fi
   if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/monitoring/uptime-kuma.yml")
@@ -68,6 +132,10 @@ export_env_for_compose() {
   export IMMICH_PG_IMAGE="${IMMICH_PG_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
   export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
   export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
+  export JELLYFIN_VERSION="${JELLYFIN_VERSION:-10.10.7}"
+  export JELLYFIN_CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
+  export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
+  export JELLYFIN_MEDIA_ROOT="${JELLYFIN_MEDIA_ROOT:-/srv/media}"
 
   if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
     CF_DNS_API_TOKEN="$(cat "$SECRETS_DIR/cloudflare_api_token")"
@@ -96,6 +164,8 @@ ensure_networks() {
 ensure_dirs() {
   mkdir -p "$DOMUM_LOG_DIR"
   mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT"
+  mkdir -p "${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
+  mkdir -p "${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
 }
 
 compose_cmd() {
@@ -108,15 +178,13 @@ compose_cmd() {
 # ---- btrfs snapshots ------------------------------------------------------
 
 is_btrfs_subvol() {
-  # Returns 0 if the path is a btrfs subvolume root.
   btrfs subvolume show "$1" >/dev/null 2>&1
 }
 
 snapshot_subvolumes() {
-  # Returns subvolumes under $DOMUM_DATA_ROOT that we should snapshot.
-  # We snapshot per-service to keep restore granular.
   local candidates=()
   candidates+=("$DOMUM_DATA_ROOT/immich")
+  candidates+=("$DOMUM_DATA_ROOT/jellyfin")
   candidates+=("$DOMUM_DATA_ROOT/uptime-kuma")
   candidates+=("$DOMUM_DATA_ROOT/traefik")
   for c in "${candidates[@]}"; do
@@ -153,12 +221,10 @@ snapshot_list() {
 snapshot_prune() {
   local keep="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
-  # Group by base subvolume name (everything before the first '-YYYYMMDD-')
   local names
   names="$(ls -1 "$DOMUM_SNAPSHOT_ROOT" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
-    # newest last, so we delete from the top until only $keep remain
     local snaps
     mapfile -t snaps < <(ls -1tr "$DOMUM_SNAPSHOT_ROOT" | grep -E "^${base}-[0-9]{8}-[0-9]{6}-")
     local total="${#snaps[@]}"
@@ -174,23 +240,297 @@ snapshot_prune() {
   done <<< "$names"
 }
 
+# ---- timer syncing --------------------------------------------------------
+
+normalize_daily_schedule() {
+  local value="$1"
+  if [[ "$value" =~ ^[0-9]{2}:[0-9]{2}$ ]]; then
+    printf '*-*-* %s:00' "$value"
+    return 0
+  fi
+  if [[ "$value" == *"*-*-*"* ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  die "Invalid daily schedule '$value' (expected HH:MM or full systemd OnCalendar string)"
+}
+
+normalize_weekly_schedule() {
+  local value="$1"
+  if [[ "$value" =~ ^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[[:space:]]+[0-9]{2}:[0-9]{2}$ ]]; then
+    printf '%s *-*-* %s:00' "${value%% *}" "${value##* }"
+    return 0
+  fi
+  if [[ "$value" == *"*-*-*"* ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  die "Invalid weekly schedule '$value' (expected 'Sun 03:30' or full systemd OnCalendar string)"
+}
+
+write_timer_override() {
+  local unit="$1"
+  local oncalendar="$2"
+  local randomized_delay="$3"
+  local dir="/etc/systemd/system/${unit}.d"
+  install -d "$dir"
+  cat > "${dir}/override.conf" <<EOF
+[Timer]
+OnCalendar=
+OnCalendar=${oncalendar}
+RandomizedDelaySec=${randomized_delay}
+Persistent=true
+EOF
+}
+
+sync_timer_overrides() {
+  local backup_calendar check_calendar prune_calendar
+  backup_calendar="$(normalize_daily_schedule "${BACKUP_DAILY_AT:-02:30}")"
+  check_calendar="$(normalize_weekly_schedule "${CHECK_WEEKLY_AT:-Sun 03:30}")"
+  prune_calendar="$(normalize_weekly_schedule "${SNAPSHOT_PRUNE_WEEKLY_AT:-Sun 04:30}")"
+
+  write_timer_override "domum-media-backup.timer" "$backup_calendar" "15m"
+  write_timer_override "domum-media-check.timer" "$check_calendar" "20m"
+  write_timer_override "domum-media-btrfs-snapshot.timer" "$prune_calendar" "20m"
+
+  systemctl daemon-reload
+  systemctl enable --now \
+    domum-media-backup.timer \
+    domum-media-check.timer \
+    domum-media-btrfs-snapshot.timer \
+    domum-media-dr-reminder.timer >/dev/null
+}
+
+# ---- configure flow -------------------------------------------------------
+
+config_set() {
+  local key="$1"
+  local value="${2:-}"
+  local rendered tmp
+  printf -v rendered '%q' "$value"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v val="$rendered" '
+    BEGIN { updated = 0 }
+    $0 ~ "^" key "=" {
+      print key "=" val
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print key "=" val
+      }
+    }
+  ' "$CFG_FILE" > "$tmp"
+  mv "$tmp" "$CFG_FILE"
+}
+
+prompt_with_default() {
+  local label="$1"
+  local current="${2:-}"
+  local reply
+  read -r -p "$label [$current]: " reply
+  printf '%s' "${reply:-$current}"
+}
+
+prompt_yes_no() {
+  local label="$1"
+  local current="${2:-0}"
+  local default="n"
+  local reply
+  [[ "$current" == "1" ]] && default="y"
+  while true; do
+    read -r -p "$label [y/n] (default: $default): " reply
+    reply="${reply:-$default}"
+    case "${reply,,}" in
+      y|yes) echo "1"; return 0 ;;
+      n|no)  echo "0"; return 0 ;;
+    esac
+  done
+}
+
+prompt_choice() {
+  local label="$1"
+  local current="$2"
+  shift 2
+  local reply
+  while true; do
+    read -r -p "$label [$current] ($(printf '%s ' "$@")): " reply
+    reply="${reply:-$current}"
+    for option in "$@"; do
+      if [[ "$reply" == "$option" ]]; then
+        echo "$reply"
+        return 0
+      fi
+    done
+  done
+}
+
+configure_service_toggle() {
+  local key="$1"
+  local label="$2"
+  local current="${!key:-0}"
+  config_set "$key" "$(prompt_yes_no "$label" "$current")"
+}
+
+configure_backup_target() {
+  local target="$1"
+  local upper
+  upper="$(uppercase_token "$target")"
+
+  echo
+  echo "Backup target: $target"
+
+  local enabled
+  enabled="$(prompt_yes_no "Enable $target backup target?" "$(backup_target_value "$target" ENABLED 0)")"
+  config_set "BACKUP_TARGET_${upper}_ENABLED" "$enabled"
+  if [[ "$enabled" != "1" ]]; then
+    return 0
+  fi
+
+  local target_type
+  target_type="$(prompt_choice "Target type for $target" "$(backup_target_value "$target" TYPE repository)" repository nfs ftp)"
+  config_set "BACKUP_TARGET_${upper}_TYPE" "$target_type"
+  config_set "BACKUP_TARGET_${upper}_RETENTION" \
+    "$(prompt_choice "Retention cadence for $target" "$(backup_target_value "$target" RETENTION none)" daily weekly none)"
+
+  case "$target_type" in
+    repository)
+      config_set "BACKUP_TARGET_${upper}_REPOSITORY" \
+        "$(prompt_with_default "Restic repository string for $target" "$(backup_target_value "$target" REPOSITORY)")"
+      config_set "BACKUP_TARGET_${upper}_PASSWORD_FILE" \
+        "$(prompt_with_default "Password file for $target" "$(backup_target_password_file "$target")")"
+      config_set "BACKUP_TARGET_${upper}_ENV_FILE" \
+        "$(prompt_with_default "Optional backend credential env file for $target" "$(backup_target_value "$target" ENV_FILE)")"
+      ;;
+    nfs)
+      config_set "BACKUP_TARGET_${upper}_NFS_REMOTE" \
+        "$(prompt_with_default "NFS remote for $target (server:/export/path)" "$(backup_target_value "$target" NFS_REMOTE)")"
+      config_set "BACKUP_TARGET_${upper}_NFS_MOUNT_POINT" \
+        "$(prompt_with_default "Local mount point for $target" "$(backup_target_value "$target" NFS_MOUNT_POINT "/mnt/domum-media-$target")")"
+      config_set "BACKUP_TARGET_${upper}_REPOSITORY" \
+        "$(prompt_with_default "Restic repo path on mounted NFS share" "$(backup_target_value "$target" REPOSITORY "/mnt/domum-media-$target/restic")")"
+      config_set "BACKUP_TARGET_${upper}_PASSWORD_FILE" \
+        "$(prompt_with_default "Password file for $target" "$(backup_target_password_file "$target")")"
+      ;;
+    ftp)
+      config_set "BACKUP_TARGET_${upper}_FTP_HOST" \
+        "$(prompt_with_default "FTP host for $target" "$(backup_target_value "$target" FTP_HOST)")"
+      config_set "BACKUP_TARGET_${upper}_FTP_PORT" \
+        "$(prompt_with_default "FTP port for $target" "$(backup_target_value "$target" FTP_PORT 21)")"
+      config_set "BACKUP_TARGET_${upper}_FTP_REMOTE_NAME" \
+        "$(prompt_with_default "Temporary rclone remote name for $target" "$(backup_target_value "$target" FTP_REMOTE_NAME "$target")")"
+      config_set "BACKUP_TARGET_${upper}_FTP_PATH" \
+        "$(prompt_with_default "Remote FTP path for $target" "$(backup_target_value "$target" FTP_PATH "/domum-media")")"
+      config_set "BACKUP_TARGET_${upper}_FTP_USERNAME_FILE" \
+        "$(prompt_with_default "FTP username file for $target" "$(backup_target_value "$target" FTP_USERNAME_FILE "$SECRETS_DIR/${target}_ftp_username")")"
+      config_set "BACKUP_TARGET_${upper}_FTP_PASSWORD_FILE" \
+        "$(prompt_with_default "FTP password file for $target" "$(backup_target_value "$target" FTP_PASSWORD_FILE "$SECRETS_DIR/${target}_ftp_password")")"
+      config_set "BACKUP_TARGET_${upper}_PASSWORD_FILE" \
+        "$(prompt_with_default "Restic repository password file for $target" "$(backup_target_password_file "$target")")"
+      ;;
+  esac
+}
+
+configure_cmd() {
+  need_root
+  ensure_cfg_file
+  load_cfg
+
+  echo "[domum-media] Interactive configuration"
+  echo "Press Enter to keep the current value."
+  echo
+
+  configure_service_toggle ENABLE_TRAEFIK "Enable Traefik reverse proxy?"
+  configure_service_toggle ENABLE_TAILSCALE "Enable Tailscale container?"
+  configure_service_toggle ENABLE_IMMICH "Enable Immich?"
+  configure_service_toggle ENABLE_JELLYFIN "Enable Jellyfin?"
+  configure_service_toggle ENABLE_UPTIME_KUMA "Enable Uptime Kuma?"
+  configure_service_toggle ENABLE_RESTIC_REST_SERVER "Enable local restic REST server?"
+
+  echo
+  config_set BACKUP_DAILY_AT \
+    "$(prompt_with_default "Daily backup time (HH:MM)" "${BACKUP_DAILY_AT:-02:30}")"
+  config_set CHECK_WEEKLY_AT \
+    "$(prompt_with_default "Weekly check schedule (e.g. Sun 03:30)" "${CHECK_WEEKLY_AT:-Sun 03:30}")"
+  config_set SNAPSHOT_PRUNE_WEEKLY_AT \
+    "$(prompt_with_default "Weekly snapshot prune schedule (e.g. Sun 04:30)" "${SNAPSHOT_PRUNE_WEEKLY_AT:-Sun 04:30}")"
+  config_set BACKUP_HEARTBEAT_URL \
+    "$(prompt_with_default "Backup heartbeat URL (blank to disable)" "${BACKUP_HEARTBEAT_URL:-}")"
+
+  echo
+  config_set BACKUP_TARGETS "nas cloud archive"
+  configure_backup_target nas
+  configure_backup_target cloud
+  configure_backup_target archive
+
+  ensure_cfg_file
+  load_cfg
+  sync_timer_overrides
+
+  echo
+  echo "[domum-media] Configuration saved to $CFG_FILE"
+  echo "[domum-media] Timer overrides synced. Run 'sudo domum-media apply' to converge services."
+}
+
 # ---- commands -------------------------------------------------------------
 
 init_host() {
   need_root
+  ensure_cfg_file
   load_cfg
+  export_env_for_compose
   ensure_dirs
 
   local missing=()
-  for s in cloudflare_api_token immich_db_password immich_jwt_secret \
-           restic_password_nas restic_password_cloud \
-           restic_nas_env restic_cloud_env; do
-    [[ -f "$SECRETS_DIR/$s" ]] || missing+=("$s")
-  done
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
+    while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
+      < <(missing_if_absent "$SECRETS_DIR/cloudflare_api_token" "cloudflare_api_token")
+  fi
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
+      < <(missing_if_absent "$SECRETS_DIR/immich_db_password" "immich_db_password")
+    while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
+      < <(missing_if_absent "$SECRETS_DIR/immich_jwt_secret" "immich_jwt_secret")
+  fi
+
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    local target_type pw_file
+    target_type="$(backup_target_value "$target" TYPE repository)"
+    pw_file="$(backup_target_password_file "$target")"
+    [[ -f "$pw_file" ]] || missing+=("$pw_file")
+    case "$target_type" in
+      repository)
+        if ! backup_target_has_repository_source "$target"; then
+          missing+=("BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY or $(backup_target_legacy_env_file "$target")")
+        fi
+        local env_file
+        env_file="$(backup_target_value "$target" ENV_FILE)"
+        if [[ -n "$env_file" && ! -f "$env_file" ]]; then
+          missing+=("$env_file")
+        fi
+        ;;
+      nfs)
+        [[ -n "$(backup_target_value "$target" NFS_REMOTE)" ]] || missing+=("BACKUP_TARGET_$(uppercase_token "$target")_NFS_REMOTE")
+        [[ -n "$(backup_target_value "$target" NFS_MOUNT_POINT)" ]] || missing+=("BACKUP_TARGET_$(uppercase_token "$target")_NFS_MOUNT_POINT")
+        [[ -n "$(backup_target_value "$target" REPOSITORY)" ]] || missing+=("BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY")
+        ;;
+      ftp)
+        [[ -n "$(backup_target_value "$target" FTP_HOST)" ]] || missing+=("BACKUP_TARGET_$(uppercase_token "$target")_FTP_HOST")
+        while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
+          < <(missing_if_absent "$(backup_target_value "$target" FTP_USERNAME_FILE "$SECRETS_DIR/${target}_ftp_username")" "FTP username file for $target")
+        while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
+          < <(missing_if_absent "$(backup_target_value "$target" FTP_PASSWORD_FILE "$SECRETS_DIR/${target}_ftp_password")" "FTP password file for $target")
+        ;;
+    esac
+  done < <(backup_target_names)
+
   if (( ${#missing[@]} > 0 )); then
-    echo "[domum-media] WARNING: missing secrets under $SECRETS_DIR:"
+    echo "[domum-media] WARNING: missing config/secrets:"
     for m in "${missing[@]}"; do echo "    $m"; done
-    echo "    Place them before 'apply'. See docs/SETUP-RESTIC.md + SETUP-CLOUDFLARE.md."
+    echo "    Run 'domum-media configure' or fill the listed files before the backup timer fires."
   fi
 
   if ! cmd_exists btrfs; then
@@ -200,7 +540,14 @@ init_host() {
     echo "[domum-media] WARNING: $DOMUM_DATA_ROOT is not a mount point."
     echo "    Did you complete docs/SETUP-N100.md? Snapshots will fail otherwise."
   fi
+  if ! cmd_exists mount.nfs; then
+    echo "[domum-media] WARNING: mount.nfs not found. NFS backup targets will fail until nfs-common is installed."
+  fi
+  if ! cmd_exists rclone; then
+    echo "[domum-media] WARNING: rclone not found. FTP/rclone backup targets will fail until rclone is installed."
+  fi
 
+  sync_timer_overrides
   echo "[domum-media] init complete."
 }
 
@@ -210,6 +557,7 @@ apply() {
   export_env_for_compose
   ensure_dirs
   ensure_networks
+  sync_timer_overrides
 
   echo "[domum-media] Pre-apply btrfs snapshot..."
   snapshot_create "pre-apply" || echo "[domum-media] Snapshot step failed (continuing)."
@@ -230,25 +578,7 @@ status() {
 
   echo
   echo "=== restic last snapshots ==="
-  if cmd_exists restic; then
-    for env_file in "$SECRETS_DIR/restic_nas_env" "$SECRETS_DIR/restic_cloud_env"; do
-      [[ -f "$env_file" ]] || continue
-      echo "-- ${env_file##*/} --"
-      ( set +u
-        # shellcheck disable=SC1090
-        source "$env_file"
-        local pw_file="$SECRETS_DIR/restic_password_nas"
-        [[ "$env_file" == *_cloud_env ]] && pw_file="$SECRETS_DIR/restic_password_cloud"
-        if [[ -f "$pw_file" ]]; then
-          RESTIC_PASSWORD_FILE="$pw_file" restic snapshots --latest 1 2>&1 | tail -n +1 || true
-        else
-          echo "(missing password file: $pw_file)"
-        fi
-      )
-    done
-  else
-    echo "(restic not installed)"
-  fi
+  "$DOMUM_DIR/bin/domum-media-backup" --snapshots || true
 
   echo
   echo "=== btrfs snapshots (${DOMUM_SNAPSHOT_ROOT}) ==="
@@ -297,11 +627,12 @@ domum-media (domum-core-media)
 
 Usage:
   domum-media init
+  domum-media configure
   domum-media apply
   domum-media status
   domum-media update
   domum-media logs <service>
-  domum-media backup [--check|--restore <snapshot> <target>]
+  domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
   domum-media snapshot {create [tag]|list|prune}
 
 Config:  $CFG_FILE
@@ -313,13 +644,14 @@ EOF
 main() {
   local cmd="${1:-}"
   case "$cmd" in
-    init)     shift; init_host "$@" ;;
-    apply)    shift; apply "$@" ;;
-    status)   shift; status "$@" ;;
-    update)   shift; repo_update "$@" ;;
-    logs)     shift; logs_cmd "$@" ;;
-    backup)   backup_cmd "$@" ;;
-    snapshot) shift; snapshot_cmd "$@" ;;
+    init)      shift; init_host "$@" ;;
+    configure) shift; configure_cmd "$@" ;;
+    apply)     shift; apply "$@" ;;
+    status)    shift; status "$@" ;;
+    update)    shift; repo_update "$@" ;;
+    logs)      shift; logs_cmd "$@" ;;
+    backup)    backup_cmd "$@" ;;
+    snapshot)  shift; snapshot_cmd "$@" ;;
     -h|--help|help|"") usage ;;
     *) usage; exit 1 ;;
   esac
