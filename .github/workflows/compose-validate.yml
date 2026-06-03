@@ -18,7 +18,9 @@ jobs:
         run: bash -n bin/domum-media bin/domum-media-backup install.sh
 
       - name: shellcheck
-        run: shellcheck bin/domum-media bin/domum-media-backup install.sh
+        # Fail on real warnings/errors; info-level notes (e.g. sourcing
+        # /etc/os-release, intentional subshell-scoped exports) are advisory.
+        run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup install.sh
 
       - name: docker compose config (every fragment layered on base)
         env:

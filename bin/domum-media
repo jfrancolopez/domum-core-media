@@ -58,7 +58,8 @@ backup_target_value() {
   local target="$1"
   local field="$2"
   local fallback="${3:-}"
-  local key="BACKUP_TARGET_$(uppercase_token "$target")_${field}"
+  local key
+  key="BACKUP_TARGET_$(uppercase_token "$target")_${field}"
   if [[ -n "${!key:-}" ]]; then
     printf '%s' "${!key}"
   else
@@ -226,6 +227,9 @@ snapshot_prune() {
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
     local snaps
+    # Snapshot names are controlled (subvol + timestamp), and we deliberately
+    # rely on ls mtime ordering (-tr = oldest first) to prune the oldest.
+    # shellcheck disable=SC2010
     mapfile -t snaps < <(ls -1tr "$DOMUM_SNAPSHOT_ROOT" | grep -E "^${base}-[0-9]{8}-[0-9]{6}-")
     local total="${#snaps[@]}"
     local drop=$(( total - keep ))
