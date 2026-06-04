@@ -109,6 +109,9 @@ compose_files_for_enabled_services() {
   if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/media/jellyfin.yml")
   fi
+  if [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/media/navidrome.yml")
+  fi
   if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/monitoring/uptime-kuma.yml")
   fi
@@ -137,6 +140,12 @@ export_env_for_compose() {
   export JELLYFIN_CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
   export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
   export JELLYFIN_MEDIA_ROOT="${JELLYFIN_MEDIA_ROOT:-/srv/media}"
+  export NAVIDROME_VERSION="${NAVIDROME_VERSION:-0.61.2}"
+  export NAVIDROME_DATA_DIR="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
+  export NAVIDROME_MUSIC_ROOT="${NAVIDROME_MUSIC_ROOT:-/srv/music}"
+  export NAVIDROME_USER="${NAVIDROME_USER:-0:0}"
+  export NAVIDROME_SCAN_SCHEDULE="${NAVIDROME_SCAN_SCHEDULE:-@every 1h}"
+  export NAVIDROME_LOG_LEVEL="${NAVIDROME_LOG_LEVEL:-info}"
 
   if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
     CF_DNS_API_TOKEN="$(cat "$SECRETS_DIR/cloudflare_api_token")"
@@ -167,6 +176,10 @@ ensure_dirs() {
   mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT"
   mkdir -p "${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
   mkdir -p "${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
+  mkdir -p "${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
+  # Parent root only; music sources (subfolders / NFS / rclone mounts) are
+  # assembled by the operator per docs/SETUP-NAVIDROME.md.
+  mkdir -p "${NAVIDROME_MUSIC_ROOT:-/srv/music}"
 }
 
 compose_cmd() {
@@ -186,6 +199,7 @@ snapshot_subvolumes() {
   local candidates=()
   candidates+=("$DOMUM_DATA_ROOT/immich")
   candidates+=("$DOMUM_DATA_ROOT/jellyfin")
+  candidates+=("$DOMUM_DATA_ROOT/navidrome")
   candidates+=("$DOMUM_DATA_ROOT/uptime-kuma")
   candidates+=("$DOMUM_DATA_ROOT/traefik")
   for c in "${candidates[@]}"; do
@@ -450,6 +464,7 @@ configure_cmd() {
   configure_service_toggle ENABLE_TAILSCALE "Enable Tailscale container?"
   configure_service_toggle ENABLE_IMMICH "Enable Immich?"
   configure_service_toggle ENABLE_JELLYFIN "Enable Jellyfin?"
+  configure_service_toggle ENABLE_NAVIDROME "Enable Navidrome (music)?"
   configure_service_toggle ENABLE_UPTIME_KUMA "Enable Uptime Kuma?"
   configure_service_toggle ENABLE_RESTIC_REST_SERVER "Enable local restic REST server?"
 

@@ -44,6 +44,13 @@ jobs:
           JELLYFIN_CONFIG_DIR: /srv/data/jellyfin/config
           JELLYFIN_CACHE_DIR: /srv/data/jellyfin/cache
           JELLYFIN_MEDIA_ROOT: /srv/media
+          # Navidrome defaults mirror config/domum-media.conf.example.
+          NAVIDROME_VERSION: "0.61.2"
+          NAVIDROME_DATA_DIR: /srv/data/navidrome
+          NAVIDROME_MUSIC_ROOT: /srv/music
+          NAVIDROME_USER: "0:0"
+          NAVIDROME_SCAN_SCHEDULE: "@every 1h"
+          NAVIDROME_LOG_LEVEL: info
         run: |
           set -euo pipefail
           args=(-f compose/base.yml)

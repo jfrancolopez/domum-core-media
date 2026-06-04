@@ -37,6 +37,9 @@ ENABLE_IMMICH=1
 # Media streaming
 ENABLE_JELLYFIN=0
 
+# Music streaming (Navidrome — Subsonic-compatible)
+ENABLE_NAVIDROME=0
+
 # Monitoring
 ENABLE_UPTIME_KUMA=1
 
@@ -70,6 +73,38 @@ JELLYFIN_VERSION="10.10.7"
 JELLYFIN_CONFIG_DIR="/srv/data/jellyfin/config"
 JELLYFIN_CACHE_DIR="/srv/data/jellyfin/cache"
 JELLYFIN_MEDIA_ROOT="/srv/media"
+
+# --- Navidrome -------------------------------------------------------------
+
+# Pin Navidrome deliberately. Do not use `latest`.
+NAVIDROME_VERSION="0.61.2"
+
+# State (DB, scan cache) lives on the btrfs data tier so it is snapshotted and
+# swept into restic. Create it as a subvolume — see docs/SETUP-NAVIDROME.md.
+NAVIDROME_DATA_DIR="/srv/data/navidrome"
+
+# Parent root for ALL music libraries. The music itself can live anywhere:
+# put local music in a subfolder, mount a NAS export (NFS/SMB) into another
+# subfolder, mount a cloud remote with rclone into a third. Navidrome's UI
+# (Settings -> Libraries) then exposes each subfolder as its own library.
+# This folder is bind-mounted read-only into the container at /music.
+#   /srv/music/local   -> on-box music
+#   /srv/music/nas     -> NFS/SMB mount from a NAS or another server
+#   /srv/music/cloud   -> rclone mount of a cloud remote
+# See docs/SETUP-NAVIDROME.md for the mount recipes.
+NAVIDROME_MUSIC_ROOT="/srv/music"
+
+# Container user for reading music. Default root reads every source regardless
+# of ownership. Set to "uid:gid" (e.g. "1000:1000") to drop privileges if all
+# your sources are readable by that user.
+NAVIDROME_USER="0:0"
+
+# How often Navidrome rescans for new files. Cron syntax, "@every 1h", or "0"
+# to disable scheduled scans and rely on the filesystem watcher only.
+NAVIDROME_SCAN_SCHEDULE="@every 1h"
+
+# Navidrome log level: error | warn | info | debug | trace
+NAVIDROME_LOG_LEVEL="info"
 
 # --- Backup schedule -------------------------------------------------------
 

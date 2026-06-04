@@ -57,8 +57,13 @@ Live data (btrfs, one subvolume per service):
 
     /srv/data/immich/{library,postgres}
     /srv/data/jellyfin/
+    /srv/data/navidrome/
     /srv/data/uptime-kuma/
     /srv/data/traefik/
+
+Music sources for Navidrome (assembled by the operator, mounted read-only):
+
+    /srv/music/{local,nas,cloud,...}   # plain dirs or NFS/SMB/rclone mounts
 
 btrfs snapshots (read-only):
 
@@ -133,6 +138,11 @@ Re-running the same curl command updates everything.
   Postgres data bind-mount to `/srv/data/immich/`.
 - `compose/media/jellyfin.yml` — Jellyfin, pinned via `JELLYFIN_VERSION`, with
   config/cache on `/srv/data/jellyfin/` and a read-only media mount.
+- `compose/media/navidrome.yml` — Navidrome (Subsonic-compatible music server),
+  pinned via `NAVIDROME_VERSION`. State on `/srv/data/navidrome/`; all music
+  sources are assembled under `NAVIDROME_MUSIC_ROOT` (`/srv/music`) and mounted
+  read-only. Supports multiple libraries from different machines (NFS/SMB/rclone)
+  — see `docs/SETUP-NAVIDROME.md`.
 - `compose/monitoring/uptime-kuma.yml` — status board
 - `compose/backups/restic-rest-server.yml` — **optional**; only enable if the
   NAS lives on this box. Default off.

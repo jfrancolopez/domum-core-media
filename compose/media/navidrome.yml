@@ -1,0 +1,45 @@
+services:
+  navidrome:
+    image: deluan/navidrome:${NAVIDROME_VERSION}
+    container_name: navidrome
+    restart: unless-stopped
+    networks:
+      - domum-proxy
+      - domum-internal
+    # Navidrome reads music as the configured user. Default to root so it can
+    # read every source mounted under the parent root (local, NFS, rclone).
+    # Override with NAVIDROME_USER="uid:gid" in config if you prefer.
+    user: ${NAVIDROME_USER}
+    volumes:
+      # State (DB, cache, scan data) lives on the btrfs data tier so it is
+      # snapshotted and swept into restic with the rest of /srv/data.
+      - ${NAVIDROME_DATA_DIR}:/data
+      # The music parent root is mounted read-only. Each subfolder under it can
+      # be added as a separate library in Navidrome's UI (Settings -> Libraries).
+      # Subfolders may themselves be NFS / SMB / rclone mounts from other
+      # machines — see docs/SETUP-NAVIDROME.md.
+      - ${NAVIDROME_MUSIC_ROOT}:/music:ro
+    environment:
+      # /music is "Library 1"; add the rest under /music/<name> in the UI.
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      ND_PORT: "4533"
+      ND_SCANSCHEDULE: ${NAVIDROME_SCAN_SCHEDULE}
+      ND_LOGLEVEL: ${NAVIDROME_LOG_LEVEL}
+      # Subsonic clients need to know the public URL for sharing/transcoding.
+      ND_SHARE_ENABLED: "true"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=domum-proxy
+      - traefik.http.routers.navidrome.rule=Host(`music.${DOMUM_DOMAIN}`)
+      - traefik.http.routers.navidrome.entrypoints=websecure
+      - traefik.http.routers.navidrome.tls=true
+      - traefik.http.routers.navidrome.tls.certresolver=cf
+      - traefik.http.routers.navidrome.middlewares=securityHeaders@file
+      - traefik.http.services.navidrome.loadbalancer.server.port=4533
+
+networks:
+  domum-proxy:
+    external: true
+  domum-internal:
+    external: true
