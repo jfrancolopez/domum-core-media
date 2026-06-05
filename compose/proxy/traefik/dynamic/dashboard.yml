@@ -1,7 +1,8 @@
 http:
   routers:
     traefik-dashboard:
-      rule: 'Host(`{{ env "TRAEFIK_DASHBOARD_HOST" }}`)'      entryPoints:
+      rule: 'Host(`{{ env "TRAEFIK_DASHBOARD_HOST" }}`)'      
+      entryPoints:
         - websecure
       service: api@internal
       middlewares:
