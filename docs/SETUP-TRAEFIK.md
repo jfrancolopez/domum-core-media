@@ -30,6 +30,11 @@ sudo docker run --rm --entrypoint htpasswd httpd:2.4-alpine -nB admin | \
   sudo tee /etc/domum-core-media/secrets/traefik_dashboard_users >/dev/null
 sudo chmod 600 /etc/domum-core-media/secrets/traefik_dashboard_users
 sudo chown root:root /etc/domum-core-media/secrets/traefik_dashboard_users
+
+### or manually:
+sudo docker run --rm httpd:2.4-alpine htpasswd -nbB adminuser 'YOUR_PASSWORD_HERE' | sudo tee /etc/domum-core-media/secrets/traefik_dashboard_users >/dev/null
+sudo chmod 600 /etc/domum-core-media/secrets/traefik_dashboard_users
+sudo chown root:root /etc/domum-core-media/secrets/traefik_dashboard_users
 ```
 
 If you want a different path, set `TRAEFIK_DASHBOARD_USERS_FILE` in
