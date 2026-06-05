@@ -10,7 +10,7 @@ networks declared in `compose/base.yml` — don't redefine them.
 ```yaml
 services:
   myservice:
-    image: vendor/myservice:vX.Y.Z
+    image: ${MYSERVICE_IMAGE}
     container_name: myservice
     restart: unless-stopped
     networks:
@@ -35,7 +35,8 @@ networks:
     external: true
 ```
 
-Pin the image tag. `latest` is forbidden — Immich taught us why.
+Prefer a pinned image tag. If you decide to use a moving tag, add matching
+`MYSERVICE_AUTO_UPDATE` and `MYSERVICE_AUTO_UPDATE_DELAY_DAYS` config keys.
 
 ## 2. Add a toggle
 
@@ -44,6 +45,9 @@ In `config/domum-media.conf` (host) and `config/domum-media.conf.example`
 
 ```
 ENABLE_MYSERVICE=0
+MYSERVICE_IMAGE="vendor/myservice:vX.Y.Z"
+MYSERVICE_AUTO_UPDATE=0
+MYSERVICE_AUTO_UPDATE_DELAY_DAYS=7
 ```
 
 ## 3. Register the fragment in `bin/domum-media`

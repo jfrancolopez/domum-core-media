@@ -1,7 +1,7 @@
 http:
   routers:
     traefik-dashboard:
-      rule: "Host(`traefik-media.ladomum.com`)"
+      rule: "Host(`{{ env \"TRAEFIK_DASHBOARD_HOST\" }}`)"
       entryPoints:
         - websecure
       service: api@internal
@@ -14,8 +14,4 @@ http:
   middlewares:
     traefik-auth:
       basicAuth:
-        # Generate with: htpasswd -nB admin > /etc/domum-core-media/secrets/traefik_dashboard_users
-        # Then bind-mount that file into the traefik container and switch this
-        # block to `usersFile: /etc/traefik/usersfile`.
-        users:
-          - "admin:$$apr1$$placeholder$$replaceme"
+        usersFile: /run/secrets/traefik_dashboard_users

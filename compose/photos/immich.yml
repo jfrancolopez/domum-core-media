@@ -1,6 +1,6 @@
 services:
   immich_server:
-    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION}
+    image: ${IMMICH_SERVER_IMAGE}
     container_name: immich_server
     restart: unless-stopped
     depends_on:
@@ -16,7 +16,6 @@ services:
       - /etc/localtime:/etc/localtime:ro
     environment:
       UPLOAD_LOCATION: /usr/src/app/upload
-      IMMICH_VERSION: ${IMMICH_VERSION}
       DB_HOSTNAME: immich_postgres
       DB_USERNAME: ${IMMICH_DB_USERNAME}
       DB_PASSWORD: ${IMMICH_DB_PASSWORD}
@@ -34,18 +33,15 @@ services:
       - traefik.http.services.immich.loadbalancer.server.port=2283
 
   immich_machine_learning:
-    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION}
+    image: ${IMMICH_MACHINE_LEARNING_IMAGE}
     container_name: immich_machine_learning
     restart: unless-stopped
     networks:
       - domum-internal
     volumes:
       - immich-model-cache:/cache
-    environment:
-      IMMICH_VERSION: ${IMMICH_VERSION}
-
   immich_redis:
-    image: docker.io/redis:6.2-alpine
+    image: ${IMMICH_REDIS_IMAGE}
     container_name: immich_redis
     restart: unless-stopped
     networks:
@@ -54,7 +50,7 @@ services:
       test: ["CMD-SHELL", "redis-cli ping || exit 1"]
 
   immich_postgres:
-    image: ${IMMICH_PG_IMAGE}
+    image: ${IMMICH_POSTGRES_IMAGE}
     container_name: immich_postgres
     restart: unless-stopped
     networks:

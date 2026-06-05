@@ -10,7 +10,9 @@ before the timer fires.**
 | `archive` | FTP via `rclone:` or another restic backend | Optional third copy |
 
 The easiest path now is to run `sudo domum-media configure` and fill in the
-backup target section instead of hand-maintaining multiple env files.
+backup target section instead of hand-maintaining multiple env files. The
+wizard can also create the restic password files, backend env files, and FTP
+credentials for any enabled target.
 
 ## 1. Generate passwords
 

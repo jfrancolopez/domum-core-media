@@ -57,12 +57,7 @@ install_prereqs() {
 }
 
 install_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    echo "[domum-media] Docker + compose plugin already installed."
-    return 0
-  fi
-
-  echo "[domum-media] Installing Docker from pinned apt repo..."
+  echo "[domum-media] Installing/upgrading Docker from the official apt repo..."
   install -m 0755 -d /etc/apt/keyrings
   if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
     curl -fsSL https://download.docker.com/linux/debian/gpg \
@@ -83,7 +78,7 @@ install_docker() {
     docker-buildx-plugin docker-compose-plugin
 
   systemctl enable --now docker
-  echo "[domum-media] Docker installed."
+  echo "[domum-media] Docker ready ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'version unavailable'))."
 }
 
 install_tailscale() {
@@ -144,6 +139,8 @@ install_systemd_units() {
     domum-media-backup.timer \
     domum-media-check.timer \
     domum-media-btrfs-snapshot.timer \
+    domum-media-image-refresh.timer \
+    domum-media-host-update.timer \
     domum-media-dr-reminder.timer
 }
 
@@ -158,36 +155,22 @@ print_next_steps() {
 
 [domum-media] Bootstrap done. Manual next steps:
 
-  1. Place secrets in ${CONFIG_DIR}/secrets/ (chmod 600, root-owned):
-       cloudflare_api_token
-       immich_db_password
-       immich_jwt_secret
-       restic_password_nas
-       restic_password_cloud
-       # optional, if you keep the legacy env-file flow:
-       restic_nas_env       # RESTIC_REPOSITORY=rest:... + creds
-       restic_cloud_env     # RESTIC_REPOSITORY=b2:bucket:/path + B2_ACCOUNT_ID/KEY
-       # optional, if you enable FTP or extra targets in the wizard:
-       restic_password_archive
-       archive_ftp_username
-       archive_ftp_password
-
-  2. Bring up Tailscale (operator step — not auto-run by install.sh):
+  1. Bring up Tailscale (operator step — not auto-run by install.sh):
        sudo tailscale up --ssh
 
-  3. Run the interactive config wizard (or edit the file manually):
+  2. Run the interactive config wizard (it can now create the common secrets too):
        sudo domum-media configure
        # or:
        cp ${INSTALL_DIR}/config/domum-media.conf.example ${INSTALL_DIR}/config/domum-media.conf
        \$EDITOR ${INSTALL_DIR}/config/domum-media.conf
 
-  4. Bring up the host:
+  3. Bring up the host:
        sudo domum-media init
        sudo domum-media apply
 
-  5. Initialise restic repos and run first backup — see docs/SETUP-RESTIC.md.
+  4. Initialise restic repos and run first backup — see docs/SETUP-RESTIC.md.
 
-  6. Run the disaster-recovery drill — see docs/disaster-recovery.md.
+  5. Run the disaster-recovery drill — see docs/disaster-recovery.md.
 
 Re-run this curl command anytime to converge.
 EOF

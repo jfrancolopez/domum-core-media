@@ -38,10 +38,8 @@ load_cfg() {
 export_compose_env() {
   export DOMUM_DOMAIN="${DOMUM_DOMAIN:-ladomum.com}"
   export DOMUM_DATA_ROOT
-  export IMMICH_VERSION="${IMMICH_VERSION:-release}"
   export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
   export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
-  export IMMICH_PG_IMAGE="${IMMICH_PG_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
 
   if [[ -f "$SECRETS_DIR/immich_db_password" ]]; then
     IMMICH_DB_PASSWORD="$(cat "$SECRETS_DIR/immich_db_password")"

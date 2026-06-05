@@ -18,12 +18,28 @@ DOMUM_EMAIL="you@example.com"
 DOMUM_LAN_IP=""
 DOMUM_TS_IP=""
 
+# --- Traefik ---------------------------------------------------------------
+
+# Full image refs let you choose between a pinned tag and a moving tag such as
+# :latest or :stable. Keep AUTO_UPDATE=0 for pinned images. If you use a moving
+# tag, set AUTO_UPDATE=1 and choose how many days to wait before rollout.
+TRAEFIK_IMAGE="traefik:v3.7.1"
+TRAEFIK_AUTO_UPDATE=0
+TRAEFIK_AUTO_UPDATE_DELAY_DAYS=7
+
+# Dashboard hostname. Kept in config so the repo remains the routing source of truth.
+TRAEFIK_DASHBOARD_HOST="traefik-media.${DOMUM_DOMAIN}"
+
+# Basic-auth file mounted into Traefik. Store the output of `htpasswd -nB`.
+TRAEFIK_DASHBOARD_USERS_FILE="/etc/domum-core-media/secrets/traefik_dashboard_users"
+
 # --- Data + log locations --------------------------------------------------
 
 # btrfs mount root. Subvolumes are mounted under here. See docs/SETUP-N100.md.
 DOMUM_DATA_ROOT="/srv/data"
 DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
 DOMUM_LOG_DIR="/var/log/domum-media"
+DOMUM_STATE_ROOT="/var/lib/domum-media"
 
 # --- Service toggles -------------------------------------------------------
 
@@ -47,16 +63,25 @@ ENABLE_UPTIME_KUMA=1
 # this box. Default OFF — usually the NAS lives elsewhere.
 ENABLE_RESTIC_REST_SERVER=0
 
-# --- Immich version pin ----------------------------------------------------
+# --- Images ---------------------------------------------------------------
 
-# Pin to a specific release tag. NEVER `latest` — Immich has had breaking
-# DB migrations. Bump deliberately, after reading release notes and taking
-# a pre-upgrade snapshot + restic backup.
-IMMICH_VERSION="v1.118.2"
+# Immich app images. Keep these pinned unless you are prepared for schema
+# migrations and read the release notes first.
+IMMICH_SERVER_IMAGE="ghcr.io/immich-app/immich-server:v1.118.2"
+IMMICH_SERVER_AUTO_UPDATE=0
+IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS=7
+IMMICH_MACHINE_LEARNING_IMAGE="ghcr.io/immich-app/immich-machine-learning:v1.118.2"
+IMMICH_MACHINE_LEARNING_AUTO_UPDATE=0
+IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS=7
 
-# pgvecto.rs image tag for Immich's Postgres. Must match what the pinned
-# Immich version ships in its upstream compose file — verify before bumping.
-IMMICH_PG_IMAGE="tensorchord/pgvecto-rs:pg14-v0.2.0"
+# Immich dependencies. These are config-controlled too in case you want to
+# track a newer moving tag, but pinned is safer by default.
+IMMICH_REDIS_IMAGE="docker.io/redis:6.2-alpine"
+IMMICH_REDIS_AUTO_UPDATE=0
+IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS=14
+IMMICH_POSTGRES_IMAGE="tensorchord/pgvecto-rs:pg14-v0.2.0"
+IMMICH_POSTGRES_AUTO_UPDATE=0
+IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS=14
 
 # Immich Postgres credentials. Real values live in
 # /etc/domum-core-media/secrets/{immich_db_password,immich_jwt_secret}
@@ -65,8 +90,9 @@ IMMICH_DB_DATABASE_NAME="immich"
 
 # --- Jellyfin --------------------------------------------------------------
 
-# Pin Jellyfin deliberately. Do not use `latest`.
-JELLYFIN_VERSION="10.10.7"
+JELLYFIN_IMAGE="jellyfin/jellyfin:10.10.7"
+JELLYFIN_AUTO_UPDATE=0
+JELLYFIN_AUTO_UPDATE_DELAY_DAYS=7
 
 # Jellyfin state lives on the btrfs data tier; the media library can live
 # elsewhere and is mounted read-only into the container.
@@ -76,8 +102,9 @@ JELLYFIN_MEDIA_ROOT="/srv/media"
 
 # --- Navidrome -------------------------------------------------------------
 
-# Pin Navidrome deliberately. Do not use `latest`.
-NAVIDROME_VERSION="0.61.2"
+NAVIDROME_IMAGE="deluan/navidrome:0.61.2"
+NAVIDROME_AUTO_UPDATE=0
+NAVIDROME_AUTO_UPDATE_DELAY_DAYS=7
 
 # State (DB, scan cache) lives on the btrfs data tier so it is snapshotted and
 # swept into restic. Create it as a subvolume — see docs/SETUP-NAVIDROME.md.
@@ -105,6 +132,28 @@ NAVIDROME_SCAN_SCHEDULE="@every 1h"
 
 # Navidrome log level: error | warn | info | debug | trace
 NAVIDROME_LOG_LEVEL="info"
+
+# Monitoring / optional service images.
+UPTIME_KUMA_IMAGE="louislam/uptime-kuma:1"
+UPTIME_KUMA_AUTO_UPDATE=0
+UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS=7
+RESTIC_REST_SERVER_IMAGE="restic/rest-server:latest"
+RESTIC_REST_SERVER_AUTO_UPDATE=0
+RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS=7
+TAILSCALE_IMAGE="tailscale/tailscale:stable"
+TAILSCALE_AUTO_UPDATE=0
+TAILSCALE_AUTO_UPDATE_DELAY_DAYS=7
+
+# Scheduled image refresh checks for services with *_AUTO_UPDATE=1.
+IMAGE_AUTO_UPDATE_ENABLED=0
+IMAGE_AUTO_UPDATE_AT="05:15"
+IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY="30m"
+
+# Optional weekly host package upgrades from apt. This affects Docker Engine,
+# compose plugin, tailscale, restic, and the host utilities installed by bootstrap.
+HOST_PACKAGE_AUTO_UPDATE_ENABLED=0
+HOST_PACKAGE_AUTO_UPDATE_AT="Mon 05:45"
+HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="45m"
 
 # --- Backup schedule -------------------------------------------------------
 

@@ -1,6 +1,6 @@
 services:
   traefik:
-    image: traefik:v3.2
+    image: ${TRAEFIK_IMAGE}
     container_name: traefik
     restart: unless-stopped
 
@@ -16,14 +16,17 @@ services:
       - DOMUM_DOMAIN=${DOMUM_DOMAIN}
       - DOMUM_LAN_IP=${DOMUM_LAN_IP}
       - DOMUM_EMAIL=${DOMUM_EMAIL}
+      - TRAEFIK_DASHBOARD_HOST=${TRAEFIK_DASHBOARD_HOST}
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik-letsencrypt:/letsencrypt
-      - /opt/domum-core-media/compose/proxy/traefik:/etc/traefik:ro
+      - ${DOMUM_DIR:-/opt/domum-core-media}/compose/proxy/traefik:/etc/traefik:ro
+      - ${TRAEFIK_DASHBOARD_USERS_FILE:-/etc/domum-core-media/secrets/traefik_dashboard_users}:/run/secrets/traefik_dashboard_users:ro
 
     command:
       - --configFile=/etc/traefik/traefik.yml
+      - --certificatesresolvers.cf.acme.email=${DOMUM_EMAIL}
 
     extra_hosts:
       - "host.docker.internal:host-gateway"

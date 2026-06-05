@@ -9,7 +9,7 @@ Copy-paste skeleton for a new compose fragment.
 ```yaml
 services:
   SERVICE_NAME:
-    image: VENDOR/IMAGE:vX.Y.Z      # pin — never :latest
+    image: ${SERVICE_NAME_IMAGE}
     container_name: SERVICE_NAME
     restart: unless-stopped
     networks:
@@ -42,6 +42,9 @@ In `config/domum-media.conf`:
 
 ```
 ENABLE_SERVICE_NAME=0
+SERVICE_NAME_IMAGE="vendor/image:vX.Y.Z"
+SERVICE_NAME_AUTO_UPDATE=0
+SERVICE_NAME_AUTO_UPDATE_DELAY_DAYS=7
 ```
 
 ## CLI registration
@@ -61,6 +64,7 @@ fi
 - External networks only (`domum-proxy`, `domum-internal`)
 - State under `/srv/data/<service>` as a btrfs subvolume
 - Secrets only in `/etc/domum-core-media/secrets/`
-- Pin image tags — `latest` is forbidden
+- Prefer pinned tags for stateful services. If you decide to use a moving tag,
+  add `SERVICE_NAME_AUTO_UPDATE=1` and a delay window.
 - If the service has stateful DB data, wire it into the backup quiesce
   routine in `bin/domum-media-backup`

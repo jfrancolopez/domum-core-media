@@ -1,0 +1,11 @@
+[Unit]
+Description=domum-media: upgrade host packages from configured apt repos
+Documentation=file:///opt/domum-core-media/README.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/domum-media
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/domum-media host-upgrade
+TimeoutStartSec=4h

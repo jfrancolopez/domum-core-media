@@ -1,0 +1,11 @@
+[Unit]
+Description=domum-media: schedule host package upgrades
+
+[Timer]
+OnCalendar=Mon *-*-* 05:45:00
+RandomizedDelaySec=45m
+Persistent=true
+Unit=domum-media-host-update.service
+
+[Install]
+WantedBy=timers.target

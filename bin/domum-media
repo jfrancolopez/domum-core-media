@@ -11,6 +11,7 @@ SECRETS_DIR="${SECRETS_DIR:-/etc/domum-core-media/secrets}"
 DATA_ROOT_DEFAULT="/srv/data"
 SNAPSHOT_ROOT_DEFAULT="/srv/snapshots"
 LOG_DIR_DEFAULT="/var/log/domum-media"
+STATE_ROOT_DEFAULT="/var/lib/domum-media"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -31,6 +32,7 @@ load_cfg() {
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
   DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-$SNAPSHOT_ROOT_DEFAULT}"
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
+  DOMUM_STATE_ROOT="${DOMUM_STATE_ROOT:-$STATE_ROOT_DEFAULT}"
 }
 
 ensure_cfg_file() {
@@ -91,6 +93,103 @@ missing_if_absent() {
   [[ -f "$path" ]] || echo "$label"
 }
 
+ensure_secret_dir() {
+  install -d -m 0700 "$SECRETS_DIR"
+}
+
+ensure_state_dirs() {
+  install -d -m 0700 "$DOMUM_STATE_ROOT"
+  install -d -m 0700 "$DOMUM_STATE_ROOT/image-updates"
+}
+
+converge_local_installation() {
+  install -m 0755 "$DOMUM_DIR/bin/domum-media" /usr/local/bin/domum-media
+  install -m 0755 "$DOMUM_DIR/bin/domum-media-backup" /usr/local/bin/domum-media-backup
+  install -m 0644 "$DOMUM_DIR"/systemd/*.service /etc/systemd/system/
+  install -m 0644 "$DOMUM_DIR"/systemd/*.timer /etc/systemd/system/
+  systemctl daemon-reload
+}
+
+write_secret_file() {
+  local path="$1"
+  local value="$2"
+  ensure_secret_dir
+  umask 077
+  printf '%s' "$value" > "$path"
+  chmod 600 "$path"
+}
+
+generate_secret() {
+  local bytes="${1:-32}"
+  openssl rand -hex "$bytes"
+}
+
+prompt_secret_value() {
+  local label="$1"
+  local current_file="${2:-}"
+  local reply
+  if [[ -n "$current_file" && -f "$current_file" ]]; then
+    read -r -s -p "$label [saved, leave blank to keep]: " reply
+  else
+    read -r -s -p "$label: " reply
+  fi
+  echo
+  printf '%s' "$reply"
+}
+
+prompt_multiline_value() {
+  local label="$1"
+  local current_file="${2:-}"
+  local line content=""
+
+  if [[ -n "$current_file" && -f "$current_file" ]]; then
+    echo "$label [saved]"
+  else
+    echo "$label"
+  fi
+  echo "Enter lines now. Finish with a single '.' on its own line."
+  echo "Submit just '.' to keep the current file unchanged."
+
+  while IFS= read -r line; do
+    [[ "$line" == "." ]] && break
+    content+="${line}"$'\n'
+  done
+
+  printf '%s' "$content"
+}
+
+htpasswd_hash() {
+  local username="$1"
+  local password="$2"
+
+  if cmd_exists htpasswd; then
+    htpasswd -nbB "$username" "$password"
+    return 0
+  fi
+
+  if cmd_exists docker; then
+    docker run --rm --entrypoint htpasswd httpd:2.4-alpine -nbB "$username" "$password"
+    return 0
+  fi
+
+  die "Need either 'htpasswd' or Docker to generate Traefik dashboard credentials."
+}
+
+managed_image_specs() {
+  cat <<'EOF'
+traefik|ENABLE_TRAEFIK|TRAEFIK_IMAGE|TRAEFIK_AUTO_UPDATE|TRAEFIK_AUTO_UPDATE_DELAY_DAYS|traefik
+tailscale|ENABLE_TAILSCALE|TAILSCALE_IMAGE|TAILSCALE_AUTO_UPDATE|TAILSCALE_AUTO_UPDATE_DELAY_DAYS|tailscale
+immich-server|ENABLE_IMMICH|IMMICH_SERVER_IMAGE|IMMICH_SERVER_AUTO_UPDATE|IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS|immich_server
+immich-machine-learning|ENABLE_IMMICH|IMMICH_MACHINE_LEARNING_IMAGE|IMMICH_MACHINE_LEARNING_AUTO_UPDATE|IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS|immich_machine_learning
+immich-redis|ENABLE_IMMICH|IMMICH_REDIS_IMAGE|IMMICH_REDIS_AUTO_UPDATE|IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS|immich_redis
+immich-postgres|ENABLE_IMMICH|IMMICH_POSTGRES_IMAGE|IMMICH_POSTGRES_AUTO_UPDATE|IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS|immich_postgres
+jellyfin|ENABLE_JELLYFIN|JELLYFIN_IMAGE|JELLYFIN_AUTO_UPDATE|JELLYFIN_AUTO_UPDATE_DELAY_DAYS|jellyfin
+navidrome|ENABLE_NAVIDROME|NAVIDROME_IMAGE|NAVIDROME_AUTO_UPDATE|NAVIDROME_AUTO_UPDATE_DELAY_DAYS|navidrome
+uptime-kuma|ENABLE_UPTIME_KUMA|UPTIME_KUMA_IMAGE|UPTIME_KUMA_AUTO_UPDATE|UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS|uptime-kuma
+restic-rest-server|ENABLE_RESTIC_REST_SERVER|RESTIC_REST_SERVER_IMAGE|RESTIC_REST_SERVER_AUTO_UPDATE|RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS|restic-rest-server
+EOF
+}
+
 # ---- compose layering ------------------------------------------------------
 
 compose_files_for_enabled_services() {
@@ -127,25 +226,61 @@ compose_files_for_enabled_services() {
 }
 
 export_env_for_compose() {
+  export DOMUM_DIR
   export DOMUM_DOMAIN="${DOMUM_DOMAIN:-ladomum.com}"
   export DOMUM_EMAIL="${DOMUM_EMAIL:-admin@${DOMUM_DOMAIN}}"
   export DOMUM_LAN_IP="${DOMUM_LAN_IP:-}"
   export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
+  export DOMUM_STATE_ROOT
+  export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:v3.7.1}"
+  export TRAEFIK_AUTO_UPDATE="${TRAEFIK_AUTO_UPDATE:-0}"
+  export TRAEFIK_AUTO_UPDATE_DELAY_DAYS="${TRAEFIK_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export TRAEFIK_DASHBOARD_HOST="${TRAEFIK_DASHBOARD_HOST:-traefik-media.${DOMUM_DOMAIN}}"
+  export TRAEFIK_DASHBOARD_USERS_FILE="${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}"
   export DOMUM_DATA_ROOT
-  export IMMICH_VERSION="${IMMICH_VERSION:-release}"
-  export IMMICH_PG_IMAGE="${IMMICH_PG_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
+  export TAILSCALE_IMAGE="${TAILSCALE_IMAGE:-tailscale/tailscale:stable}"
+  export TAILSCALE_AUTO_UPDATE="${TAILSCALE_AUTO_UPDATE:-0}"
+  export TAILSCALE_AUTO_UPDATE_DELAY_DAYS="${TAILSCALE_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export IMMICH_SERVER_IMAGE="${IMMICH_SERVER_IMAGE:-ghcr.io/immich-app/immich-server:v1.118.2}"
+  export IMMICH_SERVER_AUTO_UPDATE="${IMMICH_SERVER_AUTO_UPDATE:-0}"
+  export IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS="${IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export IMMICH_MACHINE_LEARNING_IMAGE="${IMMICH_MACHINE_LEARNING_IMAGE:-ghcr.io/immich-app/immich-machine-learning:v1.118.2}"
+  export IMMICH_MACHINE_LEARNING_AUTO_UPDATE="${IMMICH_MACHINE_LEARNING_AUTO_UPDATE:-0}"
+  export IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS="${IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export IMMICH_REDIS_IMAGE="${IMMICH_REDIS_IMAGE:-docker.io/redis:6.2-alpine}"
+  export IMMICH_REDIS_AUTO_UPDATE="${IMMICH_REDIS_AUTO_UPDATE:-0}"
+  export IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS="${IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS:-14}"
+  export IMMICH_POSTGRES_IMAGE="${IMMICH_POSTGRES_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
+  export IMMICH_POSTGRES_AUTO_UPDATE="${IMMICH_POSTGRES_AUTO_UPDATE:-0}"
+  export IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS="${IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS:-14}"
   export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
   export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
-  export JELLYFIN_VERSION="${JELLYFIN_VERSION:-10.10.7}"
+  export JELLYFIN_IMAGE="${JELLYFIN_IMAGE:-jellyfin/jellyfin:10.10.7}"
+  export JELLYFIN_AUTO_UPDATE="${JELLYFIN_AUTO_UPDATE:-0}"
+  export JELLYFIN_AUTO_UPDATE_DELAY_DAYS="${JELLYFIN_AUTO_UPDATE_DELAY_DAYS:-7}"
   export JELLYFIN_CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
   export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
   export JELLYFIN_MEDIA_ROOT="${JELLYFIN_MEDIA_ROOT:-/srv/media}"
-  export NAVIDROME_VERSION="${NAVIDROME_VERSION:-0.61.2}"
+  export NAVIDROME_IMAGE="${NAVIDROME_IMAGE:-deluan/navidrome:0.61.2}"
+  export NAVIDROME_AUTO_UPDATE="${NAVIDROME_AUTO_UPDATE:-0}"
+  export NAVIDROME_AUTO_UPDATE_DELAY_DAYS="${NAVIDROME_AUTO_UPDATE_DELAY_DAYS:-7}"
   export NAVIDROME_DATA_DIR="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
   export NAVIDROME_MUSIC_ROOT="${NAVIDROME_MUSIC_ROOT:-/srv/music}"
   export NAVIDROME_USER="${NAVIDROME_USER:-0:0}"
   export NAVIDROME_SCAN_SCHEDULE="${NAVIDROME_SCAN_SCHEDULE:-@every 1h}"
   export NAVIDROME_LOG_LEVEL="${NAVIDROME_LOG_LEVEL:-info}"
+  export UPTIME_KUMA_IMAGE="${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma:1}"
+  export UPTIME_KUMA_AUTO_UPDATE="${UPTIME_KUMA_AUTO_UPDATE:-0}"
+  export UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS="${UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export RESTIC_REST_SERVER_IMAGE="${RESTIC_REST_SERVER_IMAGE:-restic/rest-server:latest}"
+  export RESTIC_REST_SERVER_AUTO_UPDATE="${RESTIC_REST_SERVER_AUTO_UPDATE:-0}"
+  export RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS="${RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export IMAGE_AUTO_UPDATE_ENABLED="${IMAGE_AUTO_UPDATE_ENABLED:-0}"
+  export IMAGE_AUTO_UPDATE_AT="${IMAGE_AUTO_UPDATE_AT:-05:15}"
+  export IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY="${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}"
+  export HOST_PACKAGE_AUTO_UPDATE_ENABLED="${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}"
+  export HOST_PACKAGE_AUTO_UPDATE_AT="${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}"
+  export HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
 
   if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
     CF_DNS_API_TOKEN="$(cat "$SECRETS_DIR/cloudflare_api_token")"
@@ -172,6 +307,8 @@ ensure_networks() {
 }
 
 ensure_dirs() {
+  ensure_secret_dir
+  ensure_state_dirs
   mkdir -p "$DOMUM_LOG_DIR"
   mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT"
   mkdir -p "${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
@@ -302,20 +439,26 @@ EOF
 }
 
 sync_timer_overrides() {
-  local backup_calendar check_calendar prune_calendar
+  local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar
   backup_calendar="$(normalize_daily_schedule "${BACKUP_DAILY_AT:-02:30}")"
   check_calendar="$(normalize_weekly_schedule "${CHECK_WEEKLY_AT:-Sun 03:30}")"
   prune_calendar="$(normalize_weekly_schedule "${SNAPSHOT_PRUNE_WEEKLY_AT:-Sun 04:30}")"
+  image_update_calendar="$(normalize_daily_schedule "${IMAGE_AUTO_UPDATE_AT:-05:15}")"
+  host_update_calendar="$(normalize_weekly_schedule "${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}")"
 
   write_timer_override "domum-media-backup.timer" "$backup_calendar" "15m"
   write_timer_override "domum-media-check.timer" "$check_calendar" "20m"
   write_timer_override "domum-media-btrfs-snapshot.timer" "$prune_calendar" "20m"
+  write_timer_override "domum-media-image-refresh.timer" "$image_update_calendar" "${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}"
+  write_timer_override "domum-media-host-update.timer" "$host_update_calendar" "${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
 
   systemctl daemon-reload
   systemctl enable --now \
     domum-media-backup.timer \
     domum-media-check.timer \
     domum-media-btrfs-snapshot.timer \
+    domum-media-image-refresh.timer \
+    domum-media-host-update.timer \
     domum-media-dr-reminder.timer >/dev/null
 }
 
@@ -385,11 +528,123 @@ prompt_choice() {
   done
 }
 
+configure_text_value() {
+  local key="$1"
+  local label="$2"
+  local current="${!key:-}"
+  config_set "$key" "$(prompt_with_default "$label" "$current")"
+}
+
 configure_service_toggle() {
   local key="$1"
   local label="$2"
   local current="${!key:-0}"
   config_set "$key" "$(prompt_yes_no "$label" "$current")"
+}
+
+configure_image_behavior() {
+  local image_key="$1"
+  local auto_key="$2"
+  local delay_key="$3"
+  local label="$4"
+  local auto_enabled
+
+  echo
+  echo "Image policy: $label"
+  config_set "$image_key" "$(prompt_with_default "Container image ref for $label" "${!image_key:-}")"
+  auto_enabled="$(prompt_yes_no "Auto-update $label when a newer image is available?" "${!auto_key:-0}")"
+  config_set "$auto_key" "$auto_enabled"
+  if [[ "$auto_enabled" == "1" ]]; then
+    config_set "$delay_key" "$(prompt_with_default "Delay in days before applying the new $label image" "${!delay_key:-7}")"
+  fi
+}
+
+configure_secret_file_prompt() {
+  local path="$1"
+  local label="$2"
+  local value
+  value="$(prompt_secret_value "$label" "$path")"
+  [[ -n "$value" ]] || return 0
+  write_secret_file "$path" "$value"
+}
+
+configure_generated_secret_prompt() {
+  local path="$1"
+  local label="$2"
+  local value
+  value="$(prompt_secret_value "$label" "$path")"
+  if [[ -z "$value" ]]; then
+    [[ -f "$path" ]] && return 0
+    value="$(generate_secret 32)"
+    echo "[domum-media] Generated value for $label."
+  fi
+  write_secret_file "$path" "$value"
+}
+
+configure_multiline_secret_prompt() {
+  local path="$1"
+  local label="$2"
+  local value
+  value="$(prompt_multiline_value "$label" "$path")"
+  [[ -n "$value" ]] || return 0
+  write_secret_file "$path" "$value"
+}
+
+configure_traefik_dashboard_secret() {
+  local path="${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}"
+  local username password hash
+  local current_user="admin"
+
+  if [[ -f "$path" ]]; then
+    current_user="$(cut -d: -f1 "$path" 2>/dev/null || echo admin)"
+  fi
+
+  username="$(prompt_with_default "Traefik dashboard username" "$current_user")"
+  password="$(prompt_secret_value "Traefik dashboard password" "$path")"
+  [[ -n "$password" ]] || return 0
+
+  hash="$(htpasswd_hash "$username" "$password")"
+  write_secret_file "$path" "$hash"
+}
+
+configure_service_secrets() {
+  ensure_secret_dir
+
+  echo
+  echo "Secrets"
+
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
+    configure_secret_file_prompt "$SECRETS_DIR/cloudflare_api_token" "Cloudflare DNS API token"
+    configure_traefik_dashboard_secret
+  fi
+
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    configure_generated_secret_prompt "$SECRETS_DIR/immich_db_password" "Immich database password"
+    configure_generated_secret_prompt "$SECRETS_DIR/immich_jwt_secret" "Immich JWT secret"
+  fi
+
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    configure_generated_secret_prompt "$(backup_target_password_file "$target")" "Restic password for $target"
+
+    case "$(backup_target_value "$target" TYPE repository)" in
+      repository)
+        local env_file
+        env_file="$(backup_target_value "$target" ENV_FILE)"
+        if [[ -n "$env_file" ]]; then
+          configure_multiline_secret_prompt "$env_file" "Backend env file for $target (for example B2_ACCOUNT_ID=... / B2_ACCOUNT_KEY=...)"
+        fi
+        ;;
+      ftp)
+        configure_secret_file_prompt \
+          "$(backup_target_value "$target" FTP_USERNAME_FILE "$SECRETS_DIR/${target}_ftp_username")" \
+          "FTP username for $target"
+        configure_secret_file_prompt \
+          "$(backup_target_value "$target" FTP_PASSWORD_FILE "$SECRETS_DIR/${target}_ftp_password")" \
+          "FTP password for $target"
+        ;;
+    esac
+  done < <(backup_target_names)
 }
 
 configure_backup_target() {
@@ -455,11 +710,20 @@ configure_cmd() {
   need_root
   ensure_cfg_file
   load_cfg
+  export_env_for_compose
+  ensure_secret_dir
+  converge_local_installation
 
   echo "[domum-media] Interactive configuration"
   echo "Press Enter to keep the current value."
   echo
 
+  configure_text_value DOMUM_DOMAIN "Base domain"
+  configure_text_value DOMUM_EMAIL "ACME email for Let's Encrypt"
+  configure_text_value DOMUM_LAN_IP "LAN IP for split-DNS notes"
+  configure_text_value DOMUM_TS_IP "Tailscale IP for split-DNS notes"
+
+  echo
   configure_service_toggle ENABLE_TRAEFIK "Enable Traefik reverse proxy?"
   configure_service_toggle ENABLE_TAILSCALE "Enable Tailscale container?"
   configure_service_toggle ENABLE_IMMICH "Enable Immich?"
@@ -467,6 +731,36 @@ configure_cmd() {
   configure_service_toggle ENABLE_NAVIDROME "Enable Navidrome (music)?"
   configure_service_toggle ENABLE_UPTIME_KUMA "Enable Uptime Kuma?"
   configure_service_toggle ENABLE_RESTIC_REST_SERVER "Enable local restic REST server?"
+
+  ensure_cfg_file
+  load_cfg
+  export_env_for_compose
+
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
+    configure_text_value TRAEFIK_DASHBOARD_HOST "Traefik dashboard hostname"
+    configure_image_behavior TRAEFIK_IMAGE TRAEFIK_AUTO_UPDATE TRAEFIK_AUTO_UPDATE_DELAY_DAYS "Traefik"
+  fi
+  if [[ "${ENABLE_TAILSCALE:-0}" == "1" ]]; then
+    configure_image_behavior TAILSCALE_IMAGE TAILSCALE_AUTO_UPDATE TAILSCALE_AUTO_UPDATE_DELAY_DAYS "Tailscale"
+  fi
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    configure_image_behavior IMMICH_SERVER_IMAGE IMMICH_SERVER_AUTO_UPDATE IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS "Immich server"
+    configure_image_behavior IMMICH_MACHINE_LEARNING_IMAGE IMMICH_MACHINE_LEARNING_AUTO_UPDATE IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS "Immich machine learning"
+    configure_image_behavior IMMICH_REDIS_IMAGE IMMICH_REDIS_AUTO_UPDATE IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS "Immich Redis"
+    configure_image_behavior IMMICH_POSTGRES_IMAGE IMMICH_POSTGRES_AUTO_UPDATE IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS "Immich Postgres"
+  fi
+  if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
+    configure_image_behavior JELLYFIN_IMAGE JELLYFIN_AUTO_UPDATE JELLYFIN_AUTO_UPDATE_DELAY_DAYS "Jellyfin"
+  fi
+  if [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]; then
+    configure_image_behavior NAVIDROME_IMAGE NAVIDROME_AUTO_UPDATE NAVIDROME_AUTO_UPDATE_DELAY_DAYS "Navidrome"
+  fi
+  if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
+    configure_image_behavior UPTIME_KUMA_IMAGE UPTIME_KUMA_AUTO_UPDATE UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS "Uptime Kuma"
+  fi
+  if [[ "${ENABLE_RESTIC_REST_SERVER:-0}" == "1" ]]; then
+    configure_image_behavior RESTIC_REST_SERVER_IMAGE RESTIC_REST_SERVER_AUTO_UPDATE RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS "restic REST server"
+  fi
 
   echo
   config_set BACKUP_DAILY_AT \
@@ -477,12 +771,29 @@ configure_cmd() {
     "$(prompt_with_default "Weekly snapshot prune schedule (e.g. Sun 04:30)" "${SNAPSHOT_PRUNE_WEEKLY_AT:-Sun 04:30}")"
   config_set BACKUP_HEARTBEAT_URL \
     "$(prompt_with_default "Backup heartbeat URL (blank to disable)" "${BACKUP_HEARTBEAT_URL:-}")"
+  config_set IMAGE_AUTO_UPDATE_ENABLED \
+    "$(prompt_yes_no "Enable scheduled container image refresh checks?" "${IMAGE_AUTO_UPDATE_ENABLED:-0}")"
+  config_set IMAGE_AUTO_UPDATE_AT \
+    "$(prompt_with_default "Daily image refresh check time (HH:MM)" "${IMAGE_AUTO_UPDATE_AT:-05:15}")"
+  config_set IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY \
+    "$(prompt_with_default "Randomized delay for image refresh timer" "${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}")"
+  config_set HOST_PACKAGE_AUTO_UPDATE_ENABLED \
+    "$(prompt_yes_no "Enable scheduled host package upgrades (Docker, compose, tailscale, restic)?" "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}")"
+  config_set HOST_PACKAGE_AUTO_UPDATE_AT \
+    "$(prompt_with_default "Weekly host upgrade schedule (e.g. Mon 05:45)" "${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}")"
+  config_set HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY \
+    "$(prompt_with_default "Randomized delay for host upgrade timer" "${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}")"
 
   echo
   config_set BACKUP_TARGETS "nas cloud archive"
   configure_backup_target nas
   configure_backup_target cloud
   configure_backup_target archive
+
+  ensure_cfg_file
+  load_cfg
+  export_env_for_compose
+  configure_service_secrets
 
   ensure_cfg_file
   load_cfg
@@ -493,6 +804,133 @@ configure_cmd() {
   echo "[domum-media] Timer overrides synced. Run 'sudo domum-media apply' to converge services."
 }
 
+tracked_service_container_id() {
+  local svc="$1"
+  compose_cmd ps -q "$svc" 2>/dev/null | head -n 1
+}
+
+tracked_service_image_id() {
+  local svc="$1"
+  local cid
+  cid="$(tracked_service_container_id "$svc")"
+  [[ -n "$cid" ]] || return 0
+  docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true
+}
+
+write_update_state() {
+  local path="$1"
+  local image_id="$2"
+  local first_seen="$3"
+  cat > "$path" <<EOF
+SEEN_IMAGE_ID='$image_id'
+FIRST_SEEN_TS='$first_seen'
+EOF
+  chmod 600 "$path"
+}
+
+refresh_images() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+  local force="${1:-}"
+
+  if [[ "$force" != "--force" && "${IMAGE_AUTO_UPDATE_ENABLED:-0}" != "1" ]]; then
+    echo "[domum-media] Scheduled image refresh disabled (IMAGE_AUTO_UPDATE_ENABLED=0)."
+    return 0
+  fi
+
+  local due_services=()
+  local any_due=0
+  local now
+  now="$(date +%s)"
+
+  while IFS='|' read -r key enable_var image_var auto_var delay_var svc; do
+    [[ "${!enable_var:-0}" == "1" ]] || continue
+    [[ "${!auto_var:-0}" == "1" ]] || continue
+
+    local image_ref running_id current_id state_file delay_days delay_secs first_seen_ts remaining
+    image_ref="${!image_var:-}"
+    [[ -n "$image_ref" ]] || continue
+
+    echo "[domum-media] Checking ${key} -> ${image_ref}"
+    compose_cmd pull "$svc" >/dev/null
+
+    running_id="$(tracked_service_image_id "$svc")"
+    current_id="$(docker image inspect "$image_ref" --format '{{.Id}}' 2>/dev/null || true)"
+    state_file="$DOMUM_STATE_ROOT/image-updates/${key}.env"
+    delay_days="${!delay_var:-7}"
+    delay_secs=$(( delay_days * 86400 ))
+
+    if [[ -z "$running_id" || -z "$current_id" ]]; then
+      rm -f "$state_file"
+      echo "[domum-media] Skipping ${key}; container or image metadata unavailable."
+      continue
+    fi
+
+    if [[ "$running_id" == "$current_id" ]]; then
+      rm -f "$state_file"
+      echo "[domum-media] ${key} already running the current image."
+      continue
+    fi
+
+    unset SEEN_IMAGE_ID FIRST_SEEN_TS
+    if [[ -f "$state_file" ]]; then
+      # shellcheck disable=SC1090
+      source "$state_file"
+    fi
+
+    if [[ "${SEEN_IMAGE_ID:-}" != "$current_id" ]]; then
+      write_update_state "$state_file" "$current_id" "$now"
+      echo "[domum-media] ${key} has a newer image; waiting ${delay_days} day(s) before rollout."
+      continue
+    fi
+
+    first_seen_ts="${FIRST_SEEN_TS:-$now}"
+    if (( now - first_seen_ts < delay_secs )); then
+      remaining=$(( delay_secs - (now - first_seen_ts) ))
+      echo "[domum-media] ${key} is still in the delay window (${remaining}s remaining)."
+      continue
+    fi
+
+    due_services+=("$svc")
+    rm -f "$state_file"
+    any_due=1
+  done < <(managed_image_specs)
+
+  if (( any_due == 0 )); then
+    echo "[domum-media] No tracked images are ready to roll out."
+    return 0
+  fi
+
+  echo "[domum-media] Pre-update btrfs snapshot..."
+  snapshot_create "pre-image-update" || echo "[domum-media] Snapshot step failed (continuing)."
+
+  echo "[domum-media] Updating services: ${due_services[*]}"
+  compose_cmd up -d "${due_services[@]}"
+  echo "[domum-media] Image refresh done."
+}
+
+host_upgrade() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  local force="${1:-}"
+
+  if [[ "$force" != "--force" && "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}" != "1" ]]; then
+    echo "[domum-media] Scheduled host package upgrades disabled (HOST_PACKAGE_AUTO_UPDATE_ENABLED=0)."
+    return 0
+  fi
+
+  echo "[domum-media] Updating host packages from configured apt repos..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --only-upgrade \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    tailscale restic btrfs-progs jq apparmor nfs-common rclone
+  echo "[domum-media] Host package upgrade done."
+}
+
 # ---- commands -------------------------------------------------------------
 
 init_host() {
@@ -501,11 +939,14 @@ init_host() {
   load_cfg
   export_env_for_compose
   ensure_dirs
+  converge_local_installation
 
   local missing=()
   if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
     while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
       < <(missing_if_absent "$SECRETS_DIR/cloudflare_api_token" "cloudflare_api_token")
+    while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
+      < <(missing_if_absent "${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}" "traefik_dashboard_users")
   fi
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
     while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
@@ -575,6 +1016,7 @@ apply() {
   load_cfg
   export_env_for_compose
   ensure_dirs
+  converge_local_installation
   ensure_networks
   sync_timer_overrides
 
@@ -610,7 +1052,8 @@ repo_update() {
   [[ -d "$DOMUM_DIR/.git" ]] || die "$DOMUM_DIR is not a git repo — reinstall via install.sh"
   git -C "$DOMUM_DIR" fetch --all --prune
   git -C "$DOMUM_DIR" reset --hard origin/main
-  apply
+  converge_local_installation
+  exec /usr/local/bin/domum-media apply
 }
 
 logs_cmd() {
@@ -650,6 +1093,8 @@ Usage:
   domum-media apply
   domum-media status
   domum-media update
+  domum-media refresh-images [--force]
+  domum-media host-upgrade [--force]
   domum-media logs <service>
   domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
   domum-media snapshot {create [tag]|list|prune}
@@ -668,6 +1113,8 @@ main() {
     apply)     shift; apply "$@" ;;
     status)    shift; status "$@" ;;
     update)    shift; repo_update "$@" ;;
+    refresh-images) shift; refresh_images "$@" ;;
+    host-upgrade) shift; host_upgrade "$@" ;;
     logs)      shift; logs_cmd "$@" ;;
     backup)    backup_cmd "$@" ;;
     snapshot)  shift; snapshot_cmd "$@" ;;

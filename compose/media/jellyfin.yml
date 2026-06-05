@@ -1,6 +1,6 @@
 services:
   jellyfin:
-    image: jellyfin/jellyfin:${JELLYFIN_VERSION}
+    image: ${JELLYFIN_IMAGE}
     container_name: jellyfin
     restart: unless-stopped
     networks:

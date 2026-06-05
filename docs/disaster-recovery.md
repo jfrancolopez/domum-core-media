@@ -34,10 +34,12 @@ curl -fsSL https://raw.githubusercontent.com/jfrancolopez/domum-core-media/main/
 
 This installs Docker, Tailscale, restic, the CLI, and the systemd timers.
 
-### 3. Place secrets
+### 3. Re-create config and secrets
 
-Re-create `/etc/domum-core-media/secrets/` with every file listed in
-`SETUP-RESTIC.md` and `SETUP-CLOUDFLARE.md`. Same `chmod 600` rules.
+Run `sudo domum-media configure` first if you want the wizard to rebuild the
+common secrets, image refs, and timer settings. Otherwise, manually restore
+`config/domum-media.conf` plus every file listed in `SETUP-RESTIC.md`,
+`SETUP-CLOUDFLARE.md`, and `SETUP-TRAEFIK.md`.
 
 ### 4. Restore the data tier from restic
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=domum-media: refresh tracked container images
+Documentation=file:///opt/domum-core-media/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+ConditionPathExists=/usr/local/bin/domum-media
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/domum-media refresh-images
+TimeoutStartSec=4h

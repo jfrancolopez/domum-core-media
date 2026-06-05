@@ -3,6 +3,9 @@
 Traefik gets Let's Encrypt certs via Cloudflare DNS-01. No inbound ports
 required.
 
+If you run `sudo domum-media configure`, the wizard can write the token file
+for you. The manual flow below is still valid when you want to seed it yourself.
+
 ## Create the token
 
 In the Cloudflare dashboard → My Profile → API Tokens → Create Token →
@@ -33,6 +36,13 @@ sudo domum-media apply
 Traefik will resolve, request a cert per Host rule, and store it in the
 `traefik-letsencrypt` named volume. Watch `docker logs traefik` for the
 ACME flow on first run.
+
+If a browser or `curl` shows a self-signed certificate after the first request,
+Traefik is still serving its default cert and ACME did not complete. Inspect:
+
+```
+docker logs traefik | grep -Ei 'acme|lego|cloudflare|certificate|error'
+```
 
 ## DNS records (UniFi LAN + Tailscale split DNS)
 

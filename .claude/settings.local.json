@@ -14,7 +14,16 @@
       "Bash(bash:*)",
       "Bash(command:*)",
       "Bash(shellcheck:*)",
-      "Bash(docker:*)"
+      "Bash(docker:*)",
+      "Bash(cd:*)",
+      "Bash(do:*)",
+      "Bash(done:*)",
+      "Bash(git grep:*)",
+      "Bash(then:*)",
+      "Bash(fi:*)",
+      "WebSearch",
+      "WebFetch",
+      "Bash(curl:*)"
     ],
     "deny": [],
     "ask": []

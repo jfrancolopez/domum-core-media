@@ -34,7 +34,9 @@ Relevant config keys (`config/domum-media.conf`):
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `NAVIDROME_VERSION` | `0.61.2` | Pinned image tag — never `latest`. |
+| `NAVIDROME_IMAGE` | `deluan/navidrome:0.61.2` | Full image ref. Use an exact tag for pinned rollouts or a moving tag with `NAVIDROME_AUTO_UPDATE=1`. |
+| `NAVIDROME_AUTO_UPDATE` | `0` | Whether the image refresh timer may roll Navidrome forward automatically. |
+| `NAVIDROME_AUTO_UPDATE_DELAY_DAYS` | `7` | How long a newly pulled image must sit before rollout. |
 | `NAVIDROME_DATA_DIR` | `/srv/data/navidrome` | DB + scan cache (snapshotted, backed up). |
 | `NAVIDROME_MUSIC_ROOT` | `/srv/music` | Parent of all music sources, mounted `:ro`. |
 | `NAVIDROME_USER` | `0:0` | Container uid:gid that reads music. |
