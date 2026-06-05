@@ -1,97 +1,398 @@
-# Setting up the N100 host
+# Setting up the N100 Host (Debian 13)
 
-This is the one-shot manual procedure for the Intel N100 mini-PC running
-Debian 13. Everything here is too destructive to live inside `install.sh`.
+This document describes the manual provisioning process for the Intel N100 mini-PC running Debian 13.
 
-## 1. Install Debian 13
+These steps are intentionally kept outside of `install.sh` because they modify disks, firmware settings, users, filesystems, and other machine-specific configuration.
 
-- Net-install ISO, minimal install (no desktop). Root + an `admin` user.
-- SSH server only. Disable password SSH after you've copied your key in.
-- Hostname: `domum-media` (or whatever; nothing in the repo depends on it).
+---
 
-## 2. BIOS
+# 0. Architecture Assumptions
 
-- Disable wake-on-LAN unless you actually use it.
-- Enable C-states (C8+ is where the N100 sips power).
-- Fan curve: silent / passive if your case supports it.
-- Disable Intel ME network access if exposed.
+This guide assumes:
 
-## 3. SSD layout (btrfs)
+```text
+OS SSD
+└── 512 GB SSD
+    ├── EFI
+    ├── /
+    └── swap
 
-The plan: one 1 TB SSD, one root filesystem on a small partition, and one big
-btrfs partition for `/srv/data` with named subvolumes.
-
+Data SSD
+└── 1 TB SSD
+    └── /srv/data
 ```
-sgdisk -n 1:0:+1G   -t 1:ef00 -c 1:"EFI"   /dev/nvme0n1
-sgdisk -n 2:0:+30G  -t 2:8300 -c 2:"root"  /dev/nvme0n1
-sgdisk -n 3:0:0     -t 3:8300 -c 3:"data"  /dev/nvme0n1
+
+Current design philosophy:
+
+```text
+OS = disposable
+Configuration = Git
+Secrets = external
+Data = persistent
+Backups = recovery
+```
+
+The OS should be easy to rebuild.
+
+The data disk should survive OS reinstalls.
+
+---
+
+# 1. Install Debian 13
+
+Recommended:
+
+- Debian 13 (Trixie)
+- Minimal install
+- No desktop environment
+- OpenSSH server enabled
+- Create a normal user account (e.g. `jfranco`)
+
+Verify:
+
+```bash
+hostnamectl
+sudo whoami
+ip addr
+ping -c 3 deb.debian.org
+```
+
+Expected:
+
+- Debian 13
+- sudo works
+- network works
+- DNS works
+
+---
+
+# 2. Fix sudo (if required)
+
+Some minimal installations may not have sudo configured.
+
+Install:
+
+```bash
+su -
+apt update
+apt install -y sudo
+```
+
+Add user:
+
+```bash
+/usr/sbin/usermod -aG sudo jfranco
+```
+
+Verify:
+
+```bash
+groups jfranco
+```
+
+Expected:
+
+```text
+jfranco sudo
+```
+
+Logout and log back in.
+
+Verify:
+
+```bash
+sudo whoami
+```
+
+Expected:
+
+```text
+root
+```
+
+---
+
+# 3. BIOS Configuration
+
+Recommended:
+
+Enable:
+
+- Restore on AC Power Loss
+- Intel VT-x
+- Intel VT-d
+- CPU C-States
+
+Disable:
+
+- Fast Boot
+- Wake-on-LAN (unless used)
+
+Optional:
+
+- Silent fan profile
+
+---
+
+# 4. Verify Storage Before Modifying Anything
+
+Inspect disks:
+
+```bash
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT,MODEL
+sudo fdisk -l
+df -h
+```
+
+Example:
+
+```text
+sda  512GB  OS SSD
+sdb    1TB  Data SSD
+```
+
+Verify which disk contains Debian before continuing.
+
+Do not run partitioning commands until disk identities are confirmed.
+
+---
+
+# 5. Base Packages
+
+Install common administration tools:
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+
+sudo apt install -y \
+curl wget git vim nano tmux \
+htop btop jq yq \
+rsync unzip zip \
+smartmontools nvme-cli \
+powertop lm-sensors \
+ca-certificates gnupg \
+dnsutils tree ncdu \
+fail2ban openssh-server \
+btrfs-progs parted
+```
+
+---
+
+# 6. Configure Data SSD (Btrfs)
+
+WARNING:
+
+This destroys all data on the target disk.
+
+Example data disk:
+
+```text
+/dev/sdb
+```
+
+Create GPT:
+
+```bash
+sudo parted -s /dev/sdb mklabel gpt
+sudo parted -s /dev/sdb mkpart primary btrfs 1MiB 100%
 ```
 
 Format:
 
-```
-mkfs.vfat -F32 /dev/nvme0n1p1
-mkfs.ext4      /dev/nvme0n1p2
-mkfs.btrfs -L data /dev/nvme0n1p3
+```bash
+sudo mkfs.btrfs -f -L data /dev/sdb1
 ```
 
-Create subvolumes (mount the bare partition first, then create):
+Verify:
 
-```
-mount /dev/nvme0n1p3 /mnt
-btrfs subvolume create /mnt/@data
-btrfs subvolume create /mnt/@snapshots
-btrfs subvolume create /mnt/@data/immich
-btrfs subvolume create /mnt/@data/immich/library
-btrfs subvolume create /mnt/@data/immich/postgres
-btrfs subvolume create /mnt/@data/jellyfin
-btrfs subvolume create /mnt/@data/uptime-kuma
-btrfs subvolume create /mnt/@data/traefik
-umount /mnt
+```bash
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT,MODEL
 ```
 
-## 4. `/etc/fstab`
+Expected:
 
+```text
+sdb1 btrfs
 ```
-UUID=<data-uuid> /srv/data       btrfs subvol=@data,noatime,compress=zstd:3,space_cache=v2,ssd  0 0
-UUID=<data-uuid> /srv/snapshots  btrfs subvol=@snapshots,noatime,compress=zstd:3,space_cache=v2,ssd 0 0
+
+---
+
+# 7. Create Btrfs Subvolumes
+
+Mount temporarily:
+
+```bash
+sudo mkdir -p /mnt/btrfs
+sudo mount /dev/sdb1 /mnt/btrfs
 ```
 
-`mkdir -p /srv/data /srv/snapshots && mount -a` to apply.
+Create:
 
-## 5. Power tuning
-
-Install + enable powertop auto-tune via a systemd oneshot at boot:
-
+```bash
+sudo btrfs subvolume create /mnt/btrfs/@data
+sudo btrfs subvolume create /mnt/btrfs/@snapshots
 ```
-apt-get install -y powertop
-cat >/etc/systemd/system/powertop.service <<'EOF'
+
+Unmount:
+
+```bash
+sudo umount /mnt/btrfs
+```
+
+Verify:
+
+```bash
+sudo blkid /dev/sdb1
+```
+
+Save UUID.
+
+---
+
+# 8. Configure fstab
+
+Backup:
+
+```bash
+sudo cp /etc/fstab /etc/fstab.bak.$(date +%F-%H%M)
+```
+
+Add:
+
+```fstab
+# domum-media-core data disk
+UUID=<uuid> /srv/data btrfs subvol=@data,noatime,compress=zstd:3,ssd 0 0
+UUID=<uuid> /srv/snapshots btrfs subvol=@snapshots,noatime,compress=zstd:3,ssd 0 0
+```
+
+Create mount points:
+
+```bash
+sudo mkdir -p /srv/data /srv/snapshots
+```
+
+Apply:
+
+```bash
+sudo mount -a
+sudo systemctl daemon-reload
+```
+
+Verify:
+
+```bash
+df -h | grep srv
+findmnt | grep sdb1
+```
+
+---
+
+# 9. Create Data Structure
+
+```bash
+sudo mkdir -p /srv/data/{containers,media,backups,staging}
+
+sudo mkdir -p /srv/data/containers/{immich,postgres,redis,traefik,uptime-kuma}
+
+sudo mkdir -p /srv/data/media/{photos,videos,documents}
+
+sudo chown -R $USER:$USER /srv/data
+```
+
+---
+
+# 10. Power Tuning
+
+Calibrate:
+
+```bash
+sudo powertop --calibrate
+```
+
+Create service:
+
+```bash
+sudo nano /etc/systemd/system/powertop.service
+```
+
+Contents:
+
+```ini
 [Unit]
 Description=PowerTOP auto-tune
 After=multi-user.target
+
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/powertop --auto-tune
+
 [Install]
 WantedBy=multi-user.target
-EOF
-systemctl enable --now powertop.service
 ```
 
-Optional: enable CPU `powersave` governor in `/etc/default/cpufrequtils`.
+Enable:
 
-Done right, the N100 idles around 6–8 W with the full stack up.
+```bash
+sudo systemctl enable --now powertop.service
+```
 
-## 6. Then run `install.sh`
+---
 
-Now you're ready for the curl-bootstrap from the README.
+# 11. Neovim / LazyVim
 
-## Notes on the btrfs choice
+Debian 13 currently ships:
 
-- **Atomic snapshots before each `apply`** — instant rollback of a bad upgrade
-  via `btrfs subvolume snapshot`. The CLI does this automatically.
-- **Checksums detect bitrot.** btrfs will surface a corrupt block loudly rather
-  than silently feeding it to restic. With a single disk, it can't *repair*;
-  but it can flag, which is what we want.
-- Snapshots are *not* a substitute for restic. They die with the disk. Restic
-  is the recovery story; snapshots are the operator-error story.
+```text
+Neovim 0.10.x
+```
+
+LazyVim requires:
+
+```text
+>= 0.11.2
+```
+
+If using LazyVim, install a newer Neovim release instead of relying on the Debian package.
+
+This is not required for server operation.
+
+---
+
+# 12. Ready for Bootstrap
+
+Verify:
+
+```bash
+sudo whoami
+ping -c 3 deb.debian.org
+df -h
+findmnt | grep srv
+docker --version
+```
+
+Then:
+
+```bash
+curl -fsSL <install-url> | sudo bash
+```
+
+---
+
+# Notes
+
+Btrfs is used only on the data disk.
+
+Root remains ext4.
+
+Benefits:
+
+- checksums
+- future snapshots
+- clean data separation
+
+Backups remain the primary recovery mechanism.
+
+Snapshots protect against operator mistakes.
+
+Restic protects against disk loss.
