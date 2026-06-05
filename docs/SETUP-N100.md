@@ -82,12 +82,15 @@ Add user:
 
 ```bash
 /usr/sbin/usermod -aG sudo jfranco
+#add docker too:
+sudo usermod -aG docker jfranco
 ```
 
 Verify:
 
 ```bash
 groups jfranco
+groups
 ```
 
 Expected:
