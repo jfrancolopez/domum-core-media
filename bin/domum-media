@@ -141,10 +141,11 @@ read_secret_file_value() {
   local value=""
   [[ -f "$path" ]] || return 1
   IFS= read -r -d '' value < "$path" || true
-  if [[ "$value" == *$'\n' ]]; then
-    value="${value%$'\n'}"
-  fi
-  printf '%s' "$value"
+  # Trim all leading/trailing whitespace (spaces, tabs, CR, newlines). A stray
+  # leading newline is non-empty, so it sails through compose's ${VAR:?} guard
+  # and renders as "set" in `docker compose config`, yet the running container
+  # ends up with an empty-looking value and Postgres/Immich auth mismatches.
+  trim_spaces "$value"
 }
 
 immich_secret_empty_error() {
@@ -197,6 +198,25 @@ validate_immich_secret_exports() {
   [[ -f "$jwt_file" ]] || immich_secret_empty_error "IMMICH_JWT_SECRET" "$jwt_file"
   [[ -n "${IMMICH_DB_PASSWORD:-}" ]] || immich_secret_empty_error "IMMICH_DB_PASSWORD" "$db_file"
   [[ -n "${IMMICH_JWT_SECRET:-}" ]] || immich_secret_empty_error "IMMICH_JWT_SECRET" "$jwt_file"
+}
+
+# Rewrite Immich secret files with their trimmed value so any tool that reads
+# the file directly (not via read_secret_file_value) also gets a clean value,
+# and the on-disk sha256 fingerprint stays consistent with what compose loads.
+# Trimming an already-clean file is a no-op.
+sanitize_immich_secret_files() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+
+  local file raw trimmed
+  for file in "$(immich_db_password_file)" "$(immich_jwt_secret_file)"; do
+    [[ -f "$file" ]] || continue
+    IFS= read -r -d '' raw < "$file" || true
+    trimmed="$(trim_spaces "$raw")"
+    if [[ "$raw" != "$trimmed" ]]; then
+      echo "[domum-media] Sanitizing whitespace in $(basename "$file")"
+      write_secret_file "$file" "$trimmed"
+    fi
+  done
 }
 
 trim_spaces() {
@@ -1857,6 +1877,8 @@ apply() {
   ensure_networks
   sync_timer_overrides
 
+  sanitize_immich_secret_files
+
   local immich_first_boot=0
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]] && ! immich_db_password_initialized; then
     immich_first_boot=1
@@ -1872,11 +1894,35 @@ apply() {
 
   echo "[domum-media] Applying desired state..."
   compose_cmd up -d --remove-orphans
+
+  # docker compose won't recreate a container when it sees no config change, so
+  # a secret rotation can leave the old (or empty) env baked into a running
+  # container. If the runtime secrets aren't consistent, force-recreate the
+  # Immich services once before deciding the apply has failed.
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]] && ! immich_runtime_env_ok; then
+    echo "[domum-media] Immich runtime secrets inconsistent after up; force-recreating Immich services..."
+    compose_cmd up -d --force-recreate \
+      immich_postgres immich_redis immich_machine_learning immich_server
+  fi
   validate_immich_runtime_env
 
+  # Record the "born with" password fingerprint only on first boot and only when
+  # the database actually came up cleanly — never stamp success onto a broken
+  # deploy (auth-looping server / unhealthy postgres).
   if (( immich_first_boot == 1 )) && immich_db_password_initialized; then
-    write_immich_db_password_fingerprint
-    echo "[domum-media] Recorded Immich DB password fingerprint at $(immich_db_password_fingerprint_file)."
+    local pg_status server_status
+    pg_status="$(container_status_summary immich_postgres)"
+    server_status="$(container_status_summary immich_server)"
+    if [[ "$pg_status" == "healthy" ]] \
+       && [[ "$server_status" != "unhealthy" && "$server_status" != "restarting" \
+             && "$server_status" != "exited" && "$server_status" != "dead" \
+             && "$server_status" != "missing" ]]; then
+      write_immich_db_password_fingerprint
+      echo "[domum-media] Recorded Immich DB password fingerprint at $(immich_db_password_fingerprint_file)."
+    else
+      echo "[domum-media] WARNING: not recording Immich DB password fingerprint — immich_postgres=$pg_status immich_server=$server_status." >&2
+      echo "[domum-media] Re-run 'sudo domum-media apply' once Immich is healthy, or 'sudo domum-media immich reset-db' to start clean." >&2
+    fi
   fi
 
   echo "[domum-media] apply done."
@@ -2091,15 +2137,22 @@ immich_runtime_env_summary() {
   echo "  DB_PASSWORD == POSTGRES_PASSWORD: $db_match"
 }
 
-validate_immich_runtime_env() {
-  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
-
+# Non-exiting predicate: are the running Immich containers' secret env vars
+# present and consistent? Used by apply() to decide whether a force-recreate
+# recovery pass is warranted before hard-failing.
+immich_runtime_env_ok() {
   local server_db server_jwt postgres_db
   server_db="$(container_env_value immich_server DB_PASSWORD)"
   server_jwt="$(container_env_value immich_server JWT_SECRET)"
   postgres_db="$(container_env_value immich_postgres POSTGRES_PASSWORD)"
 
-  if [[ -z "$server_db" || -z "$server_jwt" || -z "$postgres_db" || "$server_db" != "$postgres_db" ]]; then
+  [[ -n "$server_db" && -n "$server_jwt" && -n "$postgres_db" && "$server_db" == "$postgres_db" ]]
+}
+
+validate_immich_runtime_env() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+
+  if ! immich_runtime_env_ok; then
     echo "[domum-media] Runtime Immich env validation:"
     immich_runtime_env_summary
     echo "[domum-media] ERROR: Rendered Compose validation passed, but running containers have empty Immich secrets. This means docker compose up did not receive the runtime secret environment." >&2

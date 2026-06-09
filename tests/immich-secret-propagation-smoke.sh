@@ -31,8 +31,13 @@ DOMUM_LOG_DIR='$LOG_DIR'
 DOMUM_SNAPSHOT_ROOT='$SNAPSHOT_DIR'
 EOF
 
-printf 'db-pass-123!@ \n' > "$SECRETS_DIR/immich_db_password"
-printf 'jwt-secret-456?=\n' > "$SECRETS_DIR/immich_jwt_secret"
+# Deliberately surround the secrets with leading/trailing whitespace and a
+# leading blank line — this is the prod failure mode. A leading newline is
+# non-empty, so it passes compose's ${VAR:?} guard and renders as "set", yet
+# leaves the running container with an empty-looking value. read_secret_file_value
+# must trim all surrounding whitespace so the runtime value is clean.
+printf '\n  db-pass-123!@  \n' > "$SECRETS_DIR/immich_db_password"
+printf '\n jwt-secret-456?= \n' > "$SECRETS_DIR/immich_jwt_secret"
 
 cat > "$FAKE_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -109,8 +114,14 @@ load_cfg
 export_env_for_compose
 validate_immich_secret_exports
 
-[[ "${IMMICH_DB_PASSWORD:-}" == "db-pass-123!@ " ]] || fail "IMMICH_DB_PASSWORD did not load from the secret file"
-[[ "${IMMICH_JWT_SECRET:-}" == "jwt-secret-456?=" ]] || fail "IMMICH_JWT_SECRET did not load from the secret file"
+[[ "${IMMICH_DB_PASSWORD:-}" == "db-pass-123!@" ]] || fail "IMMICH_DB_PASSWORD did not load trimmed from the secret file (got: $(printf '%q' "${IMMICH_DB_PASSWORD:-}"))"
+[[ "${IMMICH_JWT_SECRET:-}" == "jwt-secret-456?=" ]] || fail "IMMICH_JWT_SECRET did not load trimmed from the secret file (got: $(printf '%q' "${IMMICH_JWT_SECRET:-}"))"
+
+# Lock in the regression: no surrounding whitespace may survive the read.
+[[ "${IMMICH_DB_PASSWORD}" == "${IMMICH_DB_PASSWORD#[[:space:]]}" ]] || fail "IMMICH_DB_PASSWORD has leading whitespace"
+[[ "${IMMICH_DB_PASSWORD}" == "${IMMICH_DB_PASSWORD%[[:space:]]}" ]] || fail "IMMICH_DB_PASSWORD has trailing whitespace"
+[[ "${IMMICH_JWT_SECRET}" == "${IMMICH_JWT_SECRET#[[:space:]]}" ]] || fail "IMMICH_JWT_SECRET has leading whitespace"
+[[ "${IMMICH_JWT_SECRET}" == "${IMMICH_JWT_SECRET%[[:space:]]}" ]] || fail "IMMICH_JWT_SECRET has trailing whitespace"
 
 RENDERED_FILE="$TMP_DIR/rendered.yml"
 render_compose_config_file "$RENDERED_FILE"
@@ -123,8 +134,8 @@ POSTGRES_PASSWORD="$(yaml_scalar_plaintext "$(compose_rendered_env_value "$RENDE
 [[ -n "$SERVER_JWT_SECRET" ]] || fail "immich_server JWT_SECRET rendered empty"
 [[ -n "$POSTGRES_PASSWORD" ]] || fail "immich_postgres POSTGRES_PASSWORD rendered empty"
 [[ "$SERVER_DB_PASSWORD" == "$POSTGRES_PASSWORD" ]] || fail "DB_PASSWORD and POSTGRES_PASSWORD did not match"
-[[ "$SERVER_DB_PASSWORD" == "db-pass-123!@ " ]] || fail "immich_server DB_PASSWORD did not match the DB secret file"
-[[ "$POSTGRES_PASSWORD" == "db-pass-123!@ " ]] || fail "immich_postgres POSTGRES_PASSWORD did not match the DB secret file"
+[[ "$SERVER_DB_PASSWORD" == "db-pass-123!@" ]] || fail "immich_server DB_PASSWORD did not match the trimmed DB secret"
+[[ "$POSTGRES_PASSWORD" == "db-pass-123!@" ]] || fail "immich_postgres POSTGRES_PASSWORD did not match the trimmed DB secret"
 [[ "$SERVER_JWT_SECRET" == "jwt-secret-456?=" ]] || fail "immich_server JWT_SECRET did not match the JWT secret file"
 
 validate_immich_compose_config
