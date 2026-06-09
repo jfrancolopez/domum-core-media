@@ -1,0 +1,31 @@
+services:
+  calibre-web:
+    image: ${CALIBRE_WEB_IMAGE}
+    container_name: calibre-web
+    restart: unless-stopped
+    networks:
+      - domum-proxy
+      - domum-internal
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      DOCKER_MODS: linuxserver/mods:universal-calibre
+    volumes:
+      - ${CALIBRE_WEB_CONFIG_DIR}:/config
+      - ${CALIBRE_WEB_LIBRARY_DIR}:/books
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=domum-proxy
+      - traefik.http.routers.calibre-web.rule=Host(`${CALIBRE_WEB_HOST}`)
+      - traefik.http.routers.calibre-web.entrypoints=websecure
+      - traefik.http.routers.calibre-web.tls=true
+      - traefik.http.routers.calibre-web.tls.certresolver=cf
+      - traefik.http.routers.calibre-web.middlewares=securityHeaders@file
+      - traefik.http.services.calibre-web.loadbalancer.server.port=8083
+
+networks:
+  domum-proxy:
+    external: true
+  domum-internal:
+    external: true

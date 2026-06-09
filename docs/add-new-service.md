@@ -37,6 +37,11 @@ networks:
 
 Prefer a pinned image tag. If you decide to use a moving tag, add matching
 `MYSERVICE_AUTO_UPDATE` and `MYSERVICE_AUTO_UPDATE_DELAY_DAYS` config keys.
+Also decide the lifecycle class up front:
+
+- Class A for low-risk infra
+- Class B for stateful apps that need backup gates
+- Class C for bundle-managed apps that must not drift image-by-image
 
 ## 2. Add a toggle
 
@@ -92,6 +97,7 @@ set it up per `SETUP-CLOUDFLARE.md`.
 
 - One service per fragment
 - No hardcoded IPs
-- `/srv/data/<service>` for state — subvolume, not plain dir
+- `/srv/data/<service>` for durable state — subvolume, not plain dir
+- `${DOMUM_HOT_ROOT}/...` only for cache/transcode/staging paths
 - Secrets only in `/etc/domum-core-media/secrets/`, sourced by the CLI
 - Never edit files inside `/opt/domum-core-media` directly

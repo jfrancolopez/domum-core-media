@@ -1,0 +1,29 @@
+services:
+  kavita:
+    image: ${KAVITA_IMAGE}
+    container_name: kavita
+    restart: unless-stopped
+    networks:
+      - domum-proxy
+      - domum-internal
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ${KAVITA_CONFIG_DIR}:/kavita/config
+      - ${KAVITA_LIBRARY_DIR}:/books
+      - ${KAVITA_STAGING_DIR}:/staging
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=domum-proxy
+      - traefik.http.routers.kavita.rule=Host(`${KAVITA_HOST}`)
+      - traefik.http.routers.kavita.entrypoints=websecure
+      - traefik.http.routers.kavita.tls=true
+      - traefik.http.routers.kavita.tls.certresolver=cf
+      - traefik.http.routers.kavita.middlewares=securityHeaders@file
+      - traefik.http.services.kavita.loadbalancer.server.port=5000
+
+networks:
+  domum-proxy:
+    external: true
+  domum-internal:
+    external: true

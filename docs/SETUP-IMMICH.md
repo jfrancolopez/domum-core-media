@@ -2,7 +2,8 @@
 
 This page covers everything specific to running Immich here: how the database
 is bootstrapped, where the secrets live, why the DB password is locked after
-the first apply, and how to rotate or reset it cleanly.
+the first apply, how bundle-managed upgrades work, and how to rotate or reset
+it cleanly.
 
 For the underlying compose definition see `compose/photos/immich.yml`. For the
 CLI internals see `bin/domum-media`.
@@ -30,7 +31,28 @@ That is the only path where Immich's DB password is allowed to be chosen.
 
 ---
 
-## 2. Secret lifecycle
+## 2. Bundle-managed updates
+
+Immich is treated as a Class C workload. The app server, machine-learning,
+database, and redis/valkey images move together from the official upstream
+release bundle.
+
+Use:
+
+```bash
+sudo domum-media immich refresh-bundle
+```
+
+That command fetches the latest release metadata from GitHub, downloads the
+official release `docker-compose.yml`, extracts the candidate image set,
+stores it under `/var/lib/domum-media/immich/bundle-candidate.env`, respects
+the configured delay window, verifies backup freshness, snapshots the Immich
+subvolume, deploys the bundle, and restores the previous snapshot if health
+validation fails.
+
+---
+
+## 3. Secret lifecycle
 
 | File | Owner | Purpose |
 | --- | --- | --- |
@@ -46,7 +68,7 @@ repo touches the database directly.
 
 ---
 
-## 3. Why the DB password is locked after the first boot
+## 4. Why the DB password is locked after the first boot
 
 Postgres applies `POSTGRES_PASSWORD` exactly once — during the very first
 `initdb`. From then on every container restart logs:
@@ -72,7 +94,7 @@ scope. Recovery is by restoration or by wipe, both spelled out below.)
 
 ---
 
-## 4. Password rotation procedure
+## 5. Password rotation procedure
 
 There is no in-place rotation. To adopt a new password you wipe Postgres's
 data directory and let `apply` bootstrap a fresh database against the new
@@ -105,7 +127,7 @@ re-scan, or `immich-cli` upload). Plan accordingly.
 
 ---
 
-## 5. Destructive reset (for test environments)
+## 6. Destructive reset (for test environments)
 
 Same command, different framing. When you are iterating on the install and
 just want a clean slate:
@@ -144,7 +166,7 @@ sudo domum-media apply
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 ### `PostgresError: password authentication failed for user "postgres"` on `immich_server`
 
@@ -175,7 +197,7 @@ forget about it.
 
 ---
 
-## 7. Related files
+## 8. Related files
 
 - `bin/domum-media` — `validate_immich_db_password_state`, `immich_reset_db`,
   `write_immich_db_password_fingerprint`.

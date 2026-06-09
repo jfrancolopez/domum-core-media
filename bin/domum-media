@@ -12,6 +12,7 @@ DATA_ROOT_DEFAULT="/srv/data"
 SNAPSHOT_ROOT_DEFAULT="/srv/snapshots"
 LOG_DIR_DEFAULT="/var/log/domum-media"
 STATE_ROOT_DEFAULT="/var/lib/domum-media"
+HOT_ROOT_DEFAULT="/var/lib/domum-media/hot"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -33,6 +34,9 @@ load_cfg() {
   DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-$SNAPSHOT_ROOT_DEFAULT}"
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
   DOMUM_STATE_ROOT="${DOMUM_STATE_ROOT:-$STATE_ROOT_DEFAULT}"
+  DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
+  BACKUP_POLICY="${BACKUP_POLICY:-STRICT}"
+  BACKUP_REQUIRED_MAX_AGE_HOURS="${BACKUP_REQUIRED_MAX_AGE_HOURS:-48}"
 }
 
 ensure_cfg_file() {
@@ -101,6 +105,7 @@ ensure_state_dirs() {
   install -d -m 0700 "$DOMUM_STATE_ROOT"
   install -d -m 0700 "$DOMUM_STATE_ROOT/image-updates"
   install -d -m 0700 "$DOMUM_STATE_ROOT/immich"
+  install -d -m 0700 "$DOMUM_STATE_ROOT/snapshots"
 }
 
 immich_postgres_data_dir() {
@@ -289,15 +294,126 @@ managed_image_specs() {
   cat <<'EOF'
 traefik|ENABLE_TRAEFIK|TRAEFIK_IMAGE|TRAEFIK_AUTO_UPDATE|TRAEFIK_AUTO_UPDATE_DELAY_DAYS|traefik
 tailscale|ENABLE_TAILSCALE|TAILSCALE_IMAGE|TAILSCALE_AUTO_UPDATE|TAILSCALE_AUTO_UPDATE_DELAY_DAYS|tailscale
-immich-server|ENABLE_IMMICH|IMMICH_SERVER_IMAGE|IMMICH_SERVER_AUTO_UPDATE|IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS|immich_server
-immich-machine-learning|ENABLE_IMMICH|IMMICH_MACHINE_LEARNING_IMAGE|IMMICH_MACHINE_LEARNING_AUTO_UPDATE|IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS|immich_machine_learning
-immich-redis|ENABLE_IMMICH|IMMICH_REDIS_IMAGE|IMMICH_REDIS_AUTO_UPDATE|IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS|immich_redis
-immich-postgres|ENABLE_IMMICH|IMMICH_POSTGRES_IMAGE|IMMICH_POSTGRES_AUTO_UPDATE|IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS|immich_postgres
 jellyfin|ENABLE_JELLYFIN|JELLYFIN_IMAGE|JELLYFIN_AUTO_UPDATE|JELLYFIN_AUTO_UPDATE_DELAY_DAYS|jellyfin
+plex|ENABLE_PLEX|PLEX_IMAGE|PLEX_AUTO_UPDATE|PLEX_AUTO_UPDATE_DELAY_DAYS|plex
 navidrome|ENABLE_NAVIDROME|NAVIDROME_IMAGE|NAVIDROME_AUTO_UPDATE|NAVIDROME_AUTO_UPDATE_DELAY_DAYS|navidrome
+calibre-web|ENABLE_CALIBRE_WEB|CALIBRE_WEB_IMAGE|CALIBRE_WEB_AUTO_UPDATE|CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS|calibre-web
+kavita|ENABLE_KAVITA|KAVITA_IMAGE|KAVITA_AUTO_UPDATE|KAVITA_AUTO_UPDATE_DELAY_DAYS|kavita
 uptime-kuma|ENABLE_UPTIME_KUMA|UPTIME_KUMA_IMAGE|UPTIME_KUMA_AUTO_UPDATE|UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS|uptime-kuma
 restic-rest-server|ENABLE_RESTIC_REST_SERVER|RESTIC_REST_SERVER_IMAGE|RESTIC_REST_SERVER_AUTO_UPDATE|RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS|restic-rest-server
 EOF
+}
+
+service_lifecycle_specs() {
+  cat <<'EOF'
+traefik|ENABLE_TRAEFIK|A|14|traefik|TRAEFIK_IMAGE|
+tailscale|ENABLE_TAILSCALE|A|14|tailscale|TAILSCALE_IMAGE|
+uptime-kuma|ENABLE_UPTIME_KUMA|A|14|uptime-kuma|UPTIME_KUMA_IMAGE|
+jellyfin|ENABLE_JELLYFIN|B|21|jellyfin|JELLYFIN_IMAGE|
+plex|ENABLE_PLEX|B|20|plex|PLEX_IMAGE|
+navidrome|ENABLE_NAVIDROME|B|21|navidrome|NAVIDROME_IMAGE|
+calibre-web|ENABLE_CALIBRE_WEB|B|20|calibre-web|CALIBRE_WEB_IMAGE|
+kavita|ENABLE_KAVITA|B|20|kavita|KAVITA_IMAGE|
+immich|ENABLE_IMMICH|C|21|immich_server immich_machine_learning immich_postgres immich_redis|IMMICH_SERVER_IMAGE|
+EOF
+}
+
+service_data_path() {
+  case "$1" in
+    traefik) echo "$DOMUM_DATA_ROOT/traefik" ;;
+    immich) echo "$DOMUM_DATA_ROOT/immich" ;;
+    jellyfin) echo "${JELLYFIN_CONFIG_DIR%/config}" ;;
+    plex) echo "${PLEX_CONFIG_DIR%/config}" ;;
+    navidrome) echo "$NAVIDROME_DATA_DIR" ;;
+    calibre-web) echo "${CALIBRE_WEB_CONFIG_DIR%/config}" ;;
+    kavita) echo "${KAVITA_CONFIG_DIR%/config}" ;;
+    uptime-kuma) echo "$DOMUM_DATA_ROOT/uptime-kuma" ;;
+    *) return 1 ;;
+  esac
+}
+
+service_configured_version() {
+  local key="$1"
+  printf '%s' "${!key:-unknown}"
+}
+
+service_backup_required() {
+  case "$1" in
+    jellyfin|plex|navidrome|calibre-web|kavita|immich) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+service_compose_services() {
+  while IFS='|' read -r name _ _ _ compose_svcs _ _; do
+    [[ "$name" == "$1" ]] || continue
+    printf '%s' "$compose_svcs"
+    return 0
+  done < <(service_lifecycle_specs)
+  return 1
+}
+
+service_health_url() {
+  while IFS='|' read -r name _ _ _ _ _ url; do
+    [[ "$name" == "$1" ]] || continue
+    printf '%s' "$url"
+    return 0
+  done < <(service_lifecycle_specs)
+  return 1
+}
+
+backup_last_success_epoch() {
+  local file="${DOMUM_LOG_DIR}/last-success"
+  [[ -f "$file" ]] || return 1
+  date -d "$(head -n1 "$file")" +%s 2>/dev/null || return 1
+}
+
+verify_backup_freshness() {
+  local svc="$1"
+  service_backup_required "$svc" || return 0
+
+  local policy="${BACKUP_POLICY^^}"
+  local max_age_hours="${BACKUP_REQUIRED_MAX_AGE_HOURS:-48}"
+  local now last_success age_hours
+  now="$(date +%s)"
+  if ! last_success="$(backup_last_success_epoch)"; then
+    if [[ "$policy" == "STRICT" ]]; then
+      die "Refusing to update $svc: no successful backup timestamp found in $DOMUM_LOG_DIR/last-success"
+    fi
+    echo "[domum-media] WARNING: no successful backup timestamp found; continuing because BACKUP_POLICY=$BACKUP_POLICY"
+    return 0
+  fi
+  age_hours=$(( (now - last_success) / 3600 ))
+  if (( age_hours > max_age_hours )); then
+    if [[ "$policy" == "STRICT" ]]; then
+      die "Refusing to update $svc: latest successful backup is ${age_hours}h old (limit ${max_age_hours}h)"
+    fi
+    echo "[domum-media] WARNING: latest successful backup for $svc is ${age_hours}h old; continuing because BACKUP_POLICY=$BACKUP_POLICY"
+  fi
+}
+
+service_is_healthy() {
+  local svc="$1"
+  local compose_svcs cid health_url
+
+  compose_svcs="$(service_compose_services "$svc" || true)"
+  for compose_svc in $compose_svcs; do
+    cid="$(tracked_service_container_id "$compose_svc")"
+    [[ -n "$cid" ]] || return 1
+    if [[ "$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || true)" != "running" ]]; then
+      return 1
+    fi
+    if [[ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null || true)" == "unhealthy" ]]; then
+      return 1
+    fi
+  done
+
+  health_url="$(service_health_url "$svc" || true)"
+  if [[ -n "$health_url" ]] && cmd_exists curl; then
+    curl -fsS --max-time 10 "$health_url" >/dev/null 2>&1 || return 1
+  fi
+
+  return 0
 }
 
 # ---- compose layering ------------------------------------------------------
@@ -318,8 +434,17 @@ compose_files_for_enabled_services() {
   if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/media/jellyfin.yml")
   fi
+  if [[ "${ENABLE_PLEX:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/media/plex.yml")
+  fi
   if [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/media/navidrome.yml")
+  fi
+  if [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/media/calibre-web.yml")
+  fi
+  if [[ "${ENABLE_KAVITA:-0}" == "1" ]]; then
+    files+=("$DOMUM_DIR/compose/media/kavita.yml")
   fi
   if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/monitoring/uptime-kuma.yml")
@@ -342,6 +467,7 @@ export_env_for_compose() {
   export DOMUM_LAN_IP="${DOMUM_LAN_IP:-}"
   export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
   export DOMUM_STATE_ROOT
+  export DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
   export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:v3.7.1}"
   export TRAEFIK_AUTO_UPDATE="${TRAEFIK_AUTO_UPDATE:-0}"
   export TRAEFIK_AUTO_UPDATE_DELAY_DAYS="${TRAEFIK_AUTO_UPDATE_DELAY_DAYS:-7}"
@@ -367,18 +493,46 @@ export_env_for_compose() {
   export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
   export JELLYFIN_IMAGE="${JELLYFIN_IMAGE:-jellyfin/jellyfin:10.10.7}"
   export JELLYFIN_AUTO_UPDATE="${JELLYFIN_AUTO_UPDATE:-0}"
-  export JELLYFIN_AUTO_UPDATE_DELAY_DAYS="${JELLYFIN_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export JELLYFIN_AUTO_UPDATE_DELAY_DAYS="${JELLYFIN_AUTO_UPDATE_DELAY_DAYS:-21}"
   export JELLYFIN_CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
-  export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
+  export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_HOT_ROOT/jellyfin-cache}"
   export JELLYFIN_MEDIA_ROOT="${JELLYFIN_MEDIA_ROOT:-/srv/media}"
+  export JELLYFIN_HOST="${JELLYFIN_HOST:-media.${DOMUM_DOMAIN}}"
+  export PLEX_IMAGE="${PLEX_IMAGE:-lscr.io/linuxserver/plex:latest}"
+  export PLEX_AUTO_UPDATE="${PLEX_AUTO_UPDATE:-1}"
+  export PLEX_AUTO_UPDATE_DELAY_DAYS="${PLEX_AUTO_UPDATE_DELAY_DAYS:-20}"
+  export PLEX_HOST="${PLEX_HOST:-plex.${DOMUM_DOMAIN}}"
+  export PLEX_CONFIG_DIR="${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"
+  export PLEX_MEDIA_ROOT="${PLEX_MEDIA_ROOT:-/srv/media}"
+  export PLEX_TRANSCODE_DIR="${PLEX_TRANSCODE_DIR:-$DOMUM_HOT_ROOT/plex-transcode}"
+  export PLEX_ENABLE_HW_TRANSCODE="${PLEX_ENABLE_HW_TRANSCODE:-1}"
+  export PLEX_CLAIM="${PLEX_CLAIM:-}"
+  export PUID="${PUID:-1000}"
+  export PGID="${PGID:-1000}"
+  export TZ="${TZ:-UTC}"
   export NAVIDROME_IMAGE="${NAVIDROME_IMAGE:-deluan/navidrome:0.61.2}"
   export NAVIDROME_AUTO_UPDATE="${NAVIDROME_AUTO_UPDATE:-0}"
-  export NAVIDROME_AUTO_UPDATE_DELAY_DAYS="${NAVIDROME_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export NAVIDROME_AUTO_UPDATE_DELAY_DAYS="${NAVIDROME_AUTO_UPDATE_DELAY_DAYS:-21}"
   export NAVIDROME_DATA_DIR="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
-  export NAVIDROME_MUSIC_ROOT="${NAVIDROME_MUSIC_ROOT:-/srv/music}"
+  export NAVIDROME_CACHE_DIR="${NAVIDROME_CACHE_DIR:-$DOMUM_HOT_ROOT/music-cache}"
+  export NAVIDROME_MUSIC_ROOT="${NAVIDROME_MUSIC_ROOT:-/srv/media/music}"
   export NAVIDROME_USER="${NAVIDROME_USER:-0:0}"
   export NAVIDROME_SCAN_SCHEDULE="${NAVIDROME_SCAN_SCHEDULE:-@every 1h}"
   export NAVIDROME_LOG_LEVEL="${NAVIDROME_LOG_LEVEL:-info}"
+  export NAVIDROME_HOST="${NAVIDROME_HOST:-music.${DOMUM_DOMAIN}}"
+  export CALIBRE_WEB_IMAGE="${CALIBRE_WEB_IMAGE:-lscr.io/linuxserver/calibre-web:latest}"
+  export CALIBRE_WEB_AUTO_UPDATE="${CALIBRE_WEB_AUTO_UPDATE:-1}"
+  export CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS="${CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS:-20}"
+  export CALIBRE_WEB_HOST="${CALIBRE_WEB_HOST:-books.${DOMUM_DOMAIN}}"
+  export CALIBRE_WEB_CONFIG_DIR="${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"
+  export CALIBRE_WEB_LIBRARY_DIR="${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
+  export KAVITA_IMAGE="${KAVITA_IMAGE:-jvmilazz0/kavita:latest}"
+  export KAVITA_AUTO_UPDATE="${KAVITA_AUTO_UPDATE:-1}"
+  export KAVITA_AUTO_UPDATE_DELAY_DAYS="${KAVITA_AUTO_UPDATE_DELAY_DAYS:-20}"
+  export KAVITA_HOST="${KAVITA_HOST:-kavita.${DOMUM_DOMAIN}}"
+  export KAVITA_CONFIG_DIR="${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"
+  export KAVITA_LIBRARY_DIR="${KAVITA_LIBRARY_DIR:-/srv/media/books}"
+  export KAVITA_STAGING_DIR="${KAVITA_STAGING_DIR:-$DOMUM_HOT_ROOT/books-import}"
   export UPTIME_KUMA_IMAGE="${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma:1}"
   export UPTIME_KUMA_AUTO_UPDATE="${UPTIME_KUMA_AUTO_UPDATE:-0}"
   export UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS="${UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS:-7}"
@@ -451,13 +605,21 @@ ensure_dirs() {
   ensure_secret_dir
   ensure_state_dirs
   mkdir -p "$DOMUM_LOG_DIR"
-  mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT"
+  mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_HOT_ROOT"
   mkdir -p "${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
-  mkdir -p "${JELLYFIN_CACHE_DIR:-$DOMUM_DATA_ROOT/jellyfin/cache}"
+  mkdir -p "${JELLYFIN_CACHE_DIR:-$DOMUM_HOT_ROOT/jellyfin-cache}"
+  mkdir -p "${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"
+  mkdir -p "${PLEX_TRANSCODE_DIR:-$DOMUM_HOT_ROOT/plex-transcode}"
   mkdir -p "${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
+  mkdir -p "${NAVIDROME_CACHE_DIR:-$DOMUM_HOT_ROOT/music-cache}"
+  mkdir -p "${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"
+  mkdir -p "${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"
+  mkdir -p "${KAVITA_STAGING_DIR:-$DOMUM_HOT_ROOT/books-import}"
   # Parent root only; music sources (subfolders / NFS / rclone mounts) are
   # assembled by the operator per docs/SETUP-NAVIDROME.md.
-  mkdir -p "${NAVIDROME_MUSIC_ROOT:-/srv/music}"
+  mkdir -p "${NAVIDROME_MUSIC_ROOT:-/srv/media/music}"
+  mkdir -p "${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
+  mkdir -p "${KAVITA_LIBRARY_DIR:-/srv/media/books}"
 }
 
 compose_cmd() {
@@ -477,7 +639,10 @@ snapshot_subvolumes() {
   local candidates=()
   candidates+=("$DOMUM_DATA_ROOT/immich")
   candidates+=("$DOMUM_DATA_ROOT/jellyfin")
+  candidates+=("$DOMUM_DATA_ROOT/plex")
   candidates+=("$DOMUM_DATA_ROOT/navidrome")
+  candidates+=("$DOMUM_DATA_ROOT/calibre-web")
+  candidates+=("$DOMUM_DATA_ROOT/kavita")
   candidates+=("$DOMUM_DATA_ROOT/uptime-kuma")
   candidates+=("$DOMUM_DATA_ROOT/traefik")
   for c in "${candidates[@]}"; do
@@ -511,6 +676,52 @@ snapshot_list() {
   ls -1tr "$DOMUM_SNAPSHOT_ROOT"
 }
 
+snapshot_metadata_dir() {
+  printf '%s/snapshots' "$DOMUM_STATE_ROOT"
+}
+
+record_service_snapshot_metadata() {
+  local service="$1"
+  local before_version="$2"
+  local after_version="$3"
+  local snapshot_name="$4"
+  local status="${5:-created}"
+  local meta_dir meta_file
+  meta_dir="$(snapshot_metadata_dir)"
+  install -d -m 0700 "$meta_dir"
+  meta_file="$meta_dir/${snapshot_name}.env"
+  cat > "$meta_file" <<EOF
+SERVICE='$service'
+VERSION_BEFORE='$before_version'
+VERSION_AFTER='$after_version'
+SNAPSHOT_NAME='$snapshot_name'
+TIMESTAMP='$(date -Iseconds)'
+STATUS='$status'
+EOF
+  chmod 600 "$meta_file"
+}
+
+create_service_snapshot() {
+  local service="$1"
+  local tag="$2"
+  local before_version="${3:-unknown}"
+  local after_version="${4:-unknown}"
+  local data_path snapshot_name
+
+  data_path="$(service_data_path "$service")" || return 1
+  [[ -d "$data_path" ]] || return 1
+  snapshot_name="$(basename "$data_path")-$(date +%Y%m%d-%H%M%S)-${tag}"
+  if is_btrfs_subvol "$data_path"; then
+    mkdir -p "$DOMUM_SNAPSHOT_ROOT"
+    echo "[domum-media] Snapshot: $data_path -> $DOMUM_SNAPSHOT_ROOT/$snapshot_name"
+    btrfs subvolume snapshot -r "$data_path" "$DOMUM_SNAPSHOT_ROOT/$snapshot_name"
+    record_service_snapshot_metadata "$service" "$before_version" "$after_version" "$snapshot_name"
+    printf '%s' "$snapshot_name"
+    return 0
+  fi
+  return 1
+}
+
 snapshot_prune() {
   local keep="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
@@ -534,6 +745,91 @@ snapshot_prune() {
       done
     fi
   done <<< "$names"
+}
+
+hot_root_safe() {
+  [[ -n "${DOMUM_HOT_ROOT:-}" ]] || die "DOMUM_HOT_ROOT is empty"
+  case "$DOMUM_HOT_ROOT" in
+    /|/srv|/srv/data|/home|"") die "Refusing dangerous DOMUM_HOT_ROOT=$DOMUM_HOT_ROOT" ;;
+  esac
+}
+
+hot_status() {
+  load_cfg
+  hot_root_safe
+  mkdir -p "$DOMUM_HOT_ROOT"
+  du -sh "$DOMUM_HOT_ROOT" 2>/dev/null || true
+  df -h "$DOMUM_HOT_ROOT" 2>/dev/null || true
+  find "$DOMUM_HOT_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort
+}
+
+hot_usage_percent() {
+  df -P "$DOMUM_HOT_ROOT" | awk 'NR==2 {gsub("%","",$5); print $5}'
+}
+
+hot_prune() {
+  load_cfg
+  local dry_run=0
+  [[ "${1:-}" == "--dry-run" ]] && dry_run=1
+  hot_root_safe
+  mkdir -p "$DOMUM_HOT_ROOT"
+
+  local older_than_days="${HOT_STORAGE_PRUNE_OLDER_THAN_DAYS:-30}"
+  local max_percent="${HOT_STORAGE_MAX_PERCENT:-80}"
+  local log_file="${DOMUM_LOG_DIR}/hot-prune.log"
+  mkdir -p "$DOMUM_LOG_DIR"
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    echo "[$(date -Iseconds)] prune-old $file" | tee -a "$log_file"
+    if (( dry_run == 0 )); then
+      rm -f "$file"
+    fi
+  done < <(find "$DOMUM_HOT_ROOT" -type f -mtime +"$older_than_days" 2>/dev/null | sort)
+
+  while [[ "$(hot_usage_percent)" -gt "$max_percent" ]]; do
+    local victim
+    victim="$(find "$DOMUM_HOT_ROOT" -type f -print0 2>/dev/null | xargs -0 ls -1tr 2>/dev/null | head -n 1)"
+    [[ -n "$victim" ]] || break
+    echo "[$(date -Iseconds)] prune-usage $victim" | tee -a "$log_file"
+    if (( dry_run == 0 )); then
+      rm -f "$victim"
+    else
+      break
+    fi
+  done
+}
+
+list_service_snapshots() {
+  [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
+  ls -1tr "$DOMUM_SNAPSHOT_ROOT" | grep -E "^$(basename "$(service_data_path "$1" 2>/dev/null || echo "$1")")-" || true
+}
+
+restore_snapshot_for_service() {
+  local service="$1"
+  local snapshot_name="$2"
+  local data_path current_backup compose_svcs
+
+  data_path="$(service_data_path "$service")" || die "No data path mapping for $service"
+  [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || die "Snapshot not found: $snapshot_name"
+
+  compose_svcs="$(service_compose_services "$service" || true)"
+  [[ -n "$compose_svcs" ]] && compose_cmd stop $compose_svcs 2>/dev/null || true
+
+  if [[ -d "$data_path" ]] && is_btrfs_subvol "$data_path"; then
+    current_backup="${data_path}.rollback-$(date +%Y%m%d-%H%M%S)"
+    mv "$data_path" "$current_backup"
+  elif [[ -e "$data_path" ]]; then
+    rm -rf "$data_path"
+  fi
+
+  echo "[domum-media] Restoring $service from $snapshot_name"
+  btrfs subvolume snapshot "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" "$data_path"
+  [[ -n "$compose_svcs" ]] && compose_cmd up -d $compose_svcs
+}
+
+latest_snapshot_for_service() {
+  list_service_snapshots "$1" | tail -n 1
 }
 
 # ---- timer syncing --------------------------------------------------------
@@ -580,18 +876,19 @@ EOF
 }
 
 sync_timer_overrides() {
-  local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar
+  local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar hot_prune_calendar
   backup_calendar="$(normalize_daily_schedule "${BACKUP_DAILY_AT:-02:30}")"
   check_calendar="$(normalize_weekly_schedule "${CHECK_WEEKLY_AT:-Sun 03:30}")"
   prune_calendar="$(normalize_weekly_schedule "${SNAPSHOT_PRUNE_WEEKLY_AT:-Sun 04:30}")"
   image_update_calendar="$(normalize_daily_schedule "${IMAGE_AUTO_UPDATE_AT:-05:15}")"
   host_update_calendar="$(normalize_weekly_schedule "${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}")"
-
+  hot_prune_calendar="$(normalize_daily_schedule "${HOT_STORAGE_PRUNE_AT:-04:45}")"
   write_timer_override "domum-media-backup.timer" "$backup_calendar" "15m"
   write_timer_override "domum-media-check.timer" "$check_calendar" "20m"
   write_timer_override "domum-media-btrfs-snapshot.timer" "$prune_calendar" "20m"
   write_timer_override "domum-media-image-refresh.timer" "$image_update_calendar" "${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}"
   write_timer_override "domum-media-host-update.timer" "$host_update_calendar" "${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
+  write_timer_override "domum-media-hot-prune.timer" "$hot_prune_calendar" "${HOT_STORAGE_PRUNE_RANDOMIZED_DELAY:-30m}"
 
   systemctl daemon-reload
   systemctl enable --now \
@@ -601,6 +898,12 @@ sync_timer_overrides() {
     domum-media-image-refresh.timer \
     domum-media-host-update.timer \
     domum-media-dr-reminder.timer >/dev/null
+
+  if [[ "${HOT_STORAGE_PRUNE_ENABLED:-1}" == "1" ]]; then
+    systemctl enable --now domum-media-hot-prune.timer >/dev/null
+  else
+    systemctl disable --now domum-media-hot-prune.timer >/dev/null 2>&1 || true
+  fi
 }
 
 # ---- configure flow -------------------------------------------------------
@@ -878,7 +1181,10 @@ configure_cmd() {
   configure_service_toggle ENABLE_TAILSCALE "Enable Tailscale container?"
   configure_service_toggle ENABLE_IMMICH "Enable Immich?"
   configure_service_toggle ENABLE_JELLYFIN "Enable Jellyfin?"
+  configure_service_toggle ENABLE_PLEX "Enable Plex?"
   configure_service_toggle ENABLE_NAVIDROME "Enable Navidrome (music)?"
+  configure_service_toggle ENABLE_CALIBRE_WEB "Enable Calibre-Web?"
+  configure_service_toggle ENABLE_KAVITA "Enable Kavita?"
   configure_service_toggle ENABLE_UPTIME_KUMA "Enable Uptime Kuma?"
   configure_service_toggle ENABLE_RESTIC_REST_SERVER "Enable local restic REST server?"
 
@@ -900,10 +1206,24 @@ configure_cmd() {
     configure_image_behavior IMMICH_POSTGRES_IMAGE IMMICH_POSTGRES_AUTO_UPDATE IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS "Immich Postgres"
   fi
   if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
+    configure_text_value JELLYFIN_HOST "Jellyfin hostname"
     configure_image_behavior JELLYFIN_IMAGE JELLYFIN_AUTO_UPDATE JELLYFIN_AUTO_UPDATE_DELAY_DAYS "Jellyfin"
   fi
+  if [[ "${ENABLE_PLEX:-0}" == "1" ]]; then
+    configure_text_value PLEX_HOST "Plex hostname"
+    configure_image_behavior PLEX_IMAGE PLEX_AUTO_UPDATE PLEX_AUTO_UPDATE_DELAY_DAYS "Plex"
+  fi
   if [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]; then
+    configure_text_value NAVIDROME_HOST "Navidrome hostname"
     configure_image_behavior NAVIDROME_IMAGE NAVIDROME_AUTO_UPDATE NAVIDROME_AUTO_UPDATE_DELAY_DAYS "Navidrome"
+  fi
+  if [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]]; then
+    configure_text_value CALIBRE_WEB_HOST "Calibre-Web hostname"
+    configure_image_behavior CALIBRE_WEB_IMAGE CALIBRE_WEB_AUTO_UPDATE CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS "Calibre-Web"
+  fi
+  if [[ "${ENABLE_KAVITA:-0}" == "1" ]]; then
+    configure_text_value KAVITA_HOST "Kavita hostname"
+    configure_image_behavior KAVITA_IMAGE KAVITA_AUTO_UPDATE KAVITA_AUTO_UPDATE_DELAY_DAYS "Kavita"
   fi
   if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
     configure_image_behavior UPTIME_KUMA_IMAGE UPTIME_KUMA_AUTO_UPDATE UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS "Uptime Kuma"
@@ -927,6 +1247,14 @@ configure_cmd() {
     "$(prompt_with_default "Daily image refresh check time (HH:MM)" "${IMAGE_AUTO_UPDATE_AT:-05:15}")"
   config_set IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY \
     "$(prompt_with_default "Randomized delay for image refresh timer" "${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}")"
+  config_set HOT_STORAGE_PRUNE_ENABLED \
+    "$(prompt_yes_no "Enable scheduled hot storage pruning?" "${HOT_STORAGE_PRUNE_ENABLED:-1}")"
+  config_set HOT_STORAGE_PRUNE_AT \
+    "$(prompt_with_default "Daily hot storage prune time (HH:MM)" "${HOT_STORAGE_PRUNE_AT:-04:45}")"
+  config_set HOT_STORAGE_PRUNE_RANDOMIZED_DELAY \
+    "$(prompt_with_default "Randomized delay for hot storage prune timer" "${HOT_STORAGE_PRUNE_RANDOMIZED_DELAY:-30m}")"
+  config_set BACKUP_POLICY \
+    "$(prompt_choice "Backup policy for stateful auto-updates" "${BACKUP_POLICY:-STRICT}" STRICT LENIENT)"
   config_set HOST_PACKAGE_AUTO_UPDATE_ENABLED \
     "$(prompt_yes_no "Enable scheduled host package upgrades (Docker, compose, tailscale, restic)?" "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}")"
   config_set HOST_PACKAGE_AUTO_UPDATE_AT \
@@ -1043,7 +1371,7 @@ refresh_images() {
       continue
     fi
 
-    due_services+=("$svc")
+    due_services+=("$key")
     rm -f "$state_file"
     any_due=1
   done < <(managed_image_specs)
@@ -1053,11 +1381,24 @@ refresh_images() {
     return 0
   fi
 
-  echo "[domum-media] Pre-update btrfs snapshot..."
-  snapshot_create "pre-image-update" || echo "[domum-media] Snapshot step failed (continuing)."
-
-  echo "[domum-media] Updating services: ${due_services[*]}"
-  compose_cmd up -d "${due_services[@]}"
+  local logical_service compose_svcs version_key before_version snapshot_name
+  for logical_service in "${due_services[@]}"; do
+    verify_backup_freshness "$logical_service"
+    version_key="$(printf '%s_IMAGE' "$(uppercase_token "$logical_service")")"
+    before_version="$(service_configured_version "$version_key")"
+    snapshot_name="$(create_service_snapshot "$logical_service" "pre-update" "$before_version" "$before_version" || true)"
+    compose_svcs="$(service_compose_services "$logical_service" || true)"
+    [[ -n "$compose_svcs" ]] || continue
+    echo "[domum-media] Updating $logical_service (${compose_svcs})"
+    compose_cmd up -d $compose_svcs
+    if ! service_is_healthy "$logical_service"; then
+      echo "[domum-media] Health validation failed for $logical_service"
+      if [[ -n "$snapshot_name" ]]; then
+        restore_snapshot_for_service "$logical_service" "$snapshot_name"
+      fi
+      die "Update aborted: $logical_service failed health validation and was rolled back."
+    fi
+  done
   echo "[domum-media] Image refresh done."
 }
 
@@ -1079,6 +1420,148 @@ host_upgrade() {
     docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
     tailscale restic btrfs-progs jq apparmor nfs-common rclone gettext-base
   echo "[domum-media] Host package upgrade done."
+}
+
+updates_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+
+  printf '%-14s %-5s %-5s %-8s %-24s\n' "SERVICE" "CLASS" "AUTO" "DELAY" "CURRENT"
+  while IFS='|' read -r name enable_var class default_delay _ image_var _; do
+    [[ "${!enable_var:-0}" == "1" ]] || continue
+    local auto_var delay_var auto_value delay_value
+    auto_var="$(printf '%s_AUTO_UPDATE' "$(uppercase_token "$name")")"
+    delay_var="$(printf '%s_AUTO_UPDATE_DELAY_DAYS' "$(uppercase_token "$name")")"
+    auto_value="${!auto_var:-0}"
+    delay_value="${!delay_var:-$default_delay}"
+    printf '%-14s %-5s %-5s %-8s %-24s\n' \
+      "$name" "$class" "$auto_value" "${delay_value}d" "$(service_configured_version "$image_var")"
+  done < <(service_lifecycle_specs)
+
+  if [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]]; then
+    echo
+    echo "Immich bundle candidate:"
+    # shellcheck disable=SC1090
+    source "$DOMUM_STATE_ROOT/immich/bundle-candidate.env"
+    printf '  release=%s published=%s\n' "${IMMICH_BUNDLE_TAG:-unknown}" "${IMMICH_BUNDLE_PUBLISHED_AT:-unknown}"
+    printf '  server=%s\n' "${IMMICH_BUNDLE_SERVER_IMAGE:-unknown}"
+    printf '  ml=%s\n' "${IMMICH_BUNDLE_MACHINE_LEARNING_IMAGE:-unknown}"
+    printf '  redis=%s\n' "${IMMICH_BUNDLE_REDIS_IMAGE:-unknown}"
+    printf '  postgres=%s\n' "${IMMICH_BUNDLE_POSTGRES_IMAGE:-unknown}"
+  fi
+}
+
+immich_extract_image() {
+  local compose_file="$1"
+  local pattern="$2"
+  awk -v pattern="$pattern" '
+    $0 ~ pattern { capture=1 }
+    capture && $1 == "image:" { print $2; exit }
+    capture && NF == 0 { capture=0 }
+  ' "$compose_file"
+}
+
+immich_refresh_bundle() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+  cmd_exists curl || die "curl is required for immich bundle refresh"
+  cmd_exists jq || die "jq is required for immich bundle refresh"
+
+  local api_url="https://api.github.com/repos/immich-app/immich/releases/latest"
+  local release_json compose_tmp meta_tmp candidate_file
+  release_json="$(mktemp)"
+  compose_tmp="$(mktemp)"
+  meta_tmp="$(mktemp)"
+  candidate_file="$DOMUM_STATE_ROOT/immich/bundle-candidate.env"
+
+  curl -fsSL "$api_url" > "$release_json"
+  curl -fsSL "https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml" > "$compose_tmp"
+
+  jq -r '{
+    tag_name,
+    html_url,
+    published_at
+  } | to_entries[] | "\(.key)=\(.value)"' "$release_json" > "$meta_tmp"
+
+  local tag_name html_url published_at server_image ml_image redis_image postgres_image
+  tag_name="$(awk -F= '$1=="tag_name" {print $2}' "$meta_tmp")"
+  html_url="$(awk -F= '$1=="html_url" {print $2}' "$meta_tmp")"
+  published_at="$(awk -F= '$1=="published_at" {print $2}' "$meta_tmp")"
+  server_image="$(immich_extract_image "$compose_tmp" "container_name:[[:space:]]*immich_server")"
+  ml_image="$(immich_extract_image "$compose_tmp" "container_name:[[:space:]]*immich_machine_learning")"
+  redis_image="$(immich_extract_image "$compose_tmp" "container_name:[[:space:]]*immich_redis")"
+  postgres_image="$(immich_extract_image "$compose_tmp" "container_name:[[:space:]]*immich_postgres")"
+  [[ -n "$server_image" && -n "$ml_image" && -n "$redis_image" && -n "$postgres_image" ]] \
+    || die "Failed to parse one or more Immich images from the upstream release compose file."
+
+  cat > "$candidate_file" <<EOF
+IMMICH_BUNDLE_TAG='$tag_name'
+IMMICH_BUNDLE_RELEASE_URL='$html_url'
+IMMICH_BUNDLE_PUBLISHED_AT='$published_at'
+IMMICH_BUNDLE_SERVER_IMAGE='$server_image'
+IMMICH_BUNDLE_MACHINE_LEARNING_IMAGE='$ml_image'
+IMMICH_BUNDLE_REDIS_IMAGE='$redis_image'
+IMMICH_BUNDLE_POSTGRES_IMAGE='$postgres_image'
+EOF
+  chmod 600 "$candidate_file"
+
+  echo "[domum-media] Stored Immich candidate bundle: $candidate_file"
+  echo "[domum-media] Release: $tag_name ($published_at)"
+
+  local published_epoch now age_days delay_days
+  published_epoch="$(date -d "$published_at" +%s)"
+  now="$(date +%s)"
+  age_days=$(( (now - published_epoch) / 86400 ))
+  delay_days="${IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS:-21}"
+
+  if (( force == 0 && age_days < delay_days )); then
+    echo "[domum-media] Delay window not reached for Immich bundle (${age_days}d < ${delay_days}d)."
+    rm -f "$release_json" "$compose_tmp" "$meta_tmp"
+    return 0
+  fi
+
+  verify_backup_freshness immich
+
+  local old_server="$IMMICH_SERVER_IMAGE"
+  local old_ml="$IMMICH_MACHINE_LEARNING_IMAGE"
+  local old_redis="$IMMICH_REDIS_IMAGE"
+  local old_postgres="$IMMICH_POSTGRES_IMAGE"
+  local snapshot_name
+  snapshot_name="$(create_service_snapshot immich "pre-immich-bundle" "$old_server" "$server_image" || true)"
+
+  config_set IMMICH_SERVER_IMAGE "$server_image"
+  config_set IMMICH_MACHINE_LEARNING_IMAGE "$ml_image"
+  config_set IMMICH_REDIS_IMAGE "$redis_image"
+  config_set IMMICH_POSTGRES_IMAGE "$postgres_image"
+  load_cfg
+  export_env_for_compose
+
+  compose_cmd pull immich_server immich_machine_learning immich_redis immich_postgres
+  compose_cmd up -d immich_server immich_machine_learning immich_redis immich_postgres
+  if ! service_is_healthy immich; then
+    echo "[domum-media] Immich bundle rollout failed health validation."
+    config_set IMMICH_SERVER_IMAGE "$old_server"
+    config_set IMMICH_MACHINE_LEARNING_IMAGE "$old_ml"
+    config_set IMMICH_REDIS_IMAGE "$old_redis"
+    config_set IMMICH_POSTGRES_IMAGE "$old_postgres"
+    load_cfg
+    export_env_for_compose
+    if [[ -n "$snapshot_name" ]]; then
+      restore_snapshot_for_service immich "$snapshot_name"
+    else
+      compose_cmd up -d immich_server immich_machine_learning immich_redis immich_postgres
+    fi
+    die "Immich bundle refresh rolled back."
+  fi
+
+  echo "[domum-media] Immich bundle refreshed to $tag_name"
+  rm -f "$release_json" "$compose_tmp" "$meta_tmp"
 }
 
 # ---- commands -------------------------------------------------------------
@@ -1212,6 +1695,10 @@ status() {
   echo
   echo "=== btrfs snapshots (${DOMUM_SNAPSHOT_ROOT}) ==="
   snapshot_list
+
+  echo
+  echo "=== hot storage (${DOMUM_HOT_ROOT}) ==="
+  hot_status
 }
 
 repo_update() {
@@ -1248,6 +1735,56 @@ snapshot_cmd() {
     list)   snapshot_list ;;
     prune)  snapshot_prune ;;
     *) die "Usage: domum-media snapshot {create [tag]|list|prune}" ;;
+  esac
+}
+
+rollback_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+
+  [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || die "No snapshots available."
+
+  local snapshots=()
+  local idx=1
+  while IFS= read -r snap; do
+    [[ -n "$snap" ]] || continue
+    snapshots+=("$snap")
+    local meta_file service before after
+    meta_file="$(snapshot_metadata_dir)/${snap}.env"
+    service="$(printf '%s' "$snap" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//')"
+    before="unknown"
+    after="unknown"
+    if [[ -f "$meta_file" ]]; then
+      # shellcheck disable=SC1090
+      source "$meta_file"
+      service="${SERVICE:-$service}"
+      before="${VERSION_BEFORE:-unknown}"
+      after="${VERSION_AFTER:-unknown}"
+    fi
+    printf '%d) %s | %s | %s -> %s\n' "$idx" "$snap" "$service" "$before" "$after"
+    idx=$(( idx + 1 ))
+  done < <(snapshot_list)
+
+  (( ${#snapshots[@]} > 0 )) || die "No snapshots available."
+
+  local choice selected service
+  read -r -p "Select snapshot number to restore: " choice
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
+  selected="${snapshots[$((choice - 1))]:-}"
+  [[ -n "$selected" ]] || die "Selection out of range."
+  service="$(printf '%s' "$selected" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//')"
+  restore_snapshot_for_service "$service" "$selected"
+}
+
+hot_cmd() {
+  need_root
+  load_cfg
+  local sub="${1:-}"
+  case "$sub" in
+    status) hot_status ;;
+    prune) shift; hot_prune "${1:-}" ;;
+    *) die "Usage: domum-media hot {status|prune [--dry-run]}" ;;
   esac
 }
 
@@ -1298,8 +1835,9 @@ immich_cmd() {
   need_root
   local sub="${1:-}"
   case "$sub" in
+    refresh-bundle) shift; immich_refresh_bundle "$@" ;;
     reset-db) shift; immich_reset_db "$@" ;;
-    *) die "Usage: domum-media immich {reset-db}" ;;
+    *) die "Usage: domum-media immich {refresh-bundle [--force]|reset-db}" ;;
   esac
 }
 
@@ -1313,12 +1851,15 @@ Usage:
   domum-media apply
   domum-media status
   domum-media update
+  domum-media updates
   domum-media refresh-images [--force]
   domum-media host-upgrade [--force]
   domum-media logs <service>
   domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
   domum-media snapshot {create [tag]|list|prune}
-  domum-media immich {reset-db}
+  domum-media rollback
+  domum-media hot {status|prune [--dry-run]}
+  domum-media immich {refresh-bundle [--force]|reset-db}
 
 Config:  $CFG_FILE
 Secrets: $SECRETS_DIR
@@ -1334,11 +1875,14 @@ main() {
     apply)     shift; apply "$@" ;;
     status)    shift; status "$@" ;;
     update)    shift; repo_update "$@" ;;
+    updates)   shift; updates_cmd "$@" ;;
     refresh-images) shift; refresh_images "$@" ;;
     host-upgrade) shift; host_upgrade "$@" ;;
     logs)      shift; logs_cmd "$@" ;;
     backup)    backup_cmd "$@" ;;
     snapshot)  shift; snapshot_cmd "$@" ;;
+    rollback)  shift; rollback_cmd "$@" ;;
+    hot)       shift; hot_cmd "$@" ;;
     immich)    shift; immich_cmd "$@" ;;
     -h|--help|help|"") usage ;;
     *) usage; exit 1 ;;

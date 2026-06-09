@@ -12,7 +12,7 @@ native multi-library feature (v0.58+) then exposes each subfolder as its own
 library.
 
 ```
-                         NAVIDROME_MUSIC_ROOT (/srv/music)  --ro-->  /music
+                         NAVIDROME_MUSIC_ROOT (/srv/media/music)  --ro-->  /music
                          ├── local      (music on this box)            Library "local"
                          ├── nas        (NFS/SMB mount, another host)   Library "nas"
                          └── cloud      (rclone mount, cloud remote)    Library "cloud"
@@ -36,9 +36,9 @@ Relevant config keys (`config/domum-media.conf`):
 | --- | --- | --- |
 | `NAVIDROME_IMAGE` | `deluan/navidrome:0.61.2` | Full image ref. Use an exact tag for pinned rollouts or a moving tag with `NAVIDROME_AUTO_UPDATE=1`. |
 | `NAVIDROME_AUTO_UPDATE` | `0` | Whether the image refresh timer may roll Navidrome forward automatically. |
-| `NAVIDROME_AUTO_UPDATE_DELAY_DAYS` | `7` | How long a newly pulled image must sit before rollout. |
+| `NAVIDROME_AUTO_UPDATE_DELAY_DAYS` | `21` | How long a newly pulled image must sit before rollout. |
 | `NAVIDROME_DATA_DIR` | `/srv/data/navidrome` | DB + scan cache (snapshotted, backed up). |
-| `NAVIDROME_MUSIC_ROOT` | `/srv/music` | Parent of all music sources, mounted `:ro`. |
+| `NAVIDROME_MUSIC_ROOT` | `/srv/media/music` | Parent of all music sources, mounted `:ro`. |
 | `NAVIDROME_USER` | `0:0` | Container uid:gid that reads music. |
 | `NAVIDROME_SCAN_SCHEDULE` | `@every 1h` | Rescan cadence. `0` disables. |
 | `NAVIDROME_LOG_LEVEL` | `info` | `error\|warn\|info\|debug\|trace`. |
@@ -62,7 +62,7 @@ Create the parent root and put each source under it. Pick whichever recipes
 match where your music actually lives.
 
 ```
-sudo mkdir -p /srv/music
+sudo mkdir -p /srv/media/music
 ```
 
 ### a) Music already on this box
@@ -70,36 +70,36 @@ sudo mkdir -p /srv/music
 Just use a subfolder (or bind/symlink an existing path):
 
 ```
-sudo mkdir -p /srv/music/local
+sudo mkdir -p /srv/media/music/local
 # copy/move music in, or:
-sudo mount --bind /path/to/existing/music /srv/music/local
+sudo mount --bind /path/to/existing/music /srv/media/music/local
 ```
 
 ### b) A NAS or another server over NFS
 
 ```
 sudo apt install -y nfs-common        # if not already present
-sudo mkdir -p /srv/music/nas
+sudo mkdir -p /srv/media/music/nas
 ```
 
-Add to `/etc/fstab` so it survives reboots (then `sudo mount /srv/music/nas`):
+Add to `/etc/fstab` so it survives reboots (then `sudo mount /srv/media/music/nas`):
 
 ```
-nas.example:/exports/music   /srv/music/nas   nfs   ro,soft,timeo=30,_netdev,nofail   0 0
+nas.example:/exports/music   /srv/media/music/nas   nfs   ro,soft,timeo=30,_netdev,nofail   0 0
 ```
 
 ### c) A NAS / Windows box over SMB/CIFS
 
 ```
 sudo apt install -y cifs-utils
-sudo mkdir -p /srv/music/nas
+sudo mkdir -p /srv/media/music/nas
 ```
 
 Store the credentials root-only (`/etc/domum-core-media/secrets/smb_music`,
 `chmod 600`, lines `username=…`, `password=…`), then `/etc/fstab`:
 
 ```
-//nas.example/music   /srv/music/nas   cifs   ro,credentials=/etc/domum-core-media/secrets/smb_music,uid=0,gid=0,_netdev,nofail   0 0
+//nas.example/music   /srv/media/music/nas   cifs   ro,credentials=/etc/domum-core-media/secrets/smb_music,uid=0,gid=0,_netdev,nofail   0 0
 ```
 
 ### d) A cloud remote over rclone
@@ -116,16 +116,16 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/rclone mount myremote:music /srv/music/cloud \
+ExecStart=/usr/bin/rclone mount myremote:music /srv/media/music/cloud \
   --read-only --allow-other --dir-cache-time 24h --vfs-cache-mode full
-ExecStop=/bin/fusermount -uz /srv/music/cloud
+ExecStop=/bin/fusermount -uz /srv/media/music/cloud
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 ```
 ```
-sudo mkdir -p /srv/music/cloud
+sudo mkdir -p /srv/media/music/cloud
 sudo systemctl enable --now rclone-music
 ```
 
@@ -170,4 +170,4 @@ LAN: add an A record in UniFi for `music.${DOMUM_DOMAIN}` → `${DOMUM_LAN_IP}`
 - **Adding a new source later** is just another subfolder/mount + a new library
   in the UI — no compose or CLI changes.
 - **Backups:** `/srv/data/navidrome` (the DB) is backed up; the music under
-  `/srv/music` is not. Back up the originals at their source.
+  `/srv/media/music` is not. Back up the originals at their source.

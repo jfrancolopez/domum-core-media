@@ -31,7 +31,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy
-      - traefik.http.routers.navidrome.rule=Host(`music.${DOMUM_DOMAIN}`)
+      - traefik.http.routers.navidrome.rule=Host(`${NAVIDROME_HOST}`)
       - traefik.http.routers.navidrome.entrypoints=websecure
       - traefik.http.routers.navidrome.tls=true
       - traefik.http.routers.navidrome.tls.certresolver=cf

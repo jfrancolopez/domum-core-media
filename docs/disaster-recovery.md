@@ -54,6 +54,10 @@ sudo /usr/local/bin/domum-media-backup --restore latest /srv/data --repo cloud
 The restore lands under `/srv/data/<original-path>` because restic preserves
 absolute paths. Move files into place if your subvolume layout has changed.
 
+The volatile hot tier under `/var/lib/domum-media/hot` is intentionally not
+part of the default restore path. Recreate it empty and let caches/transcodes
+rebuild.
+
 Verify the photo library directory contents look right:
 
 ```

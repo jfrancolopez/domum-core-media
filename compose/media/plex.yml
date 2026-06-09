@@ -1,0 +1,35 @@
+services:
+  plex:
+    image: ${PLEX_IMAGE}
+    container_name: plex
+    restart: unless-stopped
+    networks:
+      - domum-proxy
+      - domum-internal
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      VERSION: docker
+      PLEX_CLAIM: ${PLEX_CLAIM}
+    volumes:
+      - ${PLEX_CONFIG_DIR}:/config
+      - ${PLEX_TRANSCODE_DIR}:/transcode
+      - ${PLEX_MEDIA_ROOT}:/media:ro
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=domum-proxy
+      - traefik.http.routers.plex.rule=Host(`${PLEX_HOST}`)
+      - traefik.http.routers.plex.entrypoints=websecure
+      - traefik.http.routers.plex.tls=true
+      - traefik.http.routers.plex.tls.certresolver=cf
+      - traefik.http.routers.plex.middlewares=securityHeaders@file
+      - traefik.http.services.plex.loadbalancer.server.port=32400
+
+networks:
+  domum-proxy:
+    external: true
+  domum-internal:
+    external: true

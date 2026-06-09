@@ -11,11 +11,11 @@ services:
       - ${JELLYFIN_CACHE_DIR}:/cache
       - ${JELLYFIN_MEDIA_ROOT}:/media:ro
     environment:
-      JELLYFIN_PublishedServerUrl: https://media.${DOMUM_DOMAIN}
+      JELLYFIN_PublishedServerUrl: https://${JELLYFIN_HOST}
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy
-      - traefik.http.routers.jellyfin.rule=Host(`media.${DOMUM_DOMAIN}`)
+      - traefik.http.routers.jellyfin.rule=Host(`${JELLYFIN_HOST}`)
       - traefik.http.routers.jellyfin.entrypoints=websecure
       - traefik.http.routers.jellyfin.tls=true
       - traefik.http.routers.jellyfin.tls.certresolver=cf

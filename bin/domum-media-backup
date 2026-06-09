@@ -28,11 +28,13 @@ load_cfg() {
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-/srv/data}"
   DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-/var/log/domum-media}"
+  DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-/var/lib/domum-media/hot}"
   RESTIC_KEEP_DAILY="${RESTIC_KEEP_DAILY:-7}"
   RESTIC_KEEP_WEEKLY="${RESTIC_KEEP_WEEKLY:-5}"
   RESTIC_KEEP_MONTHLY="${RESTIC_KEEP_MONTHLY:-12}"
   RESTIC_KEEP_YEARLY="${RESTIC_KEEP_YEARLY:-3}"
   BACKUP_DEEP_CHECK_PERCENT="${BACKUP_DEEP_CHECK_PERCENT:-10%}"
+  BACKUP_INCLUDE_PATHS="${BACKUP_INCLUDE_PATHS:-/srv/data /srv/media/books}"
 }
 
 export_compose_env() {
@@ -300,11 +302,18 @@ retention_targets() {
 
 restic_backup_to() {
   local target="$1"
+  local paths=()
+  local path
+  for path in $BACKUP_INCLUDE_PATHS; do
+    [[ -e "$path" ]] || continue
+    paths+=("$path")
+  done
   log "restic backup -> $target"
   restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
     --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
-    "$DOMUM_DATA_ROOT"
+    --exclude "${DOMUM_HOT_ROOT}/*" \
+    "${paths[@]}"
 }
 
 restic_forget_for() {

@@ -40,6 +40,22 @@ DOMUM_DATA_ROOT="/srv/data"
 DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
 DOMUM_LOG_DIR="/var/log/domum-media"
 DOMUM_STATE_ROOT="/var/lib/domum-media"
+DOMUM_HOT_ROOT="/var/lib/domum-media/hot"
+
+# Volatile hot tier on the OS SSD. Use only for caches, transcodes, staging,
+# and scratch space — never as the only copy of irreplaceable data.
+ENABLE_HOT_STORAGE=1
+HOT_STORAGE_MAX_PERCENT=80
+HOT_STORAGE_PRUNE_ENABLED=1
+HOT_STORAGE_PRUNE_AT="04:45"
+HOT_STORAGE_PRUNE_RANDOMIZED_DELAY="30m"
+HOT_STORAGE_PRUNE_OLDER_THAN_DAYS=30
+
+# How lifecycle commands react when stateful services are due for an update but
+# the last backup is stale or missing.
+BACKUP_POLICY="STRICT"                  # STRICT | LENIENT
+BACKUP_REQUIRED_MAX_AGE_HOURS=48
+BACKUP_INCLUDE_PATHS="/srv/data /srv/media/books"
 
 # --- Service toggles -------------------------------------------------------
 
@@ -52,9 +68,14 @@ ENABLE_IMMICH=1
 
 # Media streaming
 ENABLE_JELLYFIN=0
+ENABLE_PLEX=0
 
 # Music streaming (Navidrome — Subsonic-compatible)
 ENABLE_NAVIDROME=0
+
+# eBook services
+ENABLE_CALIBRE_WEB=0
+ENABLE_KAVITA=0
 
 # Monitoring
 ENABLE_UPTIME_KUMA=1
@@ -98,34 +119,51 @@ IMMICH_DB_DATABASE_NAME="immich"
 
 JELLYFIN_IMAGE="jellyfin/jellyfin:10.10.7"
 JELLYFIN_AUTO_UPDATE=0
-JELLYFIN_AUTO_UPDATE_DELAY_DAYS=7
+JELLYFIN_AUTO_UPDATE_DELAY_DAYS=21
 
-# Jellyfin state lives on the btrfs data tier; the media library can live
-# elsewhere and is mounted read-only into the container.
+# Jellyfin keeps durable config on the data SSD and volatile cache on the hot
+# tier. The media library can live elsewhere and is mounted read-only.
 JELLYFIN_CONFIG_DIR="/srv/data/jellyfin/config"
-JELLYFIN_CACHE_DIR="/srv/data/jellyfin/cache"
+JELLYFIN_CACHE_DIR="/var/lib/domum-media/hot/jellyfin-cache"
 JELLYFIN_MEDIA_ROOT="/srv/media"
+JELLYFIN_HOST="media.${DOMUM_DOMAIN}"
+
+# --- Plex ------------------------------------------------------------------
+
+PLEX_IMAGE="lscr.io/linuxserver/plex:latest"
+PLEX_AUTO_UPDATE=1
+PLEX_AUTO_UPDATE_DELAY_DAYS=20
+PLEX_HOST="plex.${DOMUM_DOMAIN}"
+PLEX_CONFIG_DIR="/srv/data/plex/config"
+PLEX_MEDIA_ROOT="/srv/media"
+PLEX_TRANSCODE_DIR="/var/lib/domum-media/hot/plex-transcode"
+PLEX_ENABLE_HW_TRANSCODE=1
+PLEX_CLAIM=""
+PUID="1000"
+PGID="1000"
+TZ="America/New_York"
 
 # --- Navidrome -------------------------------------------------------------
 
 NAVIDROME_IMAGE="deluan/navidrome:0.61.2"
 NAVIDROME_AUTO_UPDATE=0
-NAVIDROME_AUTO_UPDATE_DELAY_DAYS=7
+NAVIDROME_AUTO_UPDATE_DELAY_DAYS=21
 
 # State (DB, scan cache) lives on the btrfs data tier so it is snapshotted and
 # swept into restic. Create it as a subvolume — see docs/SETUP-NAVIDROME.md.
 NAVIDROME_DATA_DIR="/srv/data/navidrome"
+NAVIDROME_CACHE_DIR="/var/lib/domum-media/hot/music-cache"
 
 # Parent root for ALL music libraries. The music itself can live anywhere:
 # put local music in a subfolder, mount a NAS export (NFS/SMB) into another
 # subfolder, mount a cloud remote with rclone into a third. Navidrome's UI
 # (Settings -> Libraries) then exposes each subfolder as its own library.
 # This folder is bind-mounted read-only into the container at /music.
-#   /srv/music/local   -> on-box music
-#   /srv/music/nas     -> NFS/SMB mount from a NAS or another server
-#   /srv/music/cloud   -> rclone mount of a cloud remote
+#   /srv/media/music/local   -> on-box music
+#   /srv/media/music/nas     -> NFS/SMB mount from a NAS or another server
+#   /srv/media/music/cloud   -> rclone mount of a cloud remote
 # See docs/SETUP-NAVIDROME.md for the mount recipes.
-NAVIDROME_MUSIC_ROOT="/srv/music"
+NAVIDROME_MUSIC_ROOT="/srv/media/music"
 
 # Container user for reading music. Default root reads every source regardless
 # of ownership. Set to "uid:gid" (e.g. "1000:1000") to drop privileges if all
@@ -138,6 +176,24 @@ NAVIDROME_SCAN_SCHEDULE="@every 1h"
 
 # Navidrome log level: error | warn | info | debug | trace
 NAVIDROME_LOG_LEVEL="info"
+NAVIDROME_HOST="music.${DOMUM_DOMAIN}"
+
+# --- eBooks ----------------------------------------------------------------
+
+CALIBRE_WEB_IMAGE="lscr.io/linuxserver/calibre-web:latest"
+CALIBRE_WEB_AUTO_UPDATE=1
+CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS=20
+CALIBRE_WEB_HOST="books.${DOMUM_DOMAIN}"
+CALIBRE_WEB_CONFIG_DIR="/srv/data/calibre-web/config"
+CALIBRE_WEB_LIBRARY_DIR="/srv/media/books"
+
+KAVITA_IMAGE="jvmilazz0/kavita:latest"
+KAVITA_AUTO_UPDATE=1
+KAVITA_AUTO_UPDATE_DELAY_DAYS=20
+KAVITA_HOST="kavita.${DOMUM_DOMAIN}"
+KAVITA_CONFIG_DIR="/srv/data/kavita/config"
+KAVITA_LIBRARY_DIR="/srv/media/books"
+KAVITA_STAGING_DIR="/var/lib/domum-media/hot/books-import"
 
 # Monitoring / optional service images.
 UPTIME_KUMA_IMAGE="louislam/uptime-kuma:1"

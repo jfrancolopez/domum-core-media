@@ -63,8 +63,11 @@ fi
 - No hardcoded IPs
 - External networks only (`domum-proxy`, `domum-internal`)
 - State under `/srv/data/<service>` as a btrfs subvolume
+- Volatile cache/transcode/staging under `${DOMUM_HOT_ROOT}` only
 - Secrets only in `/etc/domum-core-media/secrets/`
 - Prefer pinned tags for stateful services. If you decide to use a moving tag,
   add `SERVICE_NAME_AUTO_UPDATE=1` and a delay window.
+- Pick a lifecycle class before wiring updates: A for infra, B for stateful
+  apps with backup gates, C for bundle-managed releases
 - If the service has stateful DB data, wire it into the backup quiesce
   routine in `bin/domum-media-backup`

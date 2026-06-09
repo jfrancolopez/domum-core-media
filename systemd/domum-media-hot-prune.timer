@@ -1,0 +1,11 @@
+[Unit]
+Description=domum-media: schedule hot storage pruning
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=domum-media-hot-prune.service
+
+[Install]
+WantedBy=timers.target
