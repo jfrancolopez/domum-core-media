@@ -85,6 +85,12 @@ IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS=14
 
 # Immich Postgres credentials. Real values live in
 # /etc/domum-core-media/secrets/{immich_db_password,immich_jwt_secret}
+#
+# Note: immich_db_password is locked after the first 'domum-media apply' that
+# initializes the database. Postgres only honors POSTGRES_PASSWORD during the
+# very first initdb, so changing the secret afterwards will make 'apply'
+# refuse to deploy until you either restore the previous value or wipe the
+# database with `sudo domum-media immich reset-db`. See docs/SETUP-IMMICH.md.
 IMMICH_DB_USERNAME="postgres"
 IMMICH_DB_DATABASE_NAME="immich"
 

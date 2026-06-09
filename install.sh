@@ -48,12 +48,12 @@ require_network() {
 }
 
 install_prereqs() {
-  echo "[domum-media] Installing prereqs (curl, git, gnupg, btrfs-progs, jq, apparmor, nfs-common, rclone)..."
+  echo "[domum-media] Installing prereqs (curl, git, gnupg, btrfs-progs, jq, apparmor, nfs-common, rclone, gettext-base)..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y --no-install-recommends \
     ca-certificates curl git gnupg lsb-release \
-    btrfs-progs jq apparmor nfs-common rclone
+    btrfs-progs jq apparmor nfs-common rclone gettext-base
 }
 
 install_docker() {

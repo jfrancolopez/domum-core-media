@@ -127,6 +127,7 @@ Re-running the same curl command updates everything.
 | `domum-media logs <svc>` | `docker compose logs -f <svc>` |
 | `domum-media backup [--check\ | --check-deep [target] \ | --restore]` | Ad-hoc backup, integrity check, or restore |
 | `domum-media snapshot {create\ | list\ | prune}` | btrfs subvolume snapshot management |
+| `domum-media immich reset-db` | Destructive: wipes Immich Postgres data + fingerprint, then reapplies. Use to adopt a new DB password. |
 
 ---
 
@@ -141,7 +142,9 @@ Re-running the same curl command updates everything.
 - `compose/security/tailscale.yml` — Tailscale userspace-off, host networking
 - `compose/photos/immich.yml` — Immich server, microservices, machine-learning,
   Redis, Postgres (pgvecto.rs). Image refs and update policy live in config.
-  Library and Postgres data bind-mount to `/srv/data/immich/`.
+  Library and Postgres data bind-mount to `/srv/data/immich/`. The DB password
+  is locked after first apply — see `docs/SETUP-IMMICH.md` for the secret
+  lifecycle and `domum-media immich reset-db` recovery flow.
 - `compose/media/jellyfin.yml` — Jellyfin, with image ref and update policy in
   config, plus state under `/srv/data/jellyfin/` and a read-only media mount.
 - `compose/media/navidrome.yml` — Navidrome (Subsonic-compatible music server),
