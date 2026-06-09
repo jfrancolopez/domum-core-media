@@ -138,9 +138,12 @@ immich_library_data_dir() {
 
 read_secret_file_value() {
   local path="$1"
+  local value=""
   [[ -f "$path" ]] || return 1
-  local value
-  value="$(<"$path")"
+  IFS= read -r -d '' value < "$path" || true
+  if [[ "$value" == *$'\n' ]]; then
+    value="${value%$'\n'}"
+  fi
   printf '%s' "$value"
 }
 
@@ -252,7 +255,9 @@ validate_immich_compose_config() {
   [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
 
   local rendered_file server_db_raw server_jwt_raw postgres_db_raw
-  local server_db server_jwt postgres_db
+  local server_db postgres_db
+
+  validate_immich_secret_exports
   rendered_file="$(mktemp)"
 
   if ! render_compose_config_file "$rendered_file"; then
@@ -278,26 +283,18 @@ validate_immich_compose_config() {
   fi
 
   server_db="$(yaml_scalar_plaintext "$server_db_raw")"
-  server_jwt="$(yaml_scalar_plaintext "$server_jwt_raw")"
   postgres_db="$(yaml_scalar_plaintext "$postgres_db_raw")"
 
-  if [[ "$server_db" != "${IMMICH_DB_PASSWORD:-}" || "$postgres_db" != "${IMMICH_DB_PASSWORD:-}" ]]; then
-    rm -f "$rendered_file"
-    die "Immich compose validation failed: DB_PASSWORD and POSTGRES_PASSWORD are not both sourced from $(immich_db_password_file)"
-  fi
   if [[ "$server_db" != "$postgres_db" ]]; then
     rm -f "$rendered_file"
     die "Immich compose validation failed: immich_server DB_PASSWORD and immich_postgres POSTGRES_PASSWORD do not match."
   fi
-  if [[ "$server_jwt" != "${IMMICH_JWT_SECRET:-}" ]]; then
-    rm -f "$rendered_file"
-    die "Immich compose validation failed: immich_server JWT_SECRET is not sourced from $(immich_jwt_secret_file)"
-  fi
 
   echo "[domum-media] Immich compose env validation:"
-  echo "  immich_server DB_PASSWORD: set"
-  echo "  immich_server JWT_SECRET: set"
-  echo "  immich_postgres POSTGRES_PASSWORD: set"
+  echo "  DB_PASSWORD: set"
+  echo "  POSTGRES_PASSWORD: set"
+  echo "  JWT_SECRET: set"
+  echo "  DB_PASSWORD == POSTGRES_PASSWORD: yes"
 
   rm -f "$rendered_file"
 }
@@ -836,6 +833,44 @@ snapshot_list() {
   ls -1tr "$DOMUM_SNAPSHOT_ROOT"
 }
 
+snapshot_path_mtime() {
+  local path="$1"
+  if stat -c %Y "$path" >/dev/null 2>&1; then
+    stat -c %Y "$path"
+  else
+    stat -f %m "$path"
+  fi
+}
+
+service_snapshot_base_name() {
+  local service="$1"
+  local path
+  path="$(service_data_path "$service" 2>/dev/null || echo "$service")"
+  basename -- "$path"
+}
+
+list_snapshots_for_base() {
+  local base="$1"
+  local tmp_file path name mtime
+
+  [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
+
+  tmp_file="$(mktemp)"
+  shopt -s nullglob
+  for path in "$DOMUM_SNAPSHOT_ROOT"/"$base"-*; do
+    [[ -d "$path" ]] || continue
+    name="$(basename -- "$path")"
+    mtime="$(snapshot_path_mtime "$path")" || continue
+    printf '%s\t%s\n' "$mtime" "$name" >> "$tmp_file"
+  done
+  shopt -u nullglob
+
+  if [[ -s "$tmp_file" ]]; then
+    sort -n "$tmp_file" | cut -f2-
+  fi
+  rm -f "$tmp_file"
+}
+
 snapshot_metadata_dir() {
   printf '%s/snapshots' "$DOMUM_STATE_ROOT"
 }
@@ -890,10 +925,7 @@ snapshot_prune() {
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
     local snaps
-    # Snapshot names are controlled (subvol + timestamp), and we deliberately
-    # rely on ls mtime ordering (-tr = oldest first) to prune the oldest.
-    # shellcheck disable=SC2010
-    mapfile -t snaps < <(ls -1tr "$DOMUM_SNAPSHOT_ROOT" | grep -E "^${base}-[0-9]{8}-[0-9]{6}-")
+    mapfile -t snaps < <(list_snapshots_for_base "$base")
     local total="${#snaps[@]}"
     local drop=$(( total - keep ))
     if (( drop > 0 )); then
@@ -962,7 +994,7 @@ hot_prune() {
 
 list_service_snapshots() {
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
-  ls -1tr "$DOMUM_SNAPSHOT_ROOT" | grep -E "^$(basename "$(service_data_path "$1" 2>/dev/null || echo "$1")")-" || true
+  list_snapshots_for_base "$(service_snapshot_base_name "$1")"
 }
 
 restore_snapshot_for_service() {
@@ -2061,13 +2093,16 @@ doctor_immich() {
   local db_file jwt_file fp_file pg_dir rendered_file
   local db_secret_status="missing"
   local jwt_secret_status="missing"
-  local compose_db_status="unset"
-  local compose_pg_status="unset"
-  local compose_jwt_status="unset"
+  local db_export_status="empty"
+  local jwt_export_status="empty"
+  local compose_db_status="empty"
+  local compose_pg_status="empty"
+  local compose_jwt_status="empty"
+  local compose_db_match="no"
   local fingerprint_status="missing"
   local initialized="no"
   local server_db_raw server_jwt_raw postgres_db_raw
-  local server_db server_jwt postgres_db
+  local server_db postgres_db
   local current_digest stored_digest
   local postgres_status redis_status ml_status server_status
 
@@ -2078,22 +2113,35 @@ doctor_immich() {
 
   if [[ -f "$db_file" ]]; then
     if [[ -n "$(read_secret_file_value "$db_file")" ]]; then
-      db_secret_status="present, non-empty"
+      db_secret_status="set"
     else
-      db_secret_status="present, empty"
+      db_secret_status="empty"
       issues=1
     fi
   else
+    db_secret_status="empty"
     issues=1
   fi
 
   if [[ -f "$jwt_file" ]]; then
     if [[ -n "$(read_secret_file_value "$jwt_file")" ]]; then
-      jwt_secret_status="present, non-empty"
+      jwt_secret_status="set"
     else
-      jwt_secret_status="present, empty"
+      jwt_secret_status="empty"
       issues=1
     fi
+  else
+    jwt_secret_status="empty"
+    issues=1
+  fi
+
+  if [[ -n "${IMMICH_DB_PASSWORD:-}" ]]; then
+    db_export_status="set"
+  else
+    issues=1
+  fi
+  if [[ -n "${IMMICH_JWT_SECRET:-}" ]]; then
+    jwt_export_status="set"
   else
     issues=1
   fi
@@ -2130,43 +2178,25 @@ doctor_immich() {
     if yaml_scalar_is_set "$server_db_raw"; then
       compose_db_status="set"
       server_db="$(yaml_scalar_plaintext "$server_db_raw")"
-    else
-      issues=1
     fi
     if yaml_scalar_is_set "$postgres_db_raw"; then
       compose_pg_status="set"
       postgres_db="$(yaml_scalar_plaintext "$postgres_db_raw")"
-    else
-      issues=1
     fi
     if yaml_scalar_is_set "$server_jwt_raw"; then
       compose_jwt_status="set"
-      server_jwt="$(yaml_scalar_plaintext "$server_jwt_raw")"
-    else
+    fi
+
+    if [[ "$compose_db_status" != "set" || "$compose_pg_status" != "set" || "$compose_jwt_status" != "set" ]]; then
       issues=1
     fi
 
-    if [[ "$compose_db_status" == "set" && "$compose_pg_status" == "set" && "$server_db" != "$postgres_db" ]]; then
-      compose_db_status="mismatch"
-      compose_pg_status="mismatch"
-      issues=1
-    fi
-    if [[ "$compose_db_status" == "set" && -n "${IMMICH_DB_PASSWORD:-}" && "$server_db" != "${IMMICH_DB_PASSWORD:-}" ]]; then
-      compose_db_status="mismatch"
-      issues=1
-    fi
-    if [[ "$compose_pg_status" == "set" && -n "${IMMICH_DB_PASSWORD:-}" && "$postgres_db" != "${IMMICH_DB_PASSWORD:-}" ]]; then
-      compose_pg_status="mismatch"
-      issues=1
-    fi
-    if [[ "$compose_jwt_status" == "set" && -n "${IMMICH_JWT_SECRET:-}" && "$server_jwt" != "${IMMICH_JWT_SECRET:-}" ]]; then
-      compose_jwt_status="mismatch"
+    if [[ "$compose_db_status" == "set" && "$compose_pg_status" == "set" && "$server_db" == "$postgres_db" ]]; then
+      compose_db_match="yes"
+    elif [[ "$compose_db_status" == "set" && "$compose_pg_status" == "set" ]]; then
       issues=1
     fi
   else
-    compose_db_status="config-error"
-    compose_pg_status="config-error"
-    compose_jwt_status="config-error"
     issues=1
   fi
   rm -f "$rendered_file"
@@ -2185,10 +2215,15 @@ doctor_immich() {
   echo "  immich_db_password: $db_secret_status"
   echo "  immich_jwt_secret: $jwt_secret_status"
   echo
+  echo "Exported env:"
+  echo "  IMMICH_DB_PASSWORD: $db_export_status"
+  echo "  IMMICH_JWT_SECRET: $jwt_export_status"
+  echo
   echo "Compose env:"
   echo "  DB_PASSWORD: $compose_db_status"
   echo "  POSTGRES_PASSWORD: $compose_pg_status"
   echo "  JWT_SECRET: $compose_jwt_status"
+  echo "  DB_PASSWORD == POSTGRES_PASSWORD: $compose_db_match"
   echo
   echo "Database:"
   echo "  data path: $pg_dir"

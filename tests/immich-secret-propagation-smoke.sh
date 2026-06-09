@@ -30,8 +30,8 @@ DOMUM_LOG_DIR='$LOG_DIR'
 DOMUM_SNAPSHOT_ROOT='$SNAPSHOT_DIR'
 EOF
 
-printf 'db-pass-123!@\n' > "$SECRETS_DIR/immich_db_password"
-printf 'jwt-secret-456?=\n\n' > "$SECRETS_DIR/immich_jwt_secret"
+printf 'db-pass-123!@ \n' > "$SECRETS_DIR/immich_db_password"
+printf 'jwt-secret-456?=\n' > "$SECRETS_DIR/immich_jwt_secret"
 
 cat > "$FAKE_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -83,7 +83,7 @@ load_cfg
 export_env_for_compose
 validate_immich_secret_exports
 
-[[ "${IMMICH_DB_PASSWORD:-}" == "db-pass-123!@" ]] || fail "IMMICH_DB_PASSWORD did not load from the secret file"
+[[ "${IMMICH_DB_PASSWORD:-}" == "db-pass-123!@ " ]] || fail "IMMICH_DB_PASSWORD did not load from the secret file"
 [[ "${IMMICH_JWT_SECRET:-}" == "jwt-secret-456?=" ]] || fail "IMMICH_JWT_SECRET did not load from the secret file"
 
 RENDERED_FILE="$TMP_DIR/rendered.yml"
@@ -96,9 +96,9 @@ POSTGRES_PASSWORD="$(yaml_scalar_plaintext "$(compose_rendered_env_value "$RENDE
 [[ -n "$SERVER_DB_PASSWORD" ]] || fail "immich_server DB_PASSWORD rendered empty"
 [[ -n "$SERVER_JWT_SECRET" ]] || fail "immich_server JWT_SECRET rendered empty"
 [[ -n "$POSTGRES_PASSWORD" ]] || fail "immich_postgres POSTGRES_PASSWORD rendered empty"
-[[ "$SERVER_DB_PASSWORD" == "$POSTGRES_PASSWORD" ]] || fail "DB_PASSWORD and POSTGRES_PASSWORD were not sourced from the same secret"
-[[ "$SERVER_DB_PASSWORD" == "db-pass-123!@" ]] || fail "immich_server DB_PASSWORD did not match the DB secret file"
-[[ "$POSTGRES_PASSWORD" == "db-pass-123!@" ]] || fail "immich_postgres POSTGRES_PASSWORD did not match the DB secret file"
+[[ "$SERVER_DB_PASSWORD" == "$POSTGRES_PASSWORD" ]] || fail "DB_PASSWORD and POSTGRES_PASSWORD did not match"
+[[ "$SERVER_DB_PASSWORD" == "db-pass-123!@ " ]] || fail "immich_server DB_PASSWORD did not match the DB secret file"
+[[ "$POSTGRES_PASSWORD" == "db-pass-123!@ " ]] || fail "immich_postgres POSTGRES_PASSWORD did not match the DB secret file"
 [[ "$SERVER_JWT_SECRET" == "jwt-secret-456?=" ]] || fail "immich_server JWT_SECRET did not match the JWT secret file"
 
 validate_immich_compose_config

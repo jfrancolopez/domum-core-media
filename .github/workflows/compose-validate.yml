@@ -22,6 +22,9 @@ jobs:
         # /etc/os-release, intentional subshell-scoped exports) are advisory.
         run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup install.sh
 
+      - name: Immich secret propagation smoke test
+        run: tests/immich-secret-propagation-smoke.sh
+
       - name: docker compose config (every fragment layered on base)
         env:
           # Provide harmless defaults so envsubst-style variables don't break
