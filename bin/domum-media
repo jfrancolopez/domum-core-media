@@ -120,12 +120,186 @@ immich_db_password_file() {
   printf '%s/immich_db_password' "$SECRETS_DIR"
 }
 
+immich_jwt_secret_file() {
+  printf '%s/immich_jwt_secret' "$SECRETS_DIR"
+}
+
 immich_db_password_fingerprint_file() {
   printf '%s/immich/db_password.sha256' "$DOMUM_STATE_ROOT"
 }
 
 immich_db_password_initialized() {
   [[ -f "$(immich_postgres_marker)" ]]
+}
+
+immich_library_data_dir() {
+  printf '%s/immich/library' "$DOMUM_DATA_ROOT"
+}
+
+read_secret_file_value() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  local value
+  value="$(<"$path")"
+  printf '%s' "$value"
+}
+
+immich_secret_empty_error() {
+  local env_name="$1"
+  local secret_file="$2"
+  cat >&2 <<EOF
+[domum-media] ERROR: Immich is enabled but ${env_name} is empty.
+Expected secret file: ${secret_file}
+Run: sudo domum-media configure
+EOF
+  exit 1
+}
+
+load_immich_secret_exports() {
+  local db_file jwt_file
+  db_file="$(immich_db_password_file)"
+  jwt_file="$(immich_jwt_secret_file)"
+
+  unset IMMICH_DB_PASSWORD IMMICH_JWT_SECRET
+
+  if [[ -f "$db_file" ]]; then
+    IMMICH_DB_PASSWORD="$(read_secret_file_value "$db_file")"
+    export IMMICH_DB_PASSWORD
+  fi
+  if [[ -f "$jwt_file" ]]; then
+    IMMICH_JWT_SECRET="$(read_secret_file_value "$jwt_file")"
+    export IMMICH_JWT_SECRET
+  fi
+}
+
+validate_immich_secret_exports() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+
+  local db_file jwt_file
+  db_file="$(immich_db_password_file)"
+  jwt_file="$(immich_jwt_secret_file)"
+
+  [[ -f "$db_file" ]] || immich_secret_empty_error "IMMICH_DB_PASSWORD" "$db_file"
+  [[ -f "$jwt_file" ]] || immich_secret_empty_error "IMMICH_JWT_SECRET" "$jwt_file"
+  [[ -n "${IMMICH_DB_PASSWORD:-}" ]] || immich_secret_empty_error "IMMICH_DB_PASSWORD" "$db_file"
+  [[ -n "${IMMICH_JWT_SECRET:-}" ]] || immich_secret_empty_error "IMMICH_JWT_SECRET" "$jwt_file"
+}
+
+trim_spaces() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+yaml_scalar_plaintext() {
+  local value
+  value="$(trim_spaces "$1")"
+  if [[ "$value" == \"*\" && "$value" == *\" && "${#value}" -ge 2 ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "$value" == \'*\' && "$value" == *\' && "${#value}" -ge 2 ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+yaml_scalar_is_set() {
+  local value
+  value="$(yaml_scalar_plaintext "$1")"
+  [[ -n "$value" && "$value" != "null" && "$value" != "~" ]]
+}
+
+render_compose_config_file() {
+  local output_file="$1"
+  compose_cmd config > "$output_file"
+}
+
+compose_rendered_env_value() {
+  local rendered_file="$1"
+  local service_name="$2"
+  local env_key="$3"
+
+  awk -v service="$service_name" -v key="$env_key" '
+    /^services:/ {
+      in_services = 1
+      next
+    }
+    in_services && $0 ~ "^  " service ":$" {
+      in_service = 1
+      in_env = 0
+      next
+    }
+    in_service && $0 ~ "^  [^ ]" && $0 !~ "^  " service ":$" {
+      in_service = 0
+      in_env = 0
+    }
+    in_service && $0 ~ "^    environment:$" {
+      in_env = 1
+      next
+    }
+    in_service && in_env && $0 ~ "^    [^ ]" && $0 !~ "^    environment:$" {
+      in_env = 0
+    }
+    in_service && in_env && $0 ~ "^      " key ":" {
+      sub("^      " key ":[[:space:]]*", "", $0)
+      print
+      exit
+    }
+  ' "$rendered_file"
+}
+
+validate_immich_compose_config() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+
+  local rendered_file server_db_raw server_jwt_raw postgres_db_raw
+  local server_db server_jwt postgres_db
+  rendered_file="$(mktemp)"
+
+  if ! render_compose_config_file "$rendered_file"; then
+    rm -f "$rendered_file"
+    die "docker compose config failed while validating Immich secrets."
+  fi
+
+  server_db_raw="$(compose_rendered_env_value "$rendered_file" "immich_server" "DB_PASSWORD")"
+  server_jwt_raw="$(compose_rendered_env_value "$rendered_file" "immich_server" "JWT_SECRET")"
+  postgres_db_raw="$(compose_rendered_env_value "$rendered_file" "immich_postgres" "POSTGRES_PASSWORD")"
+
+  if ! yaml_scalar_is_set "$server_db_raw"; then
+    rm -f "$rendered_file"
+    die "Immich compose validation failed: immich_server DB_PASSWORD resolved empty from $(immich_db_password_file)"
+  fi
+  if ! yaml_scalar_is_set "$server_jwt_raw"; then
+    rm -f "$rendered_file"
+    die "Immich compose validation failed: immich_server JWT_SECRET resolved empty from $(immich_jwt_secret_file)"
+  fi
+  if ! yaml_scalar_is_set "$postgres_db_raw"; then
+    rm -f "$rendered_file"
+    die "Immich compose validation failed: immich_postgres POSTGRES_PASSWORD resolved empty from $(immich_db_password_file)"
+  fi
+
+  server_db="$(yaml_scalar_plaintext "$server_db_raw")"
+  server_jwt="$(yaml_scalar_plaintext "$server_jwt_raw")"
+  postgres_db="$(yaml_scalar_plaintext "$postgres_db_raw")"
+
+  if [[ "$server_db" != "${IMMICH_DB_PASSWORD:-}" || "$postgres_db" != "${IMMICH_DB_PASSWORD:-}" ]]; then
+    rm -f "$rendered_file"
+    die "Immich compose validation failed: DB_PASSWORD and POSTGRES_PASSWORD are not both sourced from $(immich_db_password_file)"
+  fi
+  if [[ "$server_db" != "$postgres_db" ]]; then
+    rm -f "$rendered_file"
+    die "Immich compose validation failed: immich_server DB_PASSWORD and immich_postgres POSTGRES_PASSWORD do not match."
+  fi
+  if [[ "$server_jwt" != "${IMMICH_JWT_SECRET:-}" ]]; then
+    rm -f "$rendered_file"
+    die "Immich compose validation failed: immich_server JWT_SECRET is not sourced from $(immich_jwt_secret_file)"
+  fi
+
+  echo "[domum-media] Immich compose env validation:"
+  echo "  immich_server DB_PASSWORD: set"
+  echo "  immich_server JWT_SECRET: set"
+  echo "  immich_postgres POSTGRES_PASSWORD: set"
+
+  rm -f "$rendered_file"
 }
 
 sha256_of_file() {
@@ -162,13 +336,7 @@ validate_immich_db_password_state() {
   fp_file="$(immich_db_password_fingerprint_file)"
   pg_marker="$(immich_postgres_marker)"
 
-  if [[ ! -f "$secret_file" ]]; then
-    if [[ -f "$pg_marker" ]]; then
-      die "Immich Postgres data exists at $(immich_postgres_data_dir) but the secret $secret_file is missing.
-  Either restore the original password file or run: sudo domum-media immich reset-db"
-    fi
-    die "Immich is enabled but $secret_file is missing. Run: sudo domum-media configure"
-  fi
+  validate_immich_secret_exports
 
   if [[ ! -f "$pg_marker" ]]; then
     # First boot path. apply() will write the fingerprint after compose up.
@@ -179,10 +347,9 @@ validate_immich_db_password_state() {
   current_digest="$(sha256_of_file "$secret_file")"
 
   if [[ ! -f "$fp_file" ]]; then
-    echo "[domum-media] No Immich DB password fingerprint on disk yet."
-    echo "    Postgres has already been initialized — assuming the current secret is correct and recording the fingerprint."
-    write_immich_db_password_fingerprint
-    return 0
+    die "Immich Postgres data exists at $(immich_postgres_data_dir) but no password fingerprint is recorded at $fp_file.
+  Refusing to apply because the original database password cannot be verified.
+  Restore the original fingerprint or run: sudo domum-media immich reset-db"
   fi
 
   stored_digest="$(head -n1 "$fp_file" | tr -d '[:space:]')"
@@ -547,17 +714,10 @@ export_env_for_compose() {
   export HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
 
   if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
-    CF_DNS_API_TOKEN="$(cat "$SECRETS_DIR/cloudflare_api_token")"
+    CF_DNS_API_TOKEN="$(<"$SECRETS_DIR/cloudflare_api_token")"
     export CF_DNS_API_TOKEN
   fi
-  if [[ -f "$SECRETS_DIR/immich_db_password" ]]; then
-    IMMICH_DB_PASSWORD="$(cat "$SECRETS_DIR/immich_db_password")"
-    export IMMICH_DB_PASSWORD
-  fi
-  if [[ -f "$SECRETS_DIR/immich_jwt_secret" ]]; then
-    IMMICH_JWT_SECRET="$(cat "$SECRETS_DIR/immich_jwt_secret")"
-    export IMMICH_JWT_SECRET
-  fi
+  load_immich_secret_exports
 }
 
 render_traefik_dynamic() {
@@ -1588,7 +1748,8 @@ init_host() {
       < <(missing_if_absent "$SECRETS_DIR/immich_jwt_secret" "immich_jwt_secret")
     if immich_db_password_initialized && [[ ! -f "$(immich_db_password_fingerprint_file)" ]]; then
       echo "[domum-media] NOTE: Immich Postgres is initialized but no password fingerprint is recorded yet."
-      echo "    The next 'domum-media apply' will assume the current secret is correct and record one."
+      echo "    'domum-media apply' will refuse until you restore the expected fingerprint or run:"
+      echo "        sudo domum-media immich reset-db"
     fi
   fi
 
@@ -1662,8 +1823,10 @@ apply() {
     immich_first_boot=1
   fi
   validate_immich_db_password_state
+  validate_immich_secret_exports
 
   render_traefik_dynamic
+  validate_immich_compose_config
 
   echo "[domum-media] Pre-apply btrfs snapshot..."
   snapshot_create "pre-apply" || echo "[domum-media] Snapshot step failed (continuing)."
@@ -1794,16 +1957,32 @@ immich_reset_db() {
 
   [[ "${ENABLE_IMMICH:-0}" == "1" ]] || die "Immich is not enabled in $CFG_FILE (ENABLE_IMMICH=0)."
 
-  local data_dir fp_file confirm
+  local data_dir fp_file uploads_dir confirm wipe_uploads=0
   data_dir="$(immich_postgres_data_dir)"
   fp_file="$(immich_db_password_fingerprint_file)"
+  uploads_dir="$(immich_library_data_dir)"
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --wipe-uploads) wipe_uploads=1 ;;
+      *) die "Usage: domum-media immich reset-db [--wipe-uploads]" ;;
+    esac
+    shift
+  done
 
   cat <<EOF
 [domum-media] This will wipe the Immich Postgres database.
 
   Deletes: $data_dir
   Clears:  $fp_file
-  Keeps:   $DOMUM_DATA_ROOT/immich/library (photo blobs — unusable until re-import)
+  Keeps:   $uploads_dir (photo blobs — unusable until re-import)
+EOF
+  if (( wipe_uploads == 1 )); then
+    cat <<EOF
+  Also deletes: $uploads_dir
+EOF
+  fi
+  cat <<EOF
 
   Type exactly 'wipe immich' to confirm.
 EOF
@@ -1822,6 +2001,10 @@ EOF
     echo "[domum-media] Removing $data_dir"
     rm -rf "$data_dir"
   fi
+  if (( wipe_uploads == 1 )) && [[ -d "$uploads_dir" ]]; then
+    echo "[domum-media] Removing $uploads_dir"
+    rm -rf "$uploads_dir"
+  fi
   if [[ -f "$fp_file" ]]; then
     echo "[domum-media] Removing $fp_file"
     rm -f "$fp_file"
@@ -1831,13 +2014,234 @@ EOF
   exec /usr/local/bin/domum-media apply
 }
 
+container_exists() {
+  docker inspect "$1" >/dev/null 2>&1
+}
+
+container_status_summary() {
+  local container_name="$1"
+  local status health
+
+  if ! container_exists "$container_name"; then
+    printf 'missing'
+    return 0
+  fi
+
+  status="$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || true)"
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+
+  if [[ -n "$health" ]]; then
+    printf '%s' "$health"
+    return 0
+  fi
+
+  printf '%s' "${status:-unknown}"
+}
+
+container_image_ref() {
+  local container_name="$1"
+  container_exists "$container_name" || return 0
+  docker inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null || true
+}
+
+container_mount_list() {
+  local container_name="$1"
+  container_exists "$container_name" || return 0
+  docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' "$container_name" 2>/dev/null || true
+}
+
+doctor_immich() {
+  need_root
+  load_cfg
+  export_env_for_compose
+
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || die "Immich is not enabled in $CFG_FILE (ENABLE_IMMICH=0)."
+
+  local issues=0
+  local db_file jwt_file fp_file pg_dir rendered_file
+  local db_secret_status="missing"
+  local jwt_secret_status="missing"
+  local compose_db_status="unset"
+  local compose_pg_status="unset"
+  local compose_jwt_status="unset"
+  local fingerprint_status="missing"
+  local initialized="no"
+  local server_db_raw server_jwt_raw postgres_db_raw
+  local server_db server_jwt postgres_db
+  local current_digest stored_digest
+  local postgres_status redis_status ml_status server_status
+
+  db_file="$(immich_db_password_file)"
+  jwt_file="$(immich_jwt_secret_file)"
+  fp_file="$(immich_db_password_fingerprint_file)"
+  pg_dir="$(immich_postgres_data_dir)"
+
+  if [[ -f "$db_file" ]]; then
+    if [[ -n "$(read_secret_file_value "$db_file")" ]]; then
+      db_secret_status="present, non-empty"
+    else
+      db_secret_status="present, empty"
+      issues=1
+    fi
+  else
+    issues=1
+  fi
+
+  if [[ -f "$jwt_file" ]]; then
+    if [[ -n "$(read_secret_file_value "$jwt_file")" ]]; then
+      jwt_secret_status="present, non-empty"
+    else
+      jwt_secret_status="present, empty"
+      issues=1
+    fi
+  else
+    issues=1
+  fi
+
+  if immich_db_password_initialized; then
+    initialized="yes"
+    if [[ -f "$fp_file" ]]; then
+      if [[ -n "${IMMICH_DB_PASSWORD:-}" && -f "$db_file" ]]; then
+        current_digest="$(sha256_of_file "$db_file")"
+      else
+        current_digest=""
+      fi
+      stored_digest="$(head -n1 "$fp_file" | tr -d '[:space:]')"
+      if [[ -n "$current_digest" && "$current_digest" == "$stored_digest" ]]; then
+        fingerprint_status="matches"
+      else
+        fingerprint_status="mismatch"
+        issues=1
+      fi
+    else
+      fingerprint_status="missing"
+      issues=1
+    fi
+  else
+    fingerprint_status="not-recorded"
+  fi
+
+  rendered_file="$(mktemp)"
+  if render_compose_config_file "$rendered_file" 2>/dev/null; then
+    server_db_raw="$(compose_rendered_env_value "$rendered_file" "immich_server" "DB_PASSWORD")"
+    server_jwt_raw="$(compose_rendered_env_value "$rendered_file" "immich_server" "JWT_SECRET")"
+    postgres_db_raw="$(compose_rendered_env_value "$rendered_file" "immich_postgres" "POSTGRES_PASSWORD")"
+
+    if yaml_scalar_is_set "$server_db_raw"; then
+      compose_db_status="set"
+      server_db="$(yaml_scalar_plaintext "$server_db_raw")"
+    else
+      issues=1
+    fi
+    if yaml_scalar_is_set "$postgres_db_raw"; then
+      compose_pg_status="set"
+      postgres_db="$(yaml_scalar_plaintext "$postgres_db_raw")"
+    else
+      issues=1
+    fi
+    if yaml_scalar_is_set "$server_jwt_raw"; then
+      compose_jwt_status="set"
+      server_jwt="$(yaml_scalar_plaintext "$server_jwt_raw")"
+    else
+      issues=1
+    fi
+
+    if [[ "$compose_db_status" == "set" && "$compose_pg_status" == "set" && "$server_db" != "$postgres_db" ]]; then
+      compose_db_status="mismatch"
+      compose_pg_status="mismatch"
+      issues=1
+    fi
+    if [[ "$compose_db_status" == "set" && -n "${IMMICH_DB_PASSWORD:-}" && "$server_db" != "${IMMICH_DB_PASSWORD:-}" ]]; then
+      compose_db_status="mismatch"
+      issues=1
+    fi
+    if [[ "$compose_pg_status" == "set" && -n "${IMMICH_DB_PASSWORD:-}" && "$postgres_db" != "${IMMICH_DB_PASSWORD:-}" ]]; then
+      compose_pg_status="mismatch"
+      issues=1
+    fi
+    if [[ "$compose_jwt_status" == "set" && -n "${IMMICH_JWT_SECRET:-}" && "$server_jwt" != "${IMMICH_JWT_SECRET:-}" ]]; then
+      compose_jwt_status="mismatch"
+      issues=1
+    fi
+  else
+    compose_db_status="config-error"
+    compose_pg_status="config-error"
+    compose_jwt_status="config-error"
+    issues=1
+  fi
+  rm -f "$rendered_file"
+
+  postgres_status="$(container_status_summary immich_postgres)"
+  redis_status="$(container_status_summary immich_redis)"
+  ml_status="$(container_status_summary immich_machine_learning)"
+  server_status="$(container_status_summary immich_server)"
+
+  [[ "$postgres_status" == "healthy" ]] || issues=1
+  [[ "$redis_status" == "healthy" ]] || issues=1
+  [[ "$ml_status" == "healthy" || "$ml_status" == "running" ]] || issues=1
+  [[ "$server_status" == "healthy" || "$server_status" == "running" ]] || issues=1
+
+  echo "Immich secrets:"
+  echo "  immich_db_password: $db_secret_status"
+  echo "  immich_jwt_secret: $jwt_secret_status"
+  echo
+  echo "Compose env:"
+  echo "  DB_PASSWORD: $compose_db_status"
+  echo "  POSTGRES_PASSWORD: $compose_pg_status"
+  echo "  JWT_SECRET: $compose_jwt_status"
+  echo
+  echo "Database:"
+  echo "  data path: $pg_dir"
+  echo "  initialized: $initialized"
+  echo "  password fingerprint: $fingerprint_status"
+  echo
+  echo "Containers:"
+  echo "  immich_postgres: $postgres_status"
+  echo "  immich_redis: $redis_status"
+  echo "  immich_machine_learning: $ml_status"
+  echo "  immich_server: $server_status"
+  echo
+  echo "Images:"
+  echo "  immich_postgres: $(container_image_ref immich_postgres)"
+  echo "  immich_redis: $(container_image_ref immich_redis)"
+  echo "  immich_machine_learning: $(container_image_ref immich_machine_learning)"
+  echo "  immich_server: $(container_image_ref immich_server)"
+  echo
+  echo "Mounts:"
+  if container_exists immich_postgres; then
+    while IFS= read -r mount; do
+      [[ -n "$mount" ]] && echo "  immich_postgres: $mount"
+    done < <(container_mount_list immich_postgres)
+  else
+    echo "  immich_postgres: missing"
+  fi
+  if container_exists immich_server; then
+    while IFS= read -r mount; do
+      [[ -n "$mount" ]] && echo "  immich_server: $mount"
+    done < <(container_mount_list immich_server)
+  else
+    echo "  immich_server: missing"
+  fi
+
+  (( issues == 0 ))
+}
+
 immich_cmd() {
   need_root
   local sub="${1:-}"
   case "$sub" in
     refresh-bundle) shift; immich_refresh_bundle "$@" ;;
     reset-db) shift; immich_reset_db "$@" ;;
-    *) die "Usage: domum-media immich {refresh-bundle [--force]|reset-db}" ;;
+    *) die "Usage: domum-media immich {refresh-bundle [--force]|reset-db [--wipe-uploads]}" ;;
+  esac
+}
+
+doctor_cmd() {
+  need_root
+  local sub="${1:-}"
+  case "$sub" in
+    immich) shift; doctor_immich "$@" ;;
+    *) die "Usage: domum-media doctor immich" ;;
   esac
 }
 
@@ -1858,8 +2262,9 @@ Usage:
   domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback
+  domum-media doctor immich
   domum-media hot {status|prune [--dry-run]}
-  domum-media immich {refresh-bundle [--force]|reset-db}
+  domum-media immich {refresh-bundle [--force]|reset-db [--wipe-uploads]}
 
 Config:  $CFG_FILE
 Secrets: $SECRETS_DIR
@@ -1882,6 +2287,7 @@ main() {
     backup)    backup_cmd "$@" ;;
     snapshot)  shift; snapshot_cmd "$@" ;;
     rollback)  shift; rollback_cmd "$@" ;;
+    doctor)    shift; doctor_cmd "$@" ;;
     hot)       shift; hot_cmd "$@" ;;
     immich)    shift; immich_cmd "$@" ;;
     -h|--help|help|"") usage ;;
@@ -1889,4 +2295,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

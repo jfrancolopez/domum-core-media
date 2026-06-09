@@ -18,7 +18,10 @@ On a host with no prior Immich state:
    the Immich section it generates `immich_db_password` and `immich_jwt_secret`
    in `/etc/domum-core-media/secrets/` (mode 0600, owned by root) unless you
    type values explicitly.
-2. `sudo domum-media apply` exports those values into the compose environment.
+2. `sudo domum-media apply` reads those file-backed secrets, trims only trailing
+   newlines, exports them into the compose environment as `IMMICH_DB_PASSWORD`
+   and `IMMICH_JWT_SECRET`, and validates `docker compose config` before it
+   ever calls `docker compose up`.
 3. The `immich_postgres` container starts with no existing data directory at
    `/srv/data/immich/postgres`, so Postgres runs `initdb` and bakes
    `POSTGRES_PASSWORD` (= the secret you just generated) into the database.
@@ -62,9 +65,16 @@ validation fails.
 | `/srv/data/immich/postgres/` | postgres uid (container) | Postgres data directory. Presence of `PG_VERSION` here = "already initialized". |
 | `/srv/data/immich/library/` | container uid | Photo blobs. Untouched by `reset-db`, but unusable without a matching database. |
 
-`domum-media configure` is the only thing that writes the password file.
-`domum-media apply` is the only thing that reads it for Immich. Nothing in the
-repo touches the database directly.
+`domum-media configure` is the only thing that writes the password file unless
+you deliberately edit the file yourself as root. `domum-media apply` reads the
+files, exports the values into the compose environment, and refuses deployment
+if either secret resolves empty or if the rendered compose config does not show
+`immich_server.DB_PASSWORD`, `immich_server.JWT_SECRET`, and
+`immich_postgres.POSTGRES_PASSWORD` as set. The CLI never logs the raw secret
+values.
+
+These secrets are intentionally **not** committed anywhere in git. The repo is
+reset-managed; the host secret directory is not.
 
 ---
 
@@ -84,9 +94,9 @@ server container loops on:
 > PostgresError: password authentication failed for user "postgres"
 
 To prevent the silent breakage, `apply` computes the SHA-256 of the current
-secret and compares it to the fingerprint recorded at first boot. If they
-disagree, `apply` refuses to run and prints a recovery checklist instead of
-restarting services into a broken state.
+secret and compares it to the fingerprint recorded at first successful boot. If
+they disagree, `apply` refuses to run and prints a recovery checklist instead
+of restarting services into a broken state.
 
 (`apply` does not try to rotate the DB password against a running Postgres.
 That dance — `ALTER USER` while the app is online — is intentionally not in
@@ -121,9 +131,10 @@ sudo domum-media apply
 needed if you ran `configure` again after `reset-db` to change the password.
 
 **The photo library at `/srv/data/immich/library` is not deleted by
-`reset-db`.** The blobs survive, but Immich's database has no record of them
-until you re-import (Immich UI → Administration → Jobs → External Library
-re-scan, or `immich-cli` upload). Plan accordingly.
+`reset-db` unless you pass `--wipe-uploads`.** The blobs survive, but Immich's
+database has no record of them until you re-import (Immich UI →
+Administration → Jobs → External Library re-scan, or `immich-cli` upload).
+Plan accordingly.
 
 ---
 
@@ -146,10 +157,14 @@ What it does, in order:
 4. `compose stop` + `compose rm -f` against `immich_server`,
    `immich_machine_learning`, `immich_postgres`, `immich_redis` (best-effort —
    ignores errors so a half-started stack still resets cleanly).
+   `immich_redis` has no persisted host data in this stack, so container
+   removal is the only cache cleanup needed.
 5. Takes a `pre-immich-reset` btrfs snapshot of the data subvolumes.
 6. `rm -rf /srv/data/immich/postgres`.
-7. `rm -f /var/lib/domum-media/immich/db_password.sha256`.
-8. `exec domum-media apply` — runs through validation and brings the stack
+7. Optionally `rm -rf /srv/data/immich/library` if you passed
+   `--wipe-uploads`.
+8. `rm -f /var/lib/domum-media/immich/db_password.sha256`.
+9. `exec domum-media apply` — runs through validation and brings the stack
    back up; Postgres re-runs `initdb` with whatever value
    `/etc/domum-core-media/secrets/immich_db_password` holds at that moment.
 
@@ -164,9 +179,31 @@ sudo btrfs subvolume snapshot \
 sudo domum-media apply
 ```
 
+## 7. Doctor / diagnostics
+
+Run:
+
+```bash
+sudo domum-media doctor immich
+```
+
+It checks, without printing any raw secret value:
+
+- secret files exist
+- secret files are non-empty after trimming trailing newlines
+- rendered compose receives non-empty `DB_PASSWORD`, `POSTGRES_PASSWORD`, and
+  `JWT_SECRET`
+- `DB_PASSWORD` and `POSTGRES_PASSWORD` come from the same secret file
+- the DB password fingerprint matches the current secret
+- Immich containers exist and report healthy/running status
+- current container image refs
+- current bind mounts / mounted paths
+
+Use this first when debugging auth failures or after changing secret files.
+
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 ### `PostgresError: password authentication failed for user "postgres"` on `immich_server`
 
@@ -188,19 +225,20 @@ database was still alive. Recover the file from your secret manager / DR
 escrow and re-run `apply`. If you genuinely lost it, the only path forward is
 `immich reset-db` (you will lose Immich's database — photo blobs stay).
 
-### `apply` says it is recording the fingerprint for the first time
+### `apply` refuses because the fingerprint file is missing
 
-Legacy install — the database was bootstrapped before this safety net
-existed. `apply` assumes the current secret is correct and writes the
-fingerprint. Verify on the next apply that no mismatch is reported, then
-forget about it.
+The Postgres data directory already exists, but there is no trustworthy record
+of which password initialized it. `apply` now refuses instead of guessing.
+Restore the original fingerprint from backup, or run `sudo domum-media immich
+reset-db` and re-bootstrap cleanly.
 
 ---
 
-## 8. Related files
+## 9. Related files
 
-- `bin/domum-media` — `validate_immich_db_password_state`, `immich_reset_db`,
-  `write_immich_db_password_fingerprint`.
+- `bin/domum-media` — `load_immich_secret_exports`,
+  `validate_immich_compose_config`, `validate_immich_db_password_state`,
+  `doctor_immich`, `immich_reset_db`, `write_immich_db_password_fingerprint`.
 - `compose/photos/immich.yml` — service definitions and the postgres bind
   mount.
 - `config/domum-media.conf.example` — `IMMICH_DB_USERNAME` /

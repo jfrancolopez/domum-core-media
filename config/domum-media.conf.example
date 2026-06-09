@@ -111,7 +111,9 @@ IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS=14
 # initializes the database. Postgres only honors POSTGRES_PASSWORD during the
 # very first initdb, so changing the secret afterwards will make 'apply'
 # refuse to deploy until you either restore the previous value or wipe the
-# database with `sudo domum-media immich reset-db`. See docs/SETUP-IMMICH.md.
+# database with `sudo domum-media immich reset-db`. Use
+# `sudo domum-media doctor immich` to verify what compose receives. See
+# docs/SETUP-IMMICH.md.
 IMMICH_DB_USERNAME="postgres"
 IMMICH_DB_DATABASE_NAME="immich"
 

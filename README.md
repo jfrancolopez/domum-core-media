@@ -139,9 +139,10 @@ Re-running the same curl command updates everything.
 | `domum-media backup [--check\ | --check-deep [target] \ | --restore]` | Ad-hoc backup, integrity check, or restore |
 | `domum-media snapshot {create\ | list\ | prune}` | btrfs subvolume snapshot management |
 | `domum-media rollback` | Restore a per-service btrfs snapshot interactively |
+| `domum-media doctor immich` | Verify Immich secrets, rendered compose env, fingerprint state, container health, images, and mounts without printing secrets |
 | `domum-media hot {status\|prune [--dry-run]}` | Inspect or prune volatile cache/transcode/staging storage |
 | `domum-media immich refresh-bundle [--force]` | Fetch the latest official Immich release bundle and roll it out after the delay window |
-| `domum-media immich reset-db` | Destructive: wipes Immich Postgres data + fingerprint, then reapplies. Use to adopt a new DB password. |
+| `domum-media immich reset-db [--wipe-uploads]` | Destructive: wipes Immich Postgres data + fingerprint, optionally wipes uploads, then reapplies. Use to adopt a new DB password. |
 
 ---
 
@@ -156,9 +157,12 @@ Re-running the same curl command updates everything.
 - `compose/security/tailscale.yml` — Tailscale userspace-off, host networking
 - `compose/photos/immich.yml` — Immich server, microservices, machine-learning,
   Redis, Postgres (pgvecto.rs). Image refs and update policy live in config.
-  Library and Postgres data bind-mount to `/srv/data/immich/`. The DB password
-  is locked after first apply — see `docs/SETUP-IMMICH.md` for the secret
-  lifecycle and `domum-media immich reset-db` recovery flow.
+  Library and Postgres data bind-mount to `/srv/data/immich/`. Immich secrets
+  stay file-backed under `/etc/domum-core-media/secrets/`; `domum-media apply`
+  exports them into the compose environment and validates the rendered config
+  before deployment. The DB password is locked after first apply — see
+  `docs/SETUP-IMMICH.md` for the secret lifecycle, `domum-media doctor immich`,
+  and the `domum-media immich reset-db` recovery flow.
 - `compose/media/jellyfin.yml` — Jellyfin with durable config and volatile
   cache on the hot tier.
 - `compose/media/plex.yml` — Plex via LinuxServer.io with durable config,
