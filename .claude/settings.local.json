@@ -23,7 +23,18 @@
       "Bash(fi:*)",
       "WebSearch",
       "WebFetch",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(git mv:*)",
+      "Bash(true:*)",
+      "Bash(python3:*)",
+      "Bash(else:*)",
+      "Bash(pip3:*)",
+      "Bash(tmpdir=$:*)",
+      "Bash(envsubst:*)",
+      "Bash(rm:*)",
+      "Bash(git status:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git diff:*)"
     ],
     "deny": [],
     "ask": []

@@ -100,6 +100,116 @@ ensure_secret_dir() {
 ensure_state_dirs() {
   install -d -m 0700 "$DOMUM_STATE_ROOT"
   install -d -m 0700 "$DOMUM_STATE_ROOT/image-updates"
+  install -d -m 0700 "$DOMUM_STATE_ROOT/immich"
+}
+
+immich_postgres_data_dir() {
+  printf '%s/immich/postgres' "$DOMUM_DATA_ROOT"
+}
+
+immich_postgres_marker() {
+  printf '%s/PG_VERSION' "$(immich_postgres_data_dir)"
+}
+
+immich_db_password_file() {
+  printf '%s/immich_db_password' "$SECRETS_DIR"
+}
+
+immich_db_password_fingerprint_file() {
+  printf '%s/immich/db_password.sha256' "$DOMUM_STATE_ROOT"
+}
+
+immich_db_password_initialized() {
+  [[ -f "$(immich_postgres_marker)" ]]
+}
+
+sha256_of_file() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  if cmd_exists sha256sum; then
+    sha256sum "$path" | awk '{print $1}'
+  elif cmd_exists shasum; then
+    shasum -a 256 "$path" | awk '{print $1}'
+  elif cmd_exists openssl; then
+    openssl dgst -sha256 "$path" | awk '{print $NF}'
+  else
+    die "No sha256 utility available (need sha256sum, shasum, or openssl)."
+  fi
+}
+
+write_immich_db_password_fingerprint() {
+  local secret_file fp_file digest
+  secret_file="$(immich_db_password_file)"
+  fp_file="$(immich_db_password_fingerprint_file)"
+  [[ -f "$secret_file" ]] || return 0
+  digest="$(sha256_of_file "$secret_file")"
+  install -d -m 0700 "$(dirname "$fp_file")"
+  umask 077
+  printf '%s\n' "$digest" > "$fp_file"
+  chmod 600 "$fp_file"
+}
+
+validate_immich_db_password_state() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+
+  local secret_file fp_file pg_marker
+  secret_file="$(immich_db_password_file)"
+  fp_file="$(immich_db_password_fingerprint_file)"
+  pg_marker="$(immich_postgres_marker)"
+
+  if [[ ! -f "$secret_file" ]]; then
+    if [[ -f "$pg_marker" ]]; then
+      die "Immich Postgres data exists at $(immich_postgres_data_dir) but the secret $secret_file is missing.
+  Either restore the original password file or run: sudo domum-media immich reset-db"
+    fi
+    die "Immich is enabled but $secret_file is missing. Run: sudo domum-media configure"
+  fi
+
+  if [[ ! -f "$pg_marker" ]]; then
+    # First boot path. apply() will write the fingerprint after compose up.
+    return 0
+  fi
+
+  local current_digest stored_digest
+  current_digest="$(sha256_of_file "$secret_file")"
+
+  if [[ ! -f "$fp_file" ]]; then
+    echo "[domum-media] No Immich DB password fingerprint on disk yet."
+    echo "    Postgres has already been initialized — assuming the current secret is correct and recording the fingerprint."
+    write_immich_db_password_fingerprint
+    return 0
+  fi
+
+  stored_digest="$(head -n1 "$fp_file" | tr -d '[:space:]')"
+
+  if [[ "$current_digest" == "$stored_digest" ]]; then
+    return 0
+  fi
+
+  cat >&2 <<EOF
+[domum-media] ERROR: Immich Postgres password mismatch.
+
+  The password stored in $secret_file
+  does not match what $(immich_postgres_data_dir) was initialized with.
+
+  Postgres only applies POSTGRES_PASSWORD during the very first initdb,
+  so changing the secret after Immich was deployed leaves the database
+  with the old password and Immich looping on auth failure.
+
+  To recover, do exactly one of:
+
+    1. Restore the previous password:
+         sudo domum-media configure
+       and re-enter the password Postgres was born with.
+
+    2. Wipe the existing Immich database (DESTROYS PHOTOS METADATA;
+       blobs in $DOMUM_DATA_ROOT/immich/library are untouched but unusable
+       until you re-import):
+         sudo domum-media immich reset-db
+
+  Refusing to apply.
+EOF
+  exit 1
 }
 
 converge_local_installation() {
@@ -294,6 +404,37 @@ export_env_for_compose() {
     IMMICH_JWT_SECRET="$(cat "$SECRETS_DIR/immich_jwt_secret")"
     export IMMICH_JWT_SECRET
   fi
+}
+
+render_traefik_dynamic() {
+  [[ "${ENABLE_TRAEFIK:-0}" == "1" ]] || return 0
+
+  local dir="$DOMUM_DIR/compose/proxy/traefik/dynamic"
+  [[ -d "$dir" ]] || return 0
+
+  : "${TRAEFIK_DASHBOARD_HOST:?TRAEFIK_DASHBOARD_HOST is empty}"
+  : "${DOMUM_DOMAIN:?DOMUM_DOMAIN is empty}"
+
+  if ! cmd_exists envsubst; then
+    die "envsubst not found. Install gettext-base (apt install -y gettext-base) and retry."
+  fi
+
+  local src dst rendered
+  shopt -s nullglob
+  for src in "$dir"/*.tmpl; do
+    dst="${src%.tmpl}"
+    # envsubst takes the literal '${VAR}' allowlist; we do not want shell expansion here.
+    # shellcheck disable=SC2016
+    rendered="$(envsubst '${TRAEFIK_DASHBOARD_HOST} ${DOMUM_DOMAIN}' < "$src")"
+    if [[ "$rendered" == *'{{'* ]] || printf '%s' "$rendered" | grep -qE '\$\{[A-Z_][A-Z0-9_]*\}'; then
+      die "Unresolved placeholder in $src after render — refusing to write $dst"
+    fi
+    printf '%s' "$rendered" > "$dst.partial"
+    mv "$dst.partial" "$dst"
+    chmod 0644 "$dst"
+    echo "[domum-media] Rendered $(basename "$dst")"
+  done
+  shopt -u nullglob
 }
 
 ensure_networks() {
@@ -619,6 +760,15 @@ configure_service_secrets() {
   fi
 
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    if immich_db_password_initialized; then
+      cat <<EOF
+[domum-media] Immich Postgres is already initialized at $(immich_postgres_data_dir).
+  Changing immich_db_password here will cause 'domum-media apply' to refuse
+  to deploy until you either restore the old value or run:
+      sudo domum-media immich reset-db
+  Press Enter to keep the current value if you do not intend to rotate it.
+EOF
+    fi
     configure_generated_secret_prompt "$SECRETS_DIR/immich_db_password" "Immich database password"
     configure_generated_secret_prompt "$SECRETS_DIR/immich_jwt_secret" "Immich JWT secret"
   fi
@@ -927,7 +1077,7 @@ host_upgrade() {
   apt-get update -y
   apt-get install -y --only-upgrade \
     docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-    tailscale restic btrfs-progs jq apparmor nfs-common rclone
+    tailscale restic btrfs-progs jq apparmor nfs-common rclone gettext-base
   echo "[domum-media] Host package upgrade done."
 }
 
@@ -953,6 +1103,10 @@ init_host() {
       < <(missing_if_absent "$SECRETS_DIR/immich_db_password" "immich_db_password")
     while IFS= read -r item; do [[ -n "$item" ]] && missing+=("$item"); done \
       < <(missing_if_absent "$SECRETS_DIR/immich_jwt_secret" "immich_jwt_secret")
+    if immich_db_password_initialized && [[ ! -f "$(immich_db_password_fingerprint_file)" ]]; then
+      echo "[domum-media] NOTE: Immich Postgres is initialized but no password fingerprint is recorded yet."
+      echo "    The next 'domum-media apply' will assume the current secret is correct and record one."
+    fi
   fi
 
   while IFS= read -r target; do
@@ -1020,11 +1174,25 @@ apply() {
   ensure_networks
   sync_timer_overrides
 
+  local immich_first_boot=0
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]] && ! immich_db_password_initialized; then
+    immich_first_boot=1
+  fi
+  validate_immich_db_password_state
+
+  render_traefik_dynamic
+
   echo "[domum-media] Pre-apply btrfs snapshot..."
   snapshot_create "pre-apply" || echo "[domum-media] Snapshot step failed (continuing)."
 
   echo "[domum-media] Applying desired state..."
   compose_cmd up -d --remove-orphans
+
+  if (( immich_first_boot == 1 )) && immich_db_password_initialized; then
+    write_immich_db_password_fingerprint
+    echo "[domum-media] Recorded Immich DB password fingerprint at $(immich_db_password_fingerprint_file)."
+  fi
+
   echo "[domum-media] apply done."
 }
 
@@ -1083,6 +1251,58 @@ snapshot_cmd() {
   esac
 }
 
+immich_reset_db() {
+  load_cfg
+  export_env_for_compose
+
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || die "Immich is not enabled in $CFG_FILE (ENABLE_IMMICH=0)."
+
+  local data_dir fp_file confirm
+  data_dir="$(immich_postgres_data_dir)"
+  fp_file="$(immich_db_password_fingerprint_file)"
+
+  cat <<EOF
+[domum-media] This will wipe the Immich Postgres database.
+
+  Deletes: $data_dir
+  Clears:  $fp_file
+  Keeps:   $DOMUM_DATA_ROOT/immich/library (photo blobs — unusable until re-import)
+
+  Type exactly 'wipe immich' to confirm.
+EOF
+
+  read -r -p "> " confirm
+  [[ "$confirm" == "wipe immich" ]] || die "Aborted (no changes made)."
+
+  echo "[domum-media] Stopping Immich containers..."
+  compose_cmd stop immich_server immich_machine_learning immich_postgres immich_redis 2>/dev/null || true
+  compose_cmd rm -f immich_server immich_machine_learning immich_postgres immich_redis 2>/dev/null || true
+
+  echo "[domum-media] Pre-reset btrfs snapshot..."
+  snapshot_create "pre-immich-reset" || echo "[domum-media] Snapshot step failed (continuing)."
+
+  if [[ -d "$data_dir" ]]; then
+    echo "[domum-media] Removing $data_dir"
+    rm -rf "$data_dir"
+  fi
+  if [[ -f "$fp_file" ]]; then
+    echo "[domum-media] Removing $fp_file"
+    rm -f "$fp_file"
+  fi
+
+  echo "[domum-media] Reapplying desired state..."
+  exec /usr/local/bin/domum-media apply
+}
+
+immich_cmd() {
+  need_root
+  local sub="${1:-}"
+  case "$sub" in
+    reset-db) shift; immich_reset_db "$@" ;;
+    *) die "Usage: domum-media immich {reset-db}" ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 domum-media (domum-core-media)
@@ -1098,6 +1318,7 @@ Usage:
   domum-media logs <service>
   domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
   domum-media snapshot {create [tag]|list|prune}
+  domum-media immich {reset-db}
 
 Config:  $CFG_FILE
 Secrets: $SECRETS_DIR
@@ -1118,6 +1339,7 @@ main() {
     logs)      shift; logs_cmd "$@" ;;
     backup)    backup_cmd "$@" ;;
     snapshot)  shift; snapshot_cmd "$@" ;;
+    immich)    shift; immich_cmd "$@" ;;
     -h|--help|help|"") usage ;;
     *) usage; exit 1 ;;
   esac

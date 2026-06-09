@@ -29,3 +29,6 @@ logs/
 
 # Local-only Nimbalyst session state
 nimbalyst-local/
+
+# Rendered Traefik dynamic config (sources live as *.tmpl)
+compose/proxy/traefik/dynamic/dashboard.yml
