@@ -34,7 +34,9 @@
       "Bash(rm:*)",
       "Bash(git status:*)",
       "Bash(git check-ignore:*)",
-      "Bash(git diff:*)"
+      "Bash(git diff:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

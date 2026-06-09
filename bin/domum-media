@@ -2395,12 +2395,186 @@ immich_cmd() {
   esac
 }
 
+doctor_traefik() {
+  need_root
+  load_cfg
+  export_env_for_compose
+
+  [[ "${ENABLE_TRAEFIK:-0}" == "1" ]] || die "Traefik is not enabled in $CFG_FILE (ENABLE_TRAEFIK=0)."
+
+  local traefik_status traefik_image started_at ports_raw
+  local entry svc host
+  local -a hosts=()
+
+  traefik_status="$(container_status_summary traefik)"
+  traefik_image="$(container_image_ref traefik)"
+  if container_exists traefik; then
+    started_at="$(docker inspect --format '{{.State.StartedAt}}' traefik 2>/dev/null || true)"
+    ports_raw="$(docker inspect --format '{{range $p, $bindings := .NetworkSettings.Ports}}{{if $bindings}}{{range $bindings}}{{println $p "->" .HostIp ":" .HostPort}}{{end}}{{else}}{{println $p "(no host binding)"}}{{end}}{{end}}' traefik 2>/dev/null || true)"
+  else
+    started_at=""
+    ports_raw=""
+  fi
+
+  echo "Traefik container:"
+  echo "  status: $traefik_status"
+  echo "  image:  ${traefik_image:-unknown}"
+  echo "  started: ${started_at:-n/a}"
+  echo "  ports:"
+  if [[ -n "$ports_raw" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && echo "    $line"
+    done <<<"$ports_raw"
+  else
+    echo "    n/a"
+  fi
+  echo
+
+  hosts+=("dashboard|${TRAEFIK_DASHBOARD_HOST:-}")
+  [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]    && hosts+=("jellyfin|${JELLYFIN_HOST:-}")
+  [[ "${ENABLE_PLEX:-0}" == "1" ]]        && hosts+=("plex|${PLEX_HOST:-}")
+  [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]   && hosts+=("navidrome|${NAVIDROME_HOST:-}")
+  [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]] && hosts+=("calibre-web|${CALIBRE_WEB_HOST:-}")
+  [[ "${ENABLE_KAVITA:-0}" == "1" ]]      && hosts+=("kavita|${KAVITA_HOST:-}")
+  [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]] && hosts+=("uptime-kuma|status.${DOMUM_DOMAIN:-}")
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]]      && hosts+=("immich|photos.${DOMUM_DOMAIN:-}")
+
+  echo "Configured hosts:"
+  for entry in "${hosts[@]}"; do
+    svc="${entry%%|*}"
+    host="${entry#*|}"
+    printf '  %-14s %s\n' "$svc" "${host:-<unset>}"
+  done
+  echo
+
+  local have_dig=0
+  cmd_exists dig && have_dig=1
+
+  echo "DNS resolution:"
+  for entry in "${hosts[@]}"; do
+    svc="${entry%%|*}"
+    host="${entry#*|}"
+    [[ -n "$host" ]] || continue
+    local split_view public_view
+    split_view="$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | paste -sd, - 2>/dev/null || true)"
+    [[ -z "$split_view" ]] && split_view="<unresolved>"
+    if (( have_dig )); then
+      public_view="$(dig +short +time=2 +tries=1 @1.1.1.1 "$host" 2>/dev/null | paste -sd, - || true)"
+      [[ -z "$public_view" ]] && public_view="<unresolved>"
+    else
+      public_view="<dig unavailable>"
+    fi
+    printf '  %-14s split=%s public=%s\n' "$svc" "$split_view" "$public_view"
+  done
+  echo
+
+  echo "acme.json:"
+  if container_exists traefik; then
+    local acme_source acme_file
+    acme_source="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/letsencrypt"}}{{.Source}}{{end}}{{end}}' traefik 2>/dev/null || true)"
+    if [[ -n "$acme_source" ]]; then
+      acme_file="$acme_source/acme.json"
+      if [[ -f "$acme_file" ]]; then
+        local size mode owner issued_hosts state
+        size="$(stat -c '%s' "$acme_file" 2>/dev/null || echo 'unknown')"
+        mode="$(stat -c '%a' "$acme_file" 2>/dev/null || echo 'unknown')"
+        owner="$(stat -c '%U:%G' "$acme_file" 2>/dev/null || echo 'unknown')"
+        echo "  path: $acme_file"
+        echo "  size: $size bytes"
+        echo "  mode: $mode"
+        echo "  owner: $owner"
+
+        issued_hosts=""
+        if cmd_exists jq; then
+          issued_hosts="$(jq -r '
+            (.cf.Certificates // [])
+              | map(.domain.main, (.domain.sans // [])[])
+              | unique
+              | .[]
+          ' "$acme_file" 2>/dev/null || true)"
+        fi
+
+        echo "  per-host certificate state:"
+        for entry in "${hosts[@]}"; do
+          svc="${entry%%|*}"
+          host="${entry#*|}"
+          [[ -n "$host" ]] || continue
+          if ! cmd_exists jq; then
+            state="unknown (jq not installed)"
+          elif [[ -n "$issued_hosts" ]] && printf '%s\n' "$issued_hosts" | grep -Fxq -- "$host"; then
+            state="issued"
+          else
+            state="missing"
+          fi
+          printf '    %-14s %-40s %s\n' "$svc" "$host" "$state"
+        done
+      else
+        echo "  path: $acme_file (missing)"
+      fi
+    else
+      echo "  unable to resolve traefik-letsencrypt mount source from docker inspect"
+    fi
+  else
+    echo "  traefik container is not running"
+  fi
+  echo
+
+  echo "Cloudflare token:"
+  local cf_token=""
+  if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
+    cf_token="$(read_secret_file_value "$SECRETS_DIR/cloudflare_api_token")"
+  fi
+  if [[ -z "$cf_token" ]]; then
+    echo "  secret file: missing or empty ($SECRETS_DIR/cloudflare_api_token)"
+  elif ! cmd_exists curl; then
+    echo "  curl not installed — skipping token verify"
+  else
+    local resp
+    resp="$(curl -sS --max-time 10 \
+      -H "Authorization: Bearer $cf_token" \
+      -H "Content-Type: application/json" \
+      "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>&1 || true)"
+    if cmd_exists jq && jq -e . >/dev/null 2>&1 <<<"$resp"; then
+      local success status_field expires not_before
+      success="$(jq -r '.success' <<<"$resp")"
+      status_field="$(jq -r '.result.status // "unknown"' <<<"$resp")"
+      expires="$(jq -r '.result.expires_on // "n/a"' <<<"$resp")"
+      not_before="$(jq -r '.result.not_before // "n/a"' <<<"$resp")"
+      echo "  success: $success"
+      echo "  status: $status_field"
+      echo "  not_before: $not_before"
+      echo "  expires_on: $expires"
+      if [[ "$success" != "true" ]]; then
+        echo "  errors:"
+        jq -r '.errors[]? | "    [\(.code)] \(.message)"' <<<"$resp" || true
+      fi
+    else
+      echo "  raw response: $resp"
+    fi
+  fi
+  echo
+
+  echo "Recent ACME log lines:"
+  if container_exists traefik; then
+    local logs
+    logs="$(docker logs traefik 2>&1 | grep -iE 'acme|certificate|cf:' | tail -n 40 || true)"
+    if [[ -n "$logs" ]]; then
+      sed 's/^/  /' <<<"$logs"
+    else
+      echo "  (no ACME-related log lines found)"
+    fi
+  else
+    echo "  traefik container is not running"
+  fi
+}
+
 doctor_cmd() {
   need_root
   local sub="${1:-}"
   case "$sub" in
     immich) shift; doctor_immich "$@" ;;
-    *) die "Usage: domum-media doctor immich" ;;
+    traefik) shift; doctor_traefik "$@" ;;
+    *) die "Usage: domum-media doctor {immich|traefik}" ;;
   esac
 }
 
@@ -2422,6 +2596,7 @@ Usage:
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback
   domum-media doctor immich
+  domum-media doctor traefik
   domum-media hot {status|prune [--dry-run]}
   domum-media immich {refresh-bundle [--force]|reset-db [--wipe-uploads]}
 
