@@ -15,9 +15,9 @@ services:
       VERSION: docker
       PLEX_CLAIM: ${PLEX_CLAIM}
     volumes:
-      - ${PLEX_CONFIG_DIR}:/config
-      - ${PLEX_TRANSCODE_DIR}:/transcode
-      - ${PLEX_MEDIA_ROOT}:/media:ro
+      - ${PLEX_CONFIG_DIR:?PLEX_CONFIG_DIR is required}:/config
+      - ${PLEX_TRANSCODE_DIR:?PLEX_TRANSCODE_DIR is required}:/transcode
+      - ${PLEX_MEDIA_ROOT:?PLEX_MEDIA_ROOT is required}:/media:ro
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy

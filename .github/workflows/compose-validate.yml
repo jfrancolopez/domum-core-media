@@ -26,44 +26,11 @@ jobs:
         run: tests/immich-secret-propagation-smoke.sh
 
       - name: docker compose config (every fragment layered on base)
-        env:
-          # Provide harmless defaults so envsubst-style variables don't break
-          # `compose config`. Real values come from the host at runtime.
-          CF_DNS_API_TOKEN: dummy
-          DOMUM_DOMAIN: example.com
-          DOMUM_EMAIL: ci@example.com
-          DOMUM_LAN_IP: 10.0.0.1
-          DOMUM_TS_IP: 100.64.0.1
-          # Image refs must match the *_IMAGE vars used in compose fragments.
-          TRAEFIK_IMAGE: "traefik:v3.7.1"
-          TRAEFIK_DASHBOARD_HOST: traefik-media.example.com
-          TAILSCALE_IMAGE: "tailscale/tailscale:stable"
-          TS_AUTHKEY: dummy
-          IMMICH_SERVER_IMAGE: "ghcr.io/immich-app/immich-server:v1.118.2"
-          IMMICH_MACHINE_LEARNING_IMAGE: "ghcr.io/immich-app/immich-machine-learning:v1.118.2"
-          IMMICH_REDIS_IMAGE: "docker.io/redis:6.2-alpine"
-          IMMICH_POSTGRES_IMAGE: "tensorchord/pgvecto-rs:pg14-v0.2.0"
-          IMMICH_DB_USERNAME: postgres
-          IMMICH_DB_PASSWORD: dummy
-          IMMICH_DB_DATABASE_NAME: immich
-          IMMICH_JWT_SECRET: dummy
-          JELLYFIN_IMAGE: "jellyfin/jellyfin:10.10.7"
-          JELLYFIN_CONFIG_DIR: /srv/data/jellyfin/config
-          JELLYFIN_CACHE_DIR: /srv/data/jellyfin/cache
-          JELLYFIN_MEDIA_ROOT: /srv/media
-          NAVIDROME_IMAGE: "deluan/navidrome:0.61.2"
-          NAVIDROME_DATA_DIR: /srv/data/navidrome
-          NAVIDROME_MUSIC_ROOT: /srv/music
-          NAVIDROME_USER: "0:0"
-          NAVIDROME_SCAN_SCHEDULE: "@every 1h"
-          NAVIDROME_LOG_LEVEL: info
-          UPTIME_KUMA_IMAGE: "louislam/uptime-kuma:1"
-          RESTIC_REST_SERVER_IMAGE: "restic/rest-server:latest"
         run: |
           set -euo pipefail
           args=(-f compose/base.yml)
           while IFS= read -r f; do
             args+=(-f "$f")
           done < <(find compose -name '*.yml' -not -path 'compose/base.yml' -not -path '*/traefik/*' | sort)
-          echo "Running: docker compose ${args[*]} config -q"
-          docker compose "${args[@]}" config -q
+          echo "Running: docker compose --env-file config/ci.env ${args[*]} config -q"
+          docker compose --env-file config/ci.env "${args[@]}" config -q

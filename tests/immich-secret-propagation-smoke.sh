@@ -18,8 +18,9 @@ HOT_DIR="$TMP_DIR/hot"
 LOG_DIR="$TMP_DIR/log"
 SNAPSHOT_DIR="$TMP_DIR/snapshots"
 FAKE_BIN="$TMP_DIR/bin"
+FAKE_STATE="$TMP_DIR/docker-state"
 
-mkdir -p "$SECRETS_DIR" "$STATE_DIR" "$DATA_DIR" "$HOT_DIR" "$LOG_DIR" "$SNAPSHOT_DIR" "$FAKE_BIN"
+mkdir -p "$SECRETS_DIR" "$STATE_DIR" "$DATA_DIR" "$HOT_DIR" "$LOG_DIR" "$SNAPSHOT_DIR" "$FAKE_BIN" "$FAKE_STATE"
 
 cat > "$CFG_FILE" <<EOF
 ENABLE_IMMICH=1
@@ -58,7 +59,30 @@ services:
       POSTGRES_PASSWORD: "${IMMICH_DB_PASSWORD:-}"
 YAML
     ;;
+  up)
+    mkdir -p "${FAKE_DOCKER_STATE:?}"
+    cat > "${FAKE_DOCKER_STATE}/immich_server.env" <<ENV
+DB_PASSWORD=${IMMICH_DB_PASSWORD:-}
+JWT_SECRET=${IMMICH_JWT_SECRET:-}
+ENV
+    cat > "${FAKE_DOCKER_STATE}/immich_postgres.env" <<ENV
+POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD:-}
+ENV
+    ;;
+  ps)
+    case "${3:-}" in
+      immich_server) echo immich_server ;;
+      immich_postgres) echo immich_postgres ;;
+    esac
+    ;;
   *)
+    if [[ "${1:-}" == "inspect" ]]; then
+      if [[ "${2:-}" == "--format" ]]; then
+        cat "${FAKE_DOCKER_STATE:?}/${4}.env"
+      else
+        [[ -f "${FAKE_DOCKER_STATE:?}/${2}.env" ]]
+      fi
+    fi
     exit 0
     ;;
 esac
@@ -66,6 +90,7 @@ EOF
 chmod +x "$FAKE_BIN/docker"
 
 export PATH="$FAKE_BIN:$PATH"
+export FAKE_DOCKER_STATE="$FAKE_STATE"
 export DOMUM_DIR="$REPO_ROOT"
 export CFG_FILE
 export SECRETS_DIR
@@ -73,9 +98,10 @@ export SECRETS_DIR
 # shellcheck disable=SC1090
 source "$REPO_ROOT/bin/domum-media"
 
-# The host CLI's compose_cmd uses mapfile, which is fine on the Debian target
-# host. Override it here so the smoke test also runs under older local bash.
+# Keep the smoke test working under older local bash while still exercising
+# the same runtime env loading path used by the real compose wrapper.
 compose_cmd() {
+  export_env_for_compose
   docker compose "$@"
 }
 
@@ -102,5 +128,7 @@ POSTGRES_PASSWORD="$(yaml_scalar_plaintext "$(compose_rendered_env_value "$RENDE
 [[ "$SERVER_JWT_SECRET" == "jwt-secret-456?=" ]] || fail "immich_server JWT_SECRET did not match the JWT secret file"
 
 validate_immich_compose_config
+compose_cmd up -d immich_server immich_postgres
+validate_immich_runtime_env
 
 echo "PASS: Immich secret propagation smoke test"

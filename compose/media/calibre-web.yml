@@ -12,8 +12,8 @@ services:
       TZ: ${TZ}
       DOCKER_MODS: linuxserver/mods:universal-calibre
     volumes:
-      - ${CALIBRE_WEB_CONFIG_DIR}:/config
-      - ${CALIBRE_WEB_LIBRARY_DIR}:/books
+      - ${CALIBRE_WEB_CONFIG_DIR:?CALIBRE_WEB_CONFIG_DIR is required}:/config
+      - ${CALIBRE_WEB_LIBRARY_DIR:?CALIBRE_WEB_LIBRARY_DIR is required}:/books
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy

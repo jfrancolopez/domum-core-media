@@ -7,9 +7,9 @@ services:
       - domum-proxy
       - domum-internal
     volumes:
-      - ${JELLYFIN_CONFIG_DIR}:/config
-      - ${JELLYFIN_CACHE_DIR}:/cache
-      - ${JELLYFIN_MEDIA_ROOT}:/media:ro
+      - ${JELLYFIN_CONFIG_DIR:?JELLYFIN_CONFIG_DIR is required}:/config
+      - ${JELLYFIN_CACHE_DIR:?JELLYFIN_CACHE_DIR is required}:/cache
+      - ${JELLYFIN_MEDIA_ROOT:?JELLYFIN_MEDIA_ROOT is required}:/media:ro
     environment:
       JELLYFIN_PublishedServerUrl: https://${JELLYFIN_HOST}
     labels:

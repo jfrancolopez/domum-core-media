@@ -17,11 +17,11 @@ services:
     environment:
       UPLOAD_LOCATION: /usr/src/app/upload
       DB_HOSTNAME: immich_postgres
-      DB_USERNAME: ${IMMICH_DB_USERNAME}
-      DB_PASSWORD: ${IMMICH_DB_PASSWORD}
-      DB_DATABASE_NAME: ${IMMICH_DB_DATABASE_NAME}
+      DB_USERNAME: ${IMMICH_DB_USERNAME:-postgres}
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD:?IMMICH_DB_PASSWORD is required}
+      DB_DATABASE_NAME: ${IMMICH_DB_DATABASE_NAME:-immich}
       REDIS_HOSTNAME: immich_redis
-      JWT_SECRET: ${IMMICH_JWT_SECRET}
+      JWT_SECRET: ${IMMICH_JWT_SECRET:?IMMICH_JWT_SECRET is required}
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy
@@ -56,9 +56,9 @@ services:
     networks:
       - domum-internal
     environment:
-      POSTGRES_USER: ${IMMICH_DB_USERNAME}
-      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD}
-      POSTGRES_DB: ${IMMICH_DB_DATABASE_NAME}
+      POSTGRES_USER: ${IMMICH_DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD:?IMMICH_DB_PASSWORD is required}
+      POSTGRES_DB: ${IMMICH_DB_DATABASE_NAME:-immich}
       POSTGRES_INITDB_ARGS: "--data-checksums"
     volumes:
       - /srv/data/immich/postgres:/var/lib/postgresql/data
@@ -67,9 +67,9 @@ services:
         - CMD
         - pg_isready
         - -U
-        - ${IMMICH_DB_USERNAME}
+        - ${IMMICH_DB_USERNAME:-postgres}
         - -d
-        - ${IMMICH_DB_DATABASE_NAME}
+        - ${IMMICH_DB_DATABASE_NAME:-immich}
       interval: 10s
       timeout: 5s
       retries: 5

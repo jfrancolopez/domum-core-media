@@ -175,6 +175,17 @@ load_immich_secret_exports() {
   fi
 }
 
+load_runtime_secrets() {
+  unset CF_DNS_API_TOKEN
+
+  if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
+    CF_DNS_API_TOKEN="$(read_secret_file_value "$SECRETS_DIR/cloudflare_api_token")"
+    export CF_DNS_API_TOKEN
+  fi
+
+  load_immich_secret_exports
+}
+
 validate_immich_secret_exports() {
   [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
 
@@ -709,12 +720,7 @@ export_env_for_compose() {
   export HOST_PACKAGE_AUTO_UPDATE_ENABLED="${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}"
   export HOST_PACKAGE_AUTO_UPDATE_AT="${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}"
   export HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
-
-  if [[ -f "$SECRETS_DIR/cloudflare_api_token" ]]; then
-    CF_DNS_API_TOKEN="$(<"$SECRETS_DIR/cloudflare_api_token")"
-    export CF_DNS_API_TOKEN
-  fi
-  load_immich_secret_exports
+  load_runtime_secrets
 }
 
 render_traefik_dynamic() {
@@ -781,6 +787,7 @@ ensure_dirs() {
 
 compose_cmd() {
   local -a args
+  export_env_for_compose
   mapfile -t args < <(compose_files_for_enabled_services)
   cd "$DOMUM_DIR"
   docker compose "${args[@]}" "$@"
@@ -1865,6 +1872,7 @@ apply() {
 
   echo "[domum-media] Applying desired state..."
   compose_cmd up -d --remove-orphans
+  validate_immich_runtime_env
 
   if (( immich_first_boot == 1 )) && immich_db_password_initialized; then
     write_immich_db_password_fingerprint
@@ -2050,6 +2058,58 @@ container_exists() {
   docker inspect "$1" >/dev/null 2>&1
 }
 
+container_env_value() {
+  local container_name="$1"
+  local env_key="$2"
+
+  container_exists "$container_name" || return 0
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" 2>/dev/null \
+    | awk -F= -v key="$env_key" '$1 == key {print substr($0, length(key) + 2); exit}'
+}
+
+immich_runtime_env_summary() {
+  local server_db server_jwt postgres_db
+  local server_db_status="empty"
+  local server_jwt_status="empty"
+  local postgres_db_status="empty"
+  local db_match="no"
+
+  server_db="$(container_env_value immich_server DB_PASSWORD)"
+  server_jwt="$(container_env_value immich_server JWT_SECRET)"
+  postgres_db="$(container_env_value immich_postgres POSTGRES_PASSWORD)"
+
+  [[ -n "$server_db" ]] && server_db_status="set"
+  [[ -n "$server_jwt" ]] && server_jwt_status="set"
+  [[ -n "$postgres_db" ]] && postgres_db_status="set"
+  if [[ -n "$server_db" && -n "$postgres_db" && "$server_db" == "$postgres_db" ]]; then
+    db_match="yes"
+  fi
+
+  echo "  immich_server DB_PASSWORD: $server_db_status"
+  echo "  immich_server JWT_SECRET: $server_jwt_status"
+  echo "  immich_postgres POSTGRES_PASSWORD: $postgres_db_status"
+  echo "  DB_PASSWORD == POSTGRES_PASSWORD: $db_match"
+}
+
+validate_immich_runtime_env() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+
+  local server_db server_jwt postgres_db
+  server_db="$(container_env_value immich_server DB_PASSWORD)"
+  server_jwt="$(container_env_value immich_server JWT_SECRET)"
+  postgres_db="$(container_env_value immich_postgres POSTGRES_PASSWORD)"
+
+  if [[ -z "$server_db" || -z "$server_jwt" || -z "$postgres_db" || "$server_db" != "$postgres_db" ]]; then
+    echo "[domum-media] Runtime Immich env validation:"
+    immich_runtime_env_summary
+    echo "[domum-media] ERROR: Rendered Compose validation passed, but running containers have empty Immich secrets. This means docker compose up did not receive the runtime secret environment." >&2
+    exit 1
+  fi
+
+  echo "[domum-media] Runtime Immich env validation:"
+  immich_runtime_env_summary
+}
+
 container_status_summary() {
   local container_name="$1"
   local status health
@@ -2201,6 +2261,14 @@ doctor_immich() {
   fi
   rm -f "$rendered_file"
 
+  if [[ -z "$(container_env_value immich_server DB_PASSWORD)" \
+     || -z "$(container_env_value immich_server JWT_SECRET)" \
+     || -z "$(container_env_value immich_postgres POSTGRES_PASSWORD)" ]]; then
+    issues=1
+  elif [[ "$(container_env_value immich_server DB_PASSWORD)" != "$(container_env_value immich_postgres POSTGRES_PASSWORD)" ]]; then
+    issues=1
+  fi
+
   postgres_status="$(container_status_summary immich_postgres)"
   redis_status="$(container_status_summary immich_redis)"
   ml_status="$(container_status_summary immich_machine_learning)"
@@ -2219,11 +2287,14 @@ doctor_immich() {
   echo "  IMMICH_DB_PASSWORD: $db_export_status"
   echo "  IMMICH_JWT_SECRET: $jwt_export_status"
   echo
-  echo "Compose env:"
+  echo "Rendered compose env:"
   echo "  DB_PASSWORD: $compose_db_status"
   echo "  POSTGRES_PASSWORD: $compose_pg_status"
   echo "  JWT_SECRET: $compose_jwt_status"
   echo "  DB_PASSWORD == POSTGRES_PASSWORD: $compose_db_match"
+  echo
+  echo "Running container env:"
+  immich_runtime_env_summary
   echo
   echo "Database:"
   echo "  data path: $pg_dir"
