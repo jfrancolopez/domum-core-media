@@ -369,6 +369,10 @@ do_daily_backup() {
   (( ran_any == 1 )) || die "No enabled backup targets configured."
 
   heartbeat
+  if [[ "${RECOVERY_PACK_ENABLED:-1}" == "1" ]] && command -v /usr/local/bin/domum-media >/dev/null 2>&1; then
+    log "refresh recovery-pack"
+    /usr/local/bin/domum-media recovery-pack create --no-email || log "recovery-pack refresh failed"
+  fi
   log "=== daily backup ok ==="
 }
 

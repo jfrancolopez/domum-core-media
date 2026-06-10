@@ -1,152 +1,152 @@
 # restic setup
 
-At least two repos. Never one. **Initialise every enabled target manually
-before the timer fires.**
+Use at least two targets.
 
-| Repo | Transport | Why |
-| --- | --- | --- |
-| `nas` | `rest:` (REST server in append-only mode) or NFS | Fast local restore |
-| `cloud` | Backblaze B2 (`b2:bucket:/path`) | Off-site, geo-separated |
-| `archive` | FTP via `rclone:` or another restic backend | Optional third copy |
+## Recommended layout
 
-The easiest path now is to run `sudo domum-media configure` and fill in the
-backup target section instead of hand-maintaining multiple env files. The
-wizard can also create the restic password files, backend env files, and FTP
-credentials for any enabled target.
+- `nas`: fast local restore
+- `cloud`: off-site copy
+- `archive`: optional third target
 
-## 1. Generate passwords
+Configure them through:
 
-```
-openssl rand -base64 48 | sudo tee /etc/domum-core-media/secrets/restic_password_nas   >/dev/null
-openssl rand -base64 48 | sudo tee /etc/domum-core-media/secrets/restic_password_cloud >/dev/null
-sudo chmod 600 /etc/domum-core-media/secrets/restic_password_{nas,cloud}
+```bash
+sudo domum-media configure
 ```
 
-### Password escrow (NOT optional)
+The wizard writes the `BACKUP_TARGET_*` config blocks and can create:
 
-A lost restic password means the backups are useless. Place each password in
-**both** of these durable locations before you run the first backup:
+- restic password files
+- backend env files
+- FTP credential files
 
-1. **Sealed envelope**, stored with your other vital documents (birth certs,
-   etc.). Print the password, seal the envelope, sign across the flap.
-2. **Password manager** whose recovery does not depend on this house — i.e.,
-   if the house burns, you can still restore the password manager from a
-   recovery code you keep elsewhere.
+## Initialize repositories
 
-Print them. Seal them. Stash them. Then proceed.
+After configuration, initialize each enabled repo manually.
 
-## 2. Choose how to define each target
+Example:
 
-### Option A: use the config file directly
-
-In `config/domum-media.conf`, set the enabled targets and fill the matching
-`BACKUP_TARGET_*` block. For a normal restic backend, paste the repository
-string directly:
-
-```
-BACKUP_TARGET_NAS_TYPE="repository"
-BACKUP_TARGET_NAS_REPOSITORY="rest:http://nas-host:8000/domum-media"
-BACKUP_TARGET_NAS_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_nas"
-```
-
-If that backend also needs credential exports, point the target at an env file:
-
-```
-BACKUP_TARGET_CLOUD_TYPE="repository"
-BACKUP_TARGET_CLOUD_REPOSITORY="b2:your-bucket-name:/domum-media"
-BACKUP_TARGET_CLOUD_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_cloud"
-BACKUP_TARGET_CLOUD_ENV_FILE="/etc/domum-core-media/secrets/restic_cloud_env"
-```
-
-For NFS:
-
-```
-BACKUP_TARGET_ARCHIVE_TYPE="nfs"
-BACKUP_TARGET_ARCHIVE_NFS_REMOTE="nas.example:/exports/domum-media"
-BACKUP_TARGET_ARCHIVE_NFS_MOUNT_POINT="/mnt/domum-media-archive"
-BACKUP_TARGET_ARCHIVE_REPOSITORY="/mnt/domum-media-archive/restic"
-BACKUP_TARGET_ARCHIVE_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_archive"
-```
-
-For FTP, the wrapper uses restic's `rclone:` backend and reads the FTP
-username/password from files under `/etc/domum-core-media/secrets/`.
-
-### Option B: keep the legacy per-repo env files
-
-The old `restic_nas_env` / `restic_cloud_env` files are still supported as a
-fallback for repository-style targets.
-
-## 3. Write the per-repo env files
-
-`/etc/domum-core-media/secrets/restic_nas_env`:
-
-```
-export RESTIC_REPOSITORY="rest:http://<nas-host>:8000/domum-media/"
-# If your rest-server is auth'd:
-# export RESTIC_REPOSITORY="rest:http://user:pass@<nas-host>:8000/domum-media/"
-```
-
-`/etc/domum-core-media/secrets/restic_cloud_env`:
-
-```
-export RESTIC_REPOSITORY="b2:your-bucket-name:/domum-media"
-export B2_ACCOUNT_ID="<application-key-id>"
-export B2_ACCOUNT_KEY="<application-key>"
-```
-
-`chmod 600` both, root-owned.
-
-For the NAS: run a `rest-server` somewhere with `--append-only` so a
-compromised N100 can write new snapshots but cannot delete or rewrite old
-ones. Append-only mode is *the* reason we use `rest-server` over `sftp:`.
-
-## 4. Initialise the repos
-
-```
-sudo bash -c '. /etc/domum-core-media/secrets/restic_nas_env;   RESTIC_PASSWORD_FILE=/etc/domum-core-media/secrets/restic_password_nas   restic init'
+```bash
+sudo bash -c '. /etc/domum-core-media/secrets/restic_nas_env; RESTIC_PASSWORD_FILE=/etc/domum-core-media/secrets/restic_password_nas restic init'
 sudo bash -c '. /etc/domum-core-media/secrets/restic_cloud_env; RESTIC_PASSWORD_FILE=/etc/domum-core-media/secrets/restic_password_cloud restic init'
 ```
 
-## 5. Run the first backup manually
+## First run
 
-```
+```bash
 sudo /usr/local/bin/domum-media-backup
-```
-
-Then verify:
-
-```
 sudo /usr/local/bin/domum-media-backup --check
 ```
 
-Both should be clean before you trust the timer.
+## Recovery-pack setup
 
-## 6. Verification cadence
+The recovery pack is a small encrypted tarball (~50–200 KB) containing:
 
-| Cadence | What | How |
-| --- | --- | --- |
-| Daily 02:30 | Full backup → every enabled target, plus daily-retention targets | `domum-media-backup.timer` |
-| Weekly Sun 03:30 | `restic check` on enabled targets + weekly-retention targets | `domum-media-check.timer` |
-| Monthly | `restic check --read-data-subset=10%` on one target | `domum-media-backup --check-deep [target]` |
-| Quarterly | Full `--read-data` on one target + manual restore drill | `domum-media-backup --check-cloud-deep [target]` + `domum-media-dr-reminder.timer` |
+- `/etc/domum-core-media/secrets/` (minus large key material)
+- `config/domum-media.conf`
+- current image manifest and service list
+- latest restic snapshot IDs and timestamps
+- auto-generated disaster-recovery README
 
-The deep checks are still manual by default. If you want them scheduled,
-create an extra timer or add a calendar reminder.
+It is **not** a data backup — Immich photos and media files are never included.
+Its purpose is to reconstruct the system configuration quickly after a disaster,
+when combined with the git repo and a real restic restore.
 
-## If Debian's restic version is too old
+### 1. Generate an age keypair
 
-Some restic features (compression in v0.14, official Backblaze B2 auth
-improvements) need a newer version than Debian ships. Pinned binary install:
-
-```
-RESTIC_VER=0.17.3
-curl -fsSL -o /tmp/restic.bz2 \
-  https://github.com/restic/restic/releases/download/v${RESTIC_VER}/restic_${RESTIC_VER}_linux_amd64.bz2
-bunzip2 /tmp/restic.bz2
-install -m 0755 /tmp/restic /usr/local/bin/restic
-rm -f /tmp/restic
-restic version
+```bash
+sudo apt-get install -y age
+age-keygen -o /tmp/recovery_key.txt
+# Output: Public key: age1...
 ```
 
-`/usr/local/bin` takes precedence over `/usr/bin`, so the wrapper will pick it
-up without further changes.
+Store the private key somewhere safe (password manager, printed copy):
+
+```bash
+cat /tmp/recovery_key.txt   # keep the full "AGE-SECRET-KEY-1..." line
+shred -u /tmp/recovery_key.txt
+```
+
+### 2. Register the public key
+
+```bash
+sudo mkdir -p /etc/domum-core-media/secrets
+echo "age1..." | sudo tee /etc/domum-core-media/secrets/recovery_pack_pubkey
+sudo chmod 600 /etc/domum-core-media/secrets/recovery_pack_pubkey
+```
+
+### 3. Configure recovery-pack vars
+
+Edit `config/domum-media.conf` (copy from `config/domum-media.conf.example`):
+
+```bash
+RECOVERY_PACK_ENABLED=1
+RECOVERY_PACK_ENCRYPTION=age
+RECOVERY_PACK_AGE_PUBKEY_FILE="/etc/domum-core-media/secrets/recovery_pack_pubkey"
+RECOVERY_PACK_DEST="/var/lib/domum-media/recovery-pack"
+RECOVERY_PACK_REMINDER_DAYS=30
+```
+
+Optional SMTP delivery (sends the pack to your inbox after each creation):
+
+```bash
+RECOVERY_PACK_EMAIL_ENABLED=1
+RECOVERY_PACK_EMAIL_TO="you@gmail.com"
+RECOVERY_PACK_EMAIL_FROM="domum@ladomum.com"
+RECOVERY_PACK_SMTP_HOST="smtp.gmail.com"
+RECOVERY_PACK_SMTP_PORT="465"
+RECOVERY_PACK_SMTP_USERNAME_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_username"
+RECOVERY_PACK_SMTP_PASSWORD_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_password"
+```
+
+For Gmail, use an [App Password](https://myaccount.google.com/apppasswords), not your account password.
+
+### 4. Create the first pack
+
+```bash
+sudo domum-media recovery-pack create
+```
+
+Verify it was written:
+
+```bash
+sudo domum-media recovery-pack status
+```
+
+### 5. Inspect the pack (optional)
+
+```bash
+# List contents without decrypting
+age -d -i /path/to/private_key.txt \
+  /var/lib/domum-media/recovery-pack/recovery-pack-*.tar.gz.age \
+  | tar -tzvf -
+```
+
+### 6. Restore from the pack
+
+On a fresh Debian install after a disaster:
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/jfrancolopez/domum-core-media /opt/domum-core-media
+cd /opt/domum-core-media && bash install.sh
+
+# 2. Decrypt and unpack
+age -d -i /path/to/private_key.txt recovery-pack-YYYYMMDD.tar.gz.age \
+  | tar -xzvf - -C /
+
+# 3. Re-initialize restic repos and restore data
+sudo domum-media recovery-pack restore
+```
+
+### Recovery-pack and daily backups
+
+After a successful daily backup, the backup wrapper refreshes the encrypted
+recovery pack if `RECOVERY_PACK_ENABLED=1`. That means the DR bundle stays near
+the backup cadence without being mixed into the large data payload itself.
+
+Create it manually anytime with:
+
+```bash
+sudo domum-media recovery-pack create
+```

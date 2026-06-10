@@ -48,12 +48,13 @@ require_network() {
 }
 
 install_prereqs() {
-  echo "[domum-media] Installing prereqs (curl, git, gnupg, btrfs-progs, jq, apparmor, nfs-common, rclone, gettext-base)..."
+  echo "[domum-media] Installing prereqs (curl, git, gnupg, btrfs-progs, jq, apparmor, nfs-common, rclone, gettext-base, unattended-upgrades, age)..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y --no-install-recommends \
     ca-certificates curl git gnupg lsb-release \
-    btrfs-progs jq apparmor nfs-common rclone gettext-base
+    btrfs-progs jq apparmor nfs-common rclone gettext-base \
+    unattended-upgrades apt-listchanges age
 }
 
 install_docker() {
@@ -67,6 +68,7 @@ install_docker() {
 
   local arch codename
   arch="$(dpkg --print-architecture)"
+  # shellcheck disable=SC1091
   codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
 
   echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${codename} stable" \
@@ -89,6 +91,7 @@ install_tailscale() {
 
   echo "[domum-media] Installing Tailscale from pkgs.tailscale.com..."
   local codename
+  # shellcheck disable=SC1091
   codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
 
   curl -fsSL "https://pkgs.tailscale.com/stable/debian/${codename}.noarmor.gpg" \
@@ -170,7 +173,10 @@ print_next_steps() {
 
   4. Initialise restic repos and run first backup — see docs/SETUP-RESTIC.md.
 
-  5. Run the disaster-recovery drill — see docs/disaster-recovery.md.
+  5. Create the encrypted recovery pack:
+       sudo domum-media recovery-pack create
+
+  6. Run the disaster-recovery drill — see docs/disaster-recovery.md.
 
 Re-run this curl command anytime to converge.
 EOF

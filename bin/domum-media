@@ -9,6 +9,7 @@ DOMUM_DIR="${DOMUM_DIR:-/opt/domum-core-media}"
 CFG_FILE="${CFG_FILE:-$DOMUM_DIR/config/domum-media.conf}"
 SECRETS_DIR="${SECRETS_DIR:-/etc/domum-core-media/secrets}"
 DATA_ROOT_DEFAULT="/srv/data"
+MEDIA_ROOT_DEFAULT="/srv/media"
 SNAPSHOT_ROOT_DEFAULT="/srv/snapshots"
 LOG_DIR_DEFAULT="/var/log/domum-media"
 STATE_ROOT_DEFAULT="/var/lib/domum-media"
@@ -31,12 +32,30 @@ load_cfg() {
   # shellcheck disable=SC1090
   source "$CFG_FILE"
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
+  DOMUM_MEDIA_ROOT="${DOMUM_MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
   DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-$SNAPSHOT_ROOT_DEFAULT}"
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
   DOMUM_STATE_ROOT="${DOMUM_STATE_ROOT:-$STATE_ROOT_DEFAULT}"
   DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
   BACKUP_POLICY="${BACKUP_POLICY:-STRICT}"
   BACKUP_REQUIRED_MAX_AGE_HOURS="${BACKUP_REQUIRED_MAX_AGE_HOURS:-48}"
+  AUTO_ROLLBACK_ENABLED="${AUTO_ROLLBACK_ENABLED:-1}"
+  RECOVERY_PACK_ENABLED="${RECOVERY_PACK_ENABLED:-1}"
+  RECOVERY_PACK_ENCRYPTION="${RECOVERY_PACK_ENCRYPTION:-age}"
+  RECOVERY_PACK_AGE_PUBKEY_FILE="${RECOVERY_PACK_AGE_PUBKEY_FILE:-$SECRETS_DIR/recovery_pack_pubkey}"
+  RECOVERY_PACK_DEST="${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}"
+  RECOVERY_PACK_REMINDER_DAYS="${RECOVERY_PACK_REMINDER_DAYS:-30}"
+  RECOVERY_PACK_EMAIL_ENABLED="${RECOVERY_PACK_EMAIL_ENABLED:-0}"
+  RECOVERY_PACK_EMAIL_TO="${RECOVERY_PACK_EMAIL_TO:-${DOMUM_EMAIL:-}}"
+  RECOVERY_PACK_EMAIL_FROM="${RECOVERY_PACK_EMAIL_FROM:-${DOMUM_EMAIL:-}}"
+  RECOVERY_PACK_SMTP_HOST="${RECOVERY_PACK_SMTP_HOST:-}"
+  RECOVERY_PACK_SMTP_PORT="${RECOVERY_PACK_SMTP_PORT:-465}"
+  RECOVERY_PACK_SMTP_USERNAME_FILE="${RECOVERY_PACK_SMTP_USERNAME_FILE:-$SECRETS_DIR/recovery_pack_smtp_username}"
+  RECOVERY_PACK_SMTP_PASSWORD_FILE="${RECOVERY_PACK_SMTP_PASSWORD_FILE:-$SECRETS_DIR/recovery_pack_smtp_password}"
+  HOST_SECURITY_AUTO_UPDATE_ENABLED="${HOST_SECURITY_AUTO_UPDATE_ENABLED:-1}"
+  HOST_AUTO_REBOOT_ENABLED="${HOST_AUTO_REBOOT_ENABLED:-0}"
+  HOST_AUTO_REBOOT_WINDOW_START="${HOST_AUTO_REBOOT_WINDOW_START:-03:00}"
+  HOST_AUTO_REBOOT_WINDOW_END="${HOST_AUTO_REBOOT_WINDOW_END:-05:00}"
 }
 
 ensure_cfg_file() {
@@ -106,6 +125,115 @@ ensure_state_dirs() {
   install -d -m 0700 "$DOMUM_STATE_ROOT/image-updates"
   install -d -m 0700 "$DOMUM_STATE_ROOT/immich"
   install -d -m 0700 "$DOMUM_STATE_ROOT/snapshots"
+  install -d -m 0700 "$DOMUM_STATE_ROOT/rollback"
+  install -d -m 0700 "$DOMUM_STATE_ROOT/update-history"
+  install -d -m 0700 "$RECOVERY_PACK_DEST"
+}
+
+update_history_dir() {
+  printf '%s/update-history' "$DOMUM_STATE_ROOT"
+}
+
+rollback_index_dir() {
+  printf '%s/rollback' "$DOMUM_STATE_ROOT"
+}
+
+recovery_pack_state_file() {
+  printf '%s/last.env' "$RECOVERY_PACK_DEST"
+}
+
+epoch_to_iso() {
+  date -d "@$1" +%Y-%m-%dT%H:%M:%S%z
+}
+
+human_age_from_epoch() {
+  local then="$1"
+  local now delta
+  now="$(date +%s)"
+  delta=$(( now - then ))
+  if (( delta < 60 )); then
+    printf '%ss' "$delta"
+  elif (( delta < 3600 )); then
+    printf '%sm' $(( delta / 60 ))
+  elif (( delta < 86400 )); then
+    printf '%sh' $(( delta / 3600 ))
+  else
+    printf '%sd' $(( delta / 86400 ))
+  fi
+}
+
+json_escape() {
+  jq -Rsa .
+}
+
+write_env_kv() {
+  local path="$1"
+  shift
+  : > "$path"
+  while (( $# >= 2 )); do
+    printf "%s=%q\n" "$1" "$2" >> "$path"
+    shift 2
+  done
+  chmod 600 "$path"
+}
+
+record_update_history() {
+  local service="$1"
+  local event="$2"
+  local from_image="${3:-}"
+  local to_image="${4:-}"
+  local snapshot="${5:-}"
+  local result="${6:-success}"
+  local note="${7:-}"
+  local ts stamp file
+  ts="$(date +%s)"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  file="$(update_history_dir)/${service}-${stamp}.env"
+  write_env_kv "$file" \
+    SERVICE "$service" \
+    EVENT "$event" \
+    FROM_IMAGE "$from_image" \
+    TO_IMAGE "$to_image" \
+    SNAPSHOT "$snapshot" \
+    RESULT "$result" \
+    NOTE "$note" \
+    TS "$ts"
+}
+
+record_rollback_entry() {
+  local service="$1"
+  local event="$2"
+  local snapshot_name="$3"
+  local image_before="${4:-}"
+  local image_after="${5:-}"
+  local status="${6:-available}"
+  local ts id file
+  ts="$(date +%s)"
+  id="${service}-$(date +%Y%m%d-%H%M%S)"
+  file="$(rollback_index_dir)/${id}.env"
+  write_env_kv "$file" \
+    ID "$id" \
+    SERVICE "$service" \
+    EVENT "$event" \
+    SNAPSHOT "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" \
+    SNAPSHOT_NAME "$snapshot_name" \
+    IMAGE_BEFORE "$image_before" \
+    IMAGE_AFTER "$image_after" \
+    TS "$ts" \
+    STATUS "$status"
+  printf '%s' "$id"
+}
+
+update_rollback_entry_status() {
+  local file="$1"
+  local new_status="$2"
+  [[ -f "$file" ]] || return 0
+  awk -v status="$new_status" '
+    /^STATUS=/ { print "STATUS='\''" status "'\''"; next }
+    { print }
+  ' "$file" > "${file}.tmp"
+  mv "${file}.tmp" "$file"
+  chmod 600 "$file"
 }
 
 immich_postgres_data_dir() {
@@ -505,10 +633,10 @@ traefik|ENABLE_TRAEFIK|A|14|traefik|TRAEFIK_IMAGE|
 tailscale|ENABLE_TAILSCALE|A|14|tailscale|TAILSCALE_IMAGE|
 uptime-kuma|ENABLE_UPTIME_KUMA|A|14|uptime-kuma|UPTIME_KUMA_IMAGE|
 jellyfin|ENABLE_JELLYFIN|B|21|jellyfin|JELLYFIN_IMAGE|
-plex|ENABLE_PLEX|B|20|plex|PLEX_IMAGE|
+plex|ENABLE_PLEX|B|21|plex|PLEX_IMAGE|
 navidrome|ENABLE_NAVIDROME|B|21|navidrome|NAVIDROME_IMAGE|
-calibre-web|ENABLE_CALIBRE_WEB|B|20|calibre-web|CALIBRE_WEB_IMAGE|
-kavita|ENABLE_KAVITA|B|20|kavita|KAVITA_IMAGE|
+calibre-web|ENABLE_CALIBRE_WEB|B|21|calibre-web|CALIBRE_WEB_IMAGE|
+kavita|ENABLE_KAVITA|B|21|kavita|KAVITA_IMAGE|
 immich|ENABLE_IMMICH|C|21|immich_server immich_machine_learning immich_postgres immich_redis|IMMICH_SERVER_IMAGE|
 EOF
 }
@@ -535,6 +663,13 @@ service_configured_version() {
 service_backup_required() {
   case "$1" in
     jellyfin|plex|navidrome|calibre-web|kavita|immich) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+service_strict_backup_required() {
+  case "$1" in
+    immich) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -572,7 +707,7 @@ verify_backup_freshness() {
   local now last_success age_hours
   now="$(date +%s)"
   if ! last_success="$(backup_last_success_epoch)"; then
-    if [[ "$policy" == "STRICT" ]]; then
+    if [[ "$policy" == "STRICT" ]] || { [[ "$policy" == "BALANCED" ]] && service_strict_backup_required "$svc"; }; then
       die "Refusing to update $svc: no successful backup timestamp found in $DOMUM_LOG_DIR/last-success"
     fi
     echo "[domum-media] WARNING: no successful backup timestamp found; continuing because BACKUP_POLICY=$BACKUP_POLICY"
@@ -580,7 +715,7 @@ verify_backup_freshness() {
   fi
   age_hours=$(( (now - last_success) / 3600 ))
   if (( age_hours > max_age_hours )); then
-    if [[ "$policy" == "STRICT" ]]; then
+    if [[ "$policy" == "STRICT" ]] || { [[ "$policy" == "BALANCED" ]] && service_strict_backup_required "$svc"; }; then
       die "Refusing to update $svc: latest successful backup is ${age_hours}h old (limit ${max_age_hours}h)"
     fi
     echo "[domum-media] WARNING: latest successful backup for $svc is ${age_hours}h old; continuing because BACKUP_POLICY=$BACKUP_POLICY"
@@ -609,6 +744,23 @@ service_is_healthy() {
   fi
 
   return 0
+}
+
+wait_for_service_health() {
+  local svc="$1"
+  local timeout="${2:-120}"
+  local interval="${3:-5}"
+  local elapsed=0
+
+  while (( elapsed < timeout )); do
+    if service_is_healthy "$svc"; then
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$(( elapsed + interval ))
+  done
+
+  service_is_healthy "$svc"
 }
 
 # ---- compose layering ------------------------------------------------------
@@ -663,6 +815,7 @@ export_env_for_compose() {
   export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
   export DOMUM_STATE_ROOT
   export DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
+  export DOMUM_MEDIA_ROOT="${DOMUM_MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
   export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:latest}"
   export TRAEFIK_AUTO_UPDATE="${TRAEFIK_AUTO_UPDATE:-0}"
   export TRAEFIK_AUTO_UPDATE_DELAY_DAYS="${TRAEFIK_AUTO_UPDATE_DELAY_DAYS:-7}"
@@ -733,9 +886,26 @@ export_env_for_compose() {
   export IMAGE_AUTO_UPDATE_ENABLED="${IMAGE_AUTO_UPDATE_ENABLED:-0}"
   export IMAGE_AUTO_UPDATE_AT="${IMAGE_AUTO_UPDATE_AT:-05:15}"
   export IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY="${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}"
+  export AUTO_ROLLBACK_ENABLED="${AUTO_ROLLBACK_ENABLED:-1}"
+  export HOST_SECURITY_AUTO_UPDATE_ENABLED="${HOST_SECURITY_AUTO_UPDATE_ENABLED:-1}"
   export HOST_PACKAGE_AUTO_UPDATE_ENABLED="${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}"
   export HOST_PACKAGE_AUTO_UPDATE_AT="${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}"
   export HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
+  export HOST_AUTO_REBOOT_ENABLED="${HOST_AUTO_REBOOT_ENABLED:-0}"
+  export HOST_AUTO_REBOOT_WINDOW_START="${HOST_AUTO_REBOOT_WINDOW_START:-03:00}"
+  export HOST_AUTO_REBOOT_WINDOW_END="${HOST_AUTO_REBOOT_WINDOW_END:-05:00}"
+  export RECOVERY_PACK_ENABLED="${RECOVERY_PACK_ENABLED:-1}"
+  export RECOVERY_PACK_ENCRYPTION="${RECOVERY_PACK_ENCRYPTION:-age}"
+  export RECOVERY_PACK_AGE_PUBKEY_FILE="${RECOVERY_PACK_AGE_PUBKEY_FILE:-$SECRETS_DIR/recovery_pack_pubkey}"
+  export RECOVERY_PACK_DEST="${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}"
+  export RECOVERY_PACK_REMINDER_DAYS="${RECOVERY_PACK_REMINDER_DAYS:-30}"
+  export RECOVERY_PACK_EMAIL_ENABLED="${RECOVERY_PACK_EMAIL_ENABLED:-0}"
+  export RECOVERY_PACK_EMAIL_TO="${RECOVERY_PACK_EMAIL_TO:-${DOMUM_EMAIL:-}}"
+  export RECOVERY_PACK_EMAIL_FROM="${RECOVERY_PACK_EMAIL_FROM:-${DOMUM_EMAIL:-}}"
+  export RECOVERY_PACK_SMTP_HOST="${RECOVERY_PACK_SMTP_HOST:-}"
+  export RECOVERY_PACK_SMTP_PORT="${RECOVERY_PACK_SMTP_PORT:-465}"
+  export RECOVERY_PACK_SMTP_USERNAME_FILE="${RECOVERY_PACK_SMTP_USERNAME_FILE:-$SECRETS_DIR/recovery_pack_smtp_username}"
+  export RECOVERY_PACK_SMTP_PASSWORD_FILE="${RECOVERY_PACK_SMTP_PASSWORD_FILE:-$SECRETS_DIR/recovery_pack_smtp_password}"
   load_runtime_secrets
 }
 
@@ -836,12 +1006,14 @@ snapshot_create() {
   stamp="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$DOMUM_SNAPSHOT_ROOT"
   while IFS= read -r subvol; do
-    local name
+    local name target service
     name="$(basename "$subvol")"
-    local target="$DOMUM_SNAPSHOT_ROOT/${name}-${stamp}-${tag}"
+    target="$DOMUM_SNAPSHOT_ROOT/${name}-${stamp}-${tag}"
     if is_btrfs_subvol "$subvol"; then
       echo "[domum-media] Snapshot: $subvol -> $target"
       btrfs subvolume snapshot -r "$subvol" "$target"
+      service="$name"
+      record_rollback_entry "$service" "$tag" "$(basename "$target")" "" "" >/dev/null
     else
       echo "[domum-media] Skipping non-subvolume path: $subvol"
     fi
@@ -924,7 +1096,7 @@ create_service_snapshot() {
   local tag="$2"
   local before_version="${3:-unknown}"
   local after_version="${4:-unknown}"
-  local data_path snapshot_name
+  local data_path snapshot_name event
 
   data_path="$(service_data_path "$service")" || return 1
   [[ -d "$data_path" ]] || return 1
@@ -934,6 +1106,8 @@ create_service_snapshot() {
     echo "[domum-media] Snapshot: $data_path -> $DOMUM_SNAPSHOT_ROOT/$snapshot_name"
     btrfs subvolume snapshot -r "$data_path" "$DOMUM_SNAPSHOT_ROOT/$snapshot_name"
     record_service_snapshot_metadata "$service" "$before_version" "$after_version" "$snapshot_name"
+    event="${tag#pre-}"
+    record_rollback_entry "$service" "$event" "$snapshot_name" "$before_version" "$after_version" >/dev/null
     printf '%s' "$snapshot_name"
     return 0
   fi
@@ -944,7 +1118,7 @@ snapshot_prune() {
   local keep="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
   local names
-  names="$(ls -1 "$DOMUM_SNAPSHOT_ROOT" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
+  names="$(find "$DOMUM_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
     local snaps
@@ -1029,6 +1203,7 @@ restore_snapshot_for_service() {
   [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || die "Snapshot not found: $snapshot_name"
 
   compose_svcs="$(service_compose_services "$service" || true)"
+  # shellcheck disable=SC2086
   [[ -n "$compose_svcs" ]] && compose_cmd stop $compose_svcs 2>/dev/null || true
 
   if [[ -d "$data_path" ]] && is_btrfs_subvol "$data_path"; then
@@ -1040,6 +1215,7 @@ restore_snapshot_for_service() {
 
   echo "[domum-media] Restoring $service from $snapshot_name"
   btrfs subvolume snapshot "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" "$data_path"
+  # shellcheck disable=SC2086
   [[ -n "$compose_svcs" ]] && compose_cmd up -d $compose_svcs
 }
 
@@ -1090,6 +1266,41 @@ Persistent=true
 EOF
 }
 
+sync_unattended_upgrades() {
+  local auto_cfg="/etc/apt/apt.conf.d/20auto-upgrades"
+  local domum_cfg="/etc/apt/apt.conf.d/50domum-unattended-upgrades"
+  local reboot_flag="false"
+
+  if [[ "${HOST_AUTO_REBOOT_ENABLED:-0}" == "1" ]]; then
+    reboot_flag="true"
+  fi
+
+  cat > "$auto_cfg" <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "${HOST_SECURITY_AUTO_UPDATE_ENABLED:-1}";
+EOF
+
+  cat > "$domum_cfg" <<EOF
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Debian,codename=\${distro_codename}-security,label=Debian-Security";
+};
+Unattended-Upgrade::Package-Blacklist {
+  "docker-ce";
+  "docker-ce-cli";
+  "docker-buildx-plugin";
+  "docker-compose-plugin";
+  "containerd.io";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "${reboot_flag}";
+Unattended-Upgrade::Automatic-Reboot-Time "${HOST_AUTO_REBOOT_WINDOW_START:-03:00}";
+EOF
+
+  systemctl enable --now unattended-upgrades.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
+}
+
 sync_timer_overrides() {
   local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar hot_prune_calendar
   backup_calendar="$(normalize_daily_schedule "${BACKUP_DAILY_AT:-02:30}")"
@@ -1119,6 +1330,8 @@ sync_timer_overrides() {
   else
     systemctl disable --now domum-media-hot-prune.timer >/dev/null 2>&1 || true
   fi
+
+  sync_unattended_upgrades
 }
 
 # ---- configure flow -------------------------------------------------------
@@ -1374,7 +1587,57 @@ configure_backup_target() {
   esac
 }
 
+apply_update_delay_profile() {
+  local profile="$1"
+  local class_a_delay class_b_delay class_c_delay
+
+  case "$profile" in
+    Conservative) class_a_delay=14; class_b_delay=30; class_c_delay=30 ;;
+    Balanced)     class_a_delay=14; class_b_delay=21; class_c_delay=21 ;;
+    Fresh)        class_a_delay=7;  class_b_delay=7;  class_c_delay=7 ;;
+    *) die "Unknown update profile: $profile" ;;
+  esac
+
+  config_set TRAEFIK_AUTO_UPDATE 1
+  config_set TAILSCALE_AUTO_UPDATE 1
+  config_set UPTIME_KUMA_AUTO_UPDATE 1
+  config_set RESTIC_REST_SERVER_AUTO_UPDATE 1
+  config_set TRAEFIK_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
+  config_set TAILSCALE_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
+  config_set UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
+  config_set RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
+
+  config_set JELLYFIN_AUTO_UPDATE 1
+  config_set PLEX_AUTO_UPDATE 1
+  config_set NAVIDROME_AUTO_UPDATE 1
+  config_set CALIBRE_WEB_AUTO_UPDATE 1
+  config_set KAVITA_AUTO_UPDATE 1
+  config_set JELLYFIN_AUTO_UPDATE_DELAY_DAYS "$class_b_delay"
+  config_set PLEX_AUTO_UPDATE_DELAY_DAYS "$class_b_delay"
+  config_set NAVIDROME_AUTO_UPDATE_DELAY_DAYS "$class_b_delay"
+  config_set CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS "$class_b_delay"
+  config_set KAVITA_AUTO_UPDATE_DELAY_DAYS "$class_b_delay"
+
+  config_set IMMICH_BUNDLE_DELAY_DAYS "$class_c_delay"
+}
+
+configure_non_interactive() {
+  need_root
+  ensure_cfg_file
+  load_cfg
+  export_env_for_compose
+  ensure_secret_dir
+  converge_local_installation
+  sync_timer_overrides
+  echo "[domum-media] Non-interactive configure complete."
+}
+
 configure_cmd() {
+  if [[ "${1:-}" == "--non-interactive" ]]; then
+    configure_non_interactive
+    return 0
+  fi
+
   need_root
   ensure_cfg_file
   load_cfg
@@ -1409,50 +1672,57 @@ configure_cmd() {
 
   if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
     configure_text_value TRAEFIK_DASHBOARD_HOST "Traefik dashboard hostname"
-    configure_image_behavior TRAEFIK_IMAGE TRAEFIK_AUTO_UPDATE TRAEFIK_AUTO_UPDATE_DELAY_DAYS "Traefik"
-  fi
-  if [[ "${ENABLE_TAILSCALE:-0}" == "1" ]]; then
-    configure_image_behavior TAILSCALE_IMAGE TAILSCALE_AUTO_UPDATE TAILSCALE_AUTO_UPDATE_DELAY_DAYS "Tailscale"
   fi
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
-    echo
-    echo "Immich update policy (bundle-managed: server + ML + Redis + Postgres update together)"
-    local immich_bundle_auto
-    immich_bundle_auto="$(prompt_yes_no "Auto-update Immich as a matched bundle?" "${IMMICH_BUNDLE_AUTO_UPDATE:-1}")"
-    config_set IMMICH_BUNDLE_AUTO_UPDATE "$immich_bundle_auto"
-    if [[ "$immich_bundle_auto" == "1" ]]; then
-      config_set IMMICH_BUNDLE_DELAY_DAYS \
-        "$(prompt_with_default "Delay in days before applying a new Immich bundle" "${IMMICH_BUNDLE_DELAY_DAYS:-21}")"
-    fi
-    config_set IMMICH_BUNDLE_ROLLBACK_ENABLED \
-      "$(prompt_yes_no "Enable automatic rollback if Immich bundle health check fails?" "${IMMICH_BUNDLE_ROLLBACK_ENABLED:-1}")"
     configure_text_value IMMICH_HOST "Immich hostname"
   fi
   if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
     configure_text_value JELLYFIN_HOST "Jellyfin hostname"
-    configure_image_behavior JELLYFIN_IMAGE JELLYFIN_AUTO_UPDATE JELLYFIN_AUTO_UPDATE_DELAY_DAYS "Jellyfin"
   fi
   if [[ "${ENABLE_PLEX:-0}" == "1" ]]; then
     configure_text_value PLEX_HOST "Plex hostname"
-    configure_image_behavior PLEX_IMAGE PLEX_AUTO_UPDATE PLEX_AUTO_UPDATE_DELAY_DAYS "Plex"
   fi
   if [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]; then
     configure_text_value NAVIDROME_HOST "Navidrome hostname"
-    configure_image_behavior NAVIDROME_IMAGE NAVIDROME_AUTO_UPDATE NAVIDROME_AUTO_UPDATE_DELAY_DAYS "Navidrome"
   fi
   if [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]]; then
     configure_text_value CALIBRE_WEB_HOST "Calibre-Web hostname"
-    configure_image_behavior CALIBRE_WEB_IMAGE CALIBRE_WEB_AUTO_UPDATE CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS "Calibre-Web"
   fi
   if [[ "${ENABLE_KAVITA:-0}" == "1" ]]; then
     configure_text_value KAVITA_HOST "Kavita hostname"
-    configure_image_behavior KAVITA_IMAGE KAVITA_AUTO_UPDATE KAVITA_AUTO_UPDATE_DELAY_DAYS "Kavita"
   fi
-  if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
-    configure_image_behavior UPTIME_KUMA_IMAGE UPTIME_KUMA_AUTO_UPDATE UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS "Uptime Kuma"
+
+  echo
+  local freshness_profile immich_policy
+  freshness_profile="$(prompt_choice "How fresh should app updates be?" "Balanced" Conservative Balanced Fresh)"
+  apply_update_delay_profile "$freshness_profile"
+  immich_policy="$(prompt_choice "Immich update policy" "Bundle auto-update" "Bundle auto-update" "Notify only" "Manage manually")"
+  case "$immich_policy" in
+    "Bundle auto-update") config_set IMMICH_BUNDLE_AUTO_UPDATE 1 ;;
+    "Notify only") config_set IMMICH_BUNDLE_AUTO_UPDATE 0 ;;
+    "Manage manually") config_set IMMICH_BUNDLE_AUTO_UPDATE 0 ;;
+  esac
+  config_set BACKUP_POLICY \
+    "$(prompt_choice "Backup gate policy for updates" "${BACKUP_POLICY:-BALANCED}" STRICT BALANCED LENIENT)"
+  config_set AUTO_ROLLBACK_ENABLED \
+    "$(prompt_yes_no "Enable automatic rollback if a service health check fails?" "${AUTO_ROLLBACK_ENABLED:-1}")"
+  config_set IMMICH_BUNDLE_ROLLBACK_ENABLED \
+    "$(prompt_yes_no "Enable Immich bundle rollback on failed health validation?" "${IMMICH_BUNDLE_ROLLBACK_ENABLED:-1}")"
+  config_set CLEANUP_IMAGES_AFTER_UPDATE \
+    "$(prompt_yes_no "Automatically clean up old Docker images after successful updates?" "${CLEANUP_IMAGES_AFTER_UPDATE:-1}")"
+  config_set HOST_SECURITY_AUTO_UPDATE_ENABLED \
+    "$(prompt_yes_no "Enable unattended Debian security patches?" "${HOST_SECURITY_AUTO_UPDATE_ENABLED:-1}")"
+  local recovery_pack_enabled
+  recovery_pack_enabled="$(prompt_yes_no "Enable encrypted recovery-pack creation?" "${RECOVERY_PACK_ENABLED:-1}")"
+  config_set RECOVERY_PACK_ENABLED "$recovery_pack_enabled"
+  if [[ "$recovery_pack_enabled" == "1" ]]; then
+    config_set RECOVERY_PACK_AGE_PUBKEY_FILE \
+      "$(prompt_with_default "Path to the age public key for recovery-pack encryption" "${RECOVERY_PACK_AGE_PUBKEY_FILE:-$SECRETS_DIR/recovery_pack_pubkey}")"
   fi
-  if [[ "${ENABLE_RESTIC_REST_SERVER:-0}" == "1" ]]; then
-    configure_image_behavior RESTIC_REST_SERVER_IMAGE RESTIC_REST_SERVER_AUTO_UPDATE RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS "restic REST server"
+
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    config_set IMMICH_BUNDLE_DELAY_DAYS \
+      "$(prompt_with_default "Delay in days before applying a new Immich bundle" "${IMMICH_BUNDLE_DELAY_DAYS:-21}")"
   fi
 
   echo
@@ -1476,14 +1746,21 @@ configure_cmd() {
     "$(prompt_with_default "Daily hot storage prune time (HH:MM)" "${HOT_STORAGE_PRUNE_AT:-04:45}")"
   config_set HOT_STORAGE_PRUNE_RANDOMIZED_DELAY \
     "$(prompt_with_default "Randomized delay for hot storage prune timer" "${HOT_STORAGE_PRUNE_RANDOMIZED_DELAY:-30m}")"
-  config_set BACKUP_POLICY \
-    "$(prompt_choice "Backup policy for stateful auto-updates" "${BACKUP_POLICY:-STRICT}" STRICT LENIENT)"
   config_set HOST_PACKAGE_AUTO_UPDATE_ENABLED \
     "$(prompt_yes_no "Enable scheduled host package upgrades (Docker, compose, tailscale, restic)?" "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}")"
   config_set HOST_PACKAGE_AUTO_UPDATE_AT \
     "$(prompt_with_default "Weekly host upgrade schedule (e.g. Mon 05:45)" "${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}")"
   config_set HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY \
     "$(prompt_with_default "Randomized delay for host upgrade timer" "${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}")"
+  local host_auto_reboot_enabled
+  host_auto_reboot_enabled="$(prompt_yes_no "Enable auto-reboot after kernel updates during a maintenance window?" "${HOST_AUTO_REBOOT_ENABLED:-0}")"
+  config_set HOST_AUTO_REBOOT_ENABLED "$host_auto_reboot_enabled"
+  if [[ "$host_auto_reboot_enabled" == "1" ]]; then
+    config_set HOST_AUTO_REBOOT_WINDOW_START \
+      "$(prompt_with_default "Maintenance window start (HH:MM)" "${HOST_AUTO_REBOOT_WINDOW_START:-03:00}")"
+    config_set HOST_AUTO_REBOOT_WINDOW_END \
+      "$(prompt_with_default "Maintenance window end (HH:MM)" "${HOST_AUTO_REBOOT_WINDOW_END:-05:00}")"
+  fi
 
   echo
   config_set BACKUP_TARGETS "nas cloud archive"
@@ -1522,11 +1799,23 @@ write_update_state() {
   local path="$1"
   local image_id="$2"
   local first_seen="$3"
-  cat > "$path" <<EOF
-SEEN_IMAGE_ID='$image_id'
-FIRST_SEEN_TS='$first_seen'
-EOF
-  chmod 600 "$path"
+  local last_update_ts="${4:-}"
+  local last_update_from="${5:-}"
+  local last_update_to="${6:-}"
+  local last_update_snapshot="${7:-}"
+  write_env_kv "$path" \
+    SEEN_IMAGE_ID "$image_id" \
+    FIRST_SEEN_TS "$first_seen" \
+    CANDIDATE_DIGEST "$image_id" \
+    LAST_UPDATE_TS "$last_update_ts" \
+    LAST_UPDATE_FROM "$last_update_from" \
+    LAST_UPDATE_TO "$last_update_to" \
+    LAST_UPDATE_SNAPSHOT "$last_update_snapshot"
+}
+
+clear_update_candidate_state() {
+  local path="$1"
+  rm -f "$path"
 }
 
 refresh_images() {
@@ -1534,9 +1823,21 @@ refresh_images() {
   load_cfg
   export_env_for_compose
   ensure_dirs
-  local force="${1:-}"
+  local force=0
+  local check_only=0
+  local apply_now=0
 
-  if [[ "$force" != "--force" && "${IMAGE_AUTO_UPDATE_ENABLED:-0}" != "1" ]]; then
+  while (( $# )); do
+    case "$1" in
+      --force) force=1 ;;
+      --check-only) check_only=1 ;;
+      --apply-now) apply_now=1 ;;
+      *) die "Usage: domum-media refresh-images [--force] [--check-only] [--apply-now]" ;;
+    esac
+    shift
+  done
+
+  if (( force == 0 && check_only == 0 && apply_now == 0 )) && [[ "${IMAGE_AUTO_UPDATE_ENABLED:-0}" != "1" ]]; then
     echo "[domum-media] Scheduled image refresh disabled (IMAGE_AUTO_UPDATE_ENABLED=0)."
     return 0
   fi
@@ -1550,7 +1851,7 @@ refresh_images() {
     [[ "${!enable_var:-0}" == "1" ]] || continue
     [[ "${!auto_var:-0}" == "1" ]] || continue
 
-    local image_ref running_id current_id state_file delay_days delay_secs first_seen_ts remaining
+    local image_ref running_id current_id state_file delay_days delay_secs first_seen_ts remaining previous_candidate previous_seen
     image_ref="${!image_var:-}"
     [[ -n "$image_ref" ]] || continue
 
@@ -1564,74 +1865,141 @@ refresh_images() {
     delay_secs=$(( delay_days * 86400 ))
 
     if [[ -z "$running_id" || -z "$current_id" ]]; then
-      rm -f "$state_file"
+      clear_update_candidate_state "$state_file"
       echo "[domum-media] Skipping ${key}; container or image metadata unavailable."
       continue
     fi
 
     if [[ "$running_id" == "$current_id" ]]; then
-      rm -f "$state_file"
+      clear_update_candidate_state "$state_file"
       echo "[domum-media] ${key} already running the current image."
       continue
     fi
 
-    unset SEEN_IMAGE_ID FIRST_SEEN_TS
+    unset SEEN_IMAGE_ID FIRST_SEEN_TS CANDIDATE_DIGEST LAST_UPDATE_TS LAST_UPDATE_FROM LAST_UPDATE_TO LAST_UPDATE_SNAPSHOT
     if [[ -f "$state_file" ]]; then
       # shellcheck disable=SC1090
       source "$state_file"
     fi
 
-    if [[ "${SEEN_IMAGE_ID:-}" != "$current_id" ]]; then
-      write_update_state "$state_file" "$current_id" "$now"
+    previous_candidate="${CANDIDATE_DIGEST:-${SEEN_IMAGE_ID:-}}"
+    previous_seen="${FIRST_SEEN_TS:-$now}"
+
+    if [[ -z "$previous_candidate" ]]; then
+      write_update_state "$state_file" "$current_id" "$now" "${LAST_UPDATE_TS:-}" "${LAST_UPDATE_FROM:-}" "${LAST_UPDATE_TO:-}" "${LAST_UPDATE_SNAPSHOT:-}"
+      if (( apply_now == 1 )); then
+        due_services+=("${key}|${svc}|${running_id}|${current_id}|${state_file}")
+        any_due=1
+        continue
+      fi
       echo "[domum-media] ${key} has a newer image; waiting ${delay_days} day(s) before rollout."
       continue
     fi
 
-    first_seen_ts="${FIRST_SEEN_TS:-$now}"
-    if (( now - first_seen_ts < delay_secs )); then
+    if [[ "$previous_candidate" != "$current_id" ]]; then
+      write_update_state "$state_file" "$current_id" "$now" "${LAST_UPDATE_TS:-}" "${LAST_UPDATE_FROM:-}" "${LAST_UPDATE_TO:-}" "${LAST_UPDATE_SNAPSHOT:-}"
+      record_update_history "$key" "delay_reset" "$previous_candidate" "$current_id" "" "success" "upstream moved during delay window"
+      if (( apply_now == 1 )); then
+        due_services+=("${key}|${svc}|${running_id}|${current_id}|${state_file}")
+        any_due=1
+        continue
+      fi
+      echo "[domum-media] ${key} upstream moved during delay window; restarting the ${delay_days}-day timer."
+      continue
+    fi
+
+    first_seen_ts="$previous_seen"
+    if (( apply_now == 0 )) && (( now - first_seen_ts < delay_secs )); then
       remaining=$(( delay_secs - (now - first_seen_ts) ))
       echo "[domum-media] ${key} is still in the delay window (${remaining}s remaining)."
       continue
     fi
 
-    due_services+=("$key")
-    rm -f "$state_file"
+    if (( check_only == 1 )); then
+      echo "[domum-media] ${key} is ready to update (${image_ref})."
+      any_due=1
+      continue
+    fi
+
+    due_services+=("${key}|${svc}|${running_id}|${current_id}|${state_file}")
     any_due=1
   done < <(managed_image_specs)
 
   if (( any_due == 0 )); then
-    echo "[domum-media] No tracked images are ready to roll out."
+    if (( check_only == 1 )); then
+      echo "[domum-media] No tracked images are ready."
+    else
+      echo "[domum-media] No tracked images are ready to roll out."
+    fi
     return 0
   fi
 
-  local logical_service compose_svcs version_key before_version snapshot_name
-  for logical_service in "${due_services[@]}"; do
+  if (( check_only == 1 )); then
+    return 0
+  fi
+
+  local entry logical_service before_image after_image version_key before_version snapshot_name state_file compose_svcs
+  for entry in "${due_services[@]}"; do
+    IFS='|' read -r logical_service _ before_image after_image state_file <<< "$entry"
     verify_backup_freshness "$logical_service"
     version_key="$(printf '%s_IMAGE' "$(uppercase_token "$logical_service")")"
     before_version="$(service_configured_version "$version_key")"
-    snapshot_name="$(create_service_snapshot "$logical_service" "pre-update" "$before_version" "$before_version" || true)"
+    snapshot_name="$(create_service_snapshot "$logical_service" "pre-update" "$before_image" "$after_image" || true)"
     compose_svcs="$(service_compose_services "$logical_service" || true)"
     [[ -n "$compose_svcs" ]] || continue
     echo "[domum-media] Updating $logical_service (${compose_svcs})"
+    # shellcheck disable=SC2086
     compose_cmd up -d $compose_svcs
-    if ! service_is_healthy "$logical_service"; then
+    if ! wait_for_service_health "$logical_service" 120 5; then
       echo "[domum-media] Health validation failed for $logical_service"
-      if [[ -n "$snapshot_name" ]]; then
+      record_update_history "$logical_service" "skipped_unhealthy" "$before_image" "$after_image" "$snapshot_name" "failure" "automatic rollback triggered"
+      if [[ "${AUTO_ROLLBACK_ENABLED:-1}" == "1" && -n "$snapshot_name" ]]; then
         restore_snapshot_for_service "$logical_service" "$snapshot_name"
+        record_update_history "$logical_service" "rolled_back" "$after_image" "$before_image" "$snapshot_name" "success" "restored after failed health validation"
       fi
-      die "Update aborted: $logical_service failed health validation and was rolled back."
+      if [[ "${AUTO_ROLLBACK_ENABLED:-1}" == "1" && -n "$snapshot_name" ]]; then
+        die "Update aborted: $logical_service failed health validation and was rolled back."
+      fi
+      die "Update aborted: $logical_service failed health validation."
+    fi
+    clear_update_candidate_state "$state_file"
+    record_update_history "$logical_service" "applied" "$before_image" "$after_image" "$snapshot_name" "success" "$before_version -> ${!version_key:-unknown}"
+    if [[ "${CLEANUP_IMAGES_AFTER_UPDATE:-1}" == "1" ]]; then
+      cleanup_images_execute 1 0 >/dev/null 2>&1 || true
     fi
   done
   echo "[domum-media] Image refresh done."
+}
+
+time_hhmm_to_minutes() {
+  local value="$1"
+  printf '%s' $(( 10#${value%:*} * 60 + 10#${value#*:} ))
+}
+
+within_reboot_window() {
+  local now_hhmm start end now_m start_m end_m
+  now_hhmm="$(date +%H:%M)"
+  start="${HOST_AUTO_REBOOT_WINDOW_START:-03:00}"
+  end="${HOST_AUTO_REBOOT_WINDOW_END:-05:00}"
+  now_m="$(time_hhmm_to_minutes "$now_hhmm")"
+  start_m="$(time_hhmm_to_minutes "$start")"
+  end_m="$(time_hhmm_to_minutes "$end")"
+
+  if (( start_m <= end_m )); then
+    (( now_m >= start_m && now_m <= end_m ))
+  else
+    (( now_m >= start_m || now_m <= end_m ))
+  fi
 }
 
 host_upgrade() {
   need_root
   load_cfg
   export_env_for_compose
-  local force="${1:-}"
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
 
-  if [[ "$force" != "--force" && "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}" != "1" ]]; then
+  if (( force == 0 )) && [[ "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}" != "1" ]]; then
     echo "[domum-media] Scheduled host package upgrades disabled (HOST_PACKAGE_AUTO_UPDATE_ENABLED=0)."
     return 0
   fi
@@ -1641,11 +2009,20 @@ host_upgrade() {
   apt-get update -y
   apt-get install -y --only-upgrade \
     docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-    tailscale restic btrfs-progs jq apparmor nfs-common rclone gettext-base
+    tailscale restic btrfs-progs jq apparmor nfs-common rclone gettext-base \
+    unattended-upgrades apt-listchanges age
+  record_update_history "host" "applied" "" "" "" "success" "apt host-upgrade completed"
+  if [[ -f /var/run/reboot-required ]]; then
+    echo "[domum-media] Reboot required by the latest package upgrade."
+    if [[ "${HOST_AUTO_REBOOT_ENABLED:-0}" == "1" ]] && within_reboot_window; then
+      echo "[domum-media] Auto-reboot window open; rebooting now."
+      shutdown -r +1 "domum-media host-upgrade requested reboot"
+    fi
+  fi
   echo "[domum-media] Host package upgrade done."
 }
 
-updates_cmd() {
+show_update_inventory() {
   need_root
   load_cfg
   export_env_for_compose
@@ -1654,10 +2031,15 @@ updates_cmd() {
   while IFS='|' read -r name enable_var class default_delay _ image_var _; do
     [[ "${!enable_var:-0}" == "1" ]] || continue
     local auto_var delay_var auto_value delay_value
-    auto_var="$(printf '%s_AUTO_UPDATE' "$(uppercase_token "$name")")"
-    delay_var="$(printf '%s_AUTO_UPDATE_DELAY_DAYS' "$(uppercase_token "$name")")"
-    auto_value="${!auto_var:-0}"
-    delay_value="${!delay_var:-$default_delay}"
+    if [[ "$name" == "immich" ]]; then
+      auto_value="${IMMICH_BUNDLE_AUTO_UPDATE:-0}"
+      delay_value="${IMMICH_BUNDLE_DELAY_DAYS:-$default_delay}"
+    else
+      auto_var="$(printf '%s_AUTO_UPDATE' "$(uppercase_token "$name")")"
+      delay_var="$(printf '%s_AUTO_UPDATE_DELAY_DAYS' "$(uppercase_token "$name")")"
+      auto_value="${!auto_var:-0}"
+      delay_value="${!delay_var:-$default_delay}"
+    fi
     printf '%-14s %-5s %-5s %-8s %-24s\n' \
       "$name" "$class" "$auto_value" "${delay_value}d" "$(service_configured_version "$image_var")"
   done < <(service_lifecycle_specs)
@@ -1666,6 +2048,7 @@ updates_cmd() {
     echo
     echo "Immich bundle candidate:"
     # shellcheck disable=SC1090
+    # shellcheck disable=SC1091
     source "$DOMUM_STATE_ROOT/immich/bundle-candidate.env"
     printf '  release=%s published=%s\n' "${IMMICH_BUNDLE_TAG:-unknown}" "${IMMICH_BUNDLE_PUBLISHED_AT:-unknown}"
     printf '  server=%s\n' "${IMMICH_BUNDLE_SERVER_IMAGE:-unknown}"
@@ -1673,6 +2056,37 @@ updates_cmd() {
     printf '  redis=%s\n' "${IMMICH_BUNDLE_REDIS_IMAGE:-unknown}"
     printf '  postgres=%s\n' "${IMMICH_BUNDLE_POSTGRES_IMAGE:-unknown}"
   fi
+}
+
+updates_history() {
+  load_cfg
+  ensure_state_dirs
+
+  printf '%-19s %-14s %-18s %-8s %s\n' "WHEN" "SERVICE" "EVENT" "RESULT" "NOTE"
+  find "$(update_history_dir)" -type f -name '*.env' | sort | while IFS= read -r file; do
+    unset SERVICE EVENT RESULT NOTE TS
+    # shellcheck disable=SC1090
+    source "$file"
+    printf '%-19s %-14s %-18s %-8s %s\n' \
+      "$(epoch_to_iso "${TS:-0}")" \
+      "${SERVICE:-unknown}" \
+      "${EVENT:-unknown}" \
+      "${RESULT:-unknown}" \
+      "${NOTE:-}"
+  done
+}
+
+updates_cmd() {
+  load_cfg
+  export_env_for_compose
+  local sub="${1:-summary}"
+  case "$sub" in
+    ""|summary) show_update_inventory ;;
+    check) shift; show_update_inventory; echo; refresh_images --check-only; [[ "${ENABLE_IMMICH:-0}" == "1" ]] && immich_refresh_bundle --check-only ;;
+    apply) shift; refresh_images --apply-now --force; [[ "${ENABLE_IMMICH:-0}" == "1" ]] && immich_refresh_bundle --force ;;
+    history) shift; updates_history ;;
+    *) die "Usage: domum-media updates {summary|check|apply|history}" ;;
+  esac
 }
 
 immich_extract_image() {
@@ -1692,16 +2106,26 @@ immich_refresh_bundle() {
   ensure_dirs
 
   local force=0
-  [[ "${1:-}" == "--force" ]] && force=1
+  local check_only=0
+  while (( $# )); do
+    case "$1" in
+      --force) force=1 ;;
+      --check-only) check_only=1 ;;
+      *) die "Usage: domum-media immich {refresh-bundle [--force]|check-bundle|apply-bundle|rollback}" ;;
+    esac
+    shift
+  done
+
   cmd_exists curl || die "curl is required for immich bundle refresh"
   cmd_exists jq || die "jq is required for immich bundle refresh"
 
   local api_url="https://api.github.com/repos/immich-app/immich/releases/latest"
-  local release_json compose_tmp meta_tmp candidate_file
+  local release_json compose_tmp meta_tmp candidate_file applied_file
   release_json="$(mktemp)"
   compose_tmp="$(mktemp)"
   meta_tmp="$(mktemp)"
   candidate_file="$DOMUM_STATE_ROOT/immich/bundle-candidate.env"
+  applied_file="$DOMUM_STATE_ROOT/immich/applied-bundle.env"
 
   curl -fsSL "$api_url" > "$release_json"
   curl -fsSL "https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml" > "$compose_tmp"
@@ -1723,28 +2147,72 @@ immich_refresh_bundle() {
   [[ -n "$server_image" && -n "$ml_image" && -n "$redis_image" && -n "$postgres_image" ]] \
     || die "Failed to parse one or more Immich images from the upstream release compose file."
 
-  cat > "$candidate_file" <<EOF
-IMMICH_BUNDLE_TAG='$tag_name'
-IMMICH_BUNDLE_RELEASE_URL='$html_url'
-IMMICH_BUNDLE_PUBLISHED_AT='$published_at'
-IMMICH_BUNDLE_SERVER_IMAGE='$server_image'
-IMMICH_BUNDLE_MACHINE_LEARNING_IMAGE='$ml_image'
-IMMICH_BUNDLE_REDIS_IMAGE='$redis_image'
-IMMICH_BUNDLE_POSTGRES_IMAGE='$postgres_image'
-EOF
-  chmod 600 "$candidate_file"
-
-  echo "[domum-media] Stored Immich candidate bundle: $candidate_file"
-  echo "[domum-media] Release: $tag_name ($published_at)"
-
-  local published_epoch now age_days delay_days
-  published_epoch="$(date -d "$published_at" +%s)"
+  local now delay_days current_bundle_key desired_bundle_key current_candidate_tag current_candidate_first_seen
   now="$(date +%s)"
-  age_days=$(( (now - published_epoch) / 86400 ))
   delay_days="${IMMICH_BUNDLE_DELAY_DAYS:-21}"
+  current_bundle_key="${IMMICH_SERVER_IMAGE}|${IMMICH_MACHINE_LEARNING_IMAGE}|${IMMICH_REDIS_IMAGE}|${IMMICH_POSTGRES_IMAGE}"
+  desired_bundle_key="${server_image}|${ml_image}|${redis_image}|${postgres_image}"
 
-  if (( force == 0 && age_days < delay_days )); then
-    echo "[domum-media] Delay window not reached for Immich bundle (${age_days}d < ${delay_days}d)."
+  unset IMMICH_BUNDLE_TAG IMMICH_BUNDLE_RELEASE_URL IMMICH_BUNDLE_PUBLISHED_AT IMMICH_BUNDLE_SERVER_IMAGE IMMICH_BUNDLE_MACHINE_LEARNING_IMAGE IMMICH_BUNDLE_REDIS_IMAGE IMMICH_BUNDLE_POSTGRES_IMAGE FIRST_SEEN_TS
+  if [[ -f "$candidate_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$candidate_file"
+  fi
+  current_candidate_tag="${IMMICH_BUNDLE_TAG:-}"
+  current_candidate_first_seen="${FIRST_SEEN_TS:-$now}"
+
+  if [[ "$current_bundle_key" == "$desired_bundle_key" ]]; then
+    write_env_kv "$applied_file" \
+      RELEASE_TAG "$tag_name" \
+      RELEASE_URL "$html_url" \
+      RELEASE_DATE "$published_at" \
+      FIRST_APPLIED_TS "$now" \
+      SERVER_IMAGE "$server_image" \
+      ML_IMAGE "$ml_image" \
+      REDIS_IMAGE "$redis_image" \
+      POSTGRES_IMAGE "$postgres_image"
+    rm -f "$candidate_file"
+    echo "[domum-media] Immich already matches the latest release bundle ($tag_name)."
+    rm -f "$release_json" "$compose_tmp" "$meta_tmp"
+    return 0
+  fi
+
+  if [[ "$current_candidate_tag" != "$tag_name" ]]; then
+    write_env_kv "$candidate_file" \
+      IMMICH_BUNDLE_TAG "$tag_name" \
+      IMMICH_BUNDLE_RELEASE_URL "$html_url" \
+      IMMICH_BUNDLE_PUBLISHED_AT "$published_at" \
+      IMMICH_BUNDLE_SERVER_IMAGE "$server_image" \
+      IMMICH_BUNDLE_MACHINE_LEARNING_IMAGE "$ml_image" \
+      IMMICH_BUNDLE_REDIS_IMAGE "$redis_image" \
+      IMMICH_BUNDLE_POSTGRES_IMAGE "$postgres_image" \
+      FIRST_SEEN_TS "$now"
+    if [[ -n "$current_candidate_tag" ]]; then
+      record_update_history "immich" "delay_reset" "$current_candidate_tag" "$tag_name" "" "success" "newer bundle appeared during delay window"
+      echo "[domum-media] Immich bundle advanced from $current_candidate_tag to $tag_name; delay restarted."
+    else
+      echo "[domum-media] Stored new Immich bundle candidate $tag_name; waiting ${delay_days} day(s)."
+    fi
+    if (( force == 0 )); then
+      rm -f "$release_json" "$compose_tmp" "$meta_tmp"
+      return 0
+    fi
+  fi
+
+  local remaining
+  if (( force == 0 )) && (( check_only == 0 )) && [[ "${IMMICH_BUNDLE_AUTO_UPDATE:-1}" != "1" ]]; then
+    echo "[domum-media] Immich bundle auto-update is disabled."
+    rm -f "$release_json" "$compose_tmp" "$meta_tmp"
+    return 0
+  fi
+  if (( force == 0 )) && (( now - current_candidate_first_seen < delay_days * 86400 )); then
+    remaining=$(( delay_days * 86400 - (now - current_candidate_first_seen) ))
+    echo "[domum-media] Immich bundle $tag_name is still in the delay window (${remaining}s remaining)."
+    rm -f "$release_json" "$compose_tmp" "$meta_tmp"
+    return 0
+  fi
+  if (( check_only == 1 )); then
+    echo "[domum-media] Immich bundle $tag_name is ready."
     rm -f "$release_json" "$compose_tmp" "$meta_tmp"
     return 0
   fi
@@ -1767,7 +2235,7 @@ EOF
 
   compose_cmd pull immich_server immich_machine_learning immich_redis immich_postgres
   compose_cmd up -d immich_server immich_machine_learning immich_redis immich_postgres
-  if ! service_is_healthy immich; then
+  if ! wait_for_service_health immich 180 5; then
     echo "[domum-media] Immich bundle rollout failed health validation."
     config_set IMMICH_SERVER_IMAGE "$old_server"
     config_set IMMICH_MACHINE_LEARNING_IMAGE "$old_ml"
@@ -1775,14 +2243,27 @@ EOF
     config_set IMMICH_POSTGRES_IMAGE "$old_postgres"
     load_cfg
     export_env_for_compose
+    record_update_history "immich" "skipped_unhealthy" "$old_server" "$server_image" "$snapshot_name" "failure" "bundle rollout failed validation"
     if [[ -n "$snapshot_name" ]]; then
       restore_snapshot_for_service immich "$snapshot_name"
+      record_update_history "immich" "rolled_back" "$server_image" "$old_server" "$snapshot_name" "success" "restored pre-bundle snapshot"
     else
       compose_cmd up -d immich_server immich_machine_learning immich_redis immich_postgres
     fi
     die "Immich bundle refresh rolled back."
   fi
 
+  write_env_kv "$applied_file" \
+    RELEASE_TAG "$tag_name" \
+    RELEASE_URL "$html_url" \
+    RELEASE_DATE "$published_at" \
+    FIRST_APPLIED_TS "$now" \
+    SERVER_IMAGE "$server_image" \
+    ML_IMAGE "$ml_image" \
+    REDIS_IMAGE "$redis_image" \
+    POSTGRES_IMAGE "$postgres_image"
+  rm -f "$candidate_file"
+  record_update_history "immich" "applied" "$old_server" "$server_image" "$snapshot_name" "success" "$tag_name"
   echo "[domum-media] Immich bundle refreshed to $tag_name"
   rm -f "$release_json" "$compose_tmp" "$meta_tmp"
 }
@@ -1936,11 +2417,36 @@ apply() {
   echo "[domum-media] apply done."
 }
 
+status_counts() {
+  local immich_lib="${DOMUM_DATA_ROOT}/immich/library"
+  local media_root="${DOMUM_MEDIA_ROOT:-/srv/media}"
+
+  echo "=== data counts ==="
+  [[ -d "$immich_lib" ]] && printf 'Immich library files: %s\n' "$(find "$immich_lib" -type f 2>/dev/null | wc -l)" || true
+  if [[ -d "$media_root" ]]; then
+    for subdir in movies tv music books photos; do
+      [[ -d "$media_root/$subdir" ]] || continue
+      printf '%s files: %s\n' "$subdir" "$(find "$media_root/$subdir" -type f 2>/dev/null | wc -l)"
+    done
+  fi
+}
+
+status_storage() {
+  echo "=== storage ==="
+  printf '%-28s %-8s %-8s %-8s %-6s\n' "PATH" "SIZE" "USED" "AVAIL" "USE%"
+  for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_HOT_ROOT" /; do
+    [[ -e "$path" ]] || continue
+    df -h --output=target,size,used,avail,pcent "$path" 2>/dev/null | tail -n1
+  done | awk '{printf "%-28s %-8s %-8s %-8s %-6s\n",$1,$2,$3,$4,$5}'
+}
+
 status() {
   need_root
   load_cfg
   export_env_for_compose
   ensure_networks
+  local show_counts=0
+  [[ "${1:-}" == "--counts" ]] && show_counts=1
 
   echo "=== compose ps ==="
   compose_cmd ps || true
@@ -1956,6 +2462,14 @@ status() {
   echo
   echo "=== hot storage (${DOMUM_HOT_ROOT}) ==="
   hot_status
+
+  echo
+  status_storage
+
+  if (( show_counts == 1 )); then
+    echo
+    status_counts
+  fi
 }
 
 repo_update() {
@@ -1995,43 +2509,616 @@ snapshot_cmd() {
   esac
 }
 
+rollback_entries() {
+  find "$(rollback_index_dir)" -type f -name '*.env' | sort
+}
+
+rollback_list_cmd() {
+  printf '%-28s %-12s %-18s %-10s %-10s\n' "ID" "SERVICE" "EVENT" "AGE" "STATUS"
+  rollback_entries | while IFS= read -r file; do
+    unset ID SERVICE EVENT TS STATUS
+    # shellcheck disable=SC1090
+    source "$file"
+    printf '%-28s %-12s %-18s %-10s %-10s\n' \
+      "${ID:-unknown}" \
+      "${SERVICE:-unknown}" \
+      "${EVENT:-unknown}" \
+      "$(human_age_from_epoch "${TS:-0}")" \
+      "${STATUS:-unknown}"
+  done
+}
+
+rollback_show_cmd() {
+  local rollback_id="$1"
+  local file
+  file="$(rollback_index_dir)/${rollback_id}.env"
+  [[ -f "$file" ]] || die "Rollback point not found: $rollback_id"
+  cat "$file"
+}
+
+rollback_apply_entry() {
+  local rollback_id="$1"
+  local dry_run="${2:-0}"
+  local file snapshot_name
+  file="$(rollback_index_dir)/${rollback_id}.env"
+  [[ -f "$file" ]] || die "Rollback point not found: $rollback_id"
+
+  unset ID SERVICE EVENT SNAPSHOT SNAPSHOT_NAME IMAGE_BEFORE IMAGE_AFTER TS STATUS
+  # shellcheck disable=SC1090
+  source "$file"
+  [[ "${STATUS:-available}" == "available" ]] || die "Rollback point is not available: ${STATUS:-unknown}"
+  snapshot_name="${SNAPSHOT_NAME:-$(basename "${SNAPSHOT:-}")}"
+  [[ -n "$snapshot_name" ]] || die "Rollback point $rollback_id has no snapshot path."
+
+  if (( dry_run == 1 )); then
+    echo "[domum-media] Would restore ${SERVICE:-unknown} from ${snapshot_name}"
+    return 0
+  fi
+
+  restore_snapshot_for_service "${SERVICE:-unknown}" "$snapshot_name"
+  update_rollback_entry_status "$file" "consumed"
+  record_update_history "${SERVICE:-unknown}" "rolled_back" "${IMAGE_AFTER:-}" "${IMAGE_BEFORE:-}" "$snapshot_name" "success" "manual rollback apply ${rollback_id}"
+}
+
 rollback_cmd() {
   need_root
   load_cfg
   export_env_for_compose
+  ensure_state_dirs
 
-  [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || die "No snapshots available."
+  local sub="${1:-interactive}"
+  case "$sub" in
+    list) rollback_list_cmd ;;
+    show) shift; [[ -n "${1:-}" ]] || die "Usage: domum-media rollback show <id>"; rollback_show_cmd "$1" ;;
+    apply)
+      shift
+      [[ -n "${1:-}" ]] || die "Usage: domum-media rollback apply <id> [--dry-run]"
+      local rollback_id="$1"
+      local dry_run=0
+      shift || true
+      [[ "${1:-}" == "--dry-run" ]] && dry_run=1
+      rollback_apply_entry "$rollback_id" "$dry_run"
+      ;;
+    interactive)
+      local snapshots=()
+      local idx=1
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        unset ID SERVICE EVENT STATUS
+        # shellcheck disable=SC1090
+        source "$file"
+        [[ "${STATUS:-available}" == "available" ]] || continue
+        snapshots+=("${ID}")
+        printf '%d) %s | %s | %s\n' "$idx" "${ID}" "${SERVICE:-unknown}" "${EVENT:-unknown}"
+        idx=$(( idx + 1 ))
+      done < <(rollback_entries)
+      (( ${#snapshots[@]} > 0 )) || die "No rollback points available."
+      local choice selected
+      read -r -p "Select rollback number to restore: " choice
+      [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
+      selected="${snapshots[$((choice - 1))]:-}"
+      [[ -n "$selected" ]] || die "Selection out of range."
+      rollback_apply_entry "$selected" 0
+      ;;
+    *) die "Usage: domum-media rollback {list|show <id>|apply <id> [--dry-run]}" ;;
+  esac
+}
 
-  local snapshots=()
-  local idx=1
+image_ids_used_by_any_container() {
+  docker ps -aq 2>/dev/null | while IFS= read -r cid; do
+    [[ -n "$cid" ]] || continue
+    docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true
+  done | sort -u
+}
+
+collect_cleanup_image_ids() {
+  local tmp
+  tmp="$(mktemp)"
+  image_ids_used_by_any_container > "$tmp"
+
+  {
+    docker images --filter dangling=true -q 2>/dev/null || true
+    rollback_entries | while IFS= read -r file; do
+      unset IMAGE_BEFORE IMAGE_AFTER
+      # shellcheck disable=SC1090
+      source "$file"
+      [[ -n "${IMAGE_BEFORE:-}" ]] && printf '%s\n' "$IMAGE_BEFORE"
+      [[ -n "${IMAGE_AFTER:-}" ]] && printf '%s\n' "$IMAGE_AFTER"
+    done
+  } | sort -u | while IFS= read -r image_id; do
+    [[ -n "$image_id" ]] || continue
+    docker image inspect "$image_id" >/dev/null 2>&1 || continue
+    grep -Fxq "$image_id" "$tmp" && continue
+    printf '%s\n' "$image_id"
+  done
+
+  rm -f "$tmp"
+}
+
+cleanup_images_execute() {
+  local dry_run="${1:-1}"
+  local confirm="${2:-0}"
+  local -a ids=()
+  local total_size=0
+  local size
+
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    ids+=("$id")
+  done < <(collect_cleanup_image_ids)
+
+  if (( ${#ids[@]} == 0 )); then
+    echo "[domum-media] No pruneable images found."
+    return 0
+  fi
+
+  for id in "${ids[@]}"; do
+    size="$(docker image inspect "$id" --format '{{.Size}}' 2>/dev/null || echo 0)"
+    total_size=$(( total_size + size ))
+    printf '%s %s\n' "$id" "$(docker image inspect "$id" --format '{{.RepoTags}}' 2>/dev/null || echo '[]')"
+  done
+  echo "[domum-media] Candidate image count: ${#ids[@]} (approx $(( total_size / 1024 / 1024 )) MiB)"
+
+  if (( dry_run == 1 )); then
+    return 0
+  fi
+
+  if (( confirm == 0 )); then
+    die "Refusing destructive cleanup without --confirm"
+  fi
+
+  docker image rm "${ids[@]}"
+}
+
+cleanup_snapshot_candidates() {
+  local keep="${CLEANUP_OLD_SNAPSHOTS_KEEP:-${SNAPSHOT_KEEP_PER_SUBVOL:-14}}"
+  local names base total drop i
+  [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
+  names="$(find "$DOMUM_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
+  while IFS= read -r base; do
+    [[ -n "$base" ]] || continue
+    mapfile -t snaps < <(list_snapshots_for_base "$base")
+    total="${#snaps[@]}"
+    drop=$(( total - keep ))
+    if (( drop > 0 )); then
+      for (( i = 0; i < drop; i++ )); do
+        printf '%s\n' "${snaps[$i]}"
+      done
+    fi
+  done <<< "$names"
+}
+
+cleanup_snapshots_execute() {
+  local dry_run="${1:-1}"
+  local confirm="${2:-0}"
+  local -a victims=()
   while IFS= read -r snap; do
     [[ -n "$snap" ]] || continue
-    snapshots+=("$snap")
-    local meta_file service before after
-    meta_file="$(snapshot_metadata_dir)/${snap}.env"
-    service="$(printf '%s' "$snap" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//')"
-    before="unknown"
-    after="unknown"
-    if [[ -f "$meta_file" ]]; then
-      # shellcheck disable=SC1090
-      source "$meta_file"
-      service="${SERVICE:-$service}"
-      before="${VERSION_BEFORE:-unknown}"
-      after="${VERSION_AFTER:-unknown}"
+    victims+=("$snap")
+  done < <(cleanup_snapshot_candidates)
+
+  if (( ${#victims[@]} == 0 )); then
+    echo "[domum-media] No pruneable snapshots found."
+    return 0
+  fi
+
+  printf '%s\n' "${victims[@]}"
+  if (( dry_run == 1 )); then
+    return 0
+  fi
+  if (( confirm == 0 )); then
+    die "Refusing destructive cleanup without --confirm"
+  fi
+  local victim
+  for victim in "${victims[@]}"; do
+    btrfs subvolume delete "$DOMUM_SNAPSHOT_ROOT/$victim"
+  done
+}
+
+cleanup_summary() {
+  local dangling exited old_snaps
+  dangling="$(docker images --filter dangling=true -q 2>/dev/null | wc -l | tr -d ' ')"
+  exited="$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l | tr -d ' ')"
+  old_snaps="$(cleanup_snapshot_candidates | wc -l | tr -d ' ')"
+  echo "Cleanup summary:"
+  echo "  Dangling images: $dangling"
+  echo "  Exited containers: $exited"
+  echo "  Snapshots beyond retention: $old_snaps"
+}
+
+cleanup_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_state_dirs
+
+  local sub="${1:-summary}"
+  local dry_run=1
+  local confirm=0
+  shift || true
+  while (( $# )); do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      --confirm) dry_run=0; confirm=1 ;;
+      *) die "Unknown cleanup arg: $1" ;;
+    esac
+    shift
+  done
+
+  case "$sub" in
+    summary) cleanup_summary ;;
+    images) cleanup_images_execute "$dry_run" "$confirm" ;;
+    hot)
+      if (( dry_run == 1 )); then
+        hot_prune --dry-run
+      else
+        hot_prune
+      fi
+      ;;
+    snapshots) cleanup_snapshots_execute "$dry_run" "$confirm" ;;
+    *) die "Usage: domum-media cleanup {summary|images|hot|snapshots} [--dry-run|--confirm]" ;;
+  esac
+}
+
+recovery_pack_manifest() {
+  local stage_dir="$1"
+  local manifest="$stage_dir/MANIFEST.txt"
+  : > "$manifest"
+  find "$stage_dir" -type f ! -name MANIFEST.txt | sort | while IFS= read -r path; do
+    printf '%s  %s\n' "$(sha256_of_file "$path")" "${path#"$stage_dir"/}" >> "$manifest"
+  done
+}
+
+recovery_pack_restore_instructions() {
+  local stage_dir="$1"
+  cat > "$stage_dir/RESTORE.txt" <<EOF
+Recovery pack restore notes
+
+1. Decrypt the archive with your age private key.
+2. Restore config/domum-media.conf to $CFG_FILE
+3. Restore secrets/* to $SECRETS_DIR with mode 0600 and owner root:root
+4. Re-run:
+   sudo domum-media configure --non-interactive
+   sudo domum-media init
+   sudo domum-media apply
+5. Restore /srv/data from restic using domum-media-backup --restore
+EOF
+}
+
+send_recovery_pack_email() {
+  local archive="$1"
+  local smtp_user smtp_pass message
+  [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]] || return 0
+  [[ -n "${RECOVERY_PACK_SMTP_HOST:-}" ]] || die "RECOVERY_PACK_SMTP_HOST is required when email delivery is enabled."
+  [[ -f "$RECOVERY_PACK_SMTP_USERNAME_FILE" && -f "$RECOVERY_PACK_SMTP_PASSWORD_FILE" ]] || die "SMTP credential files are missing."
+  smtp_user="$(read_secret_file_value "$RECOVERY_PACK_SMTP_USERNAME_FILE")"
+  smtp_pass="$(read_secret_file_value "$RECOVERY_PACK_SMTP_PASSWORD_FILE")"
+  message="$(mktemp)"
+  {
+    printf 'From: %s\n' "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}"
+    printf 'To: %s\n' "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}"
+    printf 'Subject: domum-media recovery pack %s\n' "$(basename "$archive")"
+    printf 'MIME-Version: 1.0\n'
+    printf 'Content-Type: multipart/mixed; boundary="domum-boundary"\n\n'
+    printf -- '--domum-boundary\n'
+    printf 'Content-Type: text/plain; charset="utf-8"\n\n'
+    printf 'Attached: %s\n\n' "$(basename "$archive")"
+    printf -- '--domum-boundary\n'
+    printf 'Content-Type: application/octet-stream; name="%s"\n' "$(basename "$archive")"
+    printf 'Content-Transfer-Encoding: base64\n'
+    printf 'Content-Disposition: attachment; filename="%s"\n\n' "$(basename "$archive")"
+    base64 < "$archive"
+    printf '\n--domum-boundary--\n'
+  } > "$message"
+  curl --silent --show-error --ssl-reqd \
+    --url "smtps://${RECOVERY_PACK_SMTP_HOST}:${RECOVERY_PACK_SMTP_PORT}" \
+    --user "${smtp_user}:${smtp_pass}" \
+    --mail-from "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}" \
+    --mail-rcpt "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}" \
+    --upload-file "$message"
+  rm -f "$message"
+}
+
+recovery_pack_create() {
+  [[ "${RECOVERY_PACK_ENABLED:-1}" == "1" ]] || die "Recovery pack generation is disabled (RECOVERY_PACK_ENABLED=0)."
+  [[ "${RECOVERY_PACK_ENCRYPTION:-age}" == "age" ]] || die "Only age encryption is supported."
+  cmd_exists age || die "age is required for recovery-pack."
+  [[ -f "$RECOVERY_PACK_AGE_PUBKEY_FILE" ]] || die "Missing recovery pack age public key: $RECOVERY_PACK_AGE_PUBKEY_FILE"
+
+  local no_email="${1:-0}"
+  local stage_dir archive_plain archive_enc pubkey recipient ts sha size
+  stage_dir="$(mktemp -d)"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  archive_plain="$(mktemp "/tmp/recovery-pack-${ts}.XXXXXX")"
+  archive_enc="$RECOVERY_PACK_DEST/recovery-pack-${ts}.tar.age"
+  pubkey="$(read_secret_file_value "$RECOVERY_PACK_AGE_PUBKEY_FILE")"
+  recipient="$(printf '%s' "$pubkey" | awk '/^age1/ {print; exit}')"
+  [[ -n "$recipient" ]] || die "Could not parse age recipient from $RECOVERY_PACK_AGE_PUBKEY_FILE"
+
+  mkdir -p "$stage_dir/config" "$stage_dir/secrets" "$stage_dir/meta"
+  [[ -f "$CFG_FILE" ]] && install -m 0600 "$CFG_FILE" "$stage_dir/config/domum-media.conf"
+  find "$SECRETS_DIR" -maxdepth 1 -type f 2>/dev/null | while IFS= read -r file; do
+    install -m 0600 "$file" "$stage_dir/secrets/$(basename "$file")"
+  done
+  git -C "$DOMUM_DIR" rev-parse HEAD > "$stage_dir/meta/git-revision.txt" 2>/dev/null || true
+  compose_cmd config > "$stage_dir/meta/rendered-compose.yml" 2>/dev/null || true
+  recovery_pack_restore_instructions "$stage_dir"
+  recovery_pack_manifest "$stage_dir"
+
+  tar -C "$stage_dir" -czf "$archive_plain" .
+  age -r "$recipient" -o "$archive_enc" "$archive_plain"
+  sha="$(sha256_of_file "$archive_enc")"
+  size="$(stat -c %s "$archive_enc" 2>/dev/null || stat -f %z "$archive_enc")"
+  write_env_kv "$(recovery_pack_state_file)" \
+    ARCHIVE_PATH "$archive_enc" \
+    SHA256 "$sha" \
+    SIZE "$size" \
+    TS "$(date +%s)" \
+    VERIFIED_TS "$(date +%s)"
+  rm -rf "$stage_dir"
+  rm -f "$archive_plain"
+
+  if (( no_email == 0 )); then
+    send_recovery_pack_email "$archive_enc"
+  fi
+
+  echo "[domum-media] Recovery pack written to $archive_enc"
+}
+
+recovery_pack_status() {
+  local state_file archive_path ts size sha
+  state_file="$(recovery_pack_state_file)"
+  if [[ ! -f "$state_file" ]]; then
+    echo "[domum-media] No recovery pack has been created yet."
+    return 1
+  fi
+  unset ARCHIVE_PATH SHA256 SIZE TS VERIFIED_TS
+  # shellcheck disable=SC1090
+  source "$state_file"
+  archive_path="${ARCHIVE_PATH:-}"
+  ts="${TS:-0}"
+  size="${SIZE:-0}"
+  sha="${SHA256:-}"
+  echo "Recovery pack:"
+  echo "  path: ${archive_path:-missing}"
+  echo "  age: $(human_age_from_epoch "$ts")"
+  echo "  size: ${size} bytes"
+  echo "  sha256: ${sha:-unknown}"
+  echo "  verified age: $(human_age_from_epoch "${VERIFIED_TS:-$ts}")"
+}
+
+recovery_pack_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_state_dirs
+
+  local sub="${1:-create}"
+  case "$sub" in
+    create)
+      shift || true
+      local no_email=0
+      [[ "${1:-}" == "--no-email" ]] && no_email=1
+      recovery_pack_create "$no_email"
+      ;;
+    status) recovery_pack_status ;;
+    *) die "Usage: domum-media recovery-pack {create [--no-email]|status}" ;;
+  esac
+}
+
+json_array_from_items() {
+  if (( $# == 0 )); then
+    printf '[]'
+  else
+    printf '%s\n' "$@" | jq -R . | jq -s .
+  fi
+}
+
+checkup_add() {
+  local level="$1"
+  shift
+  case "$level" in
+    critical) CHECKUP_CRITICAL+=("$*") ;;
+    warning) CHECKUP_WARNINGS+=("$*") ;;
+    healthy) CHECKUP_HEALTHY+=("$*") ;;
+    action) CHECKUP_ACTIONS+=("$*") ;;
+  esac
+}
+
+checkup_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_state_dirs
+
+  local json=0
+  [[ "${1:-}" == "--json" ]] && json=1
+
+  CHECKUP_CRITICAL=()
+  CHECKUP_WARNINGS=()
+  CHECKUP_HEALTHY=()
+  CHECKUP_ACTIONS=()
+
+  [[ -n "${DOMUM_DOMAIN:-}" ]] || checkup_add critical "DOMUM_DOMAIN is empty."
+  [[ -n "${BACKUP_POLICY:-}" ]] || checkup_add critical "BACKUP_POLICY is unset."
+  case "${BACKUP_POLICY^^}" in
+    STRICT|BALANCED|LENIENT) ;;
+    *) checkup_add critical "BACKUP_POLICY must be STRICT, BALANCED, or LENIENT." ;;
+  esac
+  if grep -qE '^(IMMICH_VERSION|JELLYFIN_VERSION|NAVIDROME_VERSION)=' "$CFG_FILE" 2>/dev/null; then
+    checkup_add critical "Legacy image pin variables are still present in the config."
+  fi
+  if ! enabled_backup_targets | grep -q .; then
+    checkup_add critical "No backup targets are enabled."
+  else
+    checkup_add healthy "At least one backup target is enabled."
+  fi
+
+  local required_secret
+  for required_secret in \
+    $([[ "${ENABLE_TRAEFIK:-0}" == "1" ]] && printf '%s ' "$SECRETS_DIR/cloudflare_api_token" "${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}") \
+    $([[ "${ENABLE_IMMICH:-0}" == "1" ]] && printf '%s ' "$SECRETS_DIR/immich_db_password" "$SECRETS_DIR/immich_jwt_secret"); do
+    if [[ ! -s "$required_secret" ]]; then
+      checkup_add critical "Missing or empty secret: $required_secret"
     fi
-    printf '%d) %s | %s | %s -> %s\n' "$idx" "$snap" "$service" "$before" "$after"
-    idx=$(( idx + 1 ))
-  done < <(snapshot_list)
+  done
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    [[ -s "$(backup_target_password_file "$target")" ]] || checkup_add critical "Missing backup password file for $target."
+  done < <(backup_target_names)
 
-  (( ${#snapshots[@]} > 0 )) || die "No snapshots available."
+  if [[ "${RECOVERY_PACK_ENABLED:-1}" == "1" ]]; then
+    if recovery_pack_status >/dev/null 2>&1; then
+      unset ARCHIVE_PATH TS VERIFIED_TS
+      # shellcheck disable=SC1090
+      source "$(recovery_pack_state_file)"
+      if (( $(date +%s) - ${TS:-0} > RECOVERY_PACK_REMINDER_DAYS * 86400 )); then
+        checkup_add warning "Recovery pack is older than ${RECOVERY_PACK_REMINDER_DAYS} days."
+        checkup_add action "sudo domum-media recovery-pack create"
+      else
+        checkup_add healthy "Recovery pack age is within policy."
+      fi
+    else
+      checkup_add critical "Recovery pack has never completed."
+      checkup_add action "sudo domum-media recovery-pack create"
+    fi
+  fi
 
-  local choice selected service
-  read -r -p "Select snapshot number to restore: " choice
-  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
-  selected="${snapshots[$((choice - 1))]:-}"
-  [[ -n "$selected" ]] || die "Selection out of range."
-  service="$(printf '%s' "$selected" | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//')"
-  restore_snapshot_for_service "$service" "$selected"
+  local service enable_var
+  while IFS='|' read -r service enable_var _ _ _ _ _; do
+    [[ "${!enable_var:-0}" == "1" ]] || continue
+    if wait_for_service_health "$service" 1 1; then
+      checkup_add healthy "${service} healthy."
+    else
+      checkup_add warning "${service} is not healthy."
+    fi
+  done < <(service_lifecycle_specs)
+
+  local last_success age_hours
+  if last_success="$(backup_last_success_epoch)"; then
+    age_hours=$(( ($(date +%s) - last_success) / 3600 ))
+    if (( age_hours > BACKUP_REQUIRED_MAX_AGE_HOURS )); then
+      checkup_add critical "Last successful backup is ${age_hours}h old."
+    else
+      checkup_add healthy "Last backup completed ${age_hours}h ago."
+    fi
+  else
+    checkup_add critical "No successful backup timestamp found."
+  fi
+
+  local path pcent
+  for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_HOT_ROOT" /; do
+    [[ -e "$path" ]] || continue
+    pcent="$(df -P "$path" | awk 'NR==2 {gsub("%","",$5); print $5}')"
+    if (( pcent >= 90 )); then
+      checkup_add warning "$path is ${pcent}% full."
+    fi
+  done
+
+  local dangling exited waiting_count failed_recent reset_recent
+  dangling="$(docker images --filter dangling=true -q 2>/dev/null | wc -l | tr -d ' ')"
+  exited="$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l | tr -d ' ')"
+  (( dangling > 0 )) && checkup_add warning "${dangling} dangling Docker images can be pruned."
+  (( exited > 0 )) && checkup_add warning "${exited} containers are exited."
+  (( dangling > 0 )) && checkup_add action "sudo domum-media cleanup images --dry-run"
+
+  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
+  (( waiting_count > 0 )) && checkup_add warning "${waiting_count} service update candidates are waiting."
+  [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]] && checkup_add warning "Immich bundle candidate is pending."
+
+  reset_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -7 -print0 2>/dev/null | xargs -0 grep -l \"EVENT='delay_reset'\" 2>/dev/null | wc -l | tr -d ' ')"
+  failed_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -30 -print0 2>/dev/null | xargs -0 grep -l \"RESULT='failure'\" 2>/dev/null | wc -l | tr -d ' ')"
+  (( reset_recent > 0 )) && checkup_add warning "${reset_recent} delay-reset events in the last 7 days."
+  (( failed_recent > 0 )) && checkup_add warning "${failed_recent} failed update events in the last 30 days."
+
+  if [[ -f /var/run/reboot-required ]]; then
+    checkup_add warning "Reboot required."
+    checkup_add action "sudo domum-media host-upgrade --force"
+  else
+    checkup_add healthy "No reboot is pending."
+  fi
+
+  local sim_updates sim_security sim_general
+  sim_updates="$(apt-get -s upgrade 2>/dev/null || true)"
+  sim_security="$(printf '%s\n' "$sim_updates" | grep '^Inst ' | grep -ci security || true)"
+  sim_general="$(printf '%s\n' "$sim_updates" | grep -c '^Inst ' || true)"
+  (( sim_security > 0 )) && checkup_add warning "${sim_security} security updates are available."
+  (( sim_general > 0 )) && checkup_add warning "${sim_general} general package updates are available."
+
+  if (( json == 1 )); then
+    printf '{\n'
+    printf '  "critical": %s,\n' "$(json_array_from_items "${CHECKUP_CRITICAL[@]}")"
+    printf '  "warnings": %s,\n' "$(json_array_from_items "${CHECKUP_WARNINGS[@]}")"
+    printf '  "healthy": %s,\n' "$(json_array_from_items "${CHECKUP_HEALTHY[@]}")"
+    printf '  "suggested_actions": %s\n' "$(json_array_from_items "${CHECKUP_ACTIONS[@]}")"
+    printf '}\n'
+  else
+    echo "domum-media checkup"
+    echo
+    echo "Critical:"
+    if (( ${#CHECKUP_CRITICAL[@]} == 0 )); then
+      echo "  [✓] none"
+    else
+      printf '  [!] %s\n' "${CHECKUP_CRITICAL[@]}"
+    fi
+    echo
+    echo "Warnings:"
+    if (( ${#CHECKUP_WARNINGS[@]} == 0 )); then
+      echo "  [✓] none"
+    else
+      printf '  [~] %s\n' "${CHECKUP_WARNINGS[@]}"
+    fi
+    echo
+    echo "Healthy:"
+    if (( ${#CHECKUP_HEALTHY[@]} == 0 )); then
+      echo "  [~] no healthy items recorded"
+    else
+      printf '  [✓] %s\n' "${CHECKUP_HEALTHY[@]}"
+    fi
+    echo
+    echo "Suggested actions:"
+    if (( ${#CHECKUP_ACTIONS[@]} == 0 )); then
+      echo "  1. No immediate action required."
+    else
+      local i=1
+      local action
+      for action in "${CHECKUP_ACTIONS[@]}"; do
+        printf '  %d. %s\n' "$i" "$action"
+        i=$(( i + 1 ))
+      done
+    fi
+  fi
+
+  (( ${#CHECKUP_CRITICAL[@]} == 0 ))
+}
+
+doctor_backups() {
+  load_cfg
+  local target
+  echo "Backups:"
+  if backup_last_success_epoch >/dev/null 2>&1; then
+    echo "  last success: $(epoch_to_iso "$(backup_last_success_epoch)")"
+  else
+    echo "  last success: missing"
+  fi
+  echo "  enabled targets:"
+  while IFS= read -r target; do
+    printf '    %s\n' "$target"
+  done < <(enabled_backup_targets)
+}
+
+doctor_secrets() {
+  load_cfg
+  echo "Secrets:"
+  find "$SECRETS_DIR" -maxdepth 1 -type f 2>/dev/null | sort | while IFS= read -r file; do
+    if [[ -s "$file" ]]; then
+      printf '  %s: set\n' "$(basename "$file")"
+    else
+      printf '  %s: empty\n' "$(basename "$file")"
+    fi
+  done
+  echo
+  recovery_pack_status || true
 }
 
 hot_cmd() {
@@ -2395,11 +3482,27 @@ doctor_immich() {
 
 immich_cmd() {
   need_root
+  load_cfg
+  export_env_for_compose
   local sub="${1:-}"
   case "$sub" in
     refresh-bundle) shift; immich_refresh_bundle "$@" ;;
+    check-bundle) shift; immich_refresh_bundle --check-only "$@" ;;
+    apply-bundle) shift; immich_refresh_bundle --force "$@" ;;
+    rollback)
+      local rollback_id
+      rollback_id="$(rollback_entries | while IFS= read -r file; do
+        unset ID SERVICE STATUS
+        # shellcheck disable=SC1090
+        source "$file"
+        [[ "${SERVICE:-}" == "immich" && "${STATUS:-available}" == "available" ]] || continue
+        printf '%s\n' "${ID}"
+      done | tail -n 1)"
+      [[ -n "$rollback_id" ]] || die "No available Immich rollback points found."
+      rollback_apply_entry "$rollback_id" 0
+      ;;
     reset-db) shift; immich_reset_db "$@" ;;
-    *) die "Usage: domum-media immich {refresh-bundle [--force]|reset-db [--wipe-uploads]}" ;;
+    *) die "Usage: domum-media immich {refresh-bundle [--force]|check-bundle|apply-bundle|rollback|reset-db [--wipe-uploads]}" ;;
   esac
 }
 
@@ -2567,7 +3670,8 @@ doctor_traefik() {
     local logs
     logs="$(docker logs traefik 2>&1 | grep -iE 'acme|certificate|cf:' | tail -n 40 || true)"
     if [[ -n "$logs" ]]; then
-      sed 's/^/  /' <<<"$logs"
+      logs="  ${logs//$'\n'/$'\n  '}"
+      printf '%s\n' "$logs"
     else
       echo "  (no ACME-related log lines found)"
     fi
@@ -2582,7 +3686,9 @@ doctor_cmd() {
   case "$sub" in
     immich) shift; doctor_immich "$@" ;;
     traefik) shift; doctor_traefik "$@" ;;
-    *) die "Usage: domum-media doctor {immich|traefik}" ;;
+    backups) shift; doctor_backups "$@" ;;
+    secrets) shift; doctor_secrets "$@" ;;
+    *) die "Usage: domum-media doctor {immich|traefik|backups|secrets}" ;;
   esac
 }
 
@@ -2594,19 +3700,21 @@ Usage:
   domum-media init
   domum-media configure
   domum-media apply
-  domum-media status
+  domum-media status [--counts]
   domum-media update
-  domum-media updates
-  domum-media refresh-images [--force]
+  domum-media updates {summary|check|apply|history}
+  domum-media refresh-images [--force] [--check-only] [--apply-now]
   domum-media host-upgrade [--force]
   domum-media logs <service>
   domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
   domum-media snapshot {create [tag]|list|prune}
-  domum-media rollback
-  domum-media doctor immich
-  domum-media doctor traefik
+  domum-media rollback {list|show <id>|apply <id> [--dry-run]}
+  domum-media checkup [--json]
+  domum-media cleanup {summary|images|hot|snapshots} [--dry-run|--confirm]
+  domum-media recovery-pack {create [--no-email]|status}
+  domum-media doctor {immich|traefik|backups|secrets}
   domum-media hot {status|prune [--dry-run]}
-  domum-media immich {refresh-bundle [--force]|reset-db [--wipe-uploads]}
+  domum-media immich {refresh-bundle [--force]|check-bundle|apply-bundle|rollback|reset-db [--wipe-uploads]}
 
 Config:  $CFG_FILE
 Secrets: $SECRETS_DIR
@@ -2629,6 +3737,9 @@ main() {
     backup)    backup_cmd "$@" ;;
     snapshot)  shift; snapshot_cmd "$@" ;;
     rollback)  shift; rollback_cmd "$@" ;;
+    checkup)   shift; checkup_cmd "$@" ;;
+    cleanup)   shift; cleanup_cmd "$@" ;;
+    recovery-pack) shift; recovery_pack_cmd "$@" ;;
     doctor)    shift; doctor_cmd "$@" ;;
     hot)       shift; hot_cmd "$@" ;;
     immich)    shift; immich_cmd "$@" ;;

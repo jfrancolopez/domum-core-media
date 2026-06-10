@@ -1,226 +1,91 @@
 # domum-core-media
 
-Self-updating media + backup stack for an Intel N100 mini-PC running Debian 13.
-Sibling of [`domum-core`](https://github.com/solosoyfranco/domum-core), same
-philosophy, different host. Production-only — Immich (irreplaceable family
-photos) lives here, so the operational rules are stricter than on the Pi.
+Self-hosted media stack for Debian 13 with:
 
-The host is managed through a single re-runnable command:
+- Compose-managed services
+- delayed container updates
+- Immich bundle management
+- btrfs snapshots + rollback metadata
+- restic multi-target backups
+- unattended Debian security patches
+- encrypted recovery-pack generation
 
-    curl -fsSL https://raw.githubusercontent.com/jfrancolopez/domum-core-media/main/install.sh | sudo bash
+## Bootstrap
 
-That command:
+```bash
+curl -fsSL https://raw.githubusercontent.com/jfrancolopez/domum-core-media/main/install.sh | sudo bash
+sudo domum-media configure
+sudo domum-media init
+sudo domum-media apply
+sudo domum-media recovery-pack create
+```
 
-- Installs or upgrades Docker + Tailscale + restic from official apt repos
-- Clones or hard-resets `/opt/domum-core-media`
-- Installs the `domum-media` CLI and the systemd timers
-- Prints the manual follow-up checklist (`configure`, `init`, `apply`)
+The installer manages `/opt/domum-core-media` as a resettable git checkout and
+installs `domum-media` plus the systemd timers.
 
-It deliberately does **not** format the data SSD — see `docs/SETUP-N100.md`.
+## Architecture
 
----
+- Git repo: `/opt/domum-core-media`
+- Live config: `/opt/domum-core-media/config/domum-media.conf`
+- Secrets: `/etc/domum-core-media/secrets`
+- Durable data: `/srv/data`
+- Media libraries: `/srv/media`
+- Snapshots: `/srv/snapshots`
+- Runtime state: `/var/lib/domum-media`
+- Logs: `/var/log/domum-media`
 
-## Architecture Philosophy
+Workloads are grouped into update classes:
 
-- Git = source of truth (`/opt/domum-core-media` is `git reset --hard`-managed)
-- Host config in `/opt/domum-core-media/config/domum-media.conf`
-- Secrets in `/etc/domum-core-media/secrets/` (plain files, `chmod 600`, root)
-- Per-service compose fragments + an interactive `domum-media configure` wizard
-- Lifecycle classes for safe infra, stateful apps, and bundle-managed apps
-- Delayed auto-updates with backup gates, btrfs snapshots, and rollback hooks
-- Single host Traefik with Cloudflare DNS-01 — no inbound ports
-- Tailscale for remote access
-- restic to multiple targets (REST/B2/NFS/FTP via rclone), with at least two copies
-- btrfs subvolumes on the live tier — atomic snapshots before each `apply`,
-  checksums surface bitrot loudly. Snapshots are *not* a substitute for restic;
-  they protect against operator error, not disk death.
-- Two-tier storage: durable `/srv/data` + `/srv/media`, volatile
-  `${DOMUM_HOT_ROOT:-/var/lib/domum-media/hot}` for cache/transcode/staging
+- Class A: Traefik, Tailscale, Uptime Kuma
+- Class B: Jellyfin, Plex, Navidrome, Calibre-Web, Kavita
+- Class C: Immich bundle
+- Class D: host OS packages
 
-The single-disk live tier is an accepted risk. Recovery is backup-driven, not
-RAID-driven — see `docs/disaster-recovery.md` for the drill (and run it before
-declaring the host production).
+## Update model
 
----
+- `domum-media refresh-images` tracks candidate digests and enforces delay windows.
+- If upstream moves during the delay, the timer resets and the event is logged.
+- Stateful services honor `BACKUP_POLICY`:
+  `STRICT`, `BALANCED`, or `LENIENT`.
+- Successful updates write rollback metadata and update-history entries.
+- Immich is updated only through the matched upstream release bundle.
 
-## Directory Layout
+## Core commands
 
-Repo (managed by git, never edited on the host):
+See [docs/CLI-CHEATSHEET.md](docs/CLI-CHEATSHEET.md) for the full list.
 
-    /opt/domum-core-media/
+```bash
+sudo domum-media status --counts
+sudo domum-media updates check
+sudo domum-media updates apply
+sudo domum-media updates history
+sudo domum-media immich check-bundle
+sudo domum-media immich apply-bundle
+sudo domum-media rollback list
+sudo domum-media checkup
+sudo domum-media cleanup images --dry-run
+sudo domum-media recovery-pack status
+```
 
-Host config (sourced by the CLI):
+## Recovery posture
 
-    /opt/domum-core-media/config/domum-media.conf
+Recovery depends on:
 
-Secrets:
+- this git repo
+- restic backup targets
+- the encrypted recovery pack
 
-    /etc/domum-core-media/secrets/
+The recovery pack contains only small critical files: config, secrets, rendered
+manifests, and restore instructions. It does not include photo, media, or
+database payloads.
 
-Live data (btrfs, one subvolume per service):
+Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 
-    /srv/data/immich/{library,postgres}
-    /srv/data/jellyfin/
-    /srv/data/plex/
-    /srv/data/navidrome/
-    /srv/data/calibre-web/
-    /srv/data/kavita/
-    /srv/data/uptime-kuma/
-    /srv/data/traefik/
+## Additional docs
 
-Media libraries:
-
-    /srv/media/{photos,music,movies,tv,books}
-
-Hot / volatile paths:
-
-    /var/lib/domum-media/hot/{jellyfin-cache,plex-transcode,books-import,...}
-
-btrfs snapshots (read-only):
-
-    /srv/snapshots/
-
-Backup + check logs:
-
-    /var/log/domum-media/
-
-Runtime state (tracked image rollout delays):
-
-    /var/lib/domum-media/
-
----
-
-## First-Time Setup
-
-Walk through these in order — they are *not* automated because they are
-one-shots that are too destructive to retry safely.
-
-1. **Provision the host.** Install Debian 13, partition + format the SSD as
-   btrfs with the subvolumes documented in `docs/SETUP-N100.md`. Apply the
-   power tuning in the same doc.
-2. **Bootstrap.**
-
-       curl -fsSL https://raw.githubusercontent.com/jfrancolopez/domum-core-media/main/install.sh | sudo bash
-
-3. **Configure.** Run the interactive wizard to toggle services, choose image
-   refs, define delayed auto-update behavior, configure backups, and create the
-   common secrets:
-
-       sudo domum-media configure
-
-   You can still hand-edit `config/domum-media.conf` if you prefer.
-4. **Bring up the host.**
-
-       sudo domum-media init
-       sudo domum-media apply
-
-5. **Initialise restic repos.** Follow `docs/SETUP-RESTIC.md` and run the
-   first backup manually before trusting the timer.
-6. **Run the DR drill.** Do not skip — `docs/disaster-recovery.md`. A backup
-   you have not restored is a hope, not a backup.
-
-Re-running the same curl command updates everything.
-
----
-
-## CLI Cheatsheet
-
-| Command | What it does |
-| --- | --- |
-| `domum-media init` | Verify host state, create dirs, validate secrets |
-| `domum-media configure` | Interactive wizard for services, image refs, timers, backups, and common secrets |
-| `domum-media apply` | btrfs pre-apply snapshot then `docker compose up -d --remove-orphans` |
-| `domum-media status` | `docker compose ps`, last restic snapshot, btrfs snapshot list |
-| `domum-media update` | `git fetch && git reset --hard origin/main && apply` |
-| `domum-media updates` | Lifecycle inventory, auto-update policy, and stored Immich bundle candidate |
-| `domum-media refresh-images [--force]` | Pull tracked images, wait out their delay window, then roll out due services |
-| `domum-media host-upgrade [--force]` | Upgrade Docker/compose/tailscale/restic and related host packages from apt |
-| `domum-media logs <svc>` | `docker compose logs -f <svc>` |
-| `domum-media backup [--check\ | --check-deep [target] \ | --restore]` | Ad-hoc backup, integrity check, or restore |
-| `domum-media snapshot {create\ | list\ | prune}` | btrfs subvolume snapshot management |
-| `domum-media rollback` | Restore a per-service btrfs snapshot interactively |
-| `domum-media doctor immich` | Verify Immich secrets, rendered compose env, fingerprint state, container health, images, and mounts without printing secrets |
-| `domum-media hot {status\|prune [--dry-run]}` | Inspect or prune volatile cache/transcode/staging storage |
-| `domum-media immich refresh-bundle [--force]` | Fetch the latest official Immich release bundle and roll it out after the delay window |
-| `domum-media immich reset-db [--wipe-uploads]` | Destructive: wipes Immich Postgres data + fingerprint, optionally wipes uploads, then reapplies. Use to adopt a new DB password. |
-
----
-
-## What Lives Where on Disk
-
-- `compose/base.yml` — declares the shared `domum-proxy` and `domum-internal`
-  networks and named volumes
-- `compose/proxy/traefik.yml` + `compose/proxy/traefik/` — Traefik service +
-  static & dynamic config (Cloudflare DNS-01 resolver, security headers,
-  dashboard with basic auth from a host secret file). Image ref and update
-  policy live in config.
-- `compose/security/tailscale.yml` — Tailscale userspace-off, host networking
-- `compose/photos/immich.yml` — Immich server, microservices, machine-learning,
-  Redis, Postgres (pgvecto.rs). Image refs and update policy live in config.
-  Library and Postgres data bind-mount to `/srv/data/immich/`. Immich secrets
-  stay file-backed under `/etc/domum-core-media/secrets/`; `domum-media apply`
-  exports them into the compose environment and validates the rendered config
-  before deployment. The DB password is locked after first apply — see
-  `docs/SETUP-IMMICH.md` for the secret lifecycle, `domum-media doctor immich`,
-  and the `domum-media immich reset-db` recovery flow.
-- `compose/media/jellyfin.yml` — Jellyfin with durable config and volatile
-  cache on the hot tier.
-- `compose/media/plex.yml` — Plex via LinuxServer.io with durable config,
-  volatile transcode, and Intel Quick Sync device mapping for the N100.
-- `compose/media/navidrome.yml` — Navidrome (Subsonic-compatible music server),
-  with image ref and update policy in config. State on `/srv/data/navidrome/`;
-  music is mounted read-only from `NAVIDROME_MUSIC_ROOT`
-  (`/srv/media/music`).
-- `compose/media/calibre-web.yml` / `compose/media/kavita.yml` — optional
-  eBook services backed by `/srv/media/books`.
-- `compose/monitoring/uptime-kuma.yml` — status board, image ref in config
-- `compose/backups/restic-rest-server.yml` — **optional**; only enable if the
-  NAS lives on this box. Default off.
-
----
-
-## Image Strategy
-
-- Every managed workload has a full image ref in `config/domum-media.conf`.
-- Services are grouped into lifecycle classes: A (safe infra), B (stateful
-  apps), and C (bundle-managed apps such as Immich).
-- If you want a pinned rollout, use an exact tag and keep `*_AUTO_UPDATE=0`.
-- If you want a moving tag such as `latest`, `stable`, or a major-only tag,
-  set the image ref accordingly, enable `*_AUTO_UPDATE=1`, and choose
-  `*_AUTO_UPDATE_DELAY_DAYS`.
-- `domum-media-image-refresh.timer` pulls tracked images daily, waits for the
-  configured delay window, verifies backup freshness for stateful services,
-  snapshots the service subvolume, rolls it forward, and restores the snapshot
-  if health validation fails.
-- Immich does not roll individual images anymore; use
-  `domum-media immich refresh-bundle` so the server, ML, database, and
-  redis/valkey images stay on the upstream release bundle.
-- `domum-media-host-update.timer` is optional and upgrades Docker Engine,
-  compose, tailscale, restic, and the base host tooling from apt.
-- See `docs/SETUP-UPDATES.md` and `docs/SETUP-PLEX-BOOKS-HOT-STORAGE.md`.
-
----
-
-## Backups in One Paragraph
-
-`domum-media-backup` (a) takes a fresh btrfs snapshot of
-`/srv/data/immich/postgres`, (b) `pg_dump`s Immich's Postgres into a staging
-file alongside the immutable photo library, (c) runs `restic backup
-/srv/data` to every enabled backup target, whether that target is a plain
-restic repo string, an NFS-mounted repo, or an FTP archive via rclone, (d)
-applies retention according to each target's configured cadence, (e) writes a
-one-line status to `/var/log/domum-media/backup.log` and pings Uptime Kuma.
-`domum-media-check.timer` does the weekly metadata checks and weekly-retention
-pass; deep checks remain manual via `domum-media backup --check-deep`.
-
-Restic password escrow is **not optional**: see `docs/SETUP-RESTIC.md`.
-
----
-
-## Non-Goals
-
-- No Kubernetes, no Nomad, no Portainer-as-source-of-truth
-- No sops/age/Vault for secrets (gold-plating at this scale)
-- No multi-host orchestration; Pi and N100 stay independent
-- No experimental services on this box (production-only)
-- No RAID, no ZFS — accepted single-disk live tier with backup-as-recovery
+- [docs/SETUP-UPDATES.md](docs/SETUP-UPDATES.md)
+- [docs/SETUP-IMMICH.md](docs/SETUP-IMMICH.md)
+- [docs/SETUP-RESTIC.md](docs/SETUP-RESTIC.md)
+- [docs/ROLLBACK.md](docs/ROLLBACK.md)
+- [docs/CHECKUP.md](docs/CHECKUP.md)
+- [docs/SECURITY-PATCHES.md](docs/SECURITY-PATCHES.md)

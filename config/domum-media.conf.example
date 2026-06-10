@@ -26,6 +26,7 @@ DOMUM_TS_IP=''
 
 # btrfs mount root. Subvolumes are mounted under here. See docs/SETUP-N100.md.
 DOMUM_DATA_ROOT="/srv/data"
+DOMUM_MEDIA_ROOT="/srv/media"
 DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
 DOMUM_LOG_DIR="/var/log/domum-media"
 
@@ -204,10 +205,12 @@ BACKUP_DAILY_AT=02:30
 CHECK_WEEKLY_AT=Sun\ 03:30
 SNAPSHOT_PRUNE_WEEKLY_AT=Sun\ 04:30
 
-# STRICT: refuse stateful service updates if last successful backup is older
-# than BACKUP_REQUIRED_MAX_AGE_HOURS. LENIENT: warn and continue.
-BACKUP_POLICY=STRICT
+# STRICT: require fresh backup for all stateful services.
+# BALANCED: require fresh backup for Immich, warn-and-proceed for media apps.
+# LENIENT: warn and proceed for all stateful services.
+BACKUP_POLICY=BALANCED
 BACKUP_REQUIRED_MAX_AGE_HOURS=48
+AUTO_ROLLBACK_ENABLED=1
 
 # restic retention policy applied to the NAS repo on every daily run, and
 # to the cloud repo weekly (cloud forget is expensive in B2 API calls).
@@ -266,22 +269,26 @@ BACKUP_TARGET_ARCHIVE_FTP_PASSWORD_FILE="/etc/domum-core-media/secrets/archive_f
 BACKUP_HEARTBEAT_URL=''
 
 # ============================================================
-# SECTION: Secrets policy
+# SECTION: Recovery pack
 # ============================================================
 
-# Encrypt and store a secrets archive so the server can be recovered from Git
-# + secrets restore alone. Uses `age` for encryption.
-# See docs/disaster-recovery.md for the recovery workflow.
-SECRETS_BACKUP_ENABLED=1
-SECRETS_BACKUP_ENCRYPTION=age
-# Path to the age public key used to encrypt the secrets archive.
-# Generate a keypair with: age-keygen -o ~/.config/age/key.txt
-# The public key is safe to store here; keep the private key offline.
-SECRETS_BACKUP_AGE_PUBKEY_FILE="/etc/domum-core-media/secrets/secrets_backup_pubkey"
-# Where to store the encrypted archive locally (included in the restic backup).
-SECRETS_BACKUP_DEST="/var/lib/domum-media/secrets-backup"
-# Warn in `domum-media checkup` if no successful secrets backup in N days.
-SECRETS_BACKUP_REMINDER_DAYS=30
+# Encrypted DR artifact containing config, secrets, manifests, and restore
+# notes. Generated with `domum-media recovery-pack create` and refreshed after
+# successful daily backups.
+RECOVERY_PACK_ENABLED=1
+RECOVERY_PACK_ENCRYPTION=age
+RECOVERY_PACK_AGE_PUBKEY_FILE="/etc/domum-core-media/secrets/recovery_pack_pubkey"
+RECOVERY_PACK_DEST="/var/lib/domum-media/recovery-pack"
+RECOVERY_PACK_REMINDER_DAYS=30
+
+# Optional SMTP delivery for the encrypted archive.
+RECOVERY_PACK_EMAIL_ENABLED=0
+RECOVERY_PACK_EMAIL_TO=""
+RECOVERY_PACK_EMAIL_FROM=""
+RECOVERY_PACK_SMTP_HOST=""
+RECOVERY_PACK_SMTP_PORT="465"
+RECOVERY_PACK_SMTP_USERNAME_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_username"
+RECOVERY_PACK_SMTP_PASSWORD_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_password"
 
 # ============================================================
 # SECTION: Hot storage
@@ -299,3 +306,10 @@ HOT_STORAGE_MAX_PERCENT=80
 
 # Automatically prune dangling Docker images after each successful update.
 CLEANUP_IMAGES_AFTER_UPDATE=1
+
+# How many btrfs snapshots per subvolume to keep when running:
+#   sudo domum-media cleanup snapshots [--dry-run|--confirm]
+# The automatic pruner (snapshot-prune timer) uses SNAPSHOT_KEEP_PER_SUBVOL
+# from the Backup policy section. Set this lower if you want the explicit
+# cleanup command to be more aggressive without changing the normal retention.
+CLEANUP_OLD_SNAPSHOTS_KEEP=7
