@@ -1887,6 +1887,10 @@ apply() {
   validate_immich_secret_exports
 
   render_traefik_dynamic
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]] && docker inspect traefik >/dev/null 2>&1; then
+    echo "[domum-media] Restarting traefik to apply dynamic config..."
+    docker restart traefik >/dev/null
+  fi
   validate_immich_compose_config
 
   echo "[domum-media] Pre-apply btrfs snapshot..."
