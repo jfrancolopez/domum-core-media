@@ -663,7 +663,7 @@ export_env_for_compose() {
   export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
   export DOMUM_STATE_ROOT
   export DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
-  export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:v3.7.1}"
+  export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:latest}"
   export TRAEFIK_AUTO_UPDATE="${TRAEFIK_AUTO_UPDATE:-0}"
   export TRAEFIK_AUTO_UPDATE_DELAY_DAYS="${TRAEFIK_AUTO_UPDATE_DELAY_DAYS:-7}"
   export TRAEFIK_DASHBOARD_HOST="${TRAEFIK_DASHBOARD_HOST:-traefik-media.${DOMUM_DOMAIN}}"
@@ -672,21 +672,17 @@ export_env_for_compose() {
   export TAILSCALE_IMAGE="${TAILSCALE_IMAGE:-tailscale/tailscale:stable}"
   export TAILSCALE_AUTO_UPDATE="${TAILSCALE_AUTO_UPDATE:-0}"
   export TAILSCALE_AUTO_UPDATE_DELAY_DAYS="${TAILSCALE_AUTO_UPDATE_DELAY_DAYS:-7}"
-  export IMMICH_SERVER_IMAGE="${IMMICH_SERVER_IMAGE:-ghcr.io/immich-app/immich-server:v1.118.2}"
-  export IMMICH_SERVER_AUTO_UPDATE="${IMMICH_SERVER_AUTO_UPDATE:-0}"
-  export IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS="${IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS:-7}"
-  export IMMICH_MACHINE_LEARNING_IMAGE="${IMMICH_MACHINE_LEARNING_IMAGE:-ghcr.io/immich-app/immich-machine-learning:v1.118.2}"
-  export IMMICH_MACHINE_LEARNING_AUTO_UPDATE="${IMMICH_MACHINE_LEARNING_AUTO_UPDATE:-0}"
-  export IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS="${IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export IMMICH_SERVER_IMAGE="${IMMICH_SERVER_IMAGE:-ghcr.io/immich-app/immich-server:release}"
+  export IMMICH_MACHINE_LEARNING_IMAGE="${IMMICH_MACHINE_LEARNING_IMAGE:-ghcr.io/immich-app/immich-machine-learning:release}"
   export IMMICH_REDIS_IMAGE="${IMMICH_REDIS_IMAGE:-docker.io/redis:6.2-alpine}"
-  export IMMICH_REDIS_AUTO_UPDATE="${IMMICH_REDIS_AUTO_UPDATE:-0}"
-  export IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS="${IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS:-14}"
   export IMMICH_POSTGRES_IMAGE="${IMMICH_POSTGRES_IMAGE:-tensorchord/pgvecto-rs:pg14-v0.2.0}"
-  export IMMICH_POSTGRES_AUTO_UPDATE="${IMMICH_POSTGRES_AUTO_UPDATE:-0}"
-  export IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS="${IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS:-14}"
+  export IMMICH_BUNDLE_AUTO_UPDATE="${IMMICH_BUNDLE_AUTO_UPDATE:-1}"
+  export IMMICH_BUNDLE_DELAY_DAYS="${IMMICH_BUNDLE_DELAY_DAYS:-21}"
+  export IMMICH_BUNDLE_ROLLBACK_ENABLED="${IMMICH_BUNDLE_ROLLBACK_ENABLED:-1}"
+  export IMMICH_HOST="${IMMICH_HOST:-photos.${DOMUM_DOMAIN}}"
   export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
   export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
-  export JELLYFIN_IMAGE="${JELLYFIN_IMAGE:-jellyfin/jellyfin:10.10.7}"
+  export JELLYFIN_IMAGE="${JELLYFIN_IMAGE:-lscr.io/linuxserver/jellyfin:latest}"
   export JELLYFIN_AUTO_UPDATE="${JELLYFIN_AUTO_UPDATE:-0}"
   export JELLYFIN_AUTO_UPDATE_DELAY_DAYS="${JELLYFIN_AUTO_UPDATE_DELAY_DAYS:-21}"
   export JELLYFIN_CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
@@ -705,7 +701,7 @@ export_env_for_compose() {
   export PUID="${PUID:-1000}"
   export PGID="${PGID:-1000}"
   export TZ="${TZ:-UTC}"
-  export NAVIDROME_IMAGE="${NAVIDROME_IMAGE:-deluan/navidrome:0.61.2}"
+  export NAVIDROME_IMAGE="${NAVIDROME_IMAGE:-deluan/navidrome:latest}"
   export NAVIDROME_AUTO_UPDATE="${NAVIDROME_AUTO_UPDATE:-0}"
   export NAVIDROME_AUTO_UPDATE_DELAY_DAYS="${NAVIDROME_AUTO_UPDATE_DELAY_DAYS:-21}"
   export NAVIDROME_DATA_DIR="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
@@ -728,7 +724,7 @@ export_env_for_compose() {
   export KAVITA_CONFIG_DIR="${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"
   export KAVITA_LIBRARY_DIR="${KAVITA_LIBRARY_DIR:-/srv/media/books}"
   export KAVITA_STAGING_DIR="${KAVITA_STAGING_DIR:-$DOMUM_HOT_ROOT/books-import}"
-  export UPTIME_KUMA_IMAGE="${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma:1}"
+  export UPTIME_KUMA_IMAGE="${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma:2}"
   export UPTIME_KUMA_AUTO_UPDATE="${UPTIME_KUMA_AUTO_UPDATE:-0}"
   export UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS="${UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS:-7}"
   export RESTIC_REST_SERVER_IMAGE="${RESTIC_REST_SERVER_IMAGE:-restic/rest-server:latest}"
@@ -1419,10 +1415,18 @@ configure_cmd() {
     configure_image_behavior TAILSCALE_IMAGE TAILSCALE_AUTO_UPDATE TAILSCALE_AUTO_UPDATE_DELAY_DAYS "Tailscale"
   fi
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
-    configure_image_behavior IMMICH_SERVER_IMAGE IMMICH_SERVER_AUTO_UPDATE IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS "Immich server"
-    configure_image_behavior IMMICH_MACHINE_LEARNING_IMAGE IMMICH_MACHINE_LEARNING_AUTO_UPDATE IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS "Immich machine learning"
-    configure_image_behavior IMMICH_REDIS_IMAGE IMMICH_REDIS_AUTO_UPDATE IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS "Immich Redis"
-    configure_image_behavior IMMICH_POSTGRES_IMAGE IMMICH_POSTGRES_AUTO_UPDATE IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS "Immich Postgres"
+    echo
+    echo "Immich update policy (bundle-managed: server + ML + Redis + Postgres update together)"
+    local immich_bundle_auto
+    immich_bundle_auto="$(prompt_yes_no "Auto-update Immich as a matched bundle?" "${IMMICH_BUNDLE_AUTO_UPDATE:-1}")"
+    config_set IMMICH_BUNDLE_AUTO_UPDATE "$immich_bundle_auto"
+    if [[ "$immich_bundle_auto" == "1" ]]; then
+      config_set IMMICH_BUNDLE_DELAY_DAYS \
+        "$(prompt_with_default "Delay in days before applying a new Immich bundle" "${IMMICH_BUNDLE_DELAY_DAYS:-21}")"
+    fi
+    config_set IMMICH_BUNDLE_ROLLBACK_ENABLED \
+      "$(prompt_yes_no "Enable automatic rollback if Immich bundle health check fails?" "${IMMICH_BUNDLE_ROLLBACK_ENABLED:-1}")"
+    configure_text_value IMMICH_HOST "Immich hostname"
   fi
   if [[ "${ENABLE_JELLYFIN:-0}" == "1" ]]; then
     configure_text_value JELLYFIN_HOST "Jellyfin hostname"
@@ -1737,7 +1741,7 @@ EOF
   published_epoch="$(date -d "$published_at" +%s)"
   now="$(date +%s)"
   age_days=$(( (now - published_epoch) / 86400 ))
-  delay_days="${IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS:-21}"
+  delay_days="${IMMICH_BUNDLE_DELAY_DAYS:-21}"
 
   if (( force == 0 && age_days < delay_days )); then
     echo "[domum-media] Delay window not reached for Immich bundle (${age_days}d < ${delay_days}d)."

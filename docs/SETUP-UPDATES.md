@@ -1,54 +1,134 @@
-# Image and host update policy
+# Update policy
 
-The stack now separates three concerns:
+The stack uses delayed automatic updates with backup gating and automatic
+rollback. The goal: stay current without reckless changes. You intervene only
+when something goes wrong.
 
-1. `config/domum-media.conf` decides **which image ref** each service uses.
-2. `*_AUTO_UPDATE` decides whether a service should automatically roll forward
-   when that image ref points at something newer.
-3. The systemd timers decide **when** to check for new container images or new
-   apt packages on the host.
+## Update classes
 
-On top of that, services now belong to lifecycle classes:
+Services are classified by risk. The class controls the default delay and
+whether a snapshot + backup is required before updating.
 
-- Class A: safe infrastructure (`traefik`, `tailscale`, `uptime-kuma`)
-- Class B: stateful applications (`jellyfin`, `plex`, `navidrome`,
-  `calibre-web`, `kavita`)
-- Class C: bundle-managed applications (`immich`)
+### Class A — infrastructure (low-risk)
 
-## Pinned vs moving tags
+Services: `traefik`, `tailscale`, `uptime-kuma`
 
-Pinned example:
+- Auto-update allowed
+- Delay: 7–14 days
+- Health check required
+- No data snapshot required
+
+### Class B — stateful media apps
+
+Services: `jellyfin`, `plex`, `navidrome`, `calibre-web`, `kavita`
+
+- Auto-update allowed
+- Delay: 21 days
+- btrfs snapshot before update (automatic)
+- Backup freshness gate (BACKUP_POLICY=STRICT by default)
+- Health check required
+- Automatic rollback if health check fails
+
+### Class C — bundle-managed
+
+Service: `immich`
+
+Immich is updated only as a matched release bundle. The bundle manager fetches
+the official release compose file, extracts the server, machine-learning,
+Redis/Valkey, and Postgres image refs, and deploys them atomically.
+
+**Never update Immich Postgres or Redis/Valkey independently outside the
+bundle.** Doing so risks breaking migrations.
+
+- Single delay: `IMMICH_BUNDLE_DELAY_DAYS` (default: 21 days)
+- Snapshot before update (automatic)
+- Backup freshness gate
+- Full health check (HTTP + DB + Redis)
+- Automatic rollback if health check fails
+
+### Class D — host OS / packages
+
+Two tiers:
+
+1. **Security patches (automatic)**: `unattended-upgrades` applies Debian
+   Security updates immediately. Docker CE is excluded — it is in tier 2.
+2. **General upgrades (scheduled, optional)**: `domum-media host-upgrade`
+   upgrades Docker CE, Tailscale, restic, rclone, and other host tooling on a
+   configured schedule.
+
+See `docs/SECURITY-PATCHES.md` for details.
+
+---
+
+## How the delay window works
+
+For Class A and B services, the image refresh timer runs daily:
+
+1. Pull the image. If the digest matches the running container → no-op.
+2. If different → record the new image and the current timestamp.
+3. On subsequent runs, check if the delay window has elapsed.
+4. When the delay window expires, **re-pull** to confirm upstream hasn't moved
+   again. If a newer image appeared during the wait → reset the delay (new
+   delay period starts). If same → proceed to apply.
+5. Backup gate: refuse update if last successful backup is older than
+   `BACKUP_REQUIRED_MAX_AGE_HOURS` (when `BACKUP_POLICY=STRICT`).
+6. Create a btrfs snapshot (Class B services).
+7. Apply the update.
+8. Health check: if the container comes back unhealthy, automatically restore
+   the snapshot.
+
+For Immich (Class C), the same re-check logic applies to the bundle release
+date. See below.
+
+---
+
+## Config reference
+
+### Class A / B per-service image policy
 
 ```bash
+# Use a moving tag (auto-update will track it):
+TRAEFIK_IMAGE=traefik:latest
+TRAEFIK_AUTO_UPDATE=1
+TRAEFIK_AUTO_UPDATE_DELAY_DAYS=14
+
+# Pin to a specific version (auto-update disabled):
 TRAEFIK_IMAGE="traefik:v3.7.1"
 TRAEFIK_AUTO_UPDATE=0
 ```
 
-Moving-tag example:
+All Class B services follow the same pattern with their respective prefix.
+
+### Class C — Immich bundle
 
 ```bash
-TRAEFIK_IMAGE="traefik:latest"
-TRAEFIK_AUTO_UPDATE=1
-TRAEFIK_AUTO_UPDATE_DELAY_DAYS=7
+IMMICH_UPDATE_MODE=bundle
+IMMICH_BUNDLE_AUTO_UPDATE=1
+IMMICH_BUNDLE_DELAY_DAYS=21
+IMMICH_BUNDLE_ROLLBACK_ENABLED=1
 ```
 
-For moving tags, the refresh job pulls the image daily. If the pulled image is
-different from the one the container is currently running, the CLI records when
-that newer image was first seen. Once the delay window expires, the service is
-recreated during the next refresh run.
+The four image ref vars below are written automatically by the bundle manager
+after each successful apply. Do not edit them manually:
 
-For Class B services, the rollout is gated by backup freshness:
+```bash
+IMMICH_SERVER_IMAGE=...
+IMMICH_MACHINE_LEARNING_IMAGE=...
+IMMICH_REDIS_IMAGE=...
+IMMICH_POSTGRES_IMAGE=...
+```
 
-- `BACKUP_POLICY="STRICT"` refuses the update if the last successful backup is
-  older than `BACKUP_REQUIRED_MAX_AGE_HOURS`
-- `BACKUP_POLICY="LENIENT"` warns and continues
+### Backup gate
 
-Each rollout also takes a per-service btrfs snapshot and restores it if the
-container comes back unhealthy.
+```bash
+BACKUP_POLICY=STRICT           # STRICT | LENIENT
+BACKUP_REQUIRED_MAX_AGE_HOURS=48
+```
 
-## Timers
+`STRICT` refuses stateful updates if the last successful backup is older than
+`BACKUP_REQUIRED_MAX_AGE_HOURS`. `LENIENT` warns and continues.
 
-Container image refresh:
+### Update scheduler
 
 ```bash
 IMAGE_AUTO_UPDATE_ENABLED=1
@@ -56,66 +136,43 @@ IMAGE_AUTO_UPDATE_AT="05:15"
 IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY="30m"
 ```
 
-Host package upgrades:
-
-```bash
-HOST_PACKAGE_AUTO_UPDATE_ENABLED=1
-HOST_PACKAGE_AUTO_UPDATE_AT="Mon 05:45"
-HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="45m"
-```
+---
 
 ## Manual runs
 
-Run the checks immediately:
-
 ```bash
-sudo domum-media updates
+# Check all candidates without applying
+sudo domum-media updates check
+
+# Force immediate evaluation + apply all due updates
 sudo domum-media refresh-images --force
+
+# Immich bundle — check and apply
+sudo domum-media immich check-bundle
+sudo domum-media immich apply-bundle
+
+# Host packages
 sudo domum-media host-upgrade --force
-sudo domum-media immich refresh-bundle --force
 ```
 
-Inspect or manually restore snapshots:
+---
+
+## Rollback
+
+If an update fails health validation, the stack automatically restores the
+pre-update btrfs snapshot.
+
+To manually roll back after a successful update:
 
 ```bash
-sudo domum-media rollback
+sudo domum-media rollback list
+sudo domum-media rollback apply <id>
 ```
 
-Inspect or prune hot storage:
+For Immich specifically:
 
 ```bash
-sudo domum-media hot status
-sudo domum-media hot prune --dry-run
-sudo domum-media hot prune
+sudo domum-media immich rollback
 ```
 
-## Immich bundle management
-
-Immich is intentionally not updated image-by-image.
-
-Use:
-
-```bash
-sudo domum-media immich refresh-bundle
-```
-
-That command:
-
-1. Fetches the latest Immich GitHub release metadata
-2. Downloads the official release `docker-compose.yml`
-3. Extracts the upstream server, ML, redis/valkey, and postgres image refs
-4. Stores the candidate bundle under `/var/lib/domum-media/immich/`
-5. Applies the bundle only after the delay window has passed
-6. Verifies backup freshness
-7. Takes a pre-update btrfs snapshot
-8. Pulls and deploys the full bundle
-9. Rolls back if health validation fails
-
-## Operational advice
-
-- Keep stateful services pinned unless you have read their release notes and
-  understand the migration path.
-- If you use moving tags, prefer a non-zero delay so somebody else finds the
-  bad release first.
-- For Immich, keep the individual image refs repo-managed and use the bundle
-  refresh command instead of enabling independent image rollouts.
+See `docs/ROLLBACK.md` for the full rollback reference.

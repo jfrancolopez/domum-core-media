@@ -6,76 +6,50 @@
 #
 # Never commit the live config — only this example.
 
-# --- Identity --------------------------------------------------------------
+# ============================================================
+# SECTION: Identity
+# ============================================================
 
 # Base domain (Cloudflare zone with a DNS-01 token in secrets/cloudflare_api_token)
-DOMUM_DOMAIN="ladomum.com"
+DOMUM_DOMAIN=ladomum.com
 
 # ACME notification email (Let's Encrypt)
-DOMUM_EMAIL="you@example.com"
+DOMUM_EMAIL=
 
-# Optional — used by docs/dynamic routes for split DNS notes
-DOMUM_LAN_IP=""
-DOMUM_TS_IP=""
+# Optional — used by docs and dynamic routes for split-DNS notes
+DOMUM_LAN_IP=10.0.10.3
+DOMUM_TS_IP=''
 
-# --- Traefik ---------------------------------------------------------------
-
-# Full image refs let you choose between a pinned tag and a moving tag such as
-# :latest or :stable. Keep AUTO_UPDATE=0 for pinned images. If you use a moving
-# tag, set AUTO_UPDATE=1 and choose how many days to wait before rollout.
-TRAEFIK_IMAGE="traefik:v3.7.1"
-TRAEFIK_AUTO_UPDATE=0
-TRAEFIK_AUTO_UPDATE_DELAY_DAYS=7
-
-# Dashboard hostname. Kept in config so the repo remains the routing source of truth.
-TRAEFIK_DASHBOARD_HOST="traefik-media.${DOMUM_DOMAIN}"
-
-# Basic-auth file mounted into Traefik. Store the output of `htpasswd -nB`.
-TRAEFIK_DASHBOARD_USERS_FILE="/etc/domum-core-media/secrets/traefik_dashboard_users"
-
-# --- Data + log locations --------------------------------------------------
+# ============================================================
+# SECTION: Paths
+# ============================================================
 
 # btrfs mount root. Subvolumes are mounted under here. See docs/SETUP-N100.md.
 DOMUM_DATA_ROOT="/srv/data"
 DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
 DOMUM_LOG_DIR="/var/log/domum-media"
-DOMUM_STATE_ROOT="/var/lib/domum-media"
-DOMUM_HOT_ROOT="/var/lib/domum-media/hot"
 
-# Volatile hot tier on the OS SSD. Use only for caches, transcodes, staging,
-# and scratch space — never as the only copy of irreplaceable data.
-ENABLE_HOT_STORAGE=1
-HOT_STORAGE_MAX_PERCENT=80
-HOT_STORAGE_PRUNE_ENABLED=1
-HOT_STORAGE_PRUNE_AT="04:45"
-HOT_STORAGE_PRUNE_RANDOMIZED_DELAY="30m"
-HOT_STORAGE_PRUNE_OLDER_THAN_DAYS=30
+# ============================================================
+# SECTION: Service toggles
+# ============================================================
 
-# How lifecycle commands react when stateful services are due for an update but
-# the last backup is stale or missing.
-BACKUP_POLICY="STRICT"                  # STRICT | LENIENT
-BACKUP_REQUIRED_MAX_AGE_HOURS=48
-BACKUP_INCLUDE_PATHS="/srv/data /srv/media/books"
-
-# --- Service toggles -------------------------------------------------------
-
-# Proxy + remote access — keep both on; everything else funnels through Traefik
+# Proxy + remote access
 ENABLE_TRAEFIK=1
-ENABLE_TAILSCALE=0     # operator typically runs tailscale on the host, not in a container
+ENABLE_TAILSCALE=0
 
 # Photos (the whole reason this box exists)
 ENABLE_IMMICH=1
 
 # Media streaming
-ENABLE_JELLYFIN=0
-ENABLE_PLEX=0
+ENABLE_JELLYFIN=1
+ENABLE_PLEX=1
 
 # Music streaming (Navidrome — Subsonic-compatible)
-ENABLE_NAVIDROME=0
+ENABLE_NAVIDROME=1
 
-# eBook services
-ENABLE_CALIBRE_WEB=0
-ENABLE_KAVITA=0
+# eBook / comics
+ENABLE_CALIBRE_WEB=1
+ENABLE_KAVITA=1
 
 # Monitoring
 ENABLE_UPTIME_KUMA=1
@@ -84,88 +58,70 @@ ENABLE_UPTIME_KUMA=1
 # this box. Default OFF — usually the NAS lives elsewhere.
 ENABLE_RESTIC_REST_SERVER=0
 
-# --- Images ---------------------------------------------------------------
+# ============================================================
+# SECTION: Service hostnames
+# ============================================================
 
-# Immich app images. Keep these pinned unless you are prepared for schema
-# migrations and read the release notes first.
-IMMICH_SERVER_IMAGE="ghcr.io/immich-app/immich-server:v1.118.2"
-IMMICH_SERVER_AUTO_UPDATE=0
-IMMICH_SERVER_AUTO_UPDATE_DELAY_DAYS=7
-IMMICH_MACHINE_LEARNING_IMAGE="ghcr.io/immich-app/immich-machine-learning:v1.118.2"
-IMMICH_MACHINE_LEARNING_AUTO_UPDATE=0
-IMMICH_MACHINE_LEARNING_AUTO_UPDATE_DELAY_DAYS=7
+TRAEFIK_DASHBOARD_HOST=traefik-media.ladomum.com
+IMMICH_HOST=photos.ladomum.com
+JELLYFIN_HOST=media.ladomum.com
+PLEX_HOST=plex.ladomum.com
+NAVIDROME_HOST=music.ladomum.com
+CALIBRE_WEB_HOST=books.ladomum.com
+KAVITA_HOST=kavita.ladomum.com
 
-# Immich dependencies. These are config-controlled too in case you want to
-# track a newer moving tag, but pinned is safer by default.
-IMMICH_REDIS_IMAGE="docker.io/redis:6.2-alpine"
-IMMICH_REDIS_AUTO_UPDATE=0
-IMMICH_REDIS_AUTO_UPDATE_DELAY_DAYS=14
-IMMICH_POSTGRES_IMAGE="tensorchord/pgvecto-rs:pg14-v0.2.0"
-IMMICH_POSTGRES_AUTO_UPDATE=0
-IMMICH_POSTGRES_AUTO_UPDATE_DELAY_DAYS=14
+# ============================================================
+# SECTION: Update policy — Class A (infrastructure, low-risk)
+# Auto-update allowed. Delay: 7-14 days. No data snapshot required.
+# ============================================================
 
-# Immich Postgres credentials. Real values live in
-# /etc/domum-core-media/secrets/{immich_db_password,immich_jwt_secret}
-#
-# Note: immich_db_password is locked after the first 'domum-media apply' that
-# initializes the database. Postgres only honors POSTGRES_PASSWORD during the
-# very first initdb, so changing the secret afterwards will make 'apply'
-# refuse to deploy until you either restore the previous value or wipe the
-# database with `sudo domum-media immich reset-db`. Use
-# `sudo domum-media doctor immich` to verify what compose receives. See
-# docs/SETUP-IMMICH.md.
-IMMICH_DB_USERNAME="postgres"
-IMMICH_DB_DATABASE_NAME="immich"
+TRAEFIK_IMAGE=traefik:latest
+TRAEFIK_AUTO_UPDATE=1
+TRAEFIK_AUTO_UPDATE_DELAY_DAYS=14
 
-# --- Jellyfin --------------------------------------------------------------
+UPTIME_KUMA_IMAGE=louislam/uptime-kuma:2
+UPTIME_KUMA_AUTO_UPDATE=1
+UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS=7
 
-JELLYFIN_IMAGE="jellyfin/jellyfin:10.10.7"
-JELLYFIN_AUTO_UPDATE=0
+TAILSCALE_IMAGE=tailscale/tailscale:stable
+TAILSCALE_AUTO_UPDATE=1
+TAILSCALE_AUTO_UPDATE_DELAY_DAYS=14
+
+# ============================================================
+# SECTION: Update policy — Class B (stateful media apps)
+# Auto-update allowed. Delay: 21 days. Snapshot + backup gate before update.
+# ============================================================
+
+JELLYFIN_IMAGE=lscr.io/linuxserver/jellyfin:latest
+JELLYFIN_AUTO_UPDATE=1
 JELLYFIN_AUTO_UPDATE_DELAY_DAYS=21
 
-# Jellyfin keeps durable config on the data SSD and volatile cache on the hot
-# tier. The media library can live elsewhere and is mounted read-only.
+# Jellyfin state lives on the btrfs data tier; the media library is mounted read-only.
 JELLYFIN_CONFIG_DIR="/srv/data/jellyfin/config"
-JELLYFIN_CACHE_DIR="/var/lib/domum-media/hot/jellyfin-cache"
+JELLYFIN_CACHE_DIR="/srv/data/jellyfin/cache"
 JELLYFIN_MEDIA_ROOT="/srv/media"
-JELLYFIN_HOST="media.${DOMUM_DOMAIN}"
 
-# --- Plex ------------------------------------------------------------------
-
-PLEX_IMAGE="lscr.io/linuxserver/plex:latest"
+PLEX_IMAGE=lscr.io/linuxserver/plex:latest
 PLEX_AUTO_UPDATE=1
-PLEX_AUTO_UPDATE_DELAY_DAYS=20
-PLEX_HOST="plex.${DOMUM_DOMAIN}"
-PLEX_CONFIG_DIR="/srv/data/plex/config"
-PLEX_MEDIA_ROOT="/srv/media"
-PLEX_TRANSCODE_DIR="/var/lib/domum-media/hot/plex-transcode"
-PLEX_ENABLE_HW_TRANSCODE=1
-PLEX_CLAIM=""
-PUID="1000"
-PGID="1000"
-TZ="America/New_York"
+PLEX_AUTO_UPDATE_DELAY_DAYS=21
 
-# --- Navidrome -------------------------------------------------------------
-
-NAVIDROME_IMAGE="deluan/navidrome:0.61.2"
-NAVIDROME_AUTO_UPDATE=0
+NAVIDROME_IMAGE=deluan/navidrome:latest
+NAVIDROME_AUTO_UPDATE=1
 NAVIDROME_AUTO_UPDATE_DELAY_DAYS=21
 
 # State (DB, scan cache) lives on the btrfs data tier so it is snapshotted and
 # swept into restic. Create it as a subvolume — see docs/SETUP-NAVIDROME.md.
 NAVIDROME_DATA_DIR="/srv/data/navidrome"
-NAVIDROME_CACHE_DIR="/var/lib/domum-media/hot/music-cache"
 
 # Parent root for ALL music libraries. The music itself can live anywhere:
 # put local music in a subfolder, mount a NAS export (NFS/SMB) into another
-# subfolder, mount a cloud remote with rclone into a third. Navidrome's UI
+# subfolder, or mount a cloud remote with rclone into a third. Navidrome's UI
 # (Settings -> Libraries) then exposes each subfolder as its own library.
-# This folder is bind-mounted read-only into the container at /music.
-#   /srv/media/music/local   -> on-box music
-#   /srv/media/music/nas     -> NFS/SMB mount from a NAS or another server
-#   /srv/media/music/cloud   -> rclone mount of a cloud remote
+#   /srv/music/local  -> on-box music
+#   /srv/music/nas    -> NFS/SMB mount from a NAS or another server
+#   /srv/music/cloud  -> rclone mount of a cloud remote
 # See docs/SETUP-NAVIDROME.md for the mount recipes.
-NAVIDROME_MUSIC_ROOT="/srv/media/music"
+NAVIDROME_MUSIC_ROOT="/srv/music"
 
 # Container user for reading music. Default root reads every source regardless
 # of ownership. Set to "uid:gid" (e.g. "1000:1000") to drop privileges if all
@@ -178,54 +134,80 @@ NAVIDROME_SCAN_SCHEDULE="@every 1h"
 
 # Navidrome log level: error | warn | info | debug | trace
 NAVIDROME_LOG_LEVEL="info"
-NAVIDROME_HOST="music.${DOMUM_DOMAIN}"
 
-# --- eBooks ----------------------------------------------------------------
-
-CALIBRE_WEB_IMAGE="lscr.io/linuxserver/calibre-web:latest"
+CALIBRE_WEB_IMAGE=lscr.io/linuxserver/calibre-web:latest
 CALIBRE_WEB_AUTO_UPDATE=1
-CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS=20
-CALIBRE_WEB_HOST="books.${DOMUM_DOMAIN}"
-CALIBRE_WEB_CONFIG_DIR="/srv/data/calibre-web/config"
-CALIBRE_WEB_LIBRARY_DIR="/srv/media/books"
+CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS=21
 
-KAVITA_IMAGE="jvmilazz0/kavita:latest"
+KAVITA_IMAGE=jvmilazz0/kavita:latest
 KAVITA_AUTO_UPDATE=1
-KAVITA_AUTO_UPDATE_DELAY_DAYS=20
-KAVITA_HOST="kavita.${DOMUM_DOMAIN}"
-KAVITA_CONFIG_DIR="/srv/data/kavita/config"
-KAVITA_LIBRARY_DIR="/srv/media/books"
-KAVITA_STAGING_DIR="/var/lib/domum-media/hot/books-import"
+KAVITA_AUTO_UPDATE_DELAY_DAYS=21
 
-# Monitoring / optional service images.
-UPTIME_KUMA_IMAGE="louislam/uptime-kuma:1"
-UPTIME_KUMA_AUTO_UPDATE=0
-UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS=7
-RESTIC_REST_SERVER_IMAGE="restic/rest-server:latest"
-RESTIC_REST_SERVER_AUTO_UPDATE=0
-RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS=7
-TAILSCALE_IMAGE="tailscale/tailscale:stable"
-TAILSCALE_AUTO_UPDATE=0
-TAILSCALE_AUTO_UPDATE_DELAY_DAYS=7
+# ============================================================
+# SECTION: Update policy — Class C (bundle-managed)
+# Immich is updated only as a matched release bundle — all four components
+# (server, machine-learning, Redis/Valkey, Postgres) are updated together.
+# Never update Postgres or Redis/Valkey independently outside the bundle.
+# ============================================================
 
-# Scheduled image refresh checks for services with *_AUTO_UPDATE=1.
-IMAGE_AUTO_UPDATE_ENABLED=0
-IMAGE_AUTO_UPDATE_AT="05:15"
-IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY="30m"
+IMMICH_UPDATE_MODE=bundle
+IMMICH_UPDATE_CHANNEL=stable
+IMMICH_BUNDLE_AUTO_UPDATE=1
+IMMICH_BUNDLE_DELAY_DAYS=21
+IMMICH_BUNDLE_ROLLBACK_ENABLED=1
 
-# Optional weekly host package upgrades from apt. This affects Docker Engine,
-# compose plugin, tailscale, restic, and the host utilities installed by bootstrap.
+# These image refs are managed automatically by the bundle manager after each
+# successful bundle apply. Do not edit them manually.
+IMMICH_SERVER_IMAGE=ghcr.io/immich-app/immich-server:release
+IMMICH_MACHINE_LEARNING_IMAGE=ghcr.io/immich-app/immich-machine-learning:release
+IMMICH_REDIS_IMAGE=docker.io/redis:6.2-alpine
+IMMICH_POSTGRES_IMAGE=tensorchord/pgvecto-rs:pg14-v0.2.0
+
+# Immich Postgres credentials. Real values live in
+# /etc/domum-core-media/secrets/{immich_db_password,immich_jwt_secret}
+IMMICH_DB_USERNAME="postgres"
+IMMICH_DB_DATABASE_NAME="immich"
+
+# ============================================================
+# SECTION: Update policy — Class D (host OS / packages)
+# ============================================================
+
+# Security-only patches via unattended-upgrades (Debian Security origin only).
+# Docker CE is excluded — it is upgraded via host-upgrade only.
+HOST_SECURITY_AUTO_UPDATE_ENABLED=1
+
+# General package upgrades (Docker, Tailscale, restic, rclone, etc.)
 HOST_PACKAGE_AUTO_UPDATE_ENABLED=0
-HOST_PACKAGE_AUTO_UPDATE_AT="Mon 05:45"
-HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY="45m"
+HOST_PACKAGE_AUTO_UPDATE_AT=Mon\ 05:45
+HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY=45m
 
-# --- Backup schedule -------------------------------------------------------
+# Auto-reboot when a kernel update requires it (only during the window below).
+HOST_AUTO_REBOOT_ENABLED=0
+HOST_AUTO_REBOOT_WINDOW_START=03:00
+HOST_AUTO_REBOOT_WINDOW_END=05:00
+
+# ============================================================
+# SECTION: Update scheduler (container images)
+# ============================================================
+
+IMAGE_AUTO_UPDATE_ENABLED=1
+IMAGE_AUTO_UPDATE_AT=05:15
+IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY=30m
+
+# ============================================================
+# SECTION: Backup policy
+# ============================================================
 
 # `domum-media configure` and `domum-media apply` sync these into systemd
 # timer overrides, so the values here are the actual live cadence.
-BACKUP_DAILY_AT="02:30"
-CHECK_WEEKLY_AT="Sun 03:30"
-SNAPSHOT_PRUNE_WEEKLY_AT="Sun 04:30"
+BACKUP_DAILY_AT=02:30
+CHECK_WEEKLY_AT=Sun\ 03:30
+SNAPSHOT_PRUNE_WEEKLY_AT=Sun\ 04:30
+
+# STRICT: refuse stateful service updates if last successful backup is older
+# than BACKUP_REQUIRED_MAX_AGE_HOURS. LENIENT: warn and continue.
+BACKUP_POLICY=STRICT
+BACKUP_REQUIRED_MAX_AGE_HOURS=48
 
 # restic retention policy applied to the NAS repo on every daily run, and
 # to the cloud repo weekly (cloud forget is expensive in B2 API calls).
@@ -239,13 +221,13 @@ SNAPSHOT_KEEP_PER_SUBVOL=14
 
 # Which configured targets should be used. The CLI wizard manages the three
 # slots below, but you can add more names manually if needed.
-BACKUP_TARGETS="nas cloud archive"
+BACKUP_TARGETS=nas\ cloud\ archive
 
 # Shared deep-check subset for `domum-media backup --check-deep`.
 BACKUP_DEEP_CHECK_PERCENT="10%"
 
 # Target: NAS / rest-server / SFTP / any other restic repository string.
-BACKUP_TARGET_NAS_ENABLED=1
+BACKUP_TARGET_NAS_ENABLED=0
 BACKUP_TARGET_NAS_TYPE="repository"     # repository | nfs | ftp
 BACKUP_TARGET_NAS_REPOSITORY="rest:http://nas-host:8000/domum-media"
 BACKUP_TARGET_NAS_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_nas"
@@ -253,7 +235,7 @@ BACKUP_TARGET_NAS_ENV_FILE=""
 BACKUP_TARGET_NAS_RETENTION="daily"     # daily | weekly | none
 
 # Target: cloud / B2 / S3 / rclone / any other restic repository string.
-BACKUP_TARGET_CLOUD_ENABLED=1
+BACKUP_TARGET_CLOUD_ENABLED=0
 BACKUP_TARGET_CLOUD_TYPE="repository"
 BACKUP_TARGET_CLOUD_REPOSITORY="b2:your-bucket-name:/domum-media"
 BACKUP_TARGET_CLOUD_PASSWORD_FILE="/etc/domum-core-media/secrets/restic_password_cloud"
@@ -281,4 +263,39 @@ BACKUP_TARGET_ARCHIVE_FTP_USERNAME_FILE="/etc/domum-core-media/secrets/archive_f
 BACKUP_TARGET_ARCHIVE_FTP_PASSWORD_FILE="/etc/domum-core-media/secrets/archive_ftp_password"
 
 # Uptime Kuma push URL for backup heartbeat. Optional; leave empty to skip.
-BACKUP_HEARTBEAT_URL=""
+BACKUP_HEARTBEAT_URL=''
+
+# ============================================================
+# SECTION: Secrets policy
+# ============================================================
+
+# Encrypt and store a secrets archive so the server can be recovered from Git
+# + secrets restore alone. Uses `age` for encryption.
+# See docs/disaster-recovery.md for the recovery workflow.
+SECRETS_BACKUP_ENABLED=1
+SECRETS_BACKUP_ENCRYPTION=age
+# Path to the age public key used to encrypt the secrets archive.
+# Generate a keypair with: age-keygen -o ~/.config/age/key.txt
+# The public key is safe to store here; keep the private key offline.
+SECRETS_BACKUP_AGE_PUBKEY_FILE="/etc/domum-core-media/secrets/secrets_backup_pubkey"
+# Where to store the encrypted archive locally (included in the restic backup).
+SECRETS_BACKUP_DEST="/var/lib/domum-media/secrets-backup"
+# Warn in `domum-media checkup` if no successful secrets backup in N days.
+SECRETS_BACKUP_REMINDER_DAYS=30
+
+# ============================================================
+# SECTION: Hot storage
+# ============================================================
+
+HOT_STORAGE_PRUNE_ENABLED=1
+HOT_STORAGE_PRUNE_AT=04:45
+HOT_STORAGE_PRUNE_RANDOMIZED_DELAY=30m
+HOT_STORAGE_PRUNE_OLDER_THAN_DAYS=30
+HOT_STORAGE_MAX_PERCENT=80
+
+# ============================================================
+# SECTION: Cleanup policy
+# ============================================================
+
+# Automatically prune dangling Docker images after each successful update.
+CLEANUP_IMAGES_AFTER_UPDATE=1

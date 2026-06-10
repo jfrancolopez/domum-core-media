@@ -37,21 +37,36 @@ That is the only path where Immich's DB password is allowed to be chosen.
 ## 2. Bundle-managed updates
 
 Immich is treated as a Class C workload. The app server, machine-learning,
-database, and redis/valkey images move together from the official upstream
+database, and Redis/Valkey images move together from the official upstream
 release bundle.
 
-Use:
+The relevant config in `config/domum-media.conf`:
 
 ```bash
-sudo domum-media immich refresh-bundle
+IMMICH_BUNDLE_AUTO_UPDATE=1
+IMMICH_BUNDLE_DELAY_DAYS=21
+IMMICH_BUNDLE_ROLLBACK_ENABLED=1
 ```
 
-That command fetches the latest release metadata from GitHub, downloads the
-official release `docker-compose.yml`, extracts the candidate image set,
+The four image ref vars (`IMMICH_SERVER_IMAGE`, `IMMICH_MACHINE_LEARNING_IMAGE`,
+`IMMICH_REDIS_IMAGE`, `IMMICH_POSTGRES_IMAGE`) are written automatically by the
+bundle manager. Do not edit them manually — the bundle manager keeps them in
+sync with the official release.
+
+The automatic timer runs `domum-media immich refresh-bundle` daily. To trigger
+it manually:
+
+```bash
+sudo domum-media immich check-bundle   # inspect candidate status + delay remaining
+sudo domum-media immich apply-bundle   # apply now (skips delay check)
+```
+
+The bundle command fetches the latest release metadata from GitHub, downloads
+the official release `docker-compose.yml`, extracts the candidate image set,
 stores it under `/var/lib/domum-media/immich/bundle-candidate.env`, respects
-the configured delay window, verifies backup freshness, snapshots the Immich
-subvolume, deploys the bundle, and restores the previous snapshot if health
-validation fails.
+`IMMICH_BUNDLE_DELAY_DAYS`, verifies backup freshness, snapshots the Immich
+subvolume, deploys all four images together, and restores the previous snapshot
+if health validation fails.
 
 ---
 
