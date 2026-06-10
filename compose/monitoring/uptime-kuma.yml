@@ -10,7 +10,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy
-      - traefik.http.routers.status.rule=Host(`status.${DOMUM_DOMAIN}`)
+      - traefik.http.routers.status.rule=Host(`status-media.${DOMUM_DOMAIN}`)
       - traefik.http.routers.status.entrypoints=websecure
       - traefik.http.routers.status.tls=true
       - traefik.http.routers.status.tls.certresolver=cf
