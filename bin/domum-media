@@ -2822,7 +2822,11 @@ send_recovery_pack_email() {
 recovery_pack_create() {
   [[ "${RECOVERY_PACK_ENABLED:-1}" == "1" ]] || die "Recovery pack generation is disabled (RECOVERY_PACK_ENABLED=0)."
   [[ "${RECOVERY_PACK_ENCRYPTION:-age}" == "age" ]] || die "Only age encryption is supported."
-  cmd_exists age || die "age is required for recovery-pack."
+  if ! cmd_exists age; then
+    echo "[domum-media] age not found — installing via apt..."
+    apt-get install -y --no-install-recommends age \
+      || die "age is not installed and apt-get install age failed. Install manually: apt-get install -y age"
+  fi
   [[ -f "$RECOVERY_PACK_AGE_PUBKEY_FILE" ]] || die "Missing recovery pack age public key: $RECOVERY_PACK_AGE_PUBKEY_FILE"
 
   local no_email="${1:-0}"
@@ -2966,6 +2970,11 @@ checkup_cmd() {
     backup_target_enabled "$target" || continue
     [[ -s "$(backup_target_password_file "$target")" ]] || checkup_add critical "Missing backup password file for $target."
   done < <(backup_target_names)
+
+  if ! cmd_exists age; then
+    checkup_add critical "age binary missing — recovery-pack create will fail. Run: apt-get install -y age"
+    checkup_add action "Install age: apt-get install -y age"
+  fi
 
   if [[ "${RECOVERY_PACK_ENABLED:-1}" == "1" ]]; then
     if recovery_pack_status >/dev/null 2>&1; then
@@ -3115,6 +3124,15 @@ doctor_secrets() {
       printf '  %s: set\n' "$(basename "$file")"
     else
       printf '  %s: empty\n' "$(basename "$file")"
+    fi
+  done
+  echo
+  echo "Required binaries:"
+  for bin in age restic rclone; do
+    if cmd_exists "$bin"; then
+      echo "  $bin: $(command -v "$bin")"
+    else
+      echo "  $bin: MISSING (run: apt-get install -y $bin)"
     fi
   done
   echo
