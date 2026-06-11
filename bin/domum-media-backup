@@ -10,6 +10,7 @@ set -euo pipefail
 DOMUM_DIR="${DOMUM_DIR:-/opt/domum-core-media}"
 CFG_FILE="${CFG_FILE:-$DOMUM_DIR/config/domum-media.conf}"
 SECRETS_DIR="${SECRETS_DIR:-/etc/domum-core-media/secrets}"
+REPO_META_DIR="${REPO_META_DIR:-/var/lib/domum-media/backups}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE" >&2; }
@@ -113,6 +114,46 @@ backup_target_retention() {
   esac
 }
 
+backup_target_include_paths() {
+  local target="$1"
+  local paths
+  paths="$(backup_target_value "$target" INCLUDE_PATHS)"
+  printf '%s' "${paths:-${BACKUP_INCLUDE_PATHS:-/srv/data /srv/media/books}}"
+}
+
+repo_meta_file() {
+  printf '%s' "$REPO_META_DIR/$1-repo.env"
+}
+
+get_repo_id() {
+  local target="$1"
+  restic_for_target "$target" cat config 2>/dev/null \
+    | grep -oE '"id"[[:space:]]*:[[:space:]]*"[0-9a-f]+"' \
+    | grep -oE '[0-9a-f]{8,}' | head -1
+}
+
+check_repo_identity() {
+  local target="$1"
+  local meta_file
+  meta_file="$(repo_meta_file "$target")"
+  [[ -f "$meta_file" ]] || return 0
+  local saved_id current_id
+  unset REPOSITORY_ID
+  # shellcheck disable=SC1090
+  source "$meta_file"
+  saved_id="${REPOSITORY_ID:-}"
+  [[ -n "$saved_id" ]] || return 0
+  current_id="$(get_repo_id "$target")"
+  [[ -n "$current_id" ]] || return 0
+  if [[ "$current_id" != "$saved_id"* && "$saved_id" != "$current_id"* ]]; then
+    die "ERROR: $target restic repository ID mismatch.
+  Expected: $saved_id
+  Current:  $current_id
+  This usually means BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY or port changed.
+  Run: sudo domum-media backup adopt-repo $target"
+  fi
+}
+
 backup_target_legacy_env_file() {
   printf '%s/restic_%s_env' "$SECRETS_DIR" "$1"
 }
@@ -170,12 +211,15 @@ quiesce_immich_postgres() {
   local dump_file="$stage_dir/immich-postgres.dump.sql.gz"
   local pg_user="${IMMICH_DB_USERNAME:-postgres}"
   local pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
-  log "pg_dump immich -> $dump_file"
-  if docker compose -f "$DOMUM_DIR/compose/base.yml" -f "$DOMUM_DIR/compose/photos/immich.yml" ps immich_postgres >/dev/null 2>&1; then
-    docker compose -f "$DOMUM_DIR/compose/base.yml" -f "$DOMUM_DIR/compose/photos/immich.yml" exec -T immich_postgres \
-      pg_dump -U "$pg_user" -d "$pg_db" | gzip -9 > "$dump_file"
+  local pg_cid
+  pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null | head -1)"
+  if [[ -n "$pg_cid" ]]; then
+    log "pg_dump immich -> $dump_file"
+    docker exec -T "$pg_cid" pg_dump -U "$pg_user" -d "$pg_db" | gzip -9 > "$dump_file"
+    log "pg_dump complete"
   else
     log "Immich postgres container not running — skipping pg_dump."
+    return 1
   fi
 }
 
@@ -219,6 +263,24 @@ restic_for_target() {
       env_file="$(backup_target_legacy_env_file "$target")"
       extra_env_file="$(backup_target_value "$target" ENV_FILE)"
       if [[ -n "$repository" ]]; then
+        if [[ "$repository" == sftp:* ]]; then
+          local sftp_key sftp_known_hosts sftp_port
+          sftp_key="$(backup_target_value "$target" SFTP_KEY_FILE)"
+          sftp_known_hosts="$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE)"
+          sftp_port="$(backup_target_value "$target" SFTP_PORT)"
+          if [[ -n "$sftp_key" ]]; then
+            require_files "$sftp_key"
+            local sftp_cmd="ssh -i $sftp_key -o StrictHostKeyChecking=yes"
+            [[ -n "$sftp_known_hosts" && -f "$sftp_known_hosts" ]] && \
+              sftp_cmd+=" -o UserKnownHostsFile=$sftp_known_hosts"
+            [[ -n "$sftp_port" ]] && sftp_cmd+=" -p $sftp_port"
+            (
+              export SFTP_COMMAND="$sftp_cmd"
+              restic_with_env "$pw_file" "$repository" "$extra_env_file" "" "$@"
+            )
+            return 0
+          fi
+        fi
         restic_with_env "$pw_file" "$repository" "$extra_env_file" "" "$@"
         return 0
       fi
@@ -304,7 +366,7 @@ restic_backup_to() {
   local target="$1"
   local paths=()
   local path
-  for path in $BACKUP_INCLUDE_PATHS; do
+  for path in $(backup_target_include_paths "$target"); do
     [[ -e "$path" ]] || continue
     paths+=("$path")
   done
@@ -355,10 +417,19 @@ heartbeat() {
 do_daily_backup() {
   local ran_any=0
   log "=== daily backup start ==="
-  quiesce_immich_postgres
+  local pg_dump_ok=1
+  quiesce_immich_postgres || pg_dump_ok=0
+  if (( pg_dump_ok == 0 )) && [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    case "${BACKUP_POLICY:-BALANCED}" in
+      STRICT)   die "Immich is enabled but pg_dump failed/skipped. Aborting in STRICT mode." ;;
+      BALANCED) log "WARNING: Immich pg_dump failed/skipped. Continuing in BALANCED mode." ;;
+      LENIENT)  log "INFO: Immich pg_dump failed/skipped. Continuing in LENIENT mode." ;;
+    esac
+  fi
 
   while IFS= read -r target; do
     ran_any=1
+    check_repo_identity "$target"
     restic_backup_to "$target"
   done < <(enabled_backup_targets)
 
@@ -387,17 +458,20 @@ do_weekly_retention() {
 
 do_check() {
   while IFS= read -r target; do
+    check_repo_identity "$target"
     restic_check_for "$target"
   done < <(enabled_backup_targets)
 }
 
 do_check_deep() {
   local target="${1:-$(default_restore_target)}"
+  check_repo_identity "$target"
   restic_check_for "$target" --read-data-subset="$BACKUP_DEEP_CHECK_PERCENT"
 }
 
 do_check_full() {
   local target="${1:-$(default_full_check_target)}"
+  check_repo_identity "$target"
   restic_check_for "$target" --read-data
 }
 
@@ -424,6 +498,154 @@ do_restore() {
   restic_for_target "$repo" restore "$snap" --target "$target_dir"
 }
 
+do_init_repo() {
+  local target="${1:-}"
+  local adopt=0
+  [[ -n "$target" ]] || die "Usage: backup init <target> [--adopt-existing]"
+  [[ "$2" == "--adopt-existing" ]] && adopt=1
+
+  load_cfg
+  export_compose_env
+
+  local repository
+  repository="$(backup_target_value "$target" REPOSITORY)"
+  [[ -n "$repository" ]] || die "No BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY configured."
+
+  mkdir -p "$REPO_META_DIR"
+  local meta_file
+  meta_file="$(repo_meta_file "$target")"
+  if [[ -f "$meta_file" ]] && (( adopt == 0 )); then
+    die "Repository metadata already exists at $meta_file. Use --adopt-existing to overwrite."
+  fi
+
+  log "Initializing $target repository: $repository"
+  if restic_for_target "$target" snapshots >/dev/null 2>&1; then
+    if (( adopt == 0 )); then
+      log "Repository already initialized. Using existing repo."
+    else
+      log "Repository exists. Adopting."
+    fi
+  else
+    log "Repository not found. Running restic init..."
+    restic_for_target "$target" init || die "Failed to init repository."
+  fi
+
+  local repo_id
+  repo_id="$(get_repo_id "$target")"
+  [[ -n "$repo_id" ]] || die "Failed to get repository ID. Check connectivity and password."
+
+  log "Repository ID: $repo_id"
+  mkdir -p "$REPO_META_DIR"
+  cat > "$meta_file" <<EOF
+TARGET="$target"
+REPOSITORY="$repository"
+REPOSITORY_ID="$repo_id"
+INIT_TS="$(date -Iseconds)"
+EOF
+  log "Saved metadata to $meta_file"
+
+  log "Verifying connectivity..."
+  restic_for_target "$target" snapshots --latest 1 || die "Failed to read snapshots after init."
+  log "Repository initialized and ready."
+}
+
+do_plan_target() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "Usage: backup plan <target>"
+
+  load_cfg
+  local repository
+  repository="$(backup_target_value "$target" REPOSITORY)"
+  [[ -n "$repository" ]] || die "No BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY configured."
+
+  local meta_file repo_id
+  meta_file="$(repo_meta_file "$target")"
+  if [[ -f "$meta_file" ]]; then
+    unset REPOSITORY_ID
+    # shellcheck disable=SC1090
+    source "$meta_file"
+    repo_id="${REPOSITORY_ID:0:16}"
+  else
+    repo_id="(run: sudo domum-media backup init $target)"
+  fi
+
+  echo "Backup plan for target: $target"
+  echo "  Repository: $repository"
+  echo "  Repo ID: $repo_id"
+  echo "  Encryption: restic client-side encryption — data encrypted locally before upload"
+  echo
+  echo "Include paths:"
+  local path
+  for path in $(backup_target_include_paths "$target"); do
+    if [[ -e "$path" ]]; then
+      echo "  ✓ $path"
+    else
+      echo "  ⚠ $path (missing on disk)"
+    fi
+  done
+  echo
+  echo "Excluded paths (by design):"
+  echo "  /srv/media/movies (media: not included)"
+  echo "  /srv/media/tv (media: not included)"
+  echo "  /srv/media/music (media: not included)"
+  echo "  /srv/media/books (media: not included)"
+  echo "  /srv/data/jellyfin (media app: not included)"
+  echo "  /srv/data/plex (media app: not included)"
+  echo "  /srv/data/navidrome (music app: not included)"
+  echo "  /srv/data/calibre-web (ebook app: not included)"
+  echo "  /srv/data/kavita (comics app: not included)"
+}
+
+do_verify_target() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "Usage: backup verify <target>"
+
+  load_cfg
+  export_compose_env
+
+  log "Verifying repository: $target"
+  log "--- snapshots (latest 1) ---"
+  restic_for_target "$target" snapshots --latest 1
+
+  log "--- metadata check ---"
+  restic_for_target "$target" check
+
+  log "--- storage stats (best-effort) ---"
+  restic_for_target "$target" stats --mode restore-size || true
+
+  log "Verification complete."
+}
+
+do_adopt_repo() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "Usage: backup adopt-repo <target>"
+
+  load_cfg
+  export_compose_env
+
+  local repository
+  repository="$(backup_target_value "$target" REPOSITORY)"
+  [[ -n "$repository" ]] || die "No BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY configured."
+
+  log "Adopting current repository for $target: $repository"
+  local repo_id
+  repo_id="$(get_repo_id "$target")" || die "Failed to connect to repository. Check configuration."
+
+  log "Current repository ID: $repo_id"
+
+  mkdir -p "$REPO_META_DIR"
+  local meta_file
+  meta_file="$(repo_meta_file "$target")"
+  cat > "$meta_file" <<EOF
+TARGET="$target"
+REPOSITORY="$repository"
+REPOSITORY_ID="$repo_id"
+INIT_TS="$(date -Iseconds)"
+ADOPTED=1
+EOF
+  log "Repository adopted. Metadata saved to $meta_file"
+}
+
 main() {
   need_root
   load_cfg
@@ -439,6 +661,10 @@ main() {
     --weekly-cloud-forget) do_weekly_retention ;;
     --restore)            shift; do_restore "$@" ;;
     --snapshots)          list_latest_snapshots ;;
+    init)                 shift; do_init_repo "$@" ;;
+    plan)                 shift; do_plan_target "${1:-}" ;;
+    verify)               shift; do_verify_target "${1:-}" ;;
+    adopt-repo)           shift; do_adopt_repo "${1:-}" ;;
     -h|--help)
       cat <<EOF
 domum-media-backup — restic wrapper
@@ -452,6 +678,11 @@ Usage:
   domum-media-backup --weekly-retention     Run weekly retention targets
   domum-media-backup --restore <snap> <target> [--repo target-name]
   domum-media-backup --snapshots            Show latest snapshot per target
+  domum-media-backup init <target> [--adopt-existing]
+                                            Initialize restic repository
+  domum-media-backup plan <target>          Show what would be backed up
+  domum-media-backup verify <target>        Verify repository health
+  domum-media-backup adopt-repo <target>    Adopt existing repository by ID
 EOF
       ;;
     *)

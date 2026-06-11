@@ -1551,12 +1551,42 @@ configure_backup_target() {
 
   case "$target_type" in
     repository)
-      config_set "BACKUP_TARGET_${upper}_REPOSITORY" \
-        "$(prompt_with_default "Restic repository string for $target" "$(backup_target_value "$target" REPOSITORY)")"
+      local repo_url
+      repo_url="$(prompt_with_default "Restic repository string for $target" "$(backup_target_value "$target" REPOSITORY)")"
+      config_set "BACKUP_TARGET_${upper}_REPOSITORY" "$repo_url"
       config_set "BACKUP_TARGET_${upper}_PASSWORD_FILE" \
         "$(prompt_with_default "Password file for $target" "$(backup_target_password_file "$target")")"
       config_set "BACKUP_TARGET_${upper}_ENV_FILE" \
         "$(prompt_with_default "Optional backend credential env file for $target" "$(backup_target_value "$target" ENV_FILE)")"
+      if [[ "$repo_url" == sftp:* ]]; then
+        local use_key
+        use_key="$(prompt_yes_no "Use SSH key authentication (required for unattended backup)?" "1")"
+        if [[ "$use_key" == "1" ]]; then
+          config_set "BACKUP_TARGET_${upper}_SFTP_KEY_FILE" \
+            "$(prompt_with_default "Path to SSH private key" \
+              "$(backup_target_value "$target" SFTP_KEY_FILE "$SECRETS_DIR/hetzner_storagebox_ed25519")")"
+          config_set "BACKUP_TARGET_${upper}_SFTP_KNOWN_HOSTS_FILE" \
+            "$(prompt_with_default "Path to known_hosts file (or blank)" \
+              "$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE "$SECRETS_DIR/hetzner_storagebox_known_hosts")")"
+          config_set "BACKUP_TARGET_${upper}_SFTP_PORT" \
+            "$(prompt_with_default "SFTP port (Hetzner Storage Box = 23)" \
+              "$(backup_target_value "$target" SFTP_PORT 22)")"
+        fi
+      fi
+      local profile
+      profile="$(prompt_choice "Include paths profile for $target" "custom" \
+        "immich-only" "all-data" "custom")"
+      case "$profile" in
+        immich-only)
+          config_set "BACKUP_TARGET_${upper}_INCLUDE_PATHS" \
+            "/srv/data/immich/library /srv/data/immich/backup-staging /var/lib/domum-media/recovery-pack" ;;
+        all-data)
+          config_set "BACKUP_TARGET_${upper}_INCLUDE_PATHS" "/srv/data /srv/media/books" ;;
+        custom)
+          config_set "BACKUP_TARGET_${upper}_INCLUDE_PATHS" \
+            "$(prompt_with_default "Include paths (space-separated)" \
+              "$(backup_target_value "$target" INCLUDE_PATHS "${BACKUP_INCLUDE_PATHS:-/srv/data /srv/media/books}")")" ;;
+      esac
       ;;
     nfs)
       config_set "BACKUP_TARGET_${upper}_NFS_REMOTE" \
@@ -2969,6 +2999,30 @@ checkup_cmd() {
   while IFS= read -r target; do
     backup_target_enabled "$target" || continue
     [[ -s "$(backup_target_password_file "$target")" ]] || checkup_add critical "Missing backup password file for $target."
+    local repo
+    repo="$(backup_target_value "$target" REPOSITORY)"
+    if [[ "$repo" == sftp:* ]]; then
+      local sftp_key
+      sftp_key="$(backup_target_value "$target" SFTP_KEY_FILE)"
+      if [[ -n "$sftp_key" && -f "$sftp_key" ]]; then
+        checkup_add healthy "$target: SSH key authentication enabled (unattended)."
+      else
+        checkup_add warning "$target: SFTP target but SSH key not configured — will prompt for password."
+        checkup_add action "Configure BACKUP_TARGET_$(uppercase_token "$target")_SFTP_KEY_FILE and run: sudo domum-media backup init $target"
+      fi
+    fi
+    local meta_file
+    meta_file="/var/lib/domum-media/backups/${target}-repo.env"
+    if [[ -f "$meta_file" ]]; then
+      unset REPOSITORY_ID REPOSITORY
+      # shellcheck disable=SC1090
+      source "$meta_file"
+      checkup_add healthy "$target: repository initialized (id: ${REPOSITORY_ID:0:12})"
+    else
+      checkup_add warning "$target: repository not initialized. Run: sudo domum-media backup init $target"
+      checkup_add action "sudo domum-media backup init $target"
+    fi
+    checkup_add healthy "$target: encryption = restic client-side (data encrypted before upload)."
   done < <(backup_target_names)
 
   if ! cmd_exists age; then
@@ -3724,7 +3778,7 @@ Usage:
   domum-media refresh-images [--force] [--check-only] [--apply-now]
   domum-media host-upgrade [--force]
   domum-media logs <service>
-  domum-media backup [--check|--check-deep [repo]|--restore <snapshot> <target>]
+  domum-media backup {init <target> [--adopt-existing]|plan <target>|verify <target>|adopt-repo <target>|--check|--check-deep [repo]|--restore <snapshot> <target>}
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
   domum-media checkup [--json]

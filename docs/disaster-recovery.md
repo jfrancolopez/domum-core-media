@@ -37,10 +37,25 @@ sudo domum-media init
 
 ## 4. Restore `/srv/data`
 
+Restore from your preferred backup target. Example (NAS):
+
 ```bash
 sudo /usr/local/bin/domum-media-backup --restore latest / --repo nas
-# or cloud / archive
 ```
+
+Or from cloud:
+
+```bash
+sudo /usr/local/bin/domum-media-backup --restore latest / --repo cloud
+```
+
+Or archive:
+
+```bash
+sudo /usr/local/bin/domum-media-backup --restore latest / --repo archive
+```
+
+**Note**: Restic backups are encrypted. You need the correct `RESTIC_PASSWORD_FILE` from the recovery pack to restore. The password is saved in `secrets/restic_password_<target>` on the recovered host.
 
 Restore into the correct btrfs layout if you used a different target path.
 
