@@ -969,6 +969,14 @@ ensure_dirs() {
   mkdir -p "${NAVIDROME_MUSIC_ROOT:-/srv/media/music}"
   mkdir -p "${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
   mkdir -p "${KAVITA_LIBRARY_DIR:-/srv/media/books}"
+
+  if [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]]; then
+    local lib_dir="${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
+    if [[ ! -f "$lib_dir/metadata.db" ]]; then
+      warn "Calibre-Web: no Calibre library found at $lib_dir."
+      warn "  Initialize one after 'apply' completes — see docs/SETUP-PLEX-BOOKS-HOT-STORAGE.md."
+    fi
+  fi
 }
 
 compose_cmd() {

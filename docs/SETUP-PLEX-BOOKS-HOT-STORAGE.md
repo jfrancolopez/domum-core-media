@@ -105,6 +105,44 @@ Recommended split:
 - Durable config: `/srv/data/calibre-web/config`, `/srv/data/kavita/config`
 - Volatile import/staging: `${DOMUM_HOT_ROOT}/books-import`
 
+### Calibre-Web first-run
+
+Before opening Calibre-Web for the first time you must have a valid Calibre
+library (a directory containing `metadata.db`) at `CALIBRE_WEB_LIBRARY_DIR`.
+
+If the directory is empty, bootstrap an empty library inside the container:
+
+```bash
+# Create a throwaway EPUB file
+docker exec calibre-web bash -c "
+  python3 -c \"
+import zipfile, os
+os.makedirs('/tmp/epub/META-INF', exist_ok=True)
+with open('/tmp/epub/META-INF/container.xml', 'w') as f:
+    f.write('<container version=\\\"1.0\\\" xmlns=\\\"urn:oasis:schemas:container\\\">'
+            '<rootfiles><rootfile full-path=\\\"content.opf\\\" media-type=\\\"application/oebps-package+xml\\\"/>'
+            '</rootfiles></container>')
+with open('/tmp/epub/content.opf', 'w') as f:
+    f.write('<package xmlns=\\\"http://www.idpf.org/2007/opf\\\" unique-identifier=\\\"id\\\" version=\\\"2.0\\\">'
+            '<metadata xmlns:dc=\\\"http://purl.org/dc/elements/1.1/\\\">'
+            '<dc:title>Init</dc:title><dc:identifier id=\\\"id\\\">init</dc:identifier>'
+            '</metadata><manifest/><spine/></package>')
+with zipfile.ZipFile('/tmp/init.epub','w') as z:
+    z.write('/tmp/epub/META-INF/container.xml','META-INF/container.xml')
+    z.write('/tmp/epub/content.opf','content.opf')
+\"
+"
+
+# Initialize the Calibre database
+docker exec -u abc calibre-web calibredb add /tmp/init.epub --library-path /books
+
+# Optionally remove the dummy entry
+docker exec -u abc calibre-web calibredb remove 1 --library-path /books
+```
+
+Then in the Calibre-Web setup wizard enter `/books` as the database path
+(the container-internal mount point, not the host path).
+
 ## Backups
 
 Backups prioritize durable content. By default the wrapper includes:
