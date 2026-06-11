@@ -145,13 +145,25 @@ Then in the Calibre-Web setup wizard enter `/books` as the database path
 
 ## Backups
 
-Backups prioritize durable content. By default the wrapper includes:
+Cloud backups default to Immich-only to avoid uploading large media libraries:
 
-- `/srv/data`
-- `/srv/media/books`
+- `/srv/data/immich/library`
+- `/srv/data/immich/backup-staging`
+- `/var/lib/domum-media/recovery-pack`
 
-The hot tier is excluded by default. Override `BACKUP_INCLUDE_PATHS` only if
-you intentionally want volatile paths in restic.
+This is written automatically when you choose **immich-only** in
+`sudo domum-media configure` (the default for the cloud target).
+
+To back up all service data and books instead, choose **all-data** during
+configure. In the conf the key is:
+
+```
+DOMUM_HOT_ROOT="/var/lib/domum-media/hot"
+BACKUP_TARGET_CLOUD_INCLUDE_PATHS="/srv/data/immich/library /srv/data/immich/backup-staging /var/lib/domum-media/recovery-pack"
+```
+
+The hot tier is excluded by default. Do not add hot-tier paths to
+`BACKUP_TARGET_*_INCLUDE_PATHS` — they contain only volatile caches.
 
 ## Immich
 

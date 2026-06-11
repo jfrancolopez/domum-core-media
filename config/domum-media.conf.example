@@ -29,6 +29,8 @@ DOMUM_DATA_ROOT="/srv/data"
 DOMUM_MEDIA_ROOT="/srv/media"
 DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
 DOMUM_LOG_DIR="/var/log/domum-media"
+DOMUM_STATE_ROOT="/var/lib/domum-media"
+DOMUM_HOT_ROOT="/var/lib/domum-media/hot"
 
 # ============================================================
 # SECTION: Service toggles

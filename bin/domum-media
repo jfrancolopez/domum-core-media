@@ -15,7 +15,8 @@ LOG_DIR_DEFAULT="/var/log/domum-media"
 STATE_ROOT_DEFAULT="/var/lib/domum-media"
 HOT_ROOT_DEFAULT="/var/lib/domum-media/hot"
 
-die() { echo "ERROR: $*" >&2; exit 1; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "[domum-media] WARN: $*" >&2; }
 
 need_root() {
   [[ "${EUID}" -eq 0 ]] || die "Run as root (use sudo)."
@@ -29,6 +30,9 @@ uppercase_token() {
 
 load_cfg() {
   [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE (copy domum-media.conf.example or run 'domum-media configure')"
+  # Pre-seed so configs that reference ${DOMUM_HOT_ROOT} before it's defined
+  # (e.g. PLEX_TRANSCODE_DIR="${DOMUM_HOT_ROOT}/...") don't fail under set -u.
+  DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
   # shellcheck disable=SC1090
   source "$CFG_FILE"
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
@@ -1581,8 +1585,10 @@ configure_backup_target() {
               "$(backup_target_value "$target" SFTP_PORT 22)")"
         fi
       fi
-      local profile
-      profile="$(prompt_choice "Include paths profile for $target" "custom" \
+      local profile profile_default
+      profile_default="custom"
+      [[ "$target" == "cloud" ]] && profile_default="immich-only"
+      profile="$(prompt_choice "Include paths profile for $target" "$profile_default" \
         "immich-only" "all-data" "custom")"
       case "$profile" in
         immich-only)
@@ -3031,6 +3037,15 @@ checkup_cmd() {
       checkup_add action "sudo domum-media backup init $target"
     fi
     checkup_add healthy "$target: encryption = restic client-side (data encrypted before upload)."
+    local include_paths broad_path
+    include_paths="$(backup_target_value "$target" INCLUDE_PATHS)"
+    for broad_path in "/srv/data" "/srv/media" "/srv/media/books"; do
+      if [[ " $include_paths " == *" $broad_path "* ]]; then
+        checkup_add warning "$target: include paths contain broad path '$broad_path' — backs up all data under that path. Run configure to switch cloud targets to immich-only."
+        checkup_add action "sudo domum-media configure  # switch $target backup to immich-only"
+        break
+      fi
+    done
   done < <(backup_target_names)
 
   if ! cmd_exists age; then
