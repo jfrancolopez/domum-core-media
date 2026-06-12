@@ -129,20 +129,21 @@ NAVIDROME_AUTO_UPDATE_DELAY_DAYS=21
 # swept into restic. Create it as a subvolume — see docs/SETUP-NAVIDROME.md.
 NAVIDROME_DATA_DIR="/srv/data/navidrome"
 
-# Parent root for ALL music libraries. The music itself can live anywhere:
-# put local music in a subfolder, mount a NAS export (NFS/SMB) into another
-# subfolder, or mount a cloud remote with rclone into a third. Navidrome's UI
-# (Settings -> Libraries) then exposes each subfolder as its own library.
-#   /srv/music/local  -> on-box music
-#   /srv/music/nas    -> NFS/SMB mount from a NAS or another server
-#   /srv/music/cloud  -> rclone mount of a cloud remote
+# Parent root for ALL music libraries, on the disposable media tier. The music
+# itself can live anywhere: put local music in a subfolder, mount a NAS export
+# (NFS/SMB) into another subfolder, or mount a cloud remote with rclone into a
+# third. Navidrome's UI (Settings -> Libraries) exposes each subfolder as its
+# own library.
+#   /srv/media/music/local  -> on-box music
+#   /srv/media/music/nas    -> NFS/SMB mount from a NAS or another server
+#   /srv/media/music/cloud  -> rclone mount of a cloud remote
 # See docs/SETUP-NAVIDROME.md for the mount recipes.
-NAVIDROME_MUSIC_ROOT="/srv/music"
+NAVIDROME_MUSIC_ROOT="/srv/media/music"
 
-# Container user for reading music. Default root reads every source regardless
-# of ownership. Set to "uid:gid" (e.g. "1000:1000") to drop privileges if all
-# your sources are readable by that user.
-NAVIDROME_USER="0:0"
+# Container user for reading music. Recommended: drop privileges to "1000:1000"
+# instead of root — works only if every source is readable by that uid/gid.
+# Set back to "0:0" if a mounted source isn't readable by 1000:1000.
+NAVIDROME_USER="1000:1000"
 
 # How often Navidrome rescans for new files. Cron syntax, "@every 1h", or "0"
 # to disable scheduled scans and rely on the filesystem watcher only.
