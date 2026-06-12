@@ -151,6 +151,70 @@ sudo /usr/local/bin/domum-media-backup
 sudo /usr/local/bin/domum-media-backup --check
 ```
 
+---
+
+## Reset and reinitialize the cloud repo
+
+If the cloud repository was wiped (intentionally or otherwise) and you need to
+recreate it from scratch:
+
+1. (optional) Wipe the remote dir via a known-good SFTP session — example for
+   Hetzner Storage Box:
+
+   ```bash
+   ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+       -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
+       -o StrictHostKeyChecking=yes -p 23 \
+       u612125@u612125.your-storagebox.de
+   # at the sftp prompt:
+   #   rm -r /domum-core-media-restic
+   ```
+
+2. Clear the saved repo identity so the wrapper does not refuse to reinitialize:
+
+   ```bash
+   sudo rm -f /var/lib/domum-media/backups/cloud-repo.env
+   ```
+
+3. Reinitialize. `backup init <target>` recreates the repo when it is missing
+   and uses the configured `BACKUP_TARGET_<TARGET>_REPOSITORY` URL directly —
+   no password prompt:
+
+   ```bash
+   sudo domum-media backup init cloud
+   ```
+
+4. Run a fresh backup and integrity check:
+
+   ```bash
+   sudo /usr/local/bin/domum-media-backup
+   sudo /usr/local/bin/domum-media-backup --check
+   ```
+
+### Supported SFTP transport syntax
+
+`restic` is always invoked with an `-o sftp.command='…'` option built from a
+Bash array and `printf %q`-quoted, so it never falls back to its built-in
+`ssh host -s sftp` (which would prompt for a password on the wrong port). The
+expected command line is:
+
+```
+restic -o sftp.command='ssh -F /dev/null \
+  -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+  -o IdentitiesOnly=yes \
+  -o PreferredAuthentications=publickey \
+  -o PasswordAuthentication=no \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
+  -p 23 u612125@u612125.your-storagebox.de -s sftp' …
+```
+
+Do **not** hand-edit this into shell-quoted form anywhere — the option is
+assembled programmatically. The per-target `restic_<target>_env` file
+(e.g. `restic_cloud_env`) is **optional**: when `BACKUP_TARGET_<TARGET>_REPOSITORY`
+is set in `config/domum-media.conf`, the env file is purely for additional
+environment overrides (it does not need to contain `RESTIC_REPOSITORY`).
+
 ## Recovery-pack setup
 
 The recovery pack is a small encrypted tarball (~50–200 KB) containing:

@@ -480,8 +480,15 @@ list_latest_snapshots() {
   while IFS= read -r target; do
     any=1
     echo "-- $target --"
-    if ! restic_for_target "$target" snapshots --latest 1 2>&1; then
+    local out rc=0
+    out="$(restic_for_target "$target" snapshots --latest 1 2>&1)" || rc=$?
+    if (( rc == 0 )); then
+      printf '%s\n' "$out"
+    elif printf '%s' "$out" | grep -qiE 'repository does not exist|unable to open config|config file does not exist'; then
+      echo "($target: repository not initialized — run: sudo domum-media backup init $target)"
+    else
       echo "(failed to query snapshots for $target)"
+      printf '%s\n' "$out"
     fi
   done < <(enabled_backup_targets)
   (( any == 1 )) || echo "(no enabled backup targets)"

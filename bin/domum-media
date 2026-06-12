@@ -1078,6 +1078,24 @@ ensure_networks() {
   done
 }
 
+ensure_navidrome_permissions() {
+  [[ "${ENABLE_NAVIDROME:-0}" == "1" ]] || return 0
+  local data_dir="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
+  local music_root="${NAVIDROME_MUSIC_ROOT:-$DOMUM_MEDIA_ROOT/music}"
+  local user="${NAVIDROME_USER:-0:0}"
+  mkdir -p "$data_dir"
+  # Only chown the durable Navidrome state dir — never the music library
+  # (mounted :ro, read-only access is enough). Skip when running as root.
+  if [[ "$user" != "0:0" && "$user" != "root" && -n "$user" ]]; then
+    local uid="${user%%:*}" gid="${user##*:}"
+    chown -R "${uid}:${gid}" "$data_dir" \
+      || warn "Navidrome: could not chown $data_dir to $user"
+  fi
+  # Music root only needs to be readable/traversable by the configured uid.
+  [[ -r "$music_root" && -x "$music_root" ]] \
+    || warn "Navidrome: $music_root may not be readable by uid ${user%%:*}."
+}
+
 ensure_dirs() {
   ensure_secret_dir
   ensure_state_dirs
@@ -1088,6 +1106,7 @@ ensure_dirs() {
   mkdir -p "${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"
   mkdir -p "${PLEX_TRANSCODE_DIR:-$DOMUM_CACHE_ROOT/plex-transcode}"
   mkdir -p "${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
+  ensure_navidrome_permissions
   mkdir -p "${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"
   mkdir -p "${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"
   # Parent root only; music sources (subfolders / NFS / rclone mounts) are
@@ -3892,6 +3911,104 @@ doctor_traefik() {
   fi
 }
 
+doctor_navidrome() {
+  need_root
+  load_cfg
+  export_env_for_compose
+
+  [[ "${ENABLE_NAVIDROME:-0}" == "1" ]] \
+    || die "Navidrome is not enabled in $CFG_FILE (ENABLE_NAVIDROME=0)."
+
+  local user data_dir music_root
+  user="${NAVIDROME_USER:-0:0}"
+  data_dir="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
+  music_root="${NAVIDROME_MUSIC_ROOT:-$DOMUM_MEDIA_ROOT/music}"
+
+  local cfg_uid cfg_gid
+  cfg_uid="${user%%:*}"
+  cfg_gid="${user##*:}"
+
+  echo "Navidrome:"
+  echo "  NAVIDROME_USER:       $user"
+  echo "  NAVIDROME_DATA_DIR:   $data_dir"
+  echo "  NAVIDROME_MUSIC_ROOT: $music_root"
+  echo
+
+  echo "Data dir:"
+  if [[ -d "$data_dir" ]]; then
+    local owner_label owner_uid owner_gid mode
+    owner_label="$(stat -c '%U:%G (%u:%g)' "$data_dir" 2>/dev/null || echo 'unknown')"
+    owner_uid="$(stat -c '%u' "$data_dir" 2>/dev/null || echo '')"
+    owner_gid="$(stat -c '%g' "$data_dir" 2>/dev/null || echo '')"
+    mode="$(stat -c '%a' "$data_dir" 2>/dev/null || echo 'unknown')"
+    echo "  path:  $data_dir"
+    echo "  owner: $owner_label"
+    echo "  mode:  $mode"
+    if [[ -n "$owner_uid" && -n "$owner_gid" ]]; then
+      if [[ "$owner_uid" == "$cfg_uid" && "$owner_gid" == "$cfg_gid" ]]; then
+        echo "  ownership: PASS (matches NAVIDROME_USER=$user)"
+      else
+        echo "  ownership: WARN (expected $cfg_uid:$cfg_gid — run: sudo domum-media apply)"
+      fi
+    fi
+  else
+    echo "  path: $data_dir (missing — run: sudo domum-media apply)"
+  fi
+  echo
+
+  echo "Music root:"
+  if [[ -d "$music_root" ]]; then
+    local m_owner m_mode readable=0 traversable=0
+    m_owner="$(stat -c '%U:%G (%u:%g)' "$music_root" 2>/dev/null || echo 'unknown')"
+    m_mode="$(stat -c '%a' "$music_root" 2>/dev/null || echo 'unknown')"
+    echo "  path:  $music_root"
+    echo "  owner: $m_owner"
+    echo "  mode:  $m_mode"
+    if [[ "$cfg_uid" == "0" ]]; then
+      [[ -r "$music_root" ]] && readable=1
+      [[ -x "$music_root" ]] && traversable=1
+    elif cmd_exists runuser && getent passwd "$cfg_uid" >/dev/null 2>&1; then
+      runuser -u "#${cfg_uid}" -- test -r "$music_root" && readable=1
+      runuser -u "#${cfg_uid}" -- test -x "$music_root" && traversable=1
+    else
+      [[ -r "$music_root" ]] && readable=1
+      [[ -x "$music_root" ]] && traversable=1
+    fi
+    if (( readable == 1 && traversable == 1 )); then
+      echo "  access: PASS (readable+traversable by uid $cfg_uid)"
+    else
+      echo "  access: WARN (uid $cfg_uid lacks read/traverse — see docs/SETUP-NAVIDROME.md)"
+    fi
+  else
+    echo "  path: $music_root (missing)"
+  fi
+  echo
+
+  echo "Container:"
+  local nv_status nv_image
+  nv_status="$(container_status_summary navidrome)"
+  nv_image="$(container_image_ref navidrome)"
+  echo "  status: $nv_status"
+  [[ -n "$nv_image" ]] && echo "  image:  $nv_image"
+  echo
+
+  echo "Recent errors (last 5 matching readonly|panic|error|permission):"
+  if container_exists navidrome; then
+    local err_lines
+    err_lines="$(docker logs navidrome --tail 80 2>&1 \
+      | grep -iE 'readonly|panic|error|permission' \
+      | tail -n 5 || true)"
+    if [[ -n "$err_lines" ]]; then
+      err_lines="  ${err_lines//$'\n'/$'\n  '}"
+      printf '%s\n' "$err_lines"
+    else
+      echo "  (none)"
+    fi
+  else
+    echo "  navidrome container is not running"
+  fi
+}
+
 doctor_cmd() {
   need_root
   local sub="${1:-}"
@@ -3900,7 +4017,8 @@ doctor_cmd() {
     traefik) shift; doctor_traefik "$@" ;;
     backups) shift; doctor_backups "$@" ;;
     secrets) shift; doctor_secrets "$@" ;;
-    *) die "Usage: domum-media doctor {immich|traefik|backups|secrets}" ;;
+    navidrome) shift; doctor_navidrome "$@" ;;
+    *) die "Usage: domum-media doctor {immich|traefik|backups|secrets|navidrome}" ;;
   esac
 }
 
@@ -3924,7 +4042,7 @@ Usage:
   domum-media checkup [--json]
   domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]
   domum-media recovery-pack {create [--no-email]|status}
-  domum-media doctor {immich|traefik|backups|secrets}
+  domum-media doctor {immich|traefik|backups|secrets|navidrome}
   domum-media immich {refresh-bundle [--force]|check-bundle|apply-bundle|rollback|reset-db [--wipe-uploads]}
 
 Config:  $CFG_FILE

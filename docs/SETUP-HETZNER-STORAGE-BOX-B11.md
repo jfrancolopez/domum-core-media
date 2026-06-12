@@ -129,6 +129,50 @@ sudo domum-media backup init cloud --adopt-existing
 
 Use `--adopt-existing` when the directory was created by a previous host or a manual SFTP session.
 
+### Reset and reinitialize the cloud repo
+
+When the remote repo has been wiped (intentional reset, corrupted directory,
+etc.), recreate it from scratch:
+
+1. (optional) Remove the remote dir via a known-good SFTP session — using the
+   exact ssh key + known_hosts + port the backup wrapper uses, so it cannot
+   prompt for a password:
+
+   ```bash
+   ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+       -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
+       -o StrictHostKeyChecking=yes -p 23 \
+       b11@b11.your-storagebox.de
+   # at the sftp prompt:
+   #   rm -r /domum-core-media-restic
+   ```
+
+2. Clear the saved repo identity so the wrapper does not refuse to reinitialize:
+
+   ```bash
+   sudo rm -f /var/lib/domum-media/backups/cloud-repo.env
+   ```
+
+3. `backup init cloud` recreates the repo when it is missing. It uses the
+   configured `BACKUP_TARGET_CLOUD_REPOSITORY` and the array-built
+   `-o sftp.command='ssh … -s sftp'` option, so it never prompts for a password:
+
+   ```bash
+   sudo domum-media backup init cloud
+   ```
+
+4. Run a fresh backup and integrity check:
+
+   ```bash
+   sudo /usr/local/bin/domum-media-backup
+   sudo /usr/local/bin/domum-media-backup --check
+   sudo domum-media status --counts   # confirms the new snapshot lands
+   ```
+
+`restic_cloud_env` is optional — it is for additional backend env vars only and
+does not need to contain `RESTIC_REPOSITORY` (the wrapper passes the repo via
+`--repo` directly).
+
 ### Confirm a backup actually landed
 
 ```bash

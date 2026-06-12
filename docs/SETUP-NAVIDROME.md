@@ -159,6 +159,28 @@ LAN: add an A record in UniFi for `music.${DOMUM_DOMAIN}` → `${DOMUM_LAN_IP}`
 
 ---
 
+## Permissions
+
+`NAVIDROME_USER` (e.g. `1000:1000`) must own `NAVIDROME_DATA_DIR`, otherwise
+the SQLite DB falls back to read-only and Navidrome crash-loops with
+`attempt to write a readonly database`. The CLI now handles this for you:
+`sudo domum-media apply` / `sudo domum-media update` runs an
+`ensure_navidrome_permissions` step that `chown -R`s the data dir to the
+configured uid:gid on every run (it does **not** touch `NAVIDROME_MUSIC_ROOT`,
+which only needs to be readable + traversable by that uid — the music mount
+is `:ro` inside the container).
+
+Quick check:
+
+```
+sudo domum-media doctor navidrome
+```
+
+That reports the configured user, data-dir owner/mode, music-root readability,
+container state, and the last few `readonly|panic|error|permission` lines from
+the container logs. If `data dir ownership: WARN` appears, just rerun
+`sudo domum-media apply` to fix it.
+
 ## Notes & gotchas
 
 - **The music root is read-only inside the container** (`:ro`). Navidrome never
