@@ -104,6 +104,13 @@ backup_target_enabled() {
   [[ "$(backup_target_value "$1" ENABLED "$(backup_target_default_enabled "$1")")" == "1" ]]
 }
 
+enabled_backup_targets() {
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    echo "$target"
+  done < <(backup_target_names)
+}
+
 backup_target_password_file() {
   backup_target_value "$1" PASSWORD_FILE "$SECRETS_DIR/restic_password_$1"
 }
