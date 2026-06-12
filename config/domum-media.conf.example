@@ -21,16 +21,22 @@ DOMUM_LAN_IP=10.0.10.3
 DOMUM_TS_IP=''
 
 # ============================================================
-# SECTION: Paths
+# SECTION: Paths — durable vs disposable
 # ============================================================
 
-# btrfs mount root. Subvolumes are mounted under here. See docs/SETUP-N100.md.
+# DURABLE / PROTECTED tier (the 1TB btrfs data disk, SDA). Holds Immich photos +
+# database, app config/state, recovery pack, and backup staging. Snapshotted and
+# backed up. Subvolumes are mounted under here — see docs/SETUP-N100.md.
 DOMUM_DATA_ROOT="/srv/data"
+
+# DISPOSABLE media tier (on the OS disk, SDB). Holds replaceable media — movies,
+# shows, music, books — and regenerable caches/transcodes under .cache/. This is
+# NOT backed up by default and must never live on the durable photo disk.
 DOMUM_MEDIA_ROOT="/srv/media"
+
 DOMUM_SNAPSHOT_ROOT="/srv/snapshots"
 DOMUM_LOG_DIR="/var/log/domum-media"
 DOMUM_STATE_ROOT="/var/lib/domum-media"
-DOMUM_HOT_ROOT="/var/lib/domum-media/hot"
 
 # ============================================================
 # SECTION: Service toggles
@@ -99,14 +105,21 @@ JELLYFIN_IMAGE=lscr.io/linuxserver/jellyfin:latest
 JELLYFIN_AUTO_UPDATE=1
 JELLYFIN_AUTO_UPDATE_DELAY_DAYS=21
 
-# Jellyfin state lives on the btrfs data tier; the media library is mounted read-only.
+# Jellyfin config/state is durable (data tier); the media library is read-only.
+# The cache is regenerable, so it lives on the disposable media disk under .cache/.
 JELLYFIN_CONFIG_DIR="/srv/data/jellyfin/config"
-JELLYFIN_CACHE_DIR="/srv/data/jellyfin/cache"
+JELLYFIN_CACHE_DIR="/srv/media/.cache/jellyfin"
 JELLYFIN_MEDIA_ROOT="/srv/media"
 
 PLEX_IMAGE=lscr.io/linuxserver/plex:latest
 PLEX_AUTO_UPDATE=1
 PLEX_AUTO_UPDATE_DELAY_DAYS=21
+
+# Plex config/state is durable; media is read-only. Transcoding is disposable —
+# keep it off the durable disk, on the media disk under .cache/.
+PLEX_CONFIG_DIR="/srv/data/plex/config"
+PLEX_MEDIA_ROOT="/srv/media"
+PLEX_TRANSCODE_DIR="/srv/media/.cache/plex-transcode"
 
 NAVIDROME_IMAGE=deluan/navidrome:latest
 NAVIDROME_AUTO_UPDATE=1
@@ -305,16 +318,6 @@ RECOVERY_PACK_SMTP_HOST=""
 RECOVERY_PACK_SMTP_PORT="465"
 RECOVERY_PACK_SMTP_USERNAME_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_username"
 RECOVERY_PACK_SMTP_PASSWORD_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_password"
-
-# ============================================================
-# SECTION: Hot storage
-# ============================================================
-
-HOT_STORAGE_PRUNE_ENABLED=1
-HOT_STORAGE_PRUNE_AT=04:45
-HOT_STORAGE_PRUNE_RANDOMIZED_DELAY=30m
-HOT_STORAGE_PRUNE_OLDER_THAN_DAYS=30
-HOT_STORAGE_MAX_PERCENT=80
 
 # ============================================================
 # SECTION: Cleanup policy

@@ -10,8 +10,8 @@ services:
       TZ: ${TZ}
     volumes:
       - ${KAVITA_CONFIG_DIR:?KAVITA_CONFIG_DIR is required}:/kavita/config
-      - ${KAVITA_LIBRARY_DIR:?KAVITA_LIBRARY_DIR is required}:/books
-      - ${KAVITA_STAGING_DIR:?KAVITA_STAGING_DIR is required}:/staging
+      # Kavita scans and reads the library; it does not manage it. Mount read-only.
+      - ${KAVITA_LIBRARY_DIR:?KAVITA_LIBRARY_DIR is required}:/books:ro
     labels:
       - traefik.enable=true
       - traefik.docker.network=domum-proxy

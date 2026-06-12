@@ -14,19 +14,22 @@ CFG_FILE="$TMP_DIR/domum-media.conf"
 SECRETS_DIR="$TMP_DIR/secrets"
 STATE_DIR="$TMP_DIR/state"
 DATA_DIR="$TMP_DIR/data"
-HOT_DIR="$TMP_DIR/hot"
+MEDIA_DIR="$TMP_DIR/media"
 LOG_DIR="$TMP_DIR/log"
 SNAPSHOT_DIR="$TMP_DIR/snapshots"
 FAKE_BIN="$TMP_DIR/bin"
 FAKE_STATE="$TMP_DIR/docker-state"
 
-mkdir -p "$SECRETS_DIR" "$STATE_DIR" "$DATA_DIR" "$HOT_DIR" "$LOG_DIR" "$SNAPSHOT_DIR" "$FAKE_BIN" "$FAKE_STATE"
+mkdir -p "$SECRETS_DIR" "$STATE_DIR" "$DATA_DIR" "$MEDIA_DIR" "$LOG_DIR" "$SNAPSHOT_DIR" "$FAKE_BIN" "$FAKE_STATE"
 
+# Include a deprecated DOMUM_HOT_ROOT to assert the migration shim does not crash
+# under set -u and is simply ignored with a warning.
 cat > "$CFG_FILE" <<EOF
 ENABLE_IMMICH=1
 DOMUM_DATA_ROOT='$DATA_DIR'
+DOMUM_MEDIA_ROOT='$MEDIA_DIR'
 DOMUM_STATE_ROOT='$STATE_DIR'
-DOMUM_HOT_ROOT='$HOT_DIR'
+DOMUM_HOT_ROOT='/var/lib/domum-media/hot'
 DOMUM_LOG_DIR='$LOG_DIR'
 DOMUM_SNAPSHOT_ROOT='$SNAPSHOT_DIR'
 EOF

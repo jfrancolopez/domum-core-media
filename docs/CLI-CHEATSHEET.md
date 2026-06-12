@@ -62,7 +62,6 @@ sudo domum-media doctor secrets
 sudo domum-media cleanup summary
 sudo domum-media cleanup images --dry-run
 sudo domum-media cleanup images --confirm
-sudo domum-media cleanup hot --dry-run
 sudo domum-media cleanup snapshots --dry-run
 sudo domum-media cleanup snapshots --confirm
 ```

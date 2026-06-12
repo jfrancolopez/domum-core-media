@@ -28,8 +28,8 @@ installs `domum-media` plus the systemd timers.
 - Git repo: `/opt/domum-core-media`
 - Live config: `/opt/domum-core-media/config/domum-media.conf`
 - Secrets: `/etc/domum-core-media/secrets`
-- Durable data: `/srv/data`
-- Media libraries: `/srv/media`
+- Durable data (protected disk, snapshotted + backed up): `/srv/data`
+- Media libraries (disposable, on the OS disk, not backed up by default): `/srv/media`
 - Snapshots: `/srv/snapshots`
 - Runtime state: `/var/lib/domum-media`
 - Logs: `/var/log/domum-media`

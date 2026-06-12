@@ -38,7 +38,9 @@
       "Bash(git ls-files:*)",
       "Bash(git add:*)",
       "Bash(git show:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(git rm:*)",
+      "Bash(sed:*)"
     ],
     "deny": [],
     "ask": []

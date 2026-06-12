@@ -13,7 +13,8 @@ MEDIA_ROOT_DEFAULT="/srv/media"
 SNAPSHOT_ROOT_DEFAULT="/srv/snapshots"
 LOG_DIR_DEFAULT="/var/log/domum-media"
 STATE_ROOT_DEFAULT="/var/lib/domum-media"
-HOT_ROOT_DEFAULT="/var/lib/domum-media/hot"
+# Disposable, regenerable caches/transcodes live under $DOMUM_MEDIA_ROOT/.cache
+# on the media (OS) disk; see DOMUM_CACHE_ROOT in load_cfg.
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 warn() { echo "[domum-media] WARN: $*" >&2; }
@@ -30,9 +31,6 @@ uppercase_token() {
 
 load_cfg() {
   [[ -f "$CFG_FILE" ]] || die "Missing config: $CFG_FILE (copy domum-media.conf.example or run 'domum-media configure')"
-  # Pre-seed so configs that reference ${DOMUM_HOT_ROOT} before it's defined
-  # (e.g. PLEX_TRANSCODE_DIR="${DOMUM_HOT_ROOT}/...") don't fail under set -u.
-  DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
   # shellcheck disable=SC1090
   source "$CFG_FILE"
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
@@ -40,7 +38,13 @@ load_cfg() {
   DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-$SNAPSHOT_ROOT_DEFAULT}"
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
   DOMUM_STATE_ROOT="${DOMUM_STATE_ROOT:-$STATE_ROOT_DEFAULT}"
-  DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
+  DOMUM_CACHE_ROOT="${DOMUM_CACHE_ROOT:-$DOMUM_MEDIA_ROOT/.cache}"
+  # Deprecated: DOMUM_HOT_ROOT was a misnamed "hot tier". Caches now live on the
+  # disposable media disk under $DOMUM_MEDIA_ROOT/.cache. Old configs that still
+  # set it keep working — the value is ignored, with one deprecation warning.
+  if [[ -n "${DOMUM_HOT_ROOT:-}" ]]; then
+    warn "DOMUM_HOT_ROOT is deprecated and ignored. Caches now live under ${DOMUM_CACHE_ROOT}. Remove it (and KAVITA_STAGING_DIR/NAVIDROME_CACHE_DIR/HOT_STORAGE_PRUNE_*) from $CFG_FILE."
+  fi
   BACKUP_POLICY="${BACKUP_POLICY:-STRICT}"
   BACKUP_REQUIRED_MAX_AGE_HOURS="${BACKUP_REQUIRED_MAX_AGE_HOURS:-48}"
   AUTO_ROLLBACK_ENABLED="${AUTO_ROLLBACK_ENABLED:-1}"
@@ -818,8 +822,8 @@ export_env_for_compose() {
   export DOMUM_LAN_IP="${DOMUM_LAN_IP:-}"
   export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
   export DOMUM_STATE_ROOT
-  export DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-$HOT_ROOT_DEFAULT}"
   export DOMUM_MEDIA_ROOT="${DOMUM_MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
+  export DOMUM_CACHE_ROOT="${DOMUM_CACHE_ROOT:-$DOMUM_MEDIA_ROOT/.cache}"
   export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:latest}"
   export TRAEFIK_AUTO_UPDATE="${TRAEFIK_AUTO_UPDATE:-0}"
   export TRAEFIK_AUTO_UPDATE_DELAY_DAYS="${TRAEFIK_AUTO_UPDATE_DELAY_DAYS:-7}"
@@ -843,16 +847,16 @@ export_env_for_compose() {
   export JELLYFIN_AUTO_UPDATE="${JELLYFIN_AUTO_UPDATE:-0}"
   export JELLYFIN_AUTO_UPDATE_DELAY_DAYS="${JELLYFIN_AUTO_UPDATE_DELAY_DAYS:-21}"
   export JELLYFIN_CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
-  export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_HOT_ROOT/jellyfin-cache}"
-  export JELLYFIN_MEDIA_ROOT="${JELLYFIN_MEDIA_ROOT:-/srv/media}"
+  export JELLYFIN_CACHE_DIR="${JELLYFIN_CACHE_DIR:-$DOMUM_CACHE_ROOT/jellyfin}"
+  export JELLYFIN_MEDIA_ROOT="${JELLYFIN_MEDIA_ROOT:-$DOMUM_MEDIA_ROOT}"
   export JELLYFIN_HOST="${JELLYFIN_HOST:-media.${DOMUM_DOMAIN}}"
   export PLEX_IMAGE="${PLEX_IMAGE:-lscr.io/linuxserver/plex:latest}"
   export PLEX_AUTO_UPDATE="${PLEX_AUTO_UPDATE:-1}"
   export PLEX_AUTO_UPDATE_DELAY_DAYS="${PLEX_AUTO_UPDATE_DELAY_DAYS:-20}"
   export PLEX_HOST="${PLEX_HOST:-plex.${DOMUM_DOMAIN}}"
   export PLEX_CONFIG_DIR="${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"
-  export PLEX_MEDIA_ROOT="${PLEX_MEDIA_ROOT:-/srv/media}"
-  export PLEX_TRANSCODE_DIR="${PLEX_TRANSCODE_DIR:-$DOMUM_HOT_ROOT/plex-transcode}"
+  export PLEX_MEDIA_ROOT="${PLEX_MEDIA_ROOT:-$DOMUM_MEDIA_ROOT}"
+  export PLEX_TRANSCODE_DIR="${PLEX_TRANSCODE_DIR:-$DOMUM_CACHE_ROOT/plex-transcode}"
   export PLEX_ENABLE_HW_TRANSCODE="${PLEX_ENABLE_HW_TRANSCODE:-1}"
   export PLEX_CLAIM="${PLEX_CLAIM:-}"
   export PUID="${PUID:-1000}"
@@ -862,8 +866,7 @@ export_env_for_compose() {
   export NAVIDROME_AUTO_UPDATE="${NAVIDROME_AUTO_UPDATE:-0}"
   export NAVIDROME_AUTO_UPDATE_DELAY_DAYS="${NAVIDROME_AUTO_UPDATE_DELAY_DAYS:-21}"
   export NAVIDROME_DATA_DIR="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
-  export NAVIDROME_CACHE_DIR="${NAVIDROME_CACHE_DIR:-$DOMUM_HOT_ROOT/music-cache}"
-  export NAVIDROME_MUSIC_ROOT="${NAVIDROME_MUSIC_ROOT:-/srv/media/music}"
+  export NAVIDROME_MUSIC_ROOT="${NAVIDROME_MUSIC_ROOT:-$DOMUM_MEDIA_ROOT/music}"
   export NAVIDROME_USER="${NAVIDROME_USER:-0:0}"
   export NAVIDROME_SCAN_SCHEDULE="${NAVIDROME_SCAN_SCHEDULE:-@every 1h}"
   export NAVIDROME_LOG_LEVEL="${NAVIDROME_LOG_LEVEL:-info}"
@@ -873,14 +876,13 @@ export_env_for_compose() {
   export CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS="${CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS:-20}"
   export CALIBRE_WEB_HOST="${CALIBRE_WEB_HOST:-books.${DOMUM_DOMAIN}}"
   export CALIBRE_WEB_CONFIG_DIR="${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"
-  export CALIBRE_WEB_LIBRARY_DIR="${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
+  export CALIBRE_WEB_LIBRARY_DIR="${CALIBRE_WEB_LIBRARY_DIR:-$DOMUM_MEDIA_ROOT/books}"
   export KAVITA_IMAGE="${KAVITA_IMAGE:-jvmilazz0/kavita:latest}"
   export KAVITA_AUTO_UPDATE="${KAVITA_AUTO_UPDATE:-1}"
   export KAVITA_AUTO_UPDATE_DELAY_DAYS="${KAVITA_AUTO_UPDATE_DELAY_DAYS:-20}"
   export KAVITA_HOST="${KAVITA_HOST:-kavita.${DOMUM_DOMAIN}}"
   export KAVITA_CONFIG_DIR="${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"
-  export KAVITA_LIBRARY_DIR="${KAVITA_LIBRARY_DIR:-/srv/media/books}"
-  export KAVITA_STAGING_DIR="${KAVITA_STAGING_DIR:-$DOMUM_HOT_ROOT/books-import}"
+  export KAVITA_LIBRARY_DIR="${KAVITA_LIBRARY_DIR:-$DOMUM_MEDIA_ROOT/books}"
   export UPTIME_KUMA_IMAGE="${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma:2}"
   export UPTIME_KUMA_AUTO_UPDATE="${UPTIME_KUMA_AUTO_UPDATE:-0}"
   export UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS="${UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS:-7}"
@@ -958,27 +960,25 @@ ensure_dirs() {
   ensure_secret_dir
   ensure_state_dirs
   mkdir -p "$DOMUM_LOG_DIR"
-  mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_HOT_ROOT"
+  mkdir -p "$DOMUM_DATA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_CACHE_ROOT"
   mkdir -p "${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"
-  mkdir -p "${JELLYFIN_CACHE_DIR:-$DOMUM_HOT_ROOT/jellyfin-cache}"
+  mkdir -p "${JELLYFIN_CACHE_DIR:-$DOMUM_CACHE_ROOT/jellyfin}"
   mkdir -p "${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"
-  mkdir -p "${PLEX_TRANSCODE_DIR:-$DOMUM_HOT_ROOT/plex-transcode}"
+  mkdir -p "${PLEX_TRANSCODE_DIR:-$DOMUM_CACHE_ROOT/plex-transcode}"
   mkdir -p "${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"
-  mkdir -p "${NAVIDROME_CACHE_DIR:-$DOMUM_HOT_ROOT/music-cache}"
   mkdir -p "${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"
   mkdir -p "${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"
-  mkdir -p "${KAVITA_STAGING_DIR:-$DOMUM_HOT_ROOT/books-import}"
   # Parent root only; music sources (subfolders / NFS / rclone mounts) are
   # assembled by the operator per docs/SETUP-NAVIDROME.md.
-  mkdir -p "${NAVIDROME_MUSIC_ROOT:-/srv/media/music}"
-  mkdir -p "${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
-  mkdir -p "${KAVITA_LIBRARY_DIR:-/srv/media/books}"
+  mkdir -p "${NAVIDROME_MUSIC_ROOT:-$DOMUM_MEDIA_ROOT/music}"
+  mkdir -p "${CALIBRE_WEB_LIBRARY_DIR:-$DOMUM_MEDIA_ROOT/books}"
+  mkdir -p "${KAVITA_LIBRARY_DIR:-$DOMUM_MEDIA_ROOT/books}"
 
   if [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]]; then
-    local lib_dir="${CALIBRE_WEB_LIBRARY_DIR:-/srv/media/books}"
+    local lib_dir="${CALIBRE_WEB_LIBRARY_DIR:-$DOMUM_MEDIA_ROOT/books}"
     if [[ ! -f "$lib_dir/metadata.db" ]]; then
       warn "Calibre-Web: no Calibre library found at $lib_dir."
-      warn "  Initialize one after 'apply' completes — see docs/SETUP-PLEX-BOOKS-HOT-STORAGE.md."
+      warn "  Initialize one after 'apply' completes — see docs/SETUP-PLEX-BOOKS-STORAGE.md."
     fi
   fi
 }
@@ -1148,59 +1148,6 @@ snapshot_prune() {
   done <<< "$names"
 }
 
-hot_root_safe() {
-  [[ -n "${DOMUM_HOT_ROOT:-}" ]] || die "DOMUM_HOT_ROOT is empty"
-  case "$DOMUM_HOT_ROOT" in
-    /|/srv|/srv/data|/home|"") die "Refusing dangerous DOMUM_HOT_ROOT=$DOMUM_HOT_ROOT" ;;
-  esac
-}
-
-hot_status() {
-  load_cfg
-  hot_root_safe
-  mkdir -p "$DOMUM_HOT_ROOT"
-  du -sh "$DOMUM_HOT_ROOT" 2>/dev/null || true
-  df -h "$DOMUM_HOT_ROOT" 2>/dev/null || true
-  find "$DOMUM_HOT_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort
-}
-
-hot_usage_percent() {
-  df -P "$DOMUM_HOT_ROOT" | awk 'NR==2 {gsub("%","",$5); print $5}'
-}
-
-hot_prune() {
-  load_cfg
-  local dry_run=0
-  [[ "${1:-}" == "--dry-run" ]] && dry_run=1
-  hot_root_safe
-  mkdir -p "$DOMUM_HOT_ROOT"
-
-  local older_than_days="${HOT_STORAGE_PRUNE_OLDER_THAN_DAYS:-30}"
-  local max_percent="${HOT_STORAGE_MAX_PERCENT:-80}"
-  local log_file="${DOMUM_LOG_DIR}/hot-prune.log"
-  mkdir -p "$DOMUM_LOG_DIR"
-
-  while IFS= read -r file; do
-    [[ -n "$file" ]] || continue
-    echo "[$(date -Iseconds)] prune-old $file" | tee -a "$log_file"
-    if (( dry_run == 0 )); then
-      rm -f "$file"
-    fi
-  done < <(find "$DOMUM_HOT_ROOT" -type f -mtime +"$older_than_days" 2>/dev/null | sort)
-
-  while [[ "$(hot_usage_percent)" -gt "$max_percent" ]]; do
-    local victim
-    victim="$(find "$DOMUM_HOT_ROOT" -type f -print0 2>/dev/null | xargs -0 ls -1tr 2>/dev/null | head -n 1)"
-    [[ -n "$victim" ]] || break
-    echo "[$(date -Iseconds)] prune-usage $victim" | tee -a "$log_file"
-    if (( dry_run == 0 )); then
-      rm -f "$victim"
-    else
-      break
-    fi
-  done
-}
-
 list_service_snapshots() {
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
   list_snapshots_for_base "$(service_snapshot_base_name "$1")"
@@ -1314,19 +1261,17 @@ EOF
 }
 
 sync_timer_overrides() {
-  local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar hot_prune_calendar
+  local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar
   backup_calendar="$(normalize_daily_schedule "${BACKUP_DAILY_AT:-02:30}")"
   check_calendar="$(normalize_weekly_schedule "${CHECK_WEEKLY_AT:-Sun 03:30}")"
   prune_calendar="$(normalize_weekly_schedule "${SNAPSHOT_PRUNE_WEEKLY_AT:-Sun 04:30}")"
   image_update_calendar="$(normalize_daily_schedule "${IMAGE_AUTO_UPDATE_AT:-05:15}")"
   host_update_calendar="$(normalize_weekly_schedule "${HOST_PACKAGE_AUTO_UPDATE_AT:-Mon 05:45}")"
-  hot_prune_calendar="$(normalize_daily_schedule "${HOT_STORAGE_PRUNE_AT:-04:45}")"
   write_timer_override "domum-media-backup.timer" "$backup_calendar" "15m"
   write_timer_override "domum-media-check.timer" "$check_calendar" "20m"
   write_timer_override "domum-media-btrfs-snapshot.timer" "$prune_calendar" "20m"
   write_timer_override "domum-media-image-refresh.timer" "$image_update_calendar" "${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}"
   write_timer_override "domum-media-host-update.timer" "$host_update_calendar" "${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
-  write_timer_override "domum-media-hot-prune.timer" "$hot_prune_calendar" "${HOT_STORAGE_PRUNE_RANDOMIZED_DELAY:-30m}"
 
   systemctl daemon-reload
   systemctl enable --now \
@@ -1337,11 +1282,9 @@ sync_timer_overrides() {
     domum-media-host-update.timer \
     domum-media-dr-reminder.timer >/dev/null
 
-  if [[ "${HOT_STORAGE_PRUNE_ENABLED:-1}" == "1" ]]; then
-    systemctl enable --now domum-media-hot-prune.timer >/dev/null
-  else
-    systemctl disable --now domum-media-hot-prune.timer >/dev/null 2>&1 || true
-  fi
+  # Best-effort: disable the retired hot-prune timer on hosts upgraded from an
+  # older release that still has the unit installed.
+  systemctl disable --now domum-media-hot-prune.timer >/dev/null 2>&1 || true
 
   sync_unattended_upgrades
 }
@@ -1599,7 +1542,7 @@ configure_backup_target() {
         custom)
           config_set "BACKUP_TARGET_${upper}_INCLUDE_PATHS" \
             "$(prompt_with_default "Include paths (space-separated)" \
-              "$(backup_target_value "$target" INCLUDE_PATHS "${BACKUP_INCLUDE_PATHS:-/srv/data /srv/media/books}")")" ;;
+              "$(backup_target_value "$target" INCLUDE_PATHS "${BACKUP_INCLUDE_PATHS:-/srv/data}")")" ;;
       esac
       ;;
     nfs)
@@ -1784,12 +1727,6 @@ configure_cmd() {
     "$(prompt_with_default "Daily image refresh check time (HH:MM)" "${IMAGE_AUTO_UPDATE_AT:-05:15}")"
   config_set IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY \
     "$(prompt_with_default "Randomized delay for image refresh timer" "${IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-30m}")"
-  config_set HOT_STORAGE_PRUNE_ENABLED \
-    "$(prompt_yes_no "Enable scheduled hot storage pruning?" "${HOT_STORAGE_PRUNE_ENABLED:-1}")"
-  config_set HOT_STORAGE_PRUNE_AT \
-    "$(prompt_with_default "Daily hot storage prune time (HH:MM)" "${HOT_STORAGE_PRUNE_AT:-04:45}")"
-  config_set HOT_STORAGE_PRUNE_RANDOMIZED_DELAY \
-    "$(prompt_with_default "Randomized delay for hot storage prune timer" "${HOT_STORAGE_PRUNE_RANDOMIZED_DELAY:-30m}")"
   config_set HOST_PACKAGE_AUTO_UPDATE_ENABLED \
     "$(prompt_yes_no "Enable scheduled host package upgrades (Docker, compose, tailscale, restic)?" "${HOST_PACKAGE_AUTO_UPDATE_ENABLED:-0}")"
   config_set HOST_PACKAGE_AUTO_UPDATE_AT \
@@ -2463,7 +2400,7 @@ apply() {
 
 status_counts() {
   local immich_lib="${DOMUM_DATA_ROOT}/immich/library"
-  local media_root="${DOMUM_MEDIA_ROOT:-/srv/media}"
+  local media_root="${DOMUM_MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
 
   echo "=== data counts ==="
   [[ -d "$immich_lib" ]] && printf 'Immich library files: %s\n' "$(find "$immich_lib" -type f 2>/dev/null | wc -l)" || true
@@ -2477,8 +2414,10 @@ status_counts() {
 
 status_storage() {
   echo "=== storage ==="
+  echo "  $DOMUM_DATA_ROOT   = durable / protected disk (snapshotted + backed up)"
+  echo "  $DOMUM_MEDIA_ROOT  = disposable media on the OS disk (not backed up by default)"
   printf '%-28s %-8s %-8s %-8s %-6s\n' "PATH" "SIZE" "USED" "AVAIL" "USE%"
-  for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_HOT_ROOT" /; do
+  for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" /; do
     [[ -e "$path" ]] || continue
     df -h --output=target,size,used,avail,pcent "$path" 2>/dev/null | tail -n1
   done | awk '{printf "%-28s %-8s %-8s %-8s %-6s\n",$1,$2,$3,$4,$5}'
@@ -2502,10 +2441,6 @@ status() {
   echo
   echo "=== btrfs snapshots (${DOMUM_SNAPSHOT_ROOT}) ==="
   snapshot_list
-
-  echo
-  echo "=== hot storage (${DOMUM_HOT_ROOT}) ==="
-  hot_status
 
   echo
   status_storage
@@ -2792,15 +2727,8 @@ cleanup_cmd() {
   case "$sub" in
     summary) cleanup_summary ;;
     images) cleanup_images_execute "$dry_run" "$confirm" ;;
-    hot)
-      if (( dry_run == 1 )); then
-        hot_prune --dry-run
-      else
-        hot_prune
-      fi
-      ;;
     snapshots) cleanup_snapshots_execute "$dry_run" "$confirm" ;;
-    *) die "Usage: domum-media cleanup {summary|images|hot|snapshots} [--dry-run|--confirm]" ;;
+    *) die "Usage: domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]" ;;
   esac
 }
 
@@ -3093,13 +3021,38 @@ checkup_cmd() {
   fi
 
   local path pcent
-  for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" "$DOMUM_HOT_ROOT" /; do
+  for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" /; do
     [[ -e "$path" ]] || continue
     pcent="$(df -P "$path" | awk 'NR==2 {gsub("%","",$5); print $5}')"
     if (( pcent >= 90 )); then
       checkup_add warning "$path is ${pcent}% full."
     fi
   done
+
+  # Storage layout guardrails: durable (/srv/data) must be a distinct, protected
+  # filesystem from disposable media (/srv/media), and Immich must live durable.
+  if [[ -d "$DOMUM_DATA_ROOT" && -d "$DOMUM_MEDIA_ROOT" ]]; then
+    local data_fsid media_fsid
+    data_fsid="$(stat -c %d "$DOMUM_DATA_ROOT" 2>/dev/null || echo d)"
+    media_fsid="$(stat -c %d "$DOMUM_MEDIA_ROOT" 2>/dev/null || echo m)"
+    if [[ "$data_fsid" == "$media_fsid" ]]; then
+      checkup_add warning "$DOMUM_MEDIA_ROOT shares a filesystem with $DOMUM_DATA_ROOT — disposable media can fill the protected disk."
+      checkup_add action "Mount $DOMUM_MEDIA_ROOT on its own (OS) disk — see docs/SETUP-N100.md."
+    else
+      checkup_add healthy "Durable ($DOMUM_DATA_ROOT) and disposable ($DOMUM_MEDIA_ROOT) tiers are separate filesystems."
+    fi
+  fi
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    local immich_lib immich_pg
+    immich_lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+    immich_pg="${IMMICH_POSTGRES_DIR:-$DOMUM_DATA_ROOT/immich/postgres}"
+    if [[ "$immich_lib" != "$DOMUM_DATA_ROOT/immich/"* || "$immich_pg" != "$DOMUM_DATA_ROOT/immich/"* ]]; then
+      checkup_add critical "Immich paths are not under $DOMUM_DATA_ROOT/immich (library=$immich_lib postgres=$immich_pg)."
+      checkup_add action "Move Immich library + postgres under $DOMUM_DATA_ROOT/immich (durable disk)."
+    else
+      checkup_add healthy "Immich library + postgres are under $DOMUM_DATA_ROOT/immich."
+    fi
+  fi
 
   local dangling exited waiting_count failed_recent reset_recent
   dangling="$(docker images --filter dangling=true -q 2>/dev/null | wc -l | tr -d ' ')"
@@ -3214,17 +3167,6 @@ doctor_secrets() {
   done
   echo
   recovery_pack_status || true
-}
-
-hot_cmd() {
-  need_root
-  load_cfg
-  local sub="${1:-}"
-  case "$sub" in
-    status) hot_status ;;
-    prune) shift; hot_prune "${1:-}" ;;
-    *) die "Usage: domum-media hot {status|prune [--dry-run]}" ;;
-  esac
 }
 
 immich_reset_db() {
@@ -3805,10 +3747,9 @@ Usage:
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
   domum-media checkup [--json]
-  domum-media cleanup {summary|images|hot|snapshots} [--dry-run|--confirm]
+  domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]
   domum-media recovery-pack {create [--no-email]|status}
   domum-media doctor {immich|traefik|backups|secrets}
-  domum-media hot {status|prune [--dry-run]}
   domum-media immich {refresh-bundle [--force]|check-bundle|apply-bundle|rollback|reset-db [--wipe-uploads]}
 
 Config:  $CFG_FILE
@@ -3836,7 +3777,6 @@ main() {
     cleanup)   shift; cleanup_cmd "$@" ;;
     recovery-pack) shift; recovery_pack_cmd "$@" ;;
     doctor)    shift; doctor_cmd "$@" ;;
-    hot)       shift; hot_cmd "$@" ;;
     immich)    shift; immich_cmd "$@" ;;
     -h|--help|help|"") usage ;;
     *) usage; exit 1 ;;

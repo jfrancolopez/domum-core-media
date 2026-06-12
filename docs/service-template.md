@@ -63,7 +63,7 @@ fi
 - No hardcoded IPs
 - External networks only (`domum-proxy`, `domum-internal`)
 - State under `/srv/data/<service>` as a btrfs subvolume
-- Volatile cache/transcode/staging under `${DOMUM_HOT_ROOT}` only
+- Disposable cache/transcode under `/srv/media/.cache/<service>` (OS disk, not backed up)
 - Secrets only in `/etc/domum-core-media/secrets/`
 - Prefer pinned tags for stateful services. If you decide to use a moving tag,
   add `SERVICE_NAME_AUTO_UPDATE=1` and a delay window.

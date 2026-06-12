@@ -27,15 +27,24 @@ load_cfg() {
   # shellcheck disable=SC1090
   source "$CFG_FILE"
   DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-/srv/data}"
+  DOMUM_MEDIA_ROOT="${DOMUM_MEDIA_ROOT:-/srv/media}"
   DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"
   DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-/var/log/domum-media}"
-  DOMUM_HOT_ROOT="${DOMUM_HOT_ROOT:-/var/lib/domum-media/hot}"
   RESTIC_KEEP_DAILY="${RESTIC_KEEP_DAILY:-7}"
   RESTIC_KEEP_WEEKLY="${RESTIC_KEEP_WEEKLY:-5}"
   RESTIC_KEEP_MONTHLY="${RESTIC_KEEP_MONTHLY:-12}"
   RESTIC_KEEP_YEARLY="${RESTIC_KEEP_YEARLY:-3}"
   BACKUP_DEEP_CHECK_PERCENT="${BACKUP_DEEP_CHECK_PERCENT:-10%}"
-  BACKUP_INCLUDE_PATHS="${BACKUP_INCLUDE_PATHS:-/srv/data /srv/media/books}"
+  # Global fallback for targets without an explicit *_INCLUDE_PATHS. Durable
+  # state only — never the disposable /srv/media media disk by default.
+  BACKUP_INCLUDE_PATHS="${BACKUP_INCLUDE_PATHS:-/srv/data}"
+}
+
+# Immich-only profile: photos + database dump + recovery pack. This is the
+# default for the cloud target so large media libraries are never uploaded.
+immich_only_include_paths() {
+  printf '%s/immich/library %s/immich/backup-staging /var/lib/domum-media/recovery-pack' \
+    "$DOMUM_DATA_ROOT" "$DOMUM_DATA_ROOT"
 }
 
 export_compose_env() {
@@ -116,9 +125,14 @@ backup_target_retention() {
 
 backup_target_include_paths() {
   local target="$1"
-  local paths
+  local paths target_default
   paths="$(backup_target_value "$target" INCLUDE_PATHS)"
-  printf '%s' "${paths:-${BACKUP_INCLUDE_PATHS:-/srv/data /srv/media/books}}"
+  # The cloud target defaults to immich-only so /srv/media is never swept off-site.
+  case "$target" in
+    cloud) target_default="$(immich_only_include_paths)" ;;
+    *)     target_default="${BACKUP_INCLUDE_PATHS:-/srv/data}" ;;
+  esac
+  printf '%s' "${paths:-$target_default}"
 }
 
 repo_meta_file() {
@@ -374,7 +388,7 @@ restic_backup_to() {
   restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
     --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
-    --exclude "${DOMUM_HOT_ROOT}/*" \
+    --exclude "${DOMUM_MEDIA_ROOT}/.cache/*" \
     "${paths[@]}"
 }
 

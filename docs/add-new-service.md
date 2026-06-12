@@ -98,6 +98,6 @@ set it up per `SETUP-CLOUDFLARE.md`.
 - One service per fragment
 - No hardcoded IPs
 - `/srv/data/<service>` for durable state — subvolume, not plain dir
-- `${DOMUM_HOT_ROOT}/...` only for cache/transcode/staging paths
+- `/srv/media/.cache/<service>` for disposable cache/transcode paths (OS disk, not backed up)
 - Secrets only in `/etc/domum-core-media/secrets/`, sourced by the CLI
 - Never edit files inside `/opt/domum-core-media` directly
