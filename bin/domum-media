@@ -127,13 +127,17 @@ shell_join_quoted() {
 
 sftp_command_option_for_target() {
   local target="$1"
-  local sftp_key sftp_known_hosts sftp_port
+  local sftp_key sftp_known_hosts sftp_port repo
   local -a ssh_cmd=()
+  local -a sftp_parts=()
   sftp_key="$(backup_target_value "$target" SFTP_KEY_FILE)"
   sftp_known_hosts="$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE)"
   sftp_port="$(backup_target_value "$target" SFTP_PORT)"
   [[ -n "$sftp_key" ]] || return 1
   [[ -f "$sftp_key" ]] || return 1
+  repo="$(backup_target_value "$target" REPOSITORY)"
+  mapfile -t sftp_parts < <(sftp_repo_user_host "$repo") || return 1
+  [[ -n "${sftp_parts[0]:-}" && -n "${sftp_parts[1]:-}" ]] || return 1
   ssh_cmd=(ssh -F /dev/null -i "$sftp_key")
   ssh_cmd+=(-o IdentitiesOnly=yes)
   ssh_cmd+=(-o PreferredAuthentications=publickey)
@@ -146,6 +150,7 @@ sftp_command_option_for_target() {
   if [[ -n "$sftp_port" ]]; then
     ssh_cmd+=(-p "$sftp_port")
   fi
+  ssh_cmd+=("${sftp_parts[0]}@${sftp_parts[1]}" -s sftp)
   printf 'sftp.command=%s' "$(shell_join_quoted "${ssh_cmd[@]}")"
 }
 
