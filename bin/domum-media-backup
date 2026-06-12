@@ -115,6 +115,34 @@ backup_target_password_file() {
   backup_target_value "$1" PASSWORD_FILE "$SECRETS_DIR/restic_password_$1"
 }
 
+backup_env_line_is_valid() {
+  local line="$1"
+  [[ "$line" =~ ^[[:space:]]*$ ]] && return 0
+  [[ "$line" =~ ^[[:space:]]*# ]] && return 0
+  [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*= ]] && return 0
+  return 1
+}
+
+validate_backup_env_file() {
+  local path="$1"
+  local line
+  bash -n "$path" >/dev/null 2>&1 || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    backup_env_line_is_valid "$line" || return 1
+  done < "$path"
+}
+
+source_backup_env_file() {
+  local path="$1"
+  validate_backup_env_file "$path" \
+    || die "Invalid backup env file: $path. It must contain valid shell export/key=value lines."
+  set +u
+  # shellcheck disable=SC1090
+  source "$path" \
+    || die "Invalid backup env file: $path. It must contain valid shell export/key=value lines."
+  set -u
+}
+
 backup_target_retention() {
   case "$1" in
     nas)   backup_target_value "$1" RETENTION "daily" ;;
@@ -246,12 +274,8 @@ restic_with_env() {
   require_files "$pw_file"
 
   (
-    if [[ -n "$env_file" ]]; then
-      require_files "$env_file"
-      set +u
-      # shellcheck disable=SC1090
-      source "$env_file"
-      set -u
+    if [[ -n "$env_file" && -f "$env_file" ]]; then
+      source_backup_env_file "$env_file"
     fi
     export RESTIC_PASSWORD_FILE="$pw_file"
     export RESTIC_REPOSITORY="$repository"
@@ -300,9 +324,7 @@ restic_for_target() {
       fi
       require_files "$env_file" "$pw_file"
       (
-        set +u
-        # shellcheck disable=SC1090
-        source "$env_file"
+        source_backup_env_file "$env_file"
         export RESTIC_PASSWORD_FILE="$pw_file"
         restic "$@"
       )

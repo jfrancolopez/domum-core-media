@@ -22,6 +22,8 @@ The wizard writes the `BACKUP_TARGET_*` config blocks and can create:
 
 ## SSH key setup for Hetzner Storage Box (SFTP)
 
+For a concrete `b11` walkthrough, see [docs/SETUP-HETZNER-STORAGE-BOX-B11.md](/Users/franco.lopez/Desktop/domum-core-media/docs/SETUP-HETZNER-STORAGE-BOX-B11.md:1).
+
 For unattended cloud backups to Hetzner Storage Box via SFTP:
 
 ### 1. Generate an SSH key on the host
