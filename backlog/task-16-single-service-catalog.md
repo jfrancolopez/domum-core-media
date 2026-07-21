@@ -1,64 +1,71 @@
-# Task 16 — FUTURE: Consolidate service definitions into one catalog  [shared-philosophy]
+# Task 16 — Service catalog step 1: introduce the table  [shared-philosophy]
 
-> **Future idea. Do not start without an explicit go decision.** This is the
-> largest refactor in the backlog and the main pattern that should flow
-> domum-core → domum-core-media.
+> Re-scoped 2026-07-21: no longer FUTURE-gated (Phase 5 of the roadmap is
+> the go decision), and narrowed to the first of three slices. Steps 2 and 3
+> are [task 33](task-33-catalog-step2-derivations.md) and
+> [task 34](task-34-catalog-step3-ensure-dirs-ci.md).
 
 ## Objective
-Replace the ~7 parallel places a service is currently defined with one
-catalog table, so adding/removing a service is a one-row change (plus its
-compose file), like domum-core's `service_catalog()`.
+Introduce a single `service_catalog()` table in `bin/domum-media` and
+rewrite `service_lifecycle_specs()` and `managed_image_specs()` as views
+over it — zero behavior change, proven by a parity test. This is the
+foundation the ~9 duplicated per-service code sites converge onto in the
+following two tasks.
 
 ## Files involved
-- `bin/domum-media` — `compose_files_for_enabled_services()` (hardcoded
-  if-chain), `managed_image_specs()`, `service_lifecycle_specs()`,
-  `service_data_path()` (case), `service_backup_required()` (case),
-  `snapshot_subvolumes()` (hardcoded list), `ensure_dirs()` (hardcoded
-  mkdirs), plus the per-service blocks in `export_env_for_compose()`
-- `docs/add-new-service.md`, `docs/service-template.md` (simplify)
+- `bin/domum-media` — new `service_catalog()` near the top of the service
+  section; `managed_image_specs()` (~746) and `service_lifecycle_specs()`
+  (~760) become views
+- Porting source: `domum-core/bin/domum-core:747-764` (`service_catalog()`
+  pipe-table with the column docs at :736-743, plus its `catalog_field()`
+  accessor shape)
 
 ## Reason
-Today a new service must be registered in up to seven code sites; forgetting
-one produces exactly the silent-gap class of bug found in the sibling audit
-(a service that deploys but is never snapshotted, or never backed up, or
-invisible to updates). domum-core proved the single-table shape works:
-`name|enable_var|image_var|class|delay|compose_rel|data_path|compose_svcs|health_url`
-covers everything the seven sites need. Media-specific columns (snapshot
-subvol, cache dir) extend the row; Immich keeps its bespoke bundle logic and
-simply opts out of the generic image column.
+Today a new service must be registered in up to ~9 code sites (image specs,
+lifecycle specs, data path, backup flags, compose selection, env export,
+ensure_dirs, snapshot list, backup include paths); forgetting one produces
+the silent-gap bug class — a service that deploys but is never snapshotted
+or backed up. domum-core proved the single-table shape works. The catalog
+row carries the union of what all sites need:
+`name|enable_var|image_var|class|delay|compose_rel|compose_svcs|data_path|backup|snapshot|health_url`.
+Immich keeps its bespoke bundle logic and opts out of the generic image
+column; media-specific columns extend the row.
 
-Why future: high blast radius (every command reads these tables), zero
-user-visible feature gain, and the current duplication is *consistent* today.
-Do it when the next service addition is planned, so the refactor pays for
-itself immediately.
+Slicing rationale: each step is one reviewable agent session, each
+independently revertable, and old code is deleted only after old-vs-new
+parity is asserted.
 
-## Implementation plan (when activated — split into 3 PRs)
-1. **PR 1:** Introduce `service_catalog()` carrying the union of
-   `service_lifecycle_specs` + `managed_image_specs`; rewrite those two
-   functions as views over it. No behavior change; smoke test proves it.
-2. **PR 2:** Derive `compose_files_for_enabled_services`, `service_data_path`,
-   `service_backup_required`, and `snapshot_subvolumes` from the catalog.
-   Assert old-vs-new output equality in a throwaway test before deleting the
-   old code.
-3. **PR 3:** Derive the `ensure_dirs` mkdir list; add a catalog-consistency
-   smoke test (mirror of domum-core backlog task 08) to CI.
-   `export_env_for_compose` defaults stay hand-written (values differ per
-   service; a table would obscure them).
+## Implementation plan
+1. Define `service_catalog()` as a heredoc pipe-table (domum-core shape)
+   containing every current service with the union columns above, values
+   transcribed exactly from the two existing spec tables.
+2. Add a `catalog_field()` accessor (port from domum-core).
+3. Rewrite `service_lifecycle_specs()` and `managed_image_specs()` to emit
+   their current output format by projecting catalog columns — callers
+   unchanged.
+4. Parity check committed alongside: a small script that diffs the output
+   of the two functions before/after (run against the pre-change git
+   revision in CI-less local testing; keep it in `tests/` for tasks 33/34
+   to extend).
 
 ## Testing plan
-Per PR: `docker compose ... config` output byte-identical before/after with
-all services enabled (CI env); smoke test; shellcheck; on-host `apply` is a
-no-op recreate.
+- Old vs new output of both spec functions byte-identical (all `ENABLE_*`
+  combinations from `config/ci.env`).
+- `docker compose ... config` byte-identical with all services enabled.
+- On-host `apply` is a no-op recreate; smoke test + shellcheck pass.
 
 ## Rollback plan
-Each PR independently revertable; PR 1 alone is harmless.
+Revert — the views collapse back into standalone tables. Harmless in
+isolation.
 
 ## Dependencies
-Tasks 01–08 landed (touching the same functions); a planned new service as
-the trigger.
+Phase 2 landed (tasks 22/23/24 touch `refresh_images` and the spec tables;
+land the behavior changes before the refactor to avoid churn). Blocks tasks
+33, 34, and 35.
 
 ## Risk / complexity / token size
-Medium risk, large effort. ~10k tokens per PR.
+Low for this slice (pure re-plumbing with parity proof). Medium. ~10k
+tokens.
 
 ## Suggested order
-16 — future.
+Phase 5, first task of the phase.

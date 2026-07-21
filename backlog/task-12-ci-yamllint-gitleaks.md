@@ -9,6 +9,8 @@ compose-config jobs.
 - `.github/workflows/compose-validate.yml` (or a second small workflow file)
 - `.yamllint.yml` (new — copy domum-core's)
 - `.gitleaks.toml` (new — default config; no allowlist needed here)
+- `.shellcheckrc` (new — copy domum-core's: `disable=SC1091`,
+  `external-sources=true`, since runtime-sourced config can't be followed)
 
 ## Reason
 domum-core runs yamllint + gitleaks + shellcheck + compose-validate; this
@@ -32,6 +34,8 @@ Not proposing anything heavier — no CD, no scheduled workflows.
    something, STOP and report the finding instead of allowlisting it.
 3. Add both as jobs in the existing workflow (keep one workflow file — this
    repo's style).
+3b. Add `.shellcheckrc` so local runs match CI; the existing shellcheck job
+   picks it up automatically.
 4. Fix any yamllint complaints in compose files (expect minor whitespace
    only; do not restructure YAML for the linter — tune the config instead).
 
@@ -44,10 +48,11 @@ Not proposing anything heavier — no CD, no scheduled workflows.
 Delete the jobs/config files.
 
 ## Dependencies
-None.
+None. Blocks task 34 (the catalog-consistency CI test extends this
+workflow).
 
 ## Risk / complexity / token size
 Low (CI only). Small. ~6k tokens.
 
 ## Suggested order
-12.
+Phase 0, after task 18.
