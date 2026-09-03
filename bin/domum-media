@@ -194,11 +194,11 @@ sftp_key_auth_works() {
   ssh_cmd+=(-o StrictHostKeyChecking=yes)
   [[ -n "$sftp_known_hosts" ]] && ssh_cmd+=(-o UserKnownHostsFile="$sftp_known_hosts")
   [[ -n "$sftp_port" ]] && ssh_cmd+=(-p "$sftp_port")
-  ssh_cmd+=("${user}@${host}" true)
+  ssh_cmd+=("${user}@${host}" -s sftp)
   if cmd_exists timeout; then
-    timeout 15 "${ssh_cmd[@]}" >/dev/null 2>&1
+    timeout 15 "${ssh_cmd[@]}" </dev/null >/dev/null 2>&1
   else
-    "${ssh_cmd[@]}" >/dev/null 2>&1
+    "${ssh_cmd[@]}" </dev/null >/dev/null 2>&1
   fi
 }
 
@@ -3408,7 +3408,7 @@ doctor_backups() {
     if [[ "$repo" == sftp:* ]]; then
       sftp_opt="$(sftp_command_option_for_target "$target" || true)"
       if [[ -n "$sftp_opt" ]]; then
-        echo "      transport: $sftp_opt"
+        echo "      transport: explicit SFTP command configured (port: $(backup_target_value "$target" SFTP_PORT 22))"
       else
         echo "      warning: SFTP key file is configured incompletely or restic command does not use it"
       fi

@@ -12,8 +12,19 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 key_file="$TMP_DIR/storage-box-key"
 known_hosts_file="$TMP_DIR/known-hosts"
+fake_bin="$TMP_DIR/bin"
+fake_ssh_args="$TMP_DIR/ssh-args"
+mkdir -p "$fake_bin"
 : > "$key_file"
 : > "$known_hosts_file"
+
+cat > "$fake_bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${FAKE_SSH_ARGS:?}"
+EOF
+chmod +x "$fake_bin/ssh"
+export PATH="$fake_bin:$PATH"
+export FAKE_SSH_ARGS="$fake_ssh_args"
 
 valid_repo='sftp:backup-user@storage.example:/domum-core-media-restic'
 invalid_repos=(
@@ -57,6 +68,14 @@ for script in bin/domum-media bin/domum-media-backup; do
     [[ "$option" == *'backup-user@storage.example -s sftp'* ]] \
       || fail "$script generated the wrong SSH destination"
     [[ "$valid_repo" != *':23:'* ]] || fail "$script encoded the port in the repository path"
+
+    if [[ "$script" == bin/domum-media ]]; then
+      sftp_key_auth_works cloud || fail "$script rejected working SFTP subsystem authentication"
+      grep -qF 'backup-user@storage.example -s sftp' "$fake_ssh_args" \
+        || fail "$script did not test the restricted SFTP subsystem"
+      [[ "$(< "$fake_ssh_args")" != *' true'* ]] \
+        || fail "$script attempted a remote shell command"
+    fi
   )
 done
 
