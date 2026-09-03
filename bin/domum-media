@@ -3019,7 +3019,11 @@ recovery_pack_create() {
   archive_tmp="$(mktemp "$RECOVERY_PACK_DEST/.recovery-pack-${ts}.XXXXXX.tmp")"
   printf -v cleanup_cmd 'rm -rf -- %q; rm -f -- %q %q' \
     "$stage_dir" "$archive_plain" "$archive_tmp"
+  # Expand the generated, shell-quoted paths now so EXIT cleanup does not rely
+  # on function-local variables remaining in scope.
+  # shellcheck disable=SC2064
   trap "$cleanup_cmd" EXIT
+  # shellcheck disable=SC2064
   trap "$cleanup_cmd; exit 1" HUP INT TERM
   pubkey="$(read_secret_file_value "$RECOVERY_PACK_AGE_PUBKEY_FILE")"
   recipient="$(printf '%s' "$pubkey" | awk '/^age1/ {print; exit}')"
