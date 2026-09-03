@@ -31,6 +31,9 @@ jobs:
       - name: Restic SFTP configuration smoke test
         run: tests/restic-sftp-configuration-smoke.sh
 
+      - name: Recovery-pack contents smoke test
+        run: tests/recovery-pack-contents-smoke.sh
+
       - name: docker compose config (every fragment layered on base)
         run: |
           set -euo pipefail

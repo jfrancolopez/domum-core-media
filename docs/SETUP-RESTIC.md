@@ -231,13 +231,12 @@ environment overrides (it does not need to contain `RESTIC_REPOSITORY`).
 
 ## Recovery-pack setup
 
-The recovery pack is a small encrypted tarball (~50–200 KB) containing:
+The recovery pack is a small encrypted tarball containing:
 
-- `/etc/domum-core-media/secrets/` (minus large key material)
+- secrets required by enabled services and backup targets
 - `config/domum-media.conf`
-- current image manifest and service list
-- latest restic snapshot IDs and timestamps
-- auto-generated disaster-recovery README
+- the Immich database-password fingerprint
+- rendered Compose configuration and restore instructions
 
 It is **not** a data backup — Immich photos and media files are never included.
 Its purpose is to reconstruct the system configuration quickly after a disaster,

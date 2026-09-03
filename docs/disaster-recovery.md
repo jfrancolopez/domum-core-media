@@ -17,7 +17,8 @@ curl -fsSL https://raw.githubusercontent.com/jfrancolopez/domum-core-media/main/
 The pack contains:
 
 - `config/domum-media.conf`
-- `secrets/*`
+- required `secrets/*` for enabled services and backup targets
+- `state/immich/db_password.sha256`
 - rendered compose manifest
 - restore notes
 
@@ -25,17 +26,17 @@ Decrypt it with your age private key and restore:
 
 - `config/domum-media.conf` to `/opt/domum-core-media/config/domum-media.conf`
 - `secrets/*` to `/etc/domum-core-media/secrets/`
+- `state/immich/db_password.sha256` to `/var/lib/domum-media/immich/db_password.sha256`
 
 Set restored secrets to `0600 root:root`.
 
-## 3. Sync local config/state
+## 3. Restore persistent data
 
-```bash
-sudo domum-media configure --non-interactive
-sudo domum-media init
-```
+Restore `/srv/data` before starting services. The Restic credentials and
+transport files from the recovery pack are sufficient to run the backup wrapper
+without applying the Compose stack first.
 
-## 4. Restore `/srv/data`
+Do not restore live PostgreSQL files as a substitute for the validated pg_dump.
 
 Restore from your preferred backup target. Example (NAS):
 
@@ -58,6 +59,15 @@ sudo /usr/local/bin/domum-media-backup --restore latest / --repo archive
 **Note**: Restic backups are encrypted. You need the correct `RESTIC_PASSWORD_FILE` from the recovery pack to restore. The password is saved in `secrets/restic_password_<target>` on the recovered host.
 
 Restore into the correct btrfs layout if you used a different target path.
+
+## 4. Sync local config/state
+
+Only after persistent data and the Immich password fingerprint are restored:
+
+```bash
+sudo domum-media configure --non-interactive
+sudo domum-media init
+```
 
 ## 5. Bring the stack up
 
