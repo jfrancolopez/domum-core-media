@@ -298,13 +298,38 @@ quiesce_immich_postgres() {
   fi
 
   local dump_file="$stage_dir/immich-postgres.dump.sql.gz"
+  local dump_tmp
   local pg_user="${IMMICH_DB_USERNAME:-postgres}"
   local pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
   local pg_cid
   pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null | head -1)"
   if [[ -n "$pg_cid" ]]; then
     log "pg_dump immich -> $dump_file"
-    docker exec -i "$pg_cid" pg_dump -U "$pg_user" -d "$pg_db" | gzip -9 > "$dump_file"
+    dump_tmp="$(mktemp "$stage_dir/.immich-postgres.dump.sql.gz.XXXXXX.tmp")"
+    if ! (
+      local -a pipeline_status
+      trap 'rm -f -- "$dump_tmp"' EXIT HUP INT TERM
+
+      set +e
+      docker exec -i "$pg_cid" pg_dump -U "$pg_user" -d "$pg_db" | gzip -9 > "$dump_tmp"
+      pipeline_status=("${PIPESTATUS[@]}")
+      set -e
+      (( pipeline_status[0] == 0 && pipeline_status[1] == 0 )) || exit 1
+
+      gzip -t "$dump_tmp" || exit 1
+      (( $(stat -c %s "$dump_tmp") >= 1024 )) || exit 1
+      gzip -cd "$dump_tmp" \
+        | tail -n 20 \
+        | grep -Fqx -- '-- PostgreSQL database dump complete' \
+        || exit 1
+
+      sync -f "$dump_tmp" || exit 1
+      mv -fT "$dump_tmp" "$dump_file" || exit 1
+      sync -f "$dump_file" || exit 1
+    ); then
+      log "ERROR: pg_dump validation failed; preserving the previous dump."
+      return 1
+    fi
     log "pg_dump complete"
   else
     log "Immich postgres container not running — skipping pg_dump."
@@ -785,4 +810,6 @@ EOF
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
