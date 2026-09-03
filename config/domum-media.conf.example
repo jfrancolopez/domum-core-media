@@ -263,6 +263,9 @@ BACKUP_TARGET_CLOUD_RETENTION="weekly"
 
 # SFTP-specific settings (for Hetzner Storage Box and similar).
 # Only used when BACKUP_TARGET_CLOUD_REPOSITORY starts with "sftp:".
+# Use sftp:user@host:/absolute/path. Keep the port out of the repository string;
+# BACKUP_TARGET_CLOUD_SFTP_PORT supplies it through the explicit SSH command.
+# Example: sftp:b11@b11.your-storagebox.de:/domum-core-media-restic
 # SSH key must be authorized on the remote host. Port must match the SFTP server.
 BACKUP_TARGET_CLOUD_SFTP_KEY_FILE="/etc/domum-core-media/secrets/hetzner_storagebox_ed25519"
 BACKUP_TARGET_CLOUD_SFTP_KNOWN_HOSTS_FILE="/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts"

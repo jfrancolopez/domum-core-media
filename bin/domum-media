@@ -148,6 +148,7 @@ sftp_command_option_for_target() {
     ssh_cmd+=(-o UserKnownHostsFile="$sftp_known_hosts")
   fi
   if [[ -n "$sftp_port" ]]; then
+    sftp_port_is_valid "$sftp_port" || return 1
     ssh_cmd+=(-p "$sftp_port")
   fi
   ssh_cmd+=("${sftp_parts[0]}@${sftp_parts[1]}" -s sftp)
@@ -156,12 +157,19 @@ sftp_command_option_for_target() {
 
 sftp_repo_user_host() {
   local repo="$1"
-  local spec rest
-  [[ "$repo" == sftp:* ]] || return 1
-  spec="${repo#sftp:}"
-  spec="${spec%%:*}"
-  [[ "$spec" == *@* ]] || return 1
-  printf '%s\n%s\n' "${spec%%@*}" "${spec#*@}"
+  local path
+  [[ "$repo" =~ ^sftp:([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):(/.*)$ ]] || return 1
+  path="${BASH_REMATCH[3]}"
+  [[ "$path" != "/" && "$path" != *:* && "$path" != *[[:space:]]* ]] || return 1
+  [[ "$path" != "/./"* && "$path" != *"/./"* && "$path" != *"/../"* ]] || return 1
+  [[ "$path" != */. && "$path" != */.. ]] || return 1
+  printf '%s\n%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+sftp_port_is_valid() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
 sftp_key_auth_works() {
@@ -176,6 +184,7 @@ sftp_key_auth_works() {
   sftp_key="$(backup_target_value "$target" SFTP_KEY_FILE)"
   sftp_known_hosts="$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE)"
   sftp_port="$(backup_target_value "$target" SFTP_PORT)"
+  [[ -z "$sftp_port" ]] || sftp_port_is_valid "$sftp_port" || return 1
   [[ -n "$user" && -n "$host" && -f "$sftp_key" ]] || return 1
   ssh_cmd=(ssh -F /dev/null -i "$sftp_key")
   ssh_cmd+=(-o BatchMode=yes)
@@ -185,11 +194,11 @@ sftp_key_auth_works() {
   ssh_cmd+=(-o StrictHostKeyChecking=yes)
   [[ -n "$sftp_known_hosts" ]] && ssh_cmd+=(-o UserKnownHostsFile="$sftp_known_hosts")
   [[ -n "$sftp_port" ]] && ssh_cmd+=(-p "$sftp_port")
-  ssh_cmd+=("${user}@${host}" true)
+  ssh_cmd+=("${user}@${host}" -s sftp)
   if cmd_exists timeout; then
-    timeout 15 "${ssh_cmd[@]}" >/dev/null 2>&1
+    timeout 15 "${ssh_cmd[@]}" </dev/null >/dev/null 2>&1
   else
-    "${ssh_cmd[@]}" >/dev/null 2>&1
+    "${ssh_cmd[@]}" </dev/null >/dev/null 2>&1
   fi
 }
 
@@ -1655,7 +1664,10 @@ configure_backup_target() {
   case "$target_type" in
     repository)
       local repo_url
-      repo_url="$(prompt_with_default "Restic repository string for $target" "$(backup_target_value "$target" REPOSITORY)")"
+      repo_url="$(prompt_with_default "Restic repository string for $target (SFTP: sftp:user@host:/absolute/path)" "$(backup_target_value "$target" REPOSITORY)")"
+      if [[ "$repo_url" == sftp:* ]] && ! sftp_repo_user_host "$repo_url" >/dev/null; then
+        die "Invalid SFTP repository. Use sftp:user@host:/absolute/path and configure the port separately."
+      fi
       config_set "BACKUP_TARGET_${upper}_REPOSITORY" "$repo_url"
       config_set "BACKUP_TARGET_${upper}_PASSWORD_FILE" \
         "$(prompt_with_default "Password file for $target" "$(backup_target_password_file "$target")")"
@@ -1671,9 +1683,12 @@ configure_backup_target() {
           config_set "BACKUP_TARGET_${upper}_SFTP_KNOWN_HOSTS_FILE" \
             "$(prompt_with_default "Path to known_hosts file (or blank)" \
               "$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE "$SECRETS_DIR/hetzner_storagebox_known_hosts")")"
-          config_set "BACKUP_TARGET_${upper}_SFTP_PORT" \
-            "$(prompt_with_default "SFTP port (Hetzner Storage Box = 23)" \
-              "$(backup_target_value "$target" SFTP_PORT 22)")"
+          local sftp_port
+          sftp_port="$(prompt_with_default "SFTP port (Hetzner Storage Box = 23)" \
+            "$(backup_target_value "$target" SFTP_PORT 22)")"
+          sftp_port_is_valid "$sftp_port" \
+            || die "Invalid SFTP port. Expected a number from 1 through 65535."
+          config_set "BACKUP_TARGET_${upper}_SFTP_PORT" "$sftp_port"
         fi
       fi
       local profile profile_default
@@ -2899,12 +2914,54 @@ Recovery pack restore notes
 1. Decrypt the archive with your age private key.
 2. Restore config/domum-media.conf to $CFG_FILE
 3. Restore secrets/* to $SECRETS_DIR with mode 0600 and owner root:root
-4. Re-run:
+4. Restore state/immich/db_password.sha256 to
+   $DOMUM_STATE_ROOT/immich/db_password.sha256 before restoring Immich data.
+5. Restore /srv/data from restic using domum-media-backup --restore.
+   Do not start Immich or restore live PostgreSQL files as a substitute for pg_dump.
+6. After persistent state and the fingerprint are restored, run:
    sudo domum-media configure --non-interactive
    sudo domum-media init
    sudo domum-media apply
-5. Restore /srv/data from restic using domum-media-backup --restore
 EOF
+}
+
+recovery_pack_secret_files() {
+  printf '%s\n' "$RECOVERY_PACK_AGE_PUBKEY_FILE"
+
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    printf '%s\n' "$(immich_db_password_file)" "$(immich_jwt_secret_file)"
+  fi
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
+    printf '%s\n' "$SECRETS_DIR/cloudflare_api_token" \
+      "${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}"
+  fi
+
+  local target target_type
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    target_type="$(backup_target_value "$target" TYPE repository)"
+    printf '%s\n' "$(backup_target_password_file "$target")"
+    printf '%s\n' "$(backup_target_value "$target" ENV_FILE)"
+    printf '%s\n' "$(backup_target_legacy_env_file "$target")"
+    case "$target_type" in
+      repository)
+        if [[ "$(backup_target_value "$target" REPOSITORY)" == sftp:* ]]; then
+          printf '%s\n' \
+            "$(backup_target_value "$target" SFTP_KEY_FILE)" \
+            "$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE)"
+        fi
+        ;;
+      ftp)
+        printf '%s\n' \
+          "$(backup_target_value "$target" FTP_USERNAME_FILE)" \
+          "$(backup_target_value "$target" FTP_PASSWORD_FILE)"
+        ;;
+    esac
+  done < <(backup_target_names)
+
+  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then
+    printf '%s\n' "$RECOVERY_PACK_SMTP_USERNAME_FILE" "$RECOVERY_PACK_SMTP_PASSWORD_FILE"
+  fi
 }
 
 send_recovery_pack_email() {
@@ -2952,27 +3009,50 @@ recovery_pack_create() {
   [[ -f "$RECOVERY_PACK_AGE_PUBKEY_FILE" ]] || die "Missing recovery pack age public key: $RECOVERY_PACK_AGE_PUBKEY_FILE"
 
   local no_email="${1:-0}"
-  local stage_dir archive_plain archive_enc pubkey recipient ts sha size
+  local stage_dir archive_plain archive_enc archive_tmp pubkey recipient ts sha size cleanup_cmd
+  local fingerprint_file secret_file
+  mkdir -p "$RECOVERY_PACK_DEST"
   stage_dir="$(mktemp -d)"
   ts="$(date +%Y%m%d-%H%M%S)"
   archive_plain="$(mktemp "/tmp/recovery-pack-${ts}.XXXXXX")"
   archive_enc="$RECOVERY_PACK_DEST/recovery-pack-${ts}.tar.age"
+  archive_tmp="$(mktemp "$RECOVERY_PACK_DEST/.recovery-pack-${ts}.XXXXXX.tmp")"
+  printf -v cleanup_cmd 'rm -rf -- %q; rm -f -- %q %q' \
+    "$stage_dir" "$archive_plain" "$archive_tmp"
+  # Expand the generated, shell-quoted paths now so EXIT cleanup does not rely
+  # on function-local variables remaining in scope.
+  # shellcheck disable=SC2064
+  trap "$cleanup_cmd" EXIT
+  # shellcheck disable=SC2064
+  trap "$cleanup_cmd; exit 1" HUP INT TERM
   pubkey="$(read_secret_file_value "$RECOVERY_PACK_AGE_PUBKEY_FILE")"
   recipient="$(printf '%s' "$pubkey" | awk '/^age1/ {print; exit}')"
   [[ -n "$recipient" ]] || die "Could not parse age recipient from $RECOVERY_PACK_AGE_PUBKEY_FILE"
 
-  mkdir -p "$stage_dir/config" "$stage_dir/secrets" "$stage_dir/meta"
+  mkdir -p "$stage_dir/config" "$stage_dir/secrets" "$stage_dir/state/immich" "$stage_dir/meta"
   [[ -f "$CFG_FILE" ]] && install -m 0600 "$CFG_FILE" "$stage_dir/config/domum-media.conf"
-  find "$SECRETS_DIR" -maxdepth 1 -type f 2>/dev/null | while IFS= read -r file; do
-    install -m 0600 "$file" "$stage_dir/secrets/$(basename "$file")"
-  done
+  while IFS= read -r secret_file; do
+    [[ -n "$secret_file" && -f "$secret_file" ]] || continue
+    install -m 0600 "$secret_file" "$stage_dir/secrets/$(basename "$secret_file")"
+  done < <(recovery_pack_secret_files | sort -u)
+
+  fingerprint_file="$(immich_db_password_fingerprint_file)"
+  if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then
+    [[ -f "$fingerprint_file" ]] \
+      || die "Immich password fingerprint is missing: $fingerprint_file"
+    install -m 0600 "$fingerprint_file" "$stage_dir/state/immich/db_password.sha256"
+  fi
   git -C "$DOMUM_DIR" rev-parse HEAD > "$stage_dir/meta/git-revision.txt" 2>/dev/null || true
   compose_cmd config > "$stage_dir/meta/rendered-compose.yml" 2>/dev/null || true
   recovery_pack_restore_instructions "$stage_dir"
   recovery_pack_manifest "$stage_dir"
 
   tar -C "$stage_dir" -czf "$archive_plain" .
-  age -r "$recipient" -o "$archive_enc" "$archive_plain"
+  age -r "$recipient" -o "$archive_tmp" "$archive_plain"
+  chmod 0600 "$archive_tmp"
+  sync -f "$archive_tmp"
+  mv -fT "$archive_tmp" "$archive_enc"
+  sync -f "$archive_enc"
   sha="$(sha256_of_file "$archive_enc")"
   size="$(stat -c %s "$archive_enc" 2>/dev/null || stat -f %z "$archive_enc")"
   write_env_kv "$(recovery_pack_state_file)" \
@@ -2983,6 +3063,7 @@ recovery_pack_create() {
     VERIFIED_TS "$(date +%s)"
   rm -rf "$stage_dir"
   rm -f "$archive_plain"
+  trap - EXIT HUP INT TERM
 
   if (( no_email == 0 )); then
     send_recovery_pack_email "$archive_enc"
@@ -3327,7 +3408,7 @@ doctor_backups() {
     if [[ "$repo" == sftp:* ]]; then
       sftp_opt="$(sftp_command_option_for_target "$target" || true)"
       if [[ -n "$sftp_opt" ]]; then
-        echo "      transport: $sftp_opt"
+        echo "      transport: explicit SFTP command configured (port: $(backup_target_value "$target" SFTP_PORT 22))"
       else
         echo "      warning: SFTP key file is configured incompletely or restic command does not use it"
       fi
