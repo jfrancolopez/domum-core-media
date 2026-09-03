@@ -148,6 +148,7 @@ sftp_command_option_for_target() {
     ssh_cmd+=(-o UserKnownHostsFile="$sftp_known_hosts")
   fi
   if [[ -n "$sftp_port" ]]; then
+    sftp_port_is_valid "$sftp_port" || return 1
     ssh_cmd+=(-p "$sftp_port")
   fi
   ssh_cmd+=("${sftp_parts[0]}@${sftp_parts[1]}" -s sftp)
@@ -156,12 +157,19 @@ sftp_command_option_for_target() {
 
 sftp_repo_user_host() {
   local repo="$1"
-  local spec rest
-  [[ "$repo" == sftp:* ]] || return 1
-  spec="${repo#sftp:}"
-  spec="${spec%%:*}"
-  [[ "$spec" == *@* ]] || return 1
-  printf '%s\n%s\n' "${spec%%@*}" "${spec#*@}"
+  local path
+  [[ "$repo" =~ ^sftp:([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):(/.*)$ ]] || return 1
+  path="${BASH_REMATCH[3]}"
+  [[ "$path" != "/" && "$path" != *:* && "$path" != *[[:space:]]* ]] || return 1
+  [[ "$path" != "/./"* && "$path" != *"/./"* && "$path" != *"/../"* ]] || return 1
+  [[ "$path" != */. && "$path" != */.. ]] || return 1
+  printf '%s\n%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+sftp_port_is_valid() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
 sftp_key_auth_works() {
@@ -176,6 +184,7 @@ sftp_key_auth_works() {
   sftp_key="$(backup_target_value "$target" SFTP_KEY_FILE)"
   sftp_known_hosts="$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE)"
   sftp_port="$(backup_target_value "$target" SFTP_PORT)"
+  [[ -z "$sftp_port" ]] || sftp_port_is_valid "$sftp_port" || return 1
   [[ -n "$user" && -n "$host" && -f "$sftp_key" ]] || return 1
   ssh_cmd=(ssh -F /dev/null -i "$sftp_key")
   ssh_cmd+=(-o BatchMode=yes)
@@ -1655,7 +1664,10 @@ configure_backup_target() {
   case "$target_type" in
     repository)
       local repo_url
-      repo_url="$(prompt_with_default "Restic repository string for $target" "$(backup_target_value "$target" REPOSITORY)")"
+      repo_url="$(prompt_with_default "Restic repository string for $target (SFTP: sftp:user@host:/absolute/path)" "$(backup_target_value "$target" REPOSITORY)")"
+      if [[ "$repo_url" == sftp:* ]] && ! sftp_repo_user_host "$repo_url" >/dev/null; then
+        die "Invalid SFTP repository. Use sftp:user@host:/absolute/path and configure the port separately."
+      fi
       config_set "BACKUP_TARGET_${upper}_REPOSITORY" "$repo_url"
       config_set "BACKUP_TARGET_${upper}_PASSWORD_FILE" \
         "$(prompt_with_default "Password file for $target" "$(backup_target_password_file "$target")")"
@@ -1671,9 +1683,12 @@ configure_backup_target() {
           config_set "BACKUP_TARGET_${upper}_SFTP_KNOWN_HOSTS_FILE" \
             "$(prompt_with_default "Path to known_hosts file (or blank)" \
               "$(backup_target_value "$target" SFTP_KNOWN_HOSTS_FILE "$SECRETS_DIR/hetzner_storagebox_known_hosts")")"
-          config_set "BACKUP_TARGET_${upper}_SFTP_PORT" \
-            "$(prompt_with_default "SFTP port (Hetzner Storage Box = 23)" \
-              "$(backup_target_value "$target" SFTP_PORT 22)")"
+          local sftp_port
+          sftp_port="$(prompt_with_default "SFTP port (Hetzner Storage Box = 23)" \
+            "$(backup_target_value "$target" SFTP_PORT 22)")"
+          sftp_port_is_valid "$sftp_port" \
+            || die "Invalid SFTP port. Expected a number from 1 through 65535."
+          config_set "BACKUP_TARGET_${upper}_SFTP_PORT" "$sftp_port"
         fi
       fi
       local profile profile_default

@@ -123,12 +123,19 @@ shell_join_quoted() {
 
 sftp_repo_user_host() {
   local repo="$1"
-  local spec
-  [[ "$repo" == sftp:* ]] || return 1
-  spec="${repo#sftp:}"
-  spec="${spec%%:*}"
-  [[ "$spec" == *@* ]] || return 1
-  printf '%s\n%s\n' "${spec%%@*}" "${spec#*@}"
+  local path
+  [[ "$repo" =~ ^sftp:([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):(/.*)$ ]] || return 1
+  path="${BASH_REMATCH[3]}"
+  [[ "$path" != "/" && "$path" != *:* && "$path" != *[[:space:]]* ]] || return 1
+  [[ "$path" != "/./"* && "$path" != *"/./"* && "$path" != *"/../"* ]] || return 1
+  [[ "$path" != */. && "$path" != */.. ]] || return 1
+  printf '%s\n%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+sftp_port_is_valid() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
 sftp_command_option_for_target() {
@@ -143,9 +150,9 @@ sftp_command_option_for_target() {
   require_files "$sftp_key"
   repo="$(backup_target_value "$target" REPOSITORY)"
   mapfile -t sftp_parts < <(sftp_repo_user_host "$repo") \
-    || die "SFTP target '$target' has an unparseable repository: $repo"
+    || die "SFTP target '$target' must use sftp:user@host:/absolute/path; configure the port separately."
   [[ -n "${sftp_parts[0]:-}" && -n "${sftp_parts[1]:-}" ]] \
-    || die "SFTP target '$target' has an unparseable repository: $repo"
+    || die "SFTP target '$target' has an invalid repository."
   ssh_cmd=(ssh -F /dev/null -i "$sftp_key")
   ssh_cmd+=(-o IdentitiesOnly=yes)
   ssh_cmd+=(-o PreferredAuthentications=publickey)
@@ -156,6 +163,8 @@ sftp_command_option_for_target() {
     ssh_cmd+=(-o UserKnownHostsFile="$sftp_known_hosts")
   fi
   if [[ -n "$sftp_port" ]]; then
+    sftp_port_is_valid "$sftp_port" \
+      || die "SFTP target '$target' has an invalid port; expected 1-65535."
     ssh_cmd+=(-p "$sftp_port")
   fi
   ssh_cmd+=("${sftp_parts[0]}@${sftp_parts[1]}" -s sftp)
@@ -637,7 +646,7 @@ do_init_repo() {
     die "Repository metadata already exists at $meta_file. Use --adopt-existing to overwrite."
   fi
 
-  log "Initializing $target repository: $repository"
+  log "Initializing $target repository"
   if restic_for_target "$target" snapshots >/dev/null 2>&1; then
     if (( adopt == 0 )); then
       log "Repository already initialized. Using existing repo."
@@ -657,7 +666,6 @@ do_init_repo() {
   mkdir -p "$REPO_META_DIR"
   cat > "$meta_file" <<EOF
 TARGET="$target"
-REPOSITORY="$repository"
 REPOSITORY_ID="$repo_id"
 INIT_TS="$(date -Iseconds)"
 EOF
@@ -673,8 +681,9 @@ do_plan_target() {
   [[ -n "$target" ]] || die "Usage: backup plan <target>"
 
   load_cfg
-  local repository
+  local repository target_type
   repository="$(backup_target_value "$target" REPOSITORY)"
+  target_type="$(backup_target_value "$target" TYPE repository)"
   [[ -n "$repository" ]] || die "No BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY configured."
 
   local meta_file repo_id
@@ -689,7 +698,11 @@ do_plan_target() {
   fi
 
   echo "Backup plan for target: $target"
-  echo "  Repository: $repository"
+  if [[ "$repository" == sftp:* ]]; then
+    echo "  Repository: configured (sftp)"
+  else
+    echo "  Repository: configured ($target_type)"
+  fi
   echo "  Repo ID: $repo_id"
   echo "  Encryption: restic client-side encryption — data encrypted locally before upload"
   echo
@@ -746,7 +759,7 @@ do_adopt_repo() {
   repository="$(backup_target_value "$target" REPOSITORY)"
   [[ -n "$repository" ]] || die "No BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY configured."
 
-  log "Adopting current repository for $target: $repository"
+  log "Adopting current repository for $target"
   local repo_id
   repo_id="$(get_repo_id "$target")" || die "Failed to connect to repository. Check configuration."
 
@@ -757,7 +770,6 @@ do_adopt_repo() {
   meta_file="$(repo_meta_file "$target")"
   cat > "$meta_file" <<EOF
 TARGET="$target"
-REPOSITORY="$repository"
 REPOSITORY_ID="$repo_id"
 INIT_TS="$(date -Iseconds)"
 ADOPTED=1

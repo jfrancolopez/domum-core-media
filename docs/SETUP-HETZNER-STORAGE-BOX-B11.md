@@ -14,7 +14,7 @@ Use these answers for the `cloud` target:
 
 - `Enable cloud backup target?` -> `yes`
 - `Target type for cloud` -> `repository`
-- `Restic repository string for cloud` -> `sftp:b11@b11.your-storagebox.de:/./domum-core-media-restic`
+- `Restic repository string for cloud` -> `sftp:b11@b11.your-storagebox.de:/domum-core-media-restic`
 - `Password file for cloud` -> keep the default unless you have a reason to change it
 - `Optional backend credential env file for cloud` -> keep the default or set a path, but leave the file empty/comment-only for SFTP targets
 - `Use SSH key authentication` -> `yes`

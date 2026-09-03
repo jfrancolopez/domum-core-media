@@ -28,6 +28,9 @@ jobs:
       - name: Atomic Immich pg_dump smoke test
         run: tests/atomic-immich-pg-dump-smoke.sh
 
+      - name: Restic SFTP configuration smoke test
+        run: tests/restic-sftp-configuration-smoke.sh
+
       - name: docker compose config (every fragment layered on base)
         run: |
           set -euo pipefail

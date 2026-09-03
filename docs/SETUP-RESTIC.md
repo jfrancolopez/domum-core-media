@@ -88,7 +88,9 @@ Before running the first backup, preview what will be included:
 sudo domum-media backup plan cloud
 ```
 
-This shows the target, repository URL, encryption method, include paths, and excluded paths (without connecting to the repository).
+This shows the target, sanitized repository type, encryption method, include
+paths, and excluded paths without connecting to the repository or printing
+repository credentials.
 
 ---
 
@@ -192,6 +194,18 @@ recreate it from scratch:
    ```
 
 ### Supported SFTP transport syntax
+
+Configure SFTP repositories with an absolute remote path and no embedded port:
+
+```text
+sftp:user@host:/domum-core-media-restic
+```
+
+Set a nonstandard port with `BACKUP_TARGET_<TARGET>_SFTP_PORT`. The wrapper puts
+that value only in the explicit SSH command. Repository strings containing an
+embedded port such as `sftp:user@host:23:/path`, whitespace, credentials, or
+`.`/`..` path segments are rejected rather than silently addressing a different
+remote directory.
 
 `restic` is always invoked with an `-o sftp.command='…'` option built from a
 Bash array and `printf %q`-quoted, so it never falls back to its built-in
