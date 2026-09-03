@@ -391,8 +391,9 @@ restic_for_target() {
         if [[ "$repository" == sftp:* ]]; then
           sftp_command_opt="$(sftp_command_option_for_target "$target")"
         fi
-        restic_with_env "$pw_file" "$repository" "$extra_env_file" "" "$sftp_command_opt" "$@"
-        return 0
+        local rc=0
+        restic_with_env "$pw_file" "$repository" "$extra_env_file" "" "$sftp_command_opt" "$@" || rc=$?
+        return "$rc"
       fi
       require_files "$env_file" "$pw_file"
       (

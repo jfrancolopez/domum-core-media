@@ -14,6 +14,8 @@ key_file="$TMP_DIR/storage-box-key"
 known_hosts_file="$TMP_DIR/known-hosts"
 fake_bin="$TMP_DIR/bin"
 fake_ssh_args="$TMP_DIR/ssh-args"
+fake_restic_calls="$TMP_DIR/restic-calls"
+fake_restic_repo="$TMP_DIR/restic-repo"
 mkdir -p "$fake_bin"
 : > "$key_file"
 : > "$known_hosts_file"
@@ -23,8 +25,24 @@ cat > "$fake_bin/ssh" <<'EOF'
 printf '%s\n' "$*" > "${FAKE_SSH_ARGS:?}"
 EOF
 chmod +x "$fake_bin/ssh"
+cat > "$fake_bin/restic" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_RESTIC_CALLS:?}"
+case " $* " in
+  *" snapshots "*) [[ -f "${FAKE_RESTIC_REPO:?}" ]] ;;
+  *" init "*) touch "${FAKE_RESTIC_REPO:?}" ;;
+  *" cat config "*)
+    [[ -f "${FAKE_RESTIC_REPO:?}" ]] || exit 10
+    printf '{"id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}\n'
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$fake_bin/restic"
 export PATH="$fake_bin:$PATH"
 export FAKE_SSH_ARGS="$fake_ssh_args"
+export FAKE_RESTIC_CALLS="$fake_restic_calls"
+export FAKE_RESTIC_REPO="$fake_restic_repo"
 
 valid_repo='sftp:backup-user@storage.example:/domum-core-media-restic'
 invalid_repos=(
@@ -78,6 +96,28 @@ for script in bin/domum-media bin/domum-media-backup; do
     fi
   )
 done
+
+# A failed snapshots probe must retain its status so init creates a missing repo.
+(
+  # shellcheck disable=SC1090
+  source "$REPO_ROOT/bin/domum-media-backup"
+  load_cfg() { :; }
+  export_compose_env() { :; }
+  LOG_FILE="$TMP_DIR/backup.log"
+  REPO_META_DIR="$TMP_DIR/repo-meta"
+  BACKUP_TARGET_CLOUD_TYPE=repository
+  BACKUP_TARGET_CLOUD_REPOSITORY="$valid_repo"
+  BACKUP_TARGET_CLOUD_PASSWORD_FILE="$key_file"
+  BACKUP_TARGET_CLOUD_ENV_FILE=""
+  BACKUP_TARGET_CLOUD_SFTP_KEY_FILE="$key_file"
+  BACKUP_TARGET_CLOUD_SFTP_KNOWN_HOSTS_FILE="$known_hosts_file"
+  BACKUP_TARGET_CLOUD_SFTP_PORT=23
+
+  do_init_repo cloud >/dev/null 2>&1
+  [[ -f "$fake_restic_repo" ]] || fail "missing repository did not reach restic init"
+  grep -q ' init$' "$fake_restic_calls" || fail "restic init was not invoked"
+  [[ -f "$REPO_META_DIR/cloud-repo.env" ]] || fail "repository identity was not saved"
+)
 
 # Plan output reports only a sanitized backend type, never the repository user or host.
 (
