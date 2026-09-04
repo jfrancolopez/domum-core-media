@@ -2914,15 +2914,46 @@ Recovery pack restore notes
 1. Decrypt the archive with your age private key.
 2. Restore config/domum-media.conf to $CFG_FILE
 3. Restore secrets/* to $SECRETS_DIR with mode 0600 and owner root:root
-4. Restore state/immich/db_password.sha256 to
+4. Restore state/backups/*-repo.env to $DOMUM_STATE_ROOT/backups with owner root:root.
+5. Restore state/immich/db_password.sha256 to
    $DOMUM_STATE_ROOT/immich/db_password.sha256 before restoring Immich data.
-5. Restore /srv/data from restic using domum-media-backup --restore.
+6. Restore /srv/data from restic using domum-media-backup --restore.
    Do not start Immich or restore live PostgreSQL files as a substitute for pg_dump.
-6. After persistent state and the fingerprint are restored, run:
+7. After persistent state and the fingerprint are restored, run:
    sudo domum-media configure --non-interactive
    sudo domum-media init
    sudo domum-media apply
 EOF
+}
+
+recovery_pack_repo_metadata_is_safe() {
+  local file="$1"
+  local target="$2"
+  local line target_seen=0 id_seen=0 init_seen=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "TARGET=\"$target\"")
+        (( target_seen == 0 )) || return 1
+        target_seen=1
+        ;;
+      REPOSITORY_ID=\"[0-9a-f]*\")
+        (( id_seen == 0 )) || return 1
+        [[ "$line" =~ ^REPOSITORY_ID=\"[0-9a-f]{64}\"$ ]] || return 1
+        id_seen=1
+        ;;
+      INIT_TS=\"[0-9]*\")
+        (( init_seen == 0 )) || return 1
+        [[ "$line" =~ ^INIT_TS=\"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)\"$ ]] \
+          || return 1
+        init_seen=1
+        ;;
+      ADOPTED=1) ;;
+      *) return 1 ;;
+    esac
+  done < "$file"
+
+  (( target_seen == 1 && id_seen == 1 && init_seen == 1 ))
 }
 
 recovery_pack_secret_files() {
@@ -3010,7 +3041,7 @@ recovery_pack_create() {
 
   local no_email="${1:-0}"
   local stage_dir archive_plain archive_enc archive_tmp pubkey recipient ts sha size cleanup_cmd
-  local fingerprint_file secret_file
+  local fingerprint_file repo_meta_file secret_file target
   mkdir -p "$RECOVERY_PACK_DEST"
   stage_dir="$(mktemp -d)"
   ts="$(date +%Y%m%d-%H%M%S)"
@@ -3029,12 +3060,26 @@ recovery_pack_create() {
   recipient="$(printf '%s' "$pubkey" | awk '/^age1/ {print; exit}')"
   [[ -n "$recipient" ]] || die "Could not parse age recipient from $RECOVERY_PACK_AGE_PUBKEY_FILE"
 
-  mkdir -p "$stage_dir/config" "$stage_dir/secrets" "$stage_dir/state/immich" "$stage_dir/meta"
+  mkdir -p \
+    "$stage_dir/config" \
+    "$stage_dir/secrets" \
+    "$stage_dir/state/backups" \
+    "$stage_dir/state/immich" \
+    "$stage_dir/meta"
   [[ -f "$CFG_FILE" ]] && install -m 0600 "$CFG_FILE" "$stage_dir/config/domum-media.conf"
   while IFS= read -r secret_file; do
     [[ -n "$secret_file" && -f "$secret_file" ]] || continue
     install -m 0600 "$secret_file" "$stage_dir/secrets/$(basename "$secret_file")"
   done < <(recovery_pack_secret_files | sort -u)
+
+  while IFS= read -r target; do
+    backup_target_enabled "$target" || continue
+    repo_meta_file="$DOMUM_STATE_ROOT/backups/${target}-repo.env"
+    [[ -f "$repo_meta_file" ]] || continue
+    recovery_pack_repo_metadata_is_safe "$repo_meta_file" "$target" \
+      || die "Unexpected content in repository metadata: $repo_meta_file"
+    install -m 0600 "$repo_meta_file" "$stage_dir/state/backups/${target}-repo.env"
+  done < <(backup_target_names)
 
   fingerprint_file="$(immich_db_password_fingerprint_file)"
   if [[ "${ENABLE_IMMICH:-0}" == "1" ]]; then

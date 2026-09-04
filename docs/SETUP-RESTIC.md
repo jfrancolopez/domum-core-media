@@ -235,6 +235,7 @@ The recovery pack is a small encrypted tarball containing:
 
 - secrets required by enabled services and backup targets
 - `config/domum-media.conf`
+- enabled backup-target repository identity metadata
 - the Immich database-password fingerprint
 - rendered Compose configuration and restore instructions
 
