@@ -35,7 +35,9 @@ jobs:
         run: tests/recovery-pack-contents-smoke.sh
 
       - name: systemd unit validation
-        run: systemd-analyze verify systemd/*.service systemd/*.timer
+        run: |
+          sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/
+          systemd-analyze verify systemd/*.service systemd/*.timer
 
       - name: docker compose config (every fragment layered on base)
         run: |
