@@ -207,7 +207,8 @@ HOST_AUTO_REBOOT_WINDOW_END=05:00
 # SECTION: Update scheduler (container images)
 # ============================================================
 
-IMAGE_AUTO_UPDATE_ENABLED=1
+# Keep discovery/deployment disabled until backup and rollback gates are verified.
+IMAGE_AUTO_UPDATE_ENABLED=0
 IMAGE_AUTO_UPDATE_AT=05:15
 IMAGE_AUTO_UPDATE_RANDOMIZED_DELAY=30m
 
@@ -265,7 +266,7 @@ BACKUP_TARGET_CLOUD_RETENTION="weekly"
 # Only used when BACKUP_TARGET_CLOUD_REPOSITORY starts with "sftp:".
 # Use sftp:user@host:/absolute/path. Keep the port out of the repository string;
 # BACKUP_TARGET_CLOUD_SFTP_PORT supplies it through the explicit SSH command.
-# Example: sftp:b11@b11.your-storagebox.de:/domum-core-media-restic
+# Example: sftp:b11@b11.your-storagebox.de:/home/domum-core-media-restic
 # SSH key must be authorized on the remote host. Port must match the SFTP server.
 BACKUP_TARGET_CLOUD_SFTP_KEY_FILE="/etc/domum-core-media/secrets/hetzner_storagebox_ed25519"
 BACKUP_TARGET_CLOUD_SFTP_KNOWN_HOSTS_FILE="/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts"

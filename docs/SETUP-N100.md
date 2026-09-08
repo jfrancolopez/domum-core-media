@@ -293,15 +293,21 @@ findmnt | grep sdb1
 
 # 9. Create Data Structure
 
+The application uses direct service paths below `/srv/data` and media paths
+below `/srv/media`; do not create the obsolete `containers/` or nested
+`data/media/` layout.
+
 ```bash
-sudo mkdir -p /srv/data/{containers,media,backups,staging}
-
-sudo mkdir -p /srv/data/containers/{immich,postgres,redis,traefik,uptime-kuma}
-
-sudo mkdir -p /srv/data/media/{photos,videos,documents}
+sudo mkdir -p /srv/data/immich /srv/data/{jellyfin,plex,navidrome,calibre-web,kavita}
+sudo mkdir -p /srv/media/{movies,tv,music,books,photos}
 
 sudo chown -R $USER:$USER /srv/data
 ```
+
+These commands create ordinary directories, not per-service Btrfs subvolumes.
+That matches the current production layout but means the CLI's service-level
+snapshot operation will skip them. Do not claim local service rollback
+protection until an approved migration or snapshot redesign is complete.
 
 ---
 
@@ -388,14 +394,17 @@ Btrfs is used only on the data disk.
 
 Root remains ext4.
 
-Benefits:
+Current benefits:
 
 - checksums
-- future snapshots
 - clean data separation
 
 Backups remain the primary recovery mechanism.
 
-Snapshots protect against operator mistakes.
+The top-level filesystem is snapshot-capable, but current service paths are
+ordinary directories and are not protected by the per-service snapshot code.
+Current status: `Local service snapshot protection: DEGRADED / NOT AVAILABLE`.
+Verify any future migration with `btrfs subvolume show /srv/data/<service>`;
+do not run a migration as part of this setup procedure on an existing host.
 
 Restic protects against disk loss.

@@ -10,10 +10,12 @@ regenerable.
 
 - Immich photo library and Postgres database
 - App config/state (Jellyfin, Plex, Navidrome, Calibre-Web, Kavita configs)
-- Recovery pack and backup staging
+- Immich backup staging (the recovery pack lives under `/var/lib/domum-media`)
 
-This tier is snapshotted (btrfs) and swept into restic backups. It is the only
-tier that must never be lost.
+This tier is durable, but protection is mechanism-specific. Restic coverage is
+configured per target; the default cloud profile protects Immich rather than
+every service below `/srv/data`. Current service directories are not Btrfs
+subvolumes, so service-level local snapshots are not available.
 
 **Disposable media — `/srv/media` (SDB, on the OS disk)**
 
@@ -171,7 +173,8 @@ Immich is durable-only:
 - `/srv/data/immich/postgres`
 
 Do not move Immich uploads, thumbnails, or database state onto the disposable
-media disk — that data is irreplaceable and must stay on the protected tier.
+media disk. That data is irreplaceable and must stay on the durable tier covered
+by the accepted cloud profile.
 
 ## Migration from DOMUM_HOT_ROOT
 

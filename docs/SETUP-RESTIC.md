@@ -22,7 +22,8 @@ The wizard writes the `BACKUP_TARGET_*` config blocks and can create:
 
 ## SSH key setup for Hetzner Storage Box (SFTP)
 
-For a concrete `b11` walkthrough, see [docs/SETUP-HETZNER-STORAGE-BOX-B11.md](/Users/franco.lopez/Desktop/domum-core-media/docs/SETUP-HETZNER-STORAGE-BOX-B11.md:1).
+For a concrete `b11` walkthrough, see
+[SETUP-HETZNER-STORAGE-BOX-B11.md](SETUP-HETZNER-STORAGE-BOX-B11.md).
 
 For unattended cloud backups to Hetzner Storage Box via SFTP:
 
@@ -50,12 +51,18 @@ ssh-keyscan -p 23 u612125.your-storagebox.de | sudo tee /etc/domum-core-media/se
 sudo chmod 600 /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts
 ```
 
+Verify the captured fingerprint against a trusted Hetzner source before using
+it. `ssh-keyscan` retrieves a key but does not authenticate it.
+
 ### 4. Test unattended access
 
 ```bash
-ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 -o StrictHostKeyChecking=yes \
+printf 'pwd\nquit\n' | sudo sftp -F /dev/null \
+    -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+    -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+    -o PasswordAuthentication=no -o StrictHostKeyChecking=yes \
     -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-    -p 23 u612125@u612125.your-storagebox.de "ls -la /./domum-core-media-restic/"
+    -P 23 u612125@u612125.your-storagebox.de
 ```
 
 Should work without a password prompt.
@@ -108,7 +115,8 @@ Run: sudo domum-media backup adopt-repo cloud
 
 This prevents accidental split-brain backups (two separate repositories). Resolve by either:
 1. Reverting to the correct repository URL/port, or
-2. Running `sudo domum-media backup adopt-repo cloud` to adopt the new repository
+2. Running `sudo domum-media backup adopt-repo cloud` after independently
+   verifying that the new target is intentional.
 
 See the **Cloud include profile** section below if changing to a different repository path.
 
@@ -140,7 +148,8 @@ sudo domum-media configure
 
 **restic encrypts data locally before upload.**
 
-- ✅ **Data at rest**: restic uses AES-256-GCM encryption with your restic password. Ciphertext only is stored on Hetzner.
+- ✅ **Data at rest**: restic encrypts repository contents client-side with keys
+  protected by your Restic password. Ciphertext only is stored on Hetzner.
 - ✅ **Data in transit**: SSH/SFTP over port 23 encrypts the connection between your host and Hetzner.
 - ✅ **Provider visibility**: Hetzner sees encrypted blobs only. They cannot read plaintext data.
 
@@ -160,16 +169,22 @@ sudo /usr/local/bin/domum-media-backup --check
 If the cloud repository was wiped (intentionally or otherwise) and you need to
 recreate it from scratch:
 
+This is a destructive recovery procedure. Stop and obtain explicit operator
+approval before removing a repository or its identity metadata. Never apply it
+to preserved historical repositories as routine cleanup.
+
 1. (optional) Wipe the remote dir via a known-good SFTP session — example for
    Hetzner Storage Box:
 
    ```bash
-   ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+   sftp -F /dev/null -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+       -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+       -o PasswordAuthentication=no \
        -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-       -o StrictHostKeyChecking=yes -p 23 \
+       -o StrictHostKeyChecking=yes -P 23 \
        u612125@u612125.your-storagebox.de
    # at the sftp prompt:
-   #   rm -r /domum-core-media-restic
+   #   rm -r /home/domum-core-media-restic
    ```
 
 2. Clear the saved repo identity so the wrapper does not refuse to reinitialize:
@@ -198,7 +213,7 @@ recreate it from scratch:
 Configure SFTP repositories with an absolute remote path and no embedded port:
 
 ```text
-sftp:user@host:/domum-core-media-restic
+sftp:user@host:/home/domum-core-media-restic
 ```
 
 Set a nonstandard port with `BACKUP_TARGET_<TARGET>_SFTP_PORT`. The wrapper puts
@@ -309,7 +324,7 @@ sudo domum-media recovery-pack status
 ```bash
 # List contents without decrypting
 age -d -i /path/to/private_key.txt \
-  /var/lib/domum-media/recovery-pack/recovery-pack-*.tar.gz.age \
+  /var/lib/domum-media/recovery-pack/recovery-pack-*.tar.age \
   | tar -tzvf -
 ```
 
@@ -322,22 +337,37 @@ On a fresh Debian install after a disaster:
 git clone https://github.com/jfrancolopez/domum-core-media /opt/domum-core-media
 cd /opt/domum-core-media && bash install.sh
 
-# 2. Decrypt and unpack
-age -d -i /path/to/private_key.txt recovery-pack-YYYYMMDD.tar.gz.age \
-  | tar -xzvf - -C /
+# 2. Decrypt into an isolated directory and inspect the manifest/instructions
+mkdir recovery-pack-inspect
+age -d -i /path/to/private_key.txt recovery-pack-YYYYMMDD-HHMMSS.tar.age \
+  | tar -xzvf - -C recovery-pack-inspect
 
-# 3. Re-initialize restic repos and restore data
-sudo domum-media recovery-pack restore
+# 3. Follow recovery-pack-inspect/RESTORE.txt to place config, secrets,
+#    repository metadata, and the Immich fingerprint at their documented paths.
+#    The CLI does not currently provide a recovery-pack restore command.
 ```
 
 ### Recovery-pack and daily backups
 
 After a successful daily backup, the backup wrapper refreshes the encrypted
-recovery pack if `RECOVERY_PACK_ENABLED=1`. That means the DR bundle stays near
-the backup cadence without being mixed into the large data payload itself.
+recovery pack if `RECOVERY_PACK_ENABLED=1`. Because creation occurs after the
+Restic upload, that newly generated pack enters the cloud snapshot on the next
+successful run. The previously generated pack is included in the current run.
 
 Create it manually anytime with:
 
 ```bash
 sudo domum-media recovery-pack create
 ```
+
+## Production P0 acceptance
+
+The September 2026 production repository, first snapshot, representative
+scratch restore, repository identity, runtime-cache settings, and known Btrfs
+limitation are recorded in
+[P0-BACKUP-BASELINE.md](P0-BACKUP-BASELINE.md). Do not use older remote paths
+from historical notes as alternatives to the canonical target.
+
+Scheduled jobs use a private systemd-managed Restic cache at
+`/var/cache/domum-media-restic` with mode `0700`. The backup service timeout is
+18 hours and the check service timeout is 4 hours.
