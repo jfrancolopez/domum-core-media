@@ -10,6 +10,9 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+CacheDirectory=domum-media-restic
+CacheDirectoryMode=0700
+Environment=XDG_CACHE_HOME=/var/cache/domum-media-restic
 # Weekly metadata check on all enabled targets, then run retention for any
 # target configured with BACKUP_TARGET_*_RETENTION=weekly.
 ExecStart=/usr/local/bin/domum-media-backup --check

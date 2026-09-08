@@ -11,5 +11,8 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+CacheDirectory=domum-media-restic
+CacheDirectoryMode=0700
+Environment=XDG_CACHE_HOME=/var/cache/domum-media-restic
 ExecStart=/usr/local/bin/domum-media-backup
-TimeoutStartSec=6h
+TimeoutStartSec=18h
