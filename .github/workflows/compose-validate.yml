@@ -46,6 +46,9 @@ jobs:
       - name: Backup target evidence smoke test
         run: tests/backup-target-evidence-smoke.sh
 
+      - name: Backup evidence end-to-end smoke test
+        run: tests/backup-evidence-endtoend-smoke.sh
+
       - name: Restore verification smoke test
         run: tests/restore-verification-smoke.sh
 
