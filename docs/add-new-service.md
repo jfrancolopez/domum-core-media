@@ -67,7 +67,8 @@ fi
 
 ## 4. Subvolume for stateful data
 
-If the service stores state, create a btrfs subvolume so it gets snapshotted:
+For a new service whose data path does not yet exist, create a Btrfs subvolume
+so it can be snapshotted:
 
 ```
 sudo btrfs subvolume create /srv/data/myservice
@@ -76,14 +77,18 @@ sudo btrfs subvolume create /srv/data/myservice
 Then add it to the snapshot list in `bin/domum-media`
 (`snapshot_subvolumes()`).
 
+Never run `btrfs subvolume create` over an existing ordinary service directory.
+Converting live state requires an approved migration and maintenance window.
+
 ## 5. Apply
 
 ```
 sudo domum-media apply
 ```
 
-The CLI takes a pre-apply btrfs snapshot, runs `docker compose up -d
---remove-orphans`, and you're done.
+The CLI attempts a pre-apply Btrfs snapshot and then runs `docker compose up -d
+--remove-orphans`. Verify the service data path is a subvolume first; an
+ordinary directory is skipped and provides no local rollback point.
 
 ## 6. DNS
 

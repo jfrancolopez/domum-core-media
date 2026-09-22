@@ -23,7 +23,10 @@ Default delay: 7-14 days.
 - `kavita`
 
 Default delay: 21 days.
-These services take a pre-update btrfs snapshot and honor `BACKUP_POLICY`.
+These services honor `BACKUP_POLICY`. A pre-update Btrfs snapshot is available
+only when that service's data path is itself a Btrfs subvolume. The current
+production service paths are ordinary directories, so local service snapshot
+protection is degraded and must not be treated as a rollback guarantee.
 
 ### Class C
 
@@ -55,6 +58,12 @@ sudo domum-media updates check
 sudo domum-media updates apply
 sudo domum-media updates history
 ```
+
+`updates check` pulls tracked images while recording candidate state; it is not
+a read-only registry query. Keep `domum-media-image-refresh.timer` disabled
+until snapshot truthfulness, rollback-image restoration, and deployment gates
+have been completed and verified. Do not deploy a staged candidate merely
+because it appears in status output.
 
 ## Backup policy
 

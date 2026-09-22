@@ -1,5 +1,10 @@
 # Task 32 — Monthly restore verification  [shared-philosophy]
 
+Status: **PARTIALLY DONE operationally**. The first production scratch restore
+passed on September 8, 2026 for the validated PostgreSQL dump, encrypted
+recovery pack, and representative Immich media file. The command, durable result
+state, checkup integration, and monthly disabled-by-default timer remain.
+
 ## Objective
 Prove recoverability automatically: a monthly timer restores a
 representative subset from restic into a scratch directory and validates it
@@ -31,10 +36,10 @@ and `restore_verify_validate_staging` (:1440-1475), plus its systemd pair
      stays a manual/quarterly exercise via task 31).
    - N sample files from the Immich library restore byte-identical
      (checksum against live copies).
-   - Config + rendered compose restore and parse.
-   - Latest recovery pack decrypts with the configured AGE key material
-     available on-host (structure check only; the offline-key fire drill
-     remains manual).
+   - Repository metadata/config recovery is represented by the encrypted pack;
+     validate the pack's encrypted bytes and manifest state on-host. The age
+     private identity intentionally remains offline, so automated server-side
+     decryption must not be required.
 2. Free-space guard and scratch-dir cleanup (trap) like the sibling.
 3. Write `last-restore-verify` state (timestamp, target, result); `checkup`
    flags a missing/old/failed verification.
@@ -59,9 +64,10 @@ Disable the timer, revert; verification state files are ignored by old
 code.
 
 ## Dependencies
-Tasks 30 (per-target state to pick a target), 31 (import machinery it
-spot-checks), 21 (timer policy), 01 and 24 (restore paths it exercises must
-be safe first).
+Tasks 30 (per-target state to pick a target) and 21 (timer policy). Task 31
+owns a real database import drill; this task validates dump structure and does
+not depend on live-path rollback code from tasks 01/24 because it restores only
+into a guarded scratch directory.
 
 ## Risk / complexity / token size
 Low (read-only against production data; writes only to scratch + state).

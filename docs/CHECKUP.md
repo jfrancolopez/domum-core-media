@@ -1,6 +1,8 @@
 # Checkup
 
-`domum-media checkup` is a read-only health sweep.
+`domum-media checkup` is a non-destructive health sweep. It may create missing
+runtime-state directories and test configured remote authentication; it does
+not apply updates, alter application data, or run backup retention.
 
 ## Commands
 
@@ -27,6 +29,11 @@ sudo domum-media checkup --json
 - available apt updates
 
 The command exits with code `1` when any Critical item is present.
+
+The current command does not prove that service paths are Btrfs subvolumes or
+that local service snapshots are usable. Until that probe is implemented,
+consult [P0-BACKUP-BASELINE.md](P0-BACKUP-BASELINE.md) and treat local service
+snapshot protection as degraded.
 
 ## Verifying backups in detail
 

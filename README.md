@@ -5,7 +5,7 @@ Self-hosted media stack for Debian 13 with:
 - Compose-managed services
 - delayed container updates
 - Immich bundle management
-- btrfs snapshots + rollback metadata
+- btrfs snapshot tooling + rollback metadata (service-level protection requires subvolumes)
 - restic multi-target backups
 - unattended Debian security patches
 - encrypted recovery-pack generation
@@ -28,7 +28,7 @@ installs `domum-media` plus the systemd timers.
 - Git repo: `/opt/domum-core-media`
 - Live config: `/opt/domum-core-media/config/domum-media.conf`
 - Secrets: `/etc/domum-core-media/secrets`
-- Durable data (protected disk, snapshotted + backed up): `/srv/data`
+- Durable data (protected disk, target-dependent Restic coverage): `/srv/data`
 - Media libraries (disposable, on the OS disk, not backed up by default): `/srv/media`
 - Snapshots: `/srv/snapshots`
 - Runtime state: `/var/lib/domum-media`
@@ -49,6 +49,11 @@ Workloads are grouped into update classes:
   `STRICT`, `BALANCED`, or `LENIENT`.
 - Successful updates write rollback metadata and update-history entries.
 - Immich is updated only through the matched upstream release bundle.
+
+On the current production host, service paths below `/srv/data` are ordinary
+directories, so service-level Btrfs snapshots are not available. Automatic
+image refresh remains disabled until this and the update safety gates are
+resolved. See [docs/P0-BACKUP-BASELINE.md](docs/P0-BACKUP-BASELINE.md).
 
 ## Core commands
 
@@ -89,3 +94,5 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/ROLLBACK.md](docs/ROLLBACK.md)
 - [docs/CHECKUP.md](docs/CHECKUP.md)
 - [docs/SECURITY-PATCHES.md](docs/SECURITY-PATCHES.md)
+- [docs/P0-BACKUP-BASELINE.md](docs/P0-BACKUP-BASELINE.md)
+- [docs/CORE-MEDIA-OPERATIONS-AUDIT.md](docs/CORE-MEDIA-OPERATIONS-AUDIT.md)

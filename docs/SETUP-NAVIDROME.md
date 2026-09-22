@@ -37,7 +37,7 @@ Relevant config keys (`config/domum-media.conf`):
 | `NAVIDROME_IMAGE` | `deluan/navidrome:0.61.2` | Full image ref. Use an exact tag for pinned rollouts or a moving tag with `NAVIDROME_AUTO_UPDATE=1`. |
 | `NAVIDROME_AUTO_UPDATE` | `0` | Whether the image refresh timer may roll Navidrome forward automatically. |
 | `NAVIDROME_AUTO_UPDATE_DELAY_DAYS` | `21` | How long a newly pulled image must sit before rollout. |
-| `NAVIDROME_DATA_DIR` | `/srv/data/navidrome` | DB + scan cache (snapshotted, backed up). |
+| `NAVIDROME_DATA_DIR` | `/srv/data/navidrome` | DB + scan cache; protection depends on service-subvolume and target configuration. |
 | `NAVIDROME_MUSIC_ROOT` | `/srv/media/music` | Parent of all music sources, mounted `:ro`. |
 | `NAVIDROME_USER` | `0:0` | Container uid:gid that reads music. |
 | `NAVIDROME_SCAN_SCHEDULE` | `@every 1h` | Rescan cadence. `0` disables. |
@@ -45,16 +45,21 @@ Relevant config keys (`config/domum-media.conf`):
 
 ## 2. Create the state subvolume
 
-State must be a btrfs subvolume so it is snapshotted before each `apply` and
-swept into restic (it lives under `/srv/data`). The music itself is **not**
-backed up here — like Jellyfin media, it is treated as large/replaceable.
+The intended snapshot design requires this path to be a Btrfs subvolume. The
+command below is only for a new path that does not exist:
 
 ```
 sudo btrfs subvolume create /srv/data/navidrome
 ```
 
-(`navidrome` is already in the CLI snapshot list and `ensure_dirs`, so once the
-subvolume exists it is picked up automatically.)
+Do not run it over an existing ordinary directory. Moving live state into a
+subvolume is a separately approved migration. `navidrome` is already in the CLI
+snapshot list, but current production uses an ordinary directory and therefore
+has no service-level snapshot.
+
+Restic coverage is target-specific. The default cloud profile does not include
+Navidrome state. The music itself is treated as large/reacquirable and is not
+included by default.
 
 ## 3. Assemble the music sources
 
@@ -191,5 +196,6 @@ the container logs. If `data dir ownership: WARN` appears, just rerun
   mount returns.
 - **Adding a new source later** is just another subfolder/mount + a new library
   in the UI — no compose or CLI changes.
-- **Backups:** `/srv/data/navidrome` (the DB) is backed up; the music under
-  `/srv/media/music` is not. Back up the originals at their source.
+- **Backups:** include `/srv/data/navidrome` in an appropriate target if its DB
+  must be protected. The default cloud profile does not include it. Music under
+  `/srv/media/music` is excluded; back up the originals at their source.
