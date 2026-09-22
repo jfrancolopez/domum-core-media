@@ -25,6 +25,31 @@ The durable P0 record is [docs/P0-BACKUP-BASELINE.md](../docs/P0-BACKUP-BASELINE
 Task statuses below reflect implemented scope; a partial status means only the
 remaining work in that task should be implemented.
 
+## September 22 2026 reconciliation
+
+Reconciled against the repository and live host rather than against the
+original plan. The operational-trust phase landed `domum-media report`
+(task 38) and the deployment-timer safety fix (task 21, partially), and
+`CLAUDE.md` supersedes the `AGENTS.md` contract (task 18).
+
+Two findings changed the shape of the remaining work:
+
+- Tasks 30 and 32 are no longer speculative. The report now surfaces
+  `backups.targets[].last_run: unknown` and
+  `backups.restore_verification: unknown` because the host records no durable
+  evidence for either. Those tasks are what make those fields meaningful.
+- Task 23 rose in priority. The report tells the truth about skipped
+  snapshots, but `apply` still calls `snapshot_create` and tolerates the
+  no-op, so the pipeline itself remains silent about protecting nothing.
+
+The image-refresh freeze is now enforced in code, not only by convention:
+`systemd/auto-enable.timers` is the single source of truth for what
+installation and convergence may enable, and
+`tests/timer-auto-enable-safety-smoke.sh` fails if a deployment timer is
+added to it. Note the defect was broader than the installer —
+`sync_timer_overrides` is reached by `apply`, `init`, `configure` and
+therefore by `update`.
+
 ## Roadmap — work the phases in order
 
 Status idiom once a task lands: `✅ done (sha)` — plus
@@ -38,7 +63,7 @@ scanning, and an explicit agent contract.
 | # | Task | Status | Complexity | Risk | Operator |
 |---|------|--------|-----------|------|----------|
 | 09 | [Untrack .claude/settings.local.json](task-09-untrack-claude-settings.md) | pending | trivial | none | — |
-| 18 | [AGENTS.md agent contract](task-18-agents-contract.md) **[shared-philosophy]** | pending | small | none | — |
+| 18 | [AGENTS.md agent contract](task-18-agents-contract.md) **[shared-philosophy]** | SUPERSEDED by `CLAUDE.md` (`8aa82cf`) | small | none | — |
 | 12 | [CI: yamllint, gitleaks + lint configs](task-12-ci-yamllint-gitleaks.md) **[shared-philosophy]** | pending | small | low | — |
 
 ### Phase 1 — Stop the bleeding
@@ -52,7 +77,7 @@ nothing else is safe to iterate on top of.
 | 05 | [Guard git reset --hard against local drift](task-05-reset-hard-drift-guard.md) **[shared-philosophy]** | pending | small | low | — |
 | 19 | [Atomic Immich pg_dump](task-19-atomic-pg-dump.md) | DONE (`07289a8`, live verified) | small | low | — |
 | 20 | [Operation locking (flock)](task-20-operation-locking.md) | pending | small-med | low | — |
-| 21 | [Installer timers disabled-by-default](task-21-timers-disabled-by-default.md) **[shared-philosophy]** | pending | small | low | yes |
+| 21 | [Installer timers disabled-by-default](task-21-timers-disabled-by-default.md) **[shared-philosophy]** | PARTIAL (`1d1b067`; deployment timers never auto-enable — remaining scope is the broader opt-in default) | small | low | yes |
 | 02 | [Fix updates exit code when Immich is disabled](task-02-updates-exit-code.md) | pending | trivial | low | — |
 | 03 | [Fix checkup update-history counters](task-03-checkup-history-grep.md) | pending | trivial | low | — |
 | 04 | [Fix misleading `backup plan` output](task-04-backup-plan-output.md) | pending | small | low | — |
@@ -69,7 +94,7 @@ failures are loud.
 | 07 | [Align --force semantics across update commands](task-07-force-semantics.md) | pending | small | low | — |
 | 06 | [Warn on pending update candidates during apply](task-06-apply-warns-on-candidates.md) **[shared-philosophy]** | pending | small | low | — |
 | 22 | [Pull-free update checks during delay windows](task-22-pull-free-update-checks.md) | pending | medium | medium | — |
-| 23 | [Loud snapshot gate for stateful updates](task-23-loud-snapshot-gate.md) | pending | small | low | — |
+| 23 | [Loud snapshot gate for stateful updates](task-23-loud-snapshot-gate.md) | STILL VALID — raised in priority; `report` now shows the no-op truthfully but `apply` still tolerates it | small | low | — |
 | 24 | [Rollback restores the previous image](task-24-rollback-previous-image.md) | pending | medium | medium | — |
 | 25 | [Remove or wire dead config vars](task-25-dead-config-vars.md) | pending | small | low | — |
 | 10 | [Restart Traefik only when config changed](task-10-traefik-conditional-restart.md) | pending | small | low | — |
@@ -95,10 +120,10 @@ import path for the Immich dump, per-target status, automated restore proof.
 | # | Task | Status | Complexity | Risk | Operator |
 |---|------|--------|-----------|------|----------|
 | 11 | [Add dry-run paths to domum-media-backup](task-11-backup-dry-run.md) **[shared-philosophy]** | pending | small | low | — |
-| 30 | [Per-target backup isolation + heartbeats](task-30-per-target-backup-isolation.md) **[shared-philosophy]** | pending | medium | low-med | — |
+| 30 | [Per-target backup isolation + heartbeats](task-30-per-target-backup-isolation.md) **[shared-philosophy]** | STILL VALID — `report` exposes `last_run: unknown` per target; this task fills it | medium | low-med | — |
 | 31 | [Guided Immich DB restore](task-31-immich-db-restore.md) | pending | medium | medium | — |
 | 13 | [Enrich the recovery pack](task-13-enrich-recovery-pack.md) **[shared-philosophy]** | PARTIAL (`1da3f2c`; inventory/dry-run/inspect remain) | small-med | low | — |
-| 32 | [Monthly restore verification](task-32-restore-verification.md) **[shared-philosophy]** | PARTIAL (first live scratch restore passed; automation remains) | medium | low | yes |
+| 32 | [Monthly restore verification](task-32-restore-verification.md) **[shared-philosophy]** | PARTIAL — `report` exposes `restore_verification: unknown`; writing durable state remains | medium | low | yes |
 
 ### Phase 5 — Catalog + health
 
@@ -120,7 +145,7 @@ bugs; health probes make "update succeeded" mean the app works.
 | 14 | [Docs index and naming normalization](task-14-docs-layout.md) **[shared-philosophy]** | pending | medium | none | — |
 | 15 | [Unified logging convention](task-15-logging-convention.md) **[shared-philosophy]** | pending | small | low | — |
 | 37 | [Checkup enrichment (NVMe, btrfs, headroom)](task-37-checkup-enrichment.md) | pending | small-med | low | — |
-| 38 | [Weekly health report](task-38-weekly-report.md) **[shared-philosophy]** | pending | medium | low | — |
+| 38 | [Weekly health report](task-38-weekly-report.md) **[shared-philosophy]** | DONE (`ff0e6c3`) — host steps remain: deploy, then enable the timer | medium | low | — |
 | 39 | [Jellyfin/Plex QuickSync](task-39-quicksync.md) | pending | small | low | yes |
 | 17 | [Adopt shared git-workflow conventions doc](task-17-git-conventions.md) **[shared-philosophy]** | pending | trivial | none | — |
 | 40 | [FUTURE: Network segmentation](task-40-future-network-segmentation.md) | pending | large | high | yes |
@@ -139,10 +164,17 @@ bugs; health probes make "update succeeded" mean the app works.
 
 ## For implementing agents
 
-Read `AGENTS.md` (created by task 18) before starting any task. Until it
-exists: never touch `/Users/franco.lopez/Desktop/domum-core` (read-only
-pattern reference), never delete data or secrets, and treat the checkout as
-distinct from the production N100.
+Read [`CLAUDE.md`](../CLAUDE.md) at the repository root before starting any
+task. It is the execution contract: workspace and path boundaries, data and
+Restic safety, the degraded Btrfs snapshot truth, the image-refresh freeze,
+production-deployment rules, the testing contract, and the stop conditions.
+
+This backlog is planning material, not an execution order. Reconcile each item
+against actual repository and production evidence before acting; items may be
+done, partially done, superseded, or in need of reordering.
+
+`domum-core` is a read-only pattern reference and is **not present on this
+host**. Record that limitation rather than assuming its behavior.
 
 ## Ground rules
 
