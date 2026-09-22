@@ -110,7 +110,7 @@ bash "$TMP_DIR/harness.sh" > "$report_json" 2>"$TMP_DIR/report.err" \
 # 4. Structural assertions — valid JSON with the agreed stable schema.
 # ---------------------------------------------------------------------------
 jq -e 'type == "object"' "$report_json" >/dev/null || fail "report is not a JSON object"
-jq -e '.schema_version == 1' "$report_json" >/dev/null || fail "missing or unexpected schema_version"
+jq -e '.schema_version == 2' "$report_json" >/dev/null || fail "missing or unexpected schema_version"
 jq -e '.generated_at | type == "string"' "$report_json" >/dev/null || fail "missing generated_at"
 jq -e '.overall | type == "string"' "$report_json" >/dev/null || fail "missing overall verdict"
 jq -e '.findings | type == "array"' "$report_json" >/dev/null || fail "findings is not an array"
@@ -181,5 +181,63 @@ grep -q 'report_systemd_property' "$REPO_ROOT/bin/domum-media-report" \
   || fail "report_systemd_state must query systemd properties individually"
 grep -qE -- "--property=[A-Za-z]+,[A-Za-z]+" "$REPO_ROOT/bin/domum-media-report" \
   && fail "multi-property 'systemctl show' parsing is order-dependent and must not be used"
+
+# ---------------------------------------------------------------------------
+# 8. A directory's mtime is not content freshness.
+#    The Immich library is a directory whose top-level mtime can be months old
+#    while photos are still being written deeper inside. It must not be
+#    presented as an age.
+# ---------------------------------------------------------------------------
+jq -e '.immich.library.kind == "directory"' "$report_json" >/dev/null \
+  || fail "the Immich library should be reported as a directory"
+jq -e '.immich.library.age_seconds == null' "$report_json" >/dev/null \
+  || fail "a directory must not report an age; its mtime is not content freshness"
+jq -e '.immich.library.path_mtime != null' "$report_json" >/dev/null \
+  || fail "a directory should still expose its own mtime under path_mtime"
+jq -e '.immich.library.age_basis | test("does not reflect")' "$report_json" >/dev/null \
+  || fail "a directory must state that its mtime is not content freshness"
+
+# A real file (the database dump) keeps a meaningful age.
+dump_file="$DOMUM_DATA_ROOT/immich/backup-staging/immich-postgres.dump.sql.gz"
+printf 'x' > "$dump_file"
+bash "$TMP_DIR/harness.sh" > "$TMP_DIR/report2.json" 2>/dev/null \
+  || fail "report generation failed after creating a dump file"
+jq -e '.immich.database_dump.kind == "file"' "$TMP_DIR/report2.json" >/dev/null \
+  || fail "the database dump should be reported as a file"
+jq -e '.immich.database_dump.age_seconds != null' "$TMP_DIR/report2.json" >/dev/null \
+  || fail "a file must keep a meaningful age"
+rm -f "$dump_file"
+
+# ---------------------------------------------------------------------------
+# 9. Docker "none" means no healthcheck is configured, and must say so.
+# ---------------------------------------------------------------------------
+cat > "$FAKE_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+# Mimics a container that is running but defines no healthcheck.
+case "${1:-}" in
+  inspect) printf 'running|none|0|sha256:deadbeef
+' ;;
+  image)   exit 1 ;;
+  *)       exit 1 ;;
+esac
+EOF
+chmod +x "$FAKE_BIN/docker"
+sed 's/\[\[ "\$1" == "docker" \]\] && return 1//' "$TMP_DIR/harness.sh" > "$TMP_DIR/harness-docker.sh"
+bash "$TMP_DIR/harness-docker.sh" > "$TMP_DIR/report3.json" 2>/dev/null \
+  || fail "report generation failed with a stubbed docker"
+jq -e 'any(.containers[]; .health == "no healthcheck")' "$TMP_DIR/report3.json" >/dev/null \
+  || fail "a container without a healthcheck must report 'no healthcheck', not 'none'"
+jq -e 'all(.containers[]; .health != "none")' "$TMP_DIR/report3.json" >/dev/null \
+  || fail "the bare 'none' health value must not reach the report"
+# ...and it must not be treated as a problem.
+jq -e 'all(.findings[]; (.message | test("no healthcheck")) | not)' "$TMP_DIR/report3.json" >/dev/null \
+  || fail "a missing healthcheck must not be raised as a finding"
+rm -f "$FAKE_BIN/docker"
+
+# ---------------------------------------------------------------------------
+# 10. The backup wrapper's read-only path must not touch the backup log.
+# ---------------------------------------------------------------------------
+grep -A6 '^ensure_dirs() {' "$REPO_ROOT/bin/domum-media-backup" | grep -qE '^\s*touch ' \
+  && fail "ensure_dirs still touches the backup log, so a read-only report mutates its mtime"
 
 echo "PASS: operational report smoke test"

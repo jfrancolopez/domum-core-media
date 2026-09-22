@@ -67,7 +67,10 @@ ensure_dirs() {
   mkdir -p "$DOMUM_LOG_DIR"
   LOG_FILE="$DOMUM_LOG_DIR/backup.log"
   HEARTBEAT_FILE="$DOMUM_LOG_DIR/last-success"
-  touch "$LOG_FILE"
+  # Deliberately no `touch`: log() appends with `tee -a`, which creates the file
+  # on first write. Touching here bumped backup.log's mtime on every read-only
+  # invocation -- including the latest-snapshot query that `domum-media report`
+  # makes -- which made a read-only report look like backup activity.
 }
 
 require_files() {
