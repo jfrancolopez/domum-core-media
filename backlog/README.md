@@ -13,6 +13,18 @@ modify it from here, and never copy its known defects (unprefixed
 named-volume backups, manifest-written-before-exports; the relevant tasks
 call these out).
 
+## September 2026 reconciliation
+
+P0 backup stabilization superseded part of the original phase order. The
+current sequence is: finish unattended backup acceptance, document the accepted
+baseline, build truthful operational visibility/reporting, then audit update
+safety before any image-deployment automation is reconsidered. Btrfs migration,
+application updates, and repository cleanup remain explicit approval boundaries.
+
+The durable P0 record is [docs/P0-BACKUP-BASELINE.md](../docs/P0-BACKUP-BASELINE.md).
+Task statuses below reflect implemented scope; a partial status means only the
+remaining work in that task should be implemented.
+
 ## Roadmap — work the phases in order
 
 Status idiom once a task lands: `✅ done (sha)` — plus
@@ -38,7 +50,7 @@ nothing else is safe to iterate on top of.
 |---|------|--------|-----------|------|----------|
 | 01 | [Fix rm -rf branch in snapshot restore](task-01-fix-restore-rm-rf.md) | pending | trivial | low | — |
 | 05 | [Guard git reset --hard against local drift](task-05-reset-hard-drift-guard.md) **[shared-philosophy]** | pending | small | low | — |
-| 19 | [Atomic Immich pg_dump](task-19-atomic-pg-dump.md) | pending | small | low | — |
+| 19 | [Atomic Immich pg_dump](task-19-atomic-pg-dump.md) | DONE (`07289a8`, live verified) | small | low | — |
 | 20 | [Operation locking (flock)](task-20-operation-locking.md) | pending | small-med | low | — |
 | 21 | [Installer timers disabled-by-default](task-21-timers-disabled-by-default.md) **[shared-philosophy]** | pending | small | low | yes |
 | 02 | [Fix updates exit code when Immich is disabled](task-02-updates-exit-code.md) | pending | trivial | low | — |
@@ -85,8 +97,8 @@ import path for the Immich dump, per-target status, automated restore proof.
 | 11 | [Add dry-run paths to domum-media-backup](task-11-backup-dry-run.md) **[shared-philosophy]** | pending | small | low | — |
 | 30 | [Per-target backup isolation + heartbeats](task-30-per-target-backup-isolation.md) **[shared-philosophy]** | pending | medium | low-med | — |
 | 31 | [Guided Immich DB restore](task-31-immich-db-restore.md) | pending | medium | medium | — |
-| 13 | [Enrich the recovery pack](task-13-enrich-recovery-pack.md) **[shared-philosophy]** | pending | small-med | low | — |
-| 32 | [Monthly restore verification](task-32-restore-verification.md) **[shared-philosophy]** | pending | medium | low | yes |
+| 13 | [Enrich the recovery pack](task-13-enrich-recovery-pack.md) **[shared-philosophy]** | PARTIAL (`1da3f2c`; inventory/dry-run/inspect remain) | small-med | low | — |
+| 32 | [Monthly restore verification](task-32-restore-verification.md) **[shared-philosophy]** | PARTIAL (first live scratch restore passed; automation remains) | medium | low | yes |
 
 ### Phase 5 — Catalog + health
 
@@ -115,10 +127,10 @@ bugs; health probes make "update succeeded" mean the app works.
 
 ## Deliberately NOT tasks (leave alone)
 
-- The btrfs snapshot + health-check + auto-rollback update pipeline — this is
-  the best pattern in either repo. Tasks 22/23/24 fix its real gaps (gate
-  bypass, silent snapshot no-op, missing image restore); don't rework the
-  pipeline itself.
+- The update pipeline's intended sequence remains useful, but current service
+  paths are ordinary directories: service snapshots silently no-op and generic
+  rollback does not restore the previous image. Tasks 22/23/24 and the approved
+  storage decision must land before this can be described as rollback-safe.
 - The Immich bundle manager — fragile-looking (parses upstream compose) but
   guarded, and matched-bundle updates are the correct model for Immich.
 - `restic` repo identity pinning, NFS/FTP target types, deep checks — keep.

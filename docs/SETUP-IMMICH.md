@@ -42,9 +42,14 @@ The workflow:
 3. store the candidate bundle
 4. wait out `IMMICH_BUNDLE_DELAY_DAYS`
 5. verify backup freshness
-6. snapshot Immich data
+6. require a usable rollback mechanism
 7. deploy the new bundle
-8. restore on failed health validation
+8. restore data and the previous image on failed health validation
+
+This is the intended flow, not the current production guarantee. The current
+Immich path is an ordinary directory, so service-level Btrfs snapshots are not
+available. Keep automatic image refresh disabled and do not deploy a staged
+bundle until the snapshot/rollback gates are corrected and verified.
 
 ## Resetting the database
 

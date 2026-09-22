@@ -14,7 +14,7 @@ Use these answers for the `cloud` target:
 
 - `Enable cloud backup target?` -> `yes`
 - `Target type for cloud` -> `repository`
-- `Restic repository string for cloud` -> `sftp:b11@b11.your-storagebox.de:/domum-core-media-restic`
+- `Restic repository string for cloud` -> `sftp:b11@b11.your-storagebox.de:/home/domum-core-media-restic`
 - `Password file for cloud` -> keep the default unless you have a reason to change it
 - `Optional backend credential env file for cloud` -> keep the default or set a path, but leave the file empty/comment-only for SFTP targets
 - `Use SSH key authentication` -> `yes`
@@ -56,16 +56,22 @@ ssh-keyscan -p 23 b11.your-storagebox.de | sudo tee /etc/domum-core-media/secret
 sudo chmod 600 /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts
 ```
 
+Verify the captured fingerprint against a trusted Hetzner source before using
+it. `ssh-keyscan` retrieves a key but does not authenticate it.
+
 If your box uses a username-specific host like `u612125.your-storagebox.de`, use that exact hostname in both the repository URL and `ssh-keyscan`.
 
 ## 5. Verify passwordless SSH access
 
 ```bash
-sudo ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+printf 'pwd\nquit\n' | sudo sftp -F /dev/null \
+  -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+  -o IdentitiesOnly=yes \
+  -o PreferredAuthentications=publickey \
+  -o PasswordAuthentication=no \
   -o StrictHostKeyChecking=yes \
   -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-  -p 23 \
-  b11@b11.your-storagebox.de "pwd"
+  -P 23 b11@b11.your-storagebox.de
 ```
 
 This should not prompt for a password.
@@ -121,7 +127,10 @@ This is a regression of a known bug: restic's `sftp.command` option must be a co
 
 ### `repository does not exist`
 
-The repo path on the box is `~/domum-core-media-restic`. If restic refuses to open it:
+The accepted path form is `/home/domum-core-media-restic`. If Restic refuses to
+open it, first compare the configured target and pinned repository ID with the
+accepted production record. Do not adopt a different repository merely because
+it opens.
 
 ```bash
 sudo domum-media backup init cloud --adopt-existing
@@ -131,20 +140,26 @@ Use `--adopt-existing` when the directory was created by a previous host or a ma
 
 ### Reset and reinitialize the cloud repo
 
-When the remote repo has been wiped (intentional reset, corrupted directory,
-etc.), recreate it from scratch:
+Repository deletion, identity removal, and reinitialization are destructive
+recovery operations. Stop and obtain explicit operator approval before using
+this procedure against the canonical repository. Historical repositories are
+not cleanup candidates.
+
+When an approved remote reset has occurred, recreate it from scratch:
 
 1. (optional) Remove the remote dir via a known-good SFTP session — using the
    exact ssh key + known_hosts + port the backup wrapper uses, so it cannot
    prompt for a password:
 
    ```bash
-   ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+   sftp -F /dev/null -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
+       -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+       -o PasswordAuthentication=no \
        -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-       -o StrictHostKeyChecking=yes -p 23 \
+       -o StrictHostKeyChecking=yes -P 23 \
        b11@b11.your-storagebox.de
-   # at the sftp prompt:
-   #   rm -r /domum-core-media-restic
+    # at the sftp prompt:
+    #   rm -r /home/domum-core-media-restic
    ```
 
 2. Clear the saved repo identity so the wrapper does not refuse to reinitialize:
@@ -189,7 +204,8 @@ The status command should list at least one snapshot under `=== restic last snap
 sudo /usr/local/bin/domum-media-backup --check-cloud-deep cloud
 ```
 
-Hetzner egress is metered and slow, so run this monthly at most — the weekly check already runs a metadata-only verification.
+Hetzner egress is metered and slow, so run this monthly at most. The weekly
+check already runs a metadata-only verification.
 
 ### Inspect the systemd timer
 
@@ -198,7 +214,8 @@ systemctl list-timers | grep domum-media
 journalctl -u domum-media-backup.service --since '7 days ago'
 ```
 
-A healthy weekly run logs no password prompt, a `restic backup` summary, and a non-zero `Added to the repository` size.
+A healthy daily run logs no password prompt, a `restic backup` summary, and a
+saved snapshot. Incremental runs can legitimately add very little data.
 
 ### Rotate the SSH key
 
@@ -206,17 +223,18 @@ Re-run §2 to generate a new key, §3 to install the new public key in Hetzner R
 
 ### Inspect disk usage on the Storage Box
 
-```bash
-sudo ssh -i /etc/domum-core-media/secrets/hetzner_storagebox_ed25519 \
-  -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-  -p 23 b11@b11.your-storagebox.de "du -sh ./domum-core-media-restic"
-```
+Use Hetzner Robot's Storage Box usage display. The backup key is intentionally
+restricted to the SFTP subsystem and should not be broadened to permit remote
+shell commands such as `du`.
 
 ## Improvement notes (optional follow-ups)
 
-These are recorded for future work; they are not required for the weekly backup to function.
+These are recorded for future work; they are not required for the daily backup to function.
 
 - **Upload bandwidth cap.** A first-ever upload of the Immich library can saturate the link. Consider adding `-o sftp.connections=2` to the restic invocation and a `BACKUP_TARGET_CLOUD_UPLOAD_LIMIT_KBPS` knob in `config/domum-media.conf` that maps to restic's `--limit-upload`.
 - **Cloud retention.** Current settings (`RESTIC_KEEP_DAILY=7`, `WEEKLY=5`, `MONTHLY=12`, `YEARLY=3` with the cloud target on the weekly `forget` cadence) are appropriate for a metered remote. No change recommended.
-- **Heartbeat.** `BACKUP_HEARTBEAT_URL` is empty. Wiring it to the existing `uptime-kuma` container produces a paging signal when a weekly run silently fails.
-- **Recovery drill.** `docs/disaster-recovery.md` documents `--restore latest --repo cloud`. Run it quarterly into a scratch directory to prove the restore path, not just the backup path.
+- **Heartbeat.** `BACKUP_HEARTBEAT_URL` can feed an external monitor when a daily run fails to report.
+- **Recovery drill.** The first representative scratch restore passed in September 2026. Retain a recurring restore-verification task rather than treating that one proof as permanent.
+
+See [P0-BACKUP-BASELINE.md](P0-BACKUP-BASELINE.md) for the accepted production
+repository ID, first snapshot, restore evidence, and preserved historical paths.

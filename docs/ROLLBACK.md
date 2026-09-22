@@ -34,6 +34,19 @@ Applying a rollback:
 4. marks the rollback entry as consumed
 5. writes an update-history event
 
+## Current production limitation
+
+The current service paths are ordinary directories rather than individual
+Btrfs subvolumes, so service-level snapshots are not available. The generic
+rollback path also records `IMAGE_BEFORE` but does not yet restore that image
+before Compose starts the service. Therefore rollback metadata is not proof of
+a usable rollback point.
+
+Do not run `rollback apply` against production until the snapshot exists and
+the previous-image restoration path has been corrected. The current
+plain-directory branch removes the live directory before restoration; that is
+a data-risk boundary, not a safe fallback.
+
 ## Immich rollback
 
 ```bash

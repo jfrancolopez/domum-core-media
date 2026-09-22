@@ -1,5 +1,9 @@
 # Task 19 — Atomic Immich pg_dump
 
+Status: **DONE** in `07289a8` (merged by PR #1); production dump replacement,
+failure preservation, gzip/footer validation, inode replacement, and temporary
+cleanup were verified on September 4, 2026.
+
 ## Objective
 Make the Immich PostgreSQL dump atomic: write to a temp file, validate it,
 then `mv` into place — so an interrupted or failed dump can never truncate

@@ -1,5 +1,11 @@
 # Task 13 — Enrich the recovery pack  [shared-philosophy]
 
+Status: **PARTIALLY DONE**. Repository metadata, the Immich fingerprint,
+interruption cleanup, atomic encrypted output, mode `0600`, and content/ordering
+tests landed through `1da3f2c`. Remaining scope is service/image inventory,
+sanitized target inventory, `create --dry-run`, and `inspect`; do not reimplement
+the completed safeguards.
+
 ## Objective
 Port the useful extras domum-core's recovery pack has and this one lacks:
 service inventory with image digests, backup-target metadata, a dry-run flag,
