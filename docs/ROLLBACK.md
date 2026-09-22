@@ -47,6 +47,10 @@ the previous-image restoration path has been corrected. The current
 plain-directory branch removes the live directory before restoration; that is
 a data-risk boundary, not a safe fallback.
 
+The snapshot model itself — event-driven creation, time-driven pruning, and
+why the weekly unit only prunes — is described in
+[SNAPSHOT-MODEL.md](SNAPSHOT-MODEL.md).
+
 ## Immich rollback
 
 ```bash
