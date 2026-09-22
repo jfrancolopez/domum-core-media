@@ -270,9 +270,12 @@ report_backup_target_state() {
     )"
     [[ -n "$r_finished" ]] && r_epoch="$(date -d "$r_finished" +%s 2>/dev/null || true)"
     case "$r_result" in
-      success) r_result=ok ;;
-      failure) r_result=failed ;;
-      *)       r_result=unknown ;;
+      success) r_result="ok" ;;
+      failure) r_result="failed" ;;
+      # A run that started and never recorded an outcome: still in flight, or
+      # killed/aborted. Never report it as ok.
+      running) r_result="incomplete" ;;
+      *)       r_result="unknown" ;;
     esac
     last_run="$(jq -cn --arg state "$r_result" --arg snapshot "$r_snapshot" \
       --argjson at "$(report_iso_from_epoch "$r_epoch")" \
@@ -481,6 +484,7 @@ report_generate_json() {
     (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
     (.backups.targets[] | select(.last_run.state == "failed") | {level:"critical",message:("Backup target "+.target+" last run FAILED"),action:("Inspect: journalctl -u domum-media-backup.service, then retry that target")}),
     (.backups.targets[] | select(.last_run.state == "unknown") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"It will be recorded after the next scheduled backup run"}),
+    (.backups.targets[] | select(.last_run.state == "incomplete") | {level:"warning",message:("Backup target "+.target+" has a run that started but recorded no outcome (in flight, or interrupted)"),action:"If no backup is running, inspect journalctl -u domum-media-backup.service"}),
     (.backups.targets[] | select(.last_run.state == "ok" and .last_run.age_seconds != null and .last_run.age_seconds > 172800) | {level:"warning",message:("Backup target "+.target+" last succeeded more than 48 hours ago"),action:"Inspect domum-media-backup.service for that target"})
   ]' <<< "$initial")"
   # `info` records an absence that is known, accepted and not an active risk; it

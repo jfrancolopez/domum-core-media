@@ -96,6 +96,24 @@ out="$(report_target cloud)" || fail "report_backup_target_state failed on a fai
 jq -e '.last_run.state == "failed"' <<< "$out" >/dev/null \
   || fail "a recorded failure was not reported as failed: $out"
 
+# A run that started but recorded no outcome must never read as ok.
+printf 'SCHEMA_VERSION=1\nTARGET=cloud\nRESULT=running\nFINISHED_TS=%s\n' "$(date -Iseconds)" > "$run_file"
+out="$(report_target cloud)" || fail "report_backup_target_state failed on a running record"
+jq -e '.last_run.state == "incomplete"' <<< "$out" >/dev/null \
+  || fail "an interrupted or in-flight run must report incomplete, not ok: $out"
+
+# The wrapper must mark the attempt BEFORE anything that can abort, otherwise a
+# killed or identity-rejected run leaves the previous success in place.
+awk '/^do_daily_backup\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup" > "$TMP_DIR/loop.txt"
+[ -s "$TMP_DIR/loop.txt" ] || fail "could not extract do_daily_backup"
+running_line="$(grep -n 'record_backup_target_run "\$target" running' "$TMP_DIR/loop.txt" | head -1 | cut -d: -f1)"
+# Ignore comment lines: the code is commented with the very name being searched.
+check_line="$(grep -nE '^[[:space:]]*(if )?check_repo_identity' "$TMP_DIR/loop.txt" | head -1 | cut -d: -f1)"
+[ -n "$check_line" ] || fail "could not locate check_repo_identity in do_daily_backup"
+[ -n "$running_line" ] || fail "the wrapper does not mark the attempt before running the backup"
+(( running_line < check_line )) \
+  || fail "the attempt must be marked before check_repo_identity, which can abort"
+
 # A target with no evidence must report unknown, never inherit another's result.
 out="$(report_target archive)" || fail "report_backup_target_state failed for an unrecorded target"
 jq -e '.last_run.state == "unknown"' <<< "$out" >/dev/null \

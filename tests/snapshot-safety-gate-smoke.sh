@@ -44,8 +44,10 @@ grep -q 'RC=1' <<< "$out" \
 grep -q '0 created' <<< "$out" \
   || fail "snapshot_create did not report how many snapshots it created: $out"
 
-# ...and it must still succeed when a snapshot really is taken.
-out="$( { bash -c "$(harness); is_btrfs_subvol() { return 0; }; btrfs() { mkdir -p \"\$4\"; }; record_rollback_entry() { :; }; if snapshot_create realtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
+# ...and it must still succeed when a snapshot really is taken. The stub creates
+# the snapshot target (the last argument), because the implementation now
+# verifies the snapshot exists rather than trusting btrfs's exit status.
+out="$( { bash -c "$(harness); is_btrfs_subvol() { return 0; }; btrfs() { mkdir -p \"\${!#}\"; }; record_rollback_entry() { :; }; if snapshot_create realtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
 grep -q 'RC=0' <<< "$out" || fail "snapshot_create failed when a snapshot was created: $out"
 
 # ---------------------------------------------------------------------------
@@ -123,5 +125,39 @@ awk '
   found && window-- > 0 && /no rollback point/ { ok=1 }
   END { exit ok ? 0 : 1 }
 ' "$REPO_ROOT/bin/domum-media" || fail "apply does not warn that it has no rollback point"
+
+# ---------------------------------------------------------------------------
+# 5. A btrfs command that FAILS on a real subvolume must not pass the gate.
+#    Counting attempts rather than successes would let ENOSPC, or an existing
+#    target, authorise a risky operation with no snapshot.
+# ---------------------------------------------------------------------------
+out="$( { bash -c "$(harness)
+is_btrfs_subvol() { return 0; }
+btrfs() { return 1; }          # the path IS a subvolume, but the snapshot fails
+record_rollback_entry() { :; }
+if snapshot_create failtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
+grep -q 'RC=1' <<< "$out" \
+  || fail "snapshot_create reported success when the btrfs command failed: $out"
+grep -q 'FAILED' <<< "$out" || fail "a failed snapshot command must be reported: $out"
+
+# Same for the per-service snapshot: it must not return a name for a snapshot
+# that was never created.
+out="$( { bash -c "$(harness)
+is_btrfs_subvol() { return 0; }
+btrfs() { return 1; }
+record_service_snapshot_metadata() { :; }
+record_rollback_entry() { :; }
+if name=\"\$(create_service_snapshot plex pre-update a b)\"; then echo \"RC=0 name=\$name\"; else echo RC=\$?; fi" ; } 2>&1 )"
+grep -q 'RC=1' <<< "$out" \
+  || fail "create_service_snapshot returned success for a snapshot that was never created: $out"
+
+# And a btrfs command that exits 0 without producing the snapshot must also fail.
+out="$( { bash -c "$(harness)
+is_btrfs_subvol() { return 0; }
+btrfs() { return 0; }          # claims success, creates nothing
+record_rollback_entry() { :; }
+if snapshot_create lyingtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
+grep -q 'RC=1' <<< "$out" \
+  || fail "snapshot_create trusted btrfs's exit status without verifying the snapshot exists: $out"
 
 echo "PASS: snapshot safety gate smoke test"

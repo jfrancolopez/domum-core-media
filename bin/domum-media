@@ -1167,7 +1167,7 @@ snapshot_subvolumes() {
 # nothing must never read as success to its caller.
 snapshot_create() {
   local tag="${1:-manual}"
-  local stamp created=0 skipped=0
+  local stamp created=0 skipped=0 failed=0
   stamp="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$DOMUM_SNAPSHOT_ROOT"
   while IFS= read -r subvol; do
@@ -1176,17 +1176,26 @@ snapshot_create() {
     target="$DOMUM_SNAPSHOT_ROOT/${name}-${stamp}-${tag}"
     if is_btrfs_subvol "$subvol"; then
       echo "[domum-media] Snapshot: $subvol -> $target"
-      btrfs subvolume snapshot -r "$subvol" "$target"
-      service="$name"
-      record_rollback_entry "$service" "$tag" "$(basename "$target")" "" "" >/dev/null
-      created=$(( created + 1 ))
+      # Count a SUCCESS, never an attempt: `btrfs subvolume snapshot` can fail
+      # (ENOSPC, target exists) on a path that really is a subvolume, and a gate
+      # that counted the attempt would pass with no snapshot.
+      if btrfs subvolume snapshot -r "$subvol" "$target" && [[ -d "$target" ]]; then
+        service="$name"
+        record_rollback_entry "$service" "$tag" "$(basename "$target")" "" "" >/dev/null
+        created=$(( created + 1 ))
+      else
+        echo "[domum-media] Snapshot FAILED for $subvol" >&2
+        failed=$(( failed + 1 ))
+      fi
     else
       echo "[domum-media] Skipping non-subvolume path: $subvol"
       skipped=$(( skipped + 1 ))
     fi
   done < <(snapshot_subvolumes)
-  echo "[domum-media] Snapshot '${tag}': ${created} created, ${skipped} skipped (not Btrfs subvolumes)."
-  (( created > 0 ))
+  echo "[domum-media] Snapshot '${tag}': ${created} created, ${skipped} skipped (not Btrfs subvolumes), ${failed} failed."
+  # Any outright failure means protection cannot be claimed, even if another
+  # subvolume succeeded.
+  (( created > 0 && failed == 0 ))
 }
 
 snapshot_list() {
@@ -1273,7 +1282,14 @@ create_service_snapshot() {
   if is_btrfs_subvol "$data_path"; then
     mkdir -p "$DOMUM_SNAPSHOT_ROOT"
     echo "[domum-media] Snapshot: $data_path -> $DOMUM_SNAPSHOT_ROOT/$snapshot_name"
-    btrfs subvolume snapshot -r "$data_path" "$DOMUM_SNAPSHOT_ROOT/$snapshot_name"
+    # Report failure unless the snapshot actually exists afterwards. Returning
+    # the name for a snapshot that was never created would let the caller's gate
+    # pass and record rollback metadata pointing at nothing.
+    if ! btrfs subvolume snapshot -r "$data_path" "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" \
+       || [[ ! -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]]; then
+      echo "[domum-media] Snapshot FAILED for $data_path" >&2
+      return 1
+    fi
     record_service_snapshot_metadata "$service" "$before_version" "$after_version" "$snapshot_name"
     event="${tag#pre-}"
     record_rollback_entry "$service" "$event" "$snapshot_name" "$before_version" "$after_version" >/dev/null

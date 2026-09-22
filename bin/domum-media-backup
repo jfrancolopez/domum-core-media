@@ -621,6 +621,12 @@ do_daily_backup() {
   while IFS= read -r target; do
     ran_any=1
     target_started="$(date -Iseconds)"
+    # Mark the attempt before anything can abort. check_repo_identity calls die
+    # on a mismatch, and a killed run exits from a trap, so without this the
+    # previous run's RESULT=success would linger and the report would show a
+    # stale "ok" for a target whose backup never actually completed.
+    record_backup_target_run "$target" running "$target_started" "" \
+      || log "WARNING: could not record run evidence for $target"
     if check_repo_identity "$target" && restic_backup_to "$target"; then
       record_backup_target_run "$target" success "$target_started" "${BACKUP_LAST_SNAPSHOT_ID:-}" \
         || log "WARNING: could not record run evidence for $target"
