@@ -37,6 +37,9 @@ jobs:
       - name: Operational report smoke test
         run: tests/operational-report-smoke.sh
 
+      - name: Timer auto-enable safety smoke test
+        run: tests/timer-auto-enable-safety-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/

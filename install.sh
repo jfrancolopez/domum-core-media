@@ -140,13 +140,21 @@ install_systemd_units() {
   install -m 0644 "${INSTALL_DIR}"/systemd/*.service /etc/systemd/system/
   install -m 0644 "${INSTALL_DIR}"/systemd/*.timer   /etc/systemd/system/
   systemctl daemon-reload
-  systemctl enable --now \
-    domum-media-backup.timer \
-    domum-media-check.timer \
-    domum-media-btrfs-snapshot.timer \
-    domum-media-image-refresh.timer \
-    domum-media-host-update.timer \
-    domum-media-dr-reminder.timer
+
+  # Enable only the timers listed in systemd/auto-enable.timers. Deployment
+  # timers (notably domum-media-image-refresh.timer) are deliberately excluded:
+  # bootstrap runs unattended and must never start deploying on its own.
+  local list="${INSTALL_DIR}/systemd/auto-enable.timers"
+  if [[ ! -r "${list}" ]]; then
+    echo "[domum-media] WARNING: ${list} is missing; no timer was enabled." >&2
+    return 0
+  fi
+  local auto_units=()
+  mapfile -t auto_units < <(sed -E 's/#.*//; s/[[:space:]]+//g' "${list}" \
+    | grep -E '^domum-media-[A-Za-z0-9-]+\.timer$' || true)
+  if (( ${#auto_units[@]} > 0 )); then
+    systemctl enable --now "${auto_units[@]}"
+  fi
 }
 
 ensure_layout() {

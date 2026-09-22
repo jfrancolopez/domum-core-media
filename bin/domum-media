@@ -1411,6 +1411,18 @@ EOF
   systemctl enable --now unattended-upgrades.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
 }
 
+# Canonical list of timers installation and convergence may enable. Read from
+# systemd/auto-enable.timers so install.sh and this CLI cannot drift apart.
+# Deployment timers are deliberately absent; see that file for the rule.
+auto_enable_timer_units() {
+  local list="$DOMUM_DIR/systemd/auto-enable.timers"
+  if [[ ! -r "$list" ]]; then
+    warn "Missing $list; not enabling any timer automatically."
+    return 0
+  fi
+  sed -E 's/#.*//; s/[[:space:]]+//g' "$list" | grep -E '^domum-media-[A-Za-z0-9-]+\.timer$' || true
+}
+
 sync_timer_overrides() {
   local backup_calendar check_calendar prune_calendar image_update_calendar host_update_calendar
   backup_calendar="$(normalize_daily_schedule "${BACKUP_DAILY_AT:-02:30}")"
@@ -1425,13 +1437,17 @@ sync_timer_overrides() {
   write_timer_override "domum-media-host-update.timer" "$host_update_calendar" "${HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY:-45m}"
 
   systemctl daemon-reload
-  systemctl enable --now \
-    domum-media-backup.timer \
-    domum-media-check.timer \
-    domum-media-btrfs-snapshot.timer \
-    domum-media-image-refresh.timer \
-    domum-media-host-update.timer \
-    domum-media-dr-reminder.timer >/dev/null
+
+  # Only auto-enable the protective timers. Image refresh is never enabled
+  # here: it stages and applies image updates, and apply/init/configure all
+  # reach this function, so enabling it here would let routine convergence
+  # silently resume automatic deployment. Existing enablement is left alone --
+  # this never fights an explicit operator decision in either direction.
+  local auto_units=()
+  mapfile -t auto_units < <(auto_enable_timer_units)
+  if (( ${#auto_units[@]} > 0 )); then
+    systemctl enable --now "${auto_units[@]}" >/dev/null
+  fi
 
   # Best-effort: disable the retired hot-prune timer on hosts upgraded from an
   # older release that still has the unit installed.
