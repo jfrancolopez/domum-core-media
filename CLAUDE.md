@@ -296,11 +296,14 @@ reprioritized.
 Documented here because they constrain what is safe to do. Remove an entry when
 it is actually fixed; keep the detail in `docs/`.
 
-- **`install.sh` can re-enable the forbidden image-refresh timer.** Its
-  `install_systemd_units()` enables `domum-media-image-refresh.timer`. Treat
-  this as a known defect needing a focused fix; **do not run the installer or
-  the documented `curl … | sudo bash` bootstrap in production** until it is
-  fixed.
+- **Deployment timers must never be auto-enabled.** `systemd/auto-enable.timers`
+  is the single source of truth for what installation and convergence may
+  enable, and `domum-media-image-refresh.timer` is deliberately absent from it.
+  Never add a deploying timer to that file, and never reintroduce a hardcoded
+  unit list next to a `systemctl enable` call — `sync_timer_overrides` is
+  reached by `apply`, `init`, `configure`, and therefore by `update`, so a
+  hardcoded list there lets routine convergence silently resume deployment.
+  `tests/timer-auto-enable-safety-smoke.sh` enforces this.
 - **`domum-media-btrfs-snapshot.service` appears to run `snapshot prune`
   rather than creating snapshots.** Investigate and document this before
   changing it; do not silently "fix" it as a side effect of other work.

@@ -1,0 +1,27 @@
+# Timers that installation and convergence may enable automatically.
+#
+# Single source of truth, read by install.sh and by bin/domum-media's
+# sync_timer_overrides. One unit name per line; blank lines and # comments are
+# ignored.
+#
+# RULE: only protective or read-only timers belong here. A timer that deploys,
+# stages, or applies application or image changes must NEVER be listed, because
+# installation and convergence run unattended and must not be able to start
+# deploying on their own. Enabling such a timer is a deliberate operator action.
+#
+# Deliberately NOT listed:
+#
+#   domum-media-image-refresh.timer
+#       Stages and applies container image updates. Image discovery must not
+#       imply deployment, and the update/apply/rollback pipeline has not been
+#       audited. See docs/P0-BACKUP-BASELINE.md and CLAUDE.md.
+#
+#   domum-media-weekly-report.timer
+#       Opt-in reporting. Harmless, but enable it deliberately once its output
+#       has been reviewed on the host. See docs/WEEKLY-REPORT.md.
+
+domum-media-backup.timer
+domum-media-check.timer
+domum-media-btrfs-snapshot.timer
+domum-media-host-update.timer
+domum-media-dr-reminder.timer
