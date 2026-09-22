@@ -94,7 +94,7 @@ failures are loud.
 | 07 | [Align --force semantics across update commands](task-07-force-semantics.md) | pending | small | low | — |
 | 06 | [Warn on pending update candidates during apply](task-06-apply-warns-on-candidates.md) **[shared-philosophy]** | pending | small | low | — |
 | 22 | [Pull-free update checks during delay windows](task-22-pull-free-update-checks.md) | pending | medium | medium | — |
-| 23 | [Loud snapshot gate for stateful updates](task-23-loud-snapshot-gate.md) | STILL VALID — raised in priority; `report` now shows the no-op truthfully but `apply` still tolerates it | small | low | — |
+| 23 | [Loud snapshot gate for stateful updates](task-23-loud-snapshot-gate.md) | DONE — `SNAPSHOT_POLICY` gate; risky operations refuse, `apply` warns loudly | small | low | — |
 | 24 | [Rollback restores the previous image](task-24-rollback-previous-image.md) | pending | medium | medium | — |
 | 25 | [Remove or wire dead config vars](task-25-dead-config-vars.md) | pending | small | low | — |
 | 10 | [Restart Traefik only when config changed](task-10-traefik-conditional-restart.md) | pending | small | low | — |

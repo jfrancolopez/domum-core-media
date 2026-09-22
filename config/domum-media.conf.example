@@ -229,6 +229,15 @@ BACKUP_POLICY=BALANCED
 BACKUP_REQUIRED_MAX_AGE_HOURS=48
 AUTO_ROLLBACK_ENABLED=1
 
+# Snapshot safety gate.
+# REQUIRED: an operation that depends on a snapshot for rollback (stateful
+#           image update, Immich bundle apply, Immich database reset) refuses to
+#           run when no snapshot could be created.
+# WARN:     the same operations warn loudly and continue with NO rollback point.
+# Service state paths must be Btrfs subvolumes for snapshots to work; where they
+# are ordinary directories the snapshot is skipped. See docs/SNAPSHOT-MODEL.md.
+SNAPSHOT_POLICY=REQUIRED
+
 # restic retention policy applied to the NAS repo on every daily run, and
 # to the cloud repo weekly (cloud forget is expensive in B2 API calls).
 RESTIC_KEEP_DAILY=7

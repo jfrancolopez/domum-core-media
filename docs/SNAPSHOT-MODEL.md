@@ -77,10 +77,37 @@ valid.
 `unprotected` with a reason rather than inferring protection from `/srv/data`
 being Btrfs — see [WEEKLY-REPORT.md](WEEKLY-REPORT.md).
 
+## The safety gate
+
+Because service snapshots silently skip on the current host, every operation
+that depended on one for rollback was continuing as if protected. That is now
+gated.
+
+`snapshot_create` returns non-zero when it created no snapshot at all, and
+reports how many it created and skipped. Operations that depend on a snapshot
+for rollback refuse to run when none was created:
+
+| Operation | Behaviour when no snapshot could be created |
+|---|---|
+| Stateful service image update | **Refuses.** The snapshot is the rollback mechanism; without it a failed health check leaves the service on the new image with no way back. |
+| Immich bundle apply | **Refuses.** A bundle can migrate the database schema; re-pinning the old images against a migrated database is not a data rollback. |
+| `immich reset-db` | **Refuses.** The snapshot is the only safety net before the `rm -rf` of the Immich state directory. |
+| `domum-media apply` | **Warns loudly and continues.** Routine convergence does not itself depend on the snapshot, but it must not report protection it does not have. |
+| `domum-media snapshot create` | **Exits non-zero.** An operator who asked for a snapshot and got none must not see success. |
+
+`SNAPSHOT_POLICY` controls the refusing operations:
+
+- `REQUIRED` (default) — refuse, and explain why.
+- `WARN` — proceed deliberately with no rollback point, after a loud warning.
+
+Setting `WARN` is an explicit operator decision to run without rollback
+protection. It does not create protection.
+
+`tests/snapshot-safety-gate-smoke.sh` proves the gate: a snapshot that cannot be
+created cannot silently authorise a risky stateful operation.
+
 ## Follow-up work, not done here
 
 - Rename the unit to reflect that it prunes (operator runbook required).
-- Make a skipped snapshot loud rather than silent when a caller depends on it
-  (backlog task 23).
 - Decide the subvolume layout for service paths (backlog task 26; high-risk,
   explicit approval required).
