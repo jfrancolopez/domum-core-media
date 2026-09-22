@@ -41,20 +41,39 @@ report_age_seconds() {
   fi
 }
 
+# A DIRECTORY's mtime changes only when its own entries change, so it says
+# nothing about the freshness of content written deeper inside it. Reporting it
+# as an "age" invites the reader to conclude the data is stale when it is not.
+# Directories therefore report a null age and carry their mtime under a name
+# that states what it actually is.
 report_file_details() {
-  local path="$1" size epoch
+  local path="$1" size epoch kind
   if [[ ! -e "$path" ]]; then
-    jq -cn --arg path "$path" '{state:"missing",path:$path,size_bytes:null,modified_at:null,age_seconds:null}'
+    jq -cn --arg path "$path" \
+      '{state:"missing",kind:"missing",path:$path,size_bytes:null,modified_at:null,age_seconds:null,path_mtime:null,age_basis:null}'
     return
   fi
   size="$(du -sb -- "$path" 2>/dev/null | awk '{print $1}' || true)"
   epoch="$(stat -c %Y -- "$path" 2>/dev/null || true)"
+  if [[ -d "$path" ]]; then
+    kind=directory
+    jq -cn \
+      --arg path "$path" \
+      --argjson size "${size:-null}" \
+      --argjson mtime "$(report_iso_from_epoch "$epoch")" \
+      '{state:"available",kind:"directory",path:$path,size_bytes:$size,
+        modified_at:null,age_seconds:null,path_mtime:$mtime,
+        age_basis:"directory mtime only; it does not reflect the freshness of content inside"}'
+    return
+  fi
+  kind=file
   jq -cn \
-    --arg path "$path" \
+    --arg path "$path" --arg kind "$kind" \
     --argjson size "${size:-null}" \
     --argjson modified "$(report_iso_from_epoch "$epoch")" \
     --argjson age "$(report_age_seconds "$epoch")" \
-    '{state:"available",path:$path,size_bytes:$size,modified_at:$modified,age_seconds:$age}'
+    '{state:"available",kind:$kind,path:$path,size_bytes:$size,modified_at:$modified,
+      age_seconds:$age,path_mtime:$modified,age_basis:"file mtime"}'
 }
 
 # Query exactly one property per call. `systemctl show` returns properties in
@@ -120,6 +139,9 @@ report_container() {
     if [[ -n "$inspect" ]]; then
       local status restart_raw
       IFS='|' read -r status health restart_raw running_id <<< "$inspect"
+      # Docker reports no Health object when the image defines no healthcheck.
+      # "none" reads like a problem; say what it actually means.
+      [[ "$health" == "none" ]] && health="no healthcheck"
       [[ "$status" == "running" ]] && running=true
       [[ "$restart_raw" =~ ^[0-9]+$ ]] && restarts="$restart_raw"
     else
@@ -341,7 +363,7 @@ report_generate_json() {
     --argjson recovery "$recovery_json" --argjson candidates "$(jq -s . "$updates_file")" \
     --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
     --arg immich_enabled "${ENABLE_IMMICH:-0}" \
-    '{schema_version:1,generated_at:$generated,overall:"unknown",
+    '{schema_version:2,generated_at:$generated,overall:"unknown",
       host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
       filesystems:$filesystems,failed_systemd_units:{state:$failed_state,count:$failed_count,units:$failed_units},containers:$containers,
       immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
@@ -384,7 +406,7 @@ report_render_text() {
     (if (.containers|length)==0 then "  No enabled application containers" else (.containers[] | "  "+.name+": "+(if .running == null then "not inspected" elif .running then .health else "not running" end)+"; restarts="+(if .restart_count==null then "unknown" else (.restart_count|tostring) end)+"; image="+(if .image.matches_available==null then "unknown" elif .image.matches_available then "current" else "staged" end)) end),
     "",
     "Immich",
-    "  Library: " + .immich.library.state + "; size=" + (if .immich.library.size_bytes==null then "unknown" else (.immich.library.size_bytes|tostring)+"B" end) + "; age=" + (.immich.library.age_seconds|age),
+    "  Library: " + .immich.library.state + "; size=" + (if .immich.library.size_bytes==null then "unknown" else (.immich.library.size_bytes|tostring)+"B" end) + (if .immich.library.kind=="directory" then "; dir mtime=" + (.immich.library.path_mtime // "unknown") + " (not content freshness)" else "; age=" + (.immich.library.age_seconds|age) end),
     "  DB dump: " + .immich.database_dump.state + "; size=" + (if .immich.database_dump.size_bytes==null then "unknown" else (.immich.database_dump.size_bytes|tostring)+"B" end) + "; age=" + (.immich.database_dump.age_seconds|age),
     "",
     "Backups",

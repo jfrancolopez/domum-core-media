@@ -22,10 +22,15 @@ degrade every probe to `unknown`, which is less useful than refusing.
 `--write` persists to `/var/lib/domum-media/reports/` as `latest.json` and
 `latest.txt`, mode `0600` in a `0700` directory, written atomically.
 
+Plain `domum-media report` writes nothing. Its only outside call is a read-only
+`restic snapshots` query per enabled target. Container health is read with
+`docker inspect`; a container whose image defines no healthcheck reports
+`no healthcheck`, which is a statement of fact and not a finding.
+
 ## Truthfulness rules
 
 The report is only worth having if it never overstates safety. It follows
-three rules, each covered by `tests/operational-report-smoke.sh`:
+four rules, each covered by `tests/operational-report-smoke.sh`:
 
 1. **Unknown is not healthy.** State that could not be inspected is reported
    as `unknown` or `null` and raises a finding. It is never rendered as
@@ -35,7 +40,15 @@ three rules, each covered by `tests/operational-report-smoke.sh`:
    evidence, the report says so instead of inferring it from something
    adjacent. Restore verification and per-target backup results are currently
    reported as `unknown` for exactly this reason (see *Known gaps*).
-3. **Snapshot claims must be probed, not assumed.** Each stateful service path
+3. **A metric is only shown where it means something.** File and directory
+   artefacts carry a `kind`. A file's `age_seconds` is its mtime and is
+   meaningful. A **directory's** mtime changes only when its own entries change,
+   so it says nothing about content written deeper inside: directories report
+   `age_seconds: null`, expose their own mtime as `path_mtime`, and carry an
+   `age_basis` saying so. The Immich library is the motivating case — its
+   top-level mtime can be months old while photos are being written right now,
+   and reporting that as an "age" would imply a stale library.
+4. **Snapshot claims must be probed, not assumed.** Each stateful service path
    is tested with `btrfs subvolume show`. An ordinary directory is reported
    `unprotected` with the reason, and raises a critical finding. `/srv/data`
    being Btrfs is never treated as evidence that a service path is protected.
@@ -46,13 +59,14 @@ three rules, each covered by `tests/operational-report-smoke.sh`:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Integer. Bumped on incompatible change. |
+| `schema_version` | Integer. Bumped on incompatible change. Currently `2`. |
 | `generated_at` | ISO-8601 generation time. |
 | `overall` | `healthy`, `warning`, or `critical`, derived from `findings`. |
 | `host` | Uptime, load, memory, temperature, pending reboot. |
 | `filesystems[]` | Capacity and used percent per mount. |
 | `failed_systemd_units` | Count and unit names; `count: null` when undeterminable. |
-| `containers[]` | Expected container, running state, health, restarts, image identity. |
+| `containers[]` | Expected container, running state, health (`no healthcheck` when the image defines none), restarts, image identity. |
+| `immich.library` / `immich.database_dump` | `kind` (`file`/`directory`/`missing`), size, `path_mtime`, `age_seconds` (null for directories), `age_basis`. |
 | `immich` | Enablement (from config), library and validated dump artefacts. |
 | `backups` | Heartbeat, timers, latest snapshot per target, per-target state, restore verification. |
 | `recovery_pack` | Presence and age. |
