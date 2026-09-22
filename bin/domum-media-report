@@ -56,7 +56,6 @@ report_file_details() {
   size="$(du -sb -- "$path" 2>/dev/null | awk '{print $1}' || true)"
   epoch="$(stat -c %Y -- "$path" 2>/dev/null || true)"
   if [[ -d "$path" ]]; then
-    kind=directory
     jq -cn \
       --arg path "$path" \
       --argjson size "${size:-null}" \
@@ -66,7 +65,7 @@ report_file_details() {
         age_basis:"directory mtime only; it does not reflect the freshness of content inside"}'
     return
   fi
-  kind=file
+  kind="file"
   jq -cn \
     --arg path "$path" --arg kind "$kind" \
     --argjson size "${size:-null}" \
