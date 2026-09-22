@@ -14,6 +14,7 @@ CONFIG_DIR_DEFAULT="/etc/domum-core-media"
 LOG_DIR_DEFAULT="/var/log/domum-media"
 BIN_PATH="/usr/local/bin/domum-media"
 BACKUP_BIN_PATH="/usr/local/bin/domum-media-backup"
+REPORT_BIN_PATH="/usr/local/lib/domum-media/domum-media-report"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (use sudo)."
@@ -131,6 +132,7 @@ install_cli() {
   echo "[domum-media] Installing CLIs to /usr/local/bin..."
   install -m 0755 "${INSTALL_DIR}/bin/domum-media" "${BIN_PATH}"
   install -m 0755 "${INSTALL_DIR}/bin/domum-media-backup" "${BACKUP_BIN_PATH}"
+  install -D -m 0755 "${INSTALL_DIR}/bin/domum-media-report" "${REPORT_BIN_PATH}"
 }
 
 install_systemd_units() {

@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+
+# Read-only operational reporting helpers. This file is sourced by domum-media
+# so it can reuse the canonical config and service inventory functions.
+
+report_iso_from_epoch() {
+  local epoch="${1:-}"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { printf 'null'; return; }
+  date -d "@$epoch" --iso-8601=seconds 2>/dev/null | jq -R . || printf 'null'
+}
+
+report_age_seconds() {
+  local epoch="${1:-}"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { printf 'null'; return; }
+  if (( REPORT_NOW_EPOCH >= epoch )); then
+    printf '%s' "$(( REPORT_NOW_EPOCH - epoch ))"
+  else
+    printf '0'
+  fi
+}
+
+report_file_details() {
+  local path="$1" size epoch
+  if [[ ! -e "$path" ]]; then
+    jq -cn --arg path "$path" '{state:"missing",path:$path,size_bytes:null,modified_at:null,age_seconds:null}'
+    return
+  fi
+  size="$(du -sb -- "$path" 2>/dev/null | awk '{print $1}' || true)"
+  epoch="$(stat -c %Y -- "$path" 2>/dev/null || true)"
+  jq -cn \
+    --arg path "$path" \
+    --argjson size "${size:-null}" \
+    --argjson modified "$(report_iso_from_epoch "$epoch")" \
+    --argjson age "$(report_age_seconds "$epoch")" \
+    '{state:"available",path:$path,size_bytes:$size,modified_at:$modified,age_seconds:$age}'
+}
+
+report_systemd_state() {
+  local timer="$1" service="$2" enabled active timer_show service_show
+  if ! cmd_exists systemctl; then
+    jq -cn --arg timer "$timer" --arg service "$service" \
+      '{timer:$timer,service:$service,enabled:"unknown",active:"unknown",last_trigger:null,next_trigger:null,result:"unknown",service_started_at:null,service_finished_at:null}'
+    return
+  fi
+  enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+  active="$(systemctl is-active "$timer" 2>/dev/null || true)"
+  timer_show="$(systemctl show "$timer" --property=LastTriggerUSec,NextElapseUSecRealtime --value 2>/dev/null || true)"
+  service_show="$(systemctl show "$service" --property=Result,ExecMainStartTimestamp,ExecMainExitTimestamp --value 2>/dev/null || true)"
+  jq -cn \
+    --arg timer "$timer" --arg service "$service" \
+    --arg enabled "${enabled:-unknown}" --arg active "${active:-unknown}" \
+    --arg last "$(printf '%s\n' "$timer_show" | sed -n '1p')" \
+    --arg next "$(printf '%s\n' "$timer_show" | sed -n '2p')" \
+    --arg result "$(printf '%s\n' "$service_show" | sed -n '1p')" \
+    --arg started "$(printf '%s\n' "$service_show" | sed -n '2p')" \
+    --arg finished "$(printf '%s\n' "$service_show" | sed -n '3p')" \
+    '{timer:$timer,service:$service,enabled:$enabled,active:$active,
+      last_trigger:($last|select(length>0 and .!="n/a")),next_trigger:($next|select(length>0 and .!="n/a")),
+      result:($result|select(length>0) // "unknown"),service_started_at:($started|select(length>0 and .!="n/a")),
+      service_finished_at:($finished|select(length>0 and .!="n/a"))}'
+}
+
+report_container_specs() {
+  while IFS='|' read -r logical enable_var _ _ compose_services image_var _; do
+    [[ "${!enable_var:-0}" == "1" ]] || continue
+    local compose_service configured_var
+    for compose_service in $compose_services; do
+      configured_var="$image_var"
+      case "$compose_service" in
+        immich_machine_learning) configured_var=IMMICH_MACHINE_LEARNING_IMAGE ;;
+        immich_redis) configured_var=IMMICH_REDIS_IMAGE ;;
+        immich_postgres) configured_var=IMMICH_POSTGRES_IMAGE ;;
+      esac
+      printf '%s|%s|%s\n' "$logical" "$compose_service" "${!configured_var:-unknown}"
+    done
+  done < <(service_lifecycle_specs)
+  if [[ "${ENABLE_RESTIC_REST_SERVER:-0}" == "1" ]]; then
+    printf 'restic-rest-server|restic-rest-server|%s\n' "${RESTIC_REST_SERVER_IMAGE:-restic/rest-server:latest}"
+  fi
+}
+
+report_container() {
+  local logical="$1" name="$2" configured="$3" inspect="" available_id="" running=false health=unknown restarts=null running_id=""
+  if cmd_exists docker; then
+    inspect="$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}|{{.Image}}' "$name" 2>/dev/null || true)"
+    if [[ -n "$inspect" ]]; then
+      local status restart_raw
+      IFS='|' read -r status health restart_raw running_id <<< "$inspect"
+      [[ "$status" == "running" ]] && running=true
+      [[ "$restart_raw" =~ ^[0-9]+$ ]] && restarts="$restart_raw"
+    else
+      health=missing
+    fi
+    available_id="$(docker image inspect --format '{{.Id}}' "$configured" 2>/dev/null || true)"
+  fi
+  local match=null
+  [[ -n "$running_id" && -n "$available_id" ]] && { match=false; [[ "$running_id" == "$available_id" ]] && match=true; }
+  jq -cn --arg service "$logical" --arg name "$name" --arg configured "$configured" \
+    --arg health "$health" --arg running_id "$running_id" --arg available_id "$available_id" \
+    --argjson running "$running" --argjson restarts "$restarts" --argjson match "$match" \
+    '{service:$service,name:$name,running:$running,health:$health,restart_count:$restarts,
+      image:{configured:$configured,running_id:($running_id|select(length>0)),available_id:($available_id|select(length>0)),matches_available:$match}}'
+}
+
+report_filesystem() {
+  local path="$1" row
+  row="$(df -B1 -P -- "$path" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $2, $3, $4, $5}' || true)"
+  if [[ -z "$row" ]]; then
+    jq -cn --arg path "$path" '{path:$path,state:"unknown",total_bytes:null,used_bytes:null,available_bytes:null,used_percent:null}'
+    return
+  fi
+  local total used available percent
+  read -r total used available percent <<< "$row"
+  jq -cn --arg path "$path" --argjson total "$total" --argjson used "$used" \
+    --argjson available "$available" --argjson percent "$percent" \
+    '{path:$path,state:"available",total_bytes:$total,used_bytes:$used,available_bytes:$available,used_percent:$percent}'
+}
+
+report_snapshot_protection() {
+  local service="$1" path="$2" state reason latest="" latest_epoch=""
+  if [[ ! -d "$path" ]]; then
+    state=unknown; reason="state path is missing"
+  elif ! cmd_exists btrfs; then
+    state=unknown; reason="btrfs tool unavailable"
+  elif btrfs subvolume show "$path" >/dev/null 2>&1; then
+    state=protected; reason="state path is a Btrfs subvolume"
+    latest="$(latest_snapshot_for_service "$service" 2>/dev/null || true)"
+    [[ -n "$latest" ]] && latest_epoch="$(snapshot_path_mtime "$DOMUM_SNAPSHOT_ROOT/$latest" 2>/dev/null || true)"
+  else
+    state=unprotected; reason="state path is an ordinary directory, not a Btrfs subvolume"
+  fi
+  jq -cn --arg service "$service" --arg path "$path" --arg state "$state" --arg reason "$reason" \
+    --arg latest "$latest" --argjson latest_at "$(report_iso_from_epoch "$latest_epoch")" \
+    --argjson age "$(report_age_seconds "$latest_epoch")" \
+    '{service:$service,path:$path,state:$state,reason:$reason,latest_snapshot:($latest|select(length>0)),latest_snapshot_at:$latest_at,latest_snapshot_age_seconds:$age}'
+}
+
+report_update_candidate() {
+  local kind="$1" service="$2" file="$3" first_seen="" candidate=""
+  if [[ "$kind" == "immich" ]]; then
+    unset IMMICH_BUNDLE_TAG FIRST_SEEN_TS
+    # shellcheck disable=SC1090
+    source "$file"
+    first_seen="${FIRST_SEEN_TS:-}"
+    candidate="${IMMICH_BUNDLE_TAG:-unknown}"
+  else
+    unset CANDIDATE_DIGEST SEEN_IMAGE_ID FIRST_SEEN_TS
+    # shellcheck disable=SC1090
+    source "$file"
+    first_seen="${FIRST_SEEN_TS:-}"
+    candidate="${CANDIDATE_DIGEST:-${SEEN_IMAGE_ID:-unknown}}"
+  fi
+  jq -cn --arg kind "$kind" --arg service "$service" --arg candidate "$candidate" \
+    --argjson first_seen_at "$(report_iso_from_epoch "$first_seen")" \
+    --argjson age "$(report_age_seconds "$first_seen")" \
+    '{kind:$kind,service:$service,candidate:$candidate,first_seen_at:$first_seen_at,age_seconds:$age}'
+}
+
+report_latest_backup_snapshot() {
+  local target="$1" output="" state=unknown
+  if [[ -x "$DOMUM_DIR/bin/domum-media-backup" ]] && cmd_exists timeout; then
+    output="$(timeout 20 "$DOMUM_DIR/bin/domum-media-backup" --latest-snapshot-json "$target" 2>/dev/null || true)"
+  fi
+  if jq -e 'type == "object"' >/dev/null 2>&1 <<< "$output"; then
+    jq -c --arg target "$target" '{target:$target,state:"available",snapshot:.}' <<< "$output"
+  else
+    jq -cn --arg target "$target" --arg state "$state" '{target:$target,state:$state,snapshot:null}'
+  fi
+}
+
+report_generate_json() {
+  cmd_exists jq || die "jq is required for report output"
+  REPORT_NOW_EPOCH="${DOMUM_REPORT_NOW_EPOCH:-$(date +%s)}"
+  local generated_at uptime_seconds=null load1=null load5=null load15=null
+  generated_at="$(date -d "@$REPORT_NOW_EPOCH" --iso-8601=seconds)"
+  [[ -r "${DOMUM_REPORT_PROC_ROOT:-/proc}/uptime" ]] && read -r uptime_seconds _ < "${DOMUM_REPORT_PROC_ROOT:-/proc}/uptime"
+  uptime_seconds="${uptime_seconds%%.*}"
+  if [[ -r "${DOMUM_REPORT_PROC_ROOT:-/proc}/loadavg" ]]; then
+    read -r load1 load5 load15 _ < "${DOMUM_REPORT_PROC_ROOT:-/proc}/loadavg"
+  fi
+
+  local mem_total=null mem_available=null mem_used=null mem_percent=null
+  if [[ -r "${DOMUM_REPORT_PROC_ROOT:-/proc}/meminfo" ]]; then
+    mem_total="$(awk '/^MemTotal:/ {print $2 * 1024}' "${DOMUM_REPORT_PROC_ROOT:-/proc}/meminfo")"
+    mem_available="$(awk '/^MemAvailable:/ {print $2 * 1024}' "${DOMUM_REPORT_PROC_ROOT:-/proc}/meminfo")"
+    if [[ "$mem_total" =~ ^[0-9]+$ && "$mem_available" =~ ^[0-9]+$ ]]; then
+      mem_used=$(( mem_total - mem_available ))
+      (( mem_total > 0 )) && mem_percent=$(( mem_used * 100 / mem_total ))
+    fi
+  fi
+  local temperature=null thermal
+  shopt -s nullglob
+  for thermal in "${DOMUM_REPORT_THERMAL_ROOT:-/sys/class/thermal}"/thermal_zone*/temp; do
+    temperature="$(awk '{printf "%.1f", $1 / 1000}' "$thermal" 2>/dev/null || true)"
+    [[ -n "$temperature" ]] && break
+  done
+  shopt -u nullglob
+
+  local work containers_file fs_file protection_file updates_file backups_file failed_file
+  work="$(mktemp -d)"; trap 'rm -rf "$work"' RETURN
+  containers_file="$work/containers"; fs_file="$work/filesystems"; protection_file="$work/protection"
+  updates_file="$work/updates"; backups_file="$work/backups"; failed_file="$work/failed"
+  : > "$containers_file"; : > "$fs_file"; : > "$protection_file"; : > "$updates_file"; : > "$backups_file"; : > "$failed_file"
+
+  local logical name image path service enable_var data_path target file
+  while IFS='|' read -r logical name image; do report_container "$logical" "$name" "$image" >> "$containers_file"; done < <(report_container_specs)
+  for path in / /srv/data /srv/media /srv/snapshots; do report_filesystem "$path" >> "$fs_file"; done
+  while IFS='|' read -r service enable_var _ _ _ _ _; do
+    [[ "${!enable_var:-0}" == "1" ]] || continue
+    service_backup_required "$service" || continue
+    data_path="$(service_data_path "$service" 2>/dev/null || true)"
+    [[ -n "$data_path" ]] && report_snapshot_protection "$service" "$data_path" >> "$protection_file"
+  done < <(service_lifecycle_specs)
+  shopt -s nullglob
+  for file in "$DOMUM_STATE_ROOT"/image-updates/*.env; do report_update_candidate generic "$(basename "$file" .env)" "$file" >> "$updates_file"; done
+  shopt -u nullglob
+  [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]] && report_update_candidate immich immich "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" >> "$updates_file"
+  while IFS= read -r target; do report_latest_backup_snapshot "$target" >> "$backups_file"; done < <(enabled_backup_targets)
+
+  local failed_state=unknown failed_count=null
+  if cmd_exists systemctl; then
+    systemctl --failed --no-legend --plain --type=service 2>/dev/null | awk 'NF {print $1}' | jq -R . >> "$failed_file" || true
+    failed_count="$(wc -l < "$failed_file" | tr -d ' ')"; failed_state=available
+  fi
+
+  local heartbeat_epoch="" heartbeat_at=null heartbeat_age=null heartbeat_state=missing
+  if heartbeat_epoch="$(backup_last_success_epoch 2>/dev/null)"; then
+    heartbeat_at="$(report_iso_from_epoch "$heartbeat_epoch")"; heartbeat_age="$(report_age_seconds "$heartbeat_epoch")"; heartbeat_state=available
+  fi
+  local recovery_json dump_json library_json
+  recovery_json="$(report_file_details "$(recovery_pack_state_file)")"
+  if [[ -f "$(recovery_pack_state_file)" ]]; then
+    unset TS SIZE ARCHIVE_PATH VERIFIED_TS
+    # shellcheck disable=SC1090
+    source "$(recovery_pack_state_file)"
+    recovery_json="$(jq -cn --argjson at "$(report_iso_from_epoch "${TS:-}")" --argjson age "$(report_age_seconds "${TS:-}")" --argjson size "${SIZE:-null}" '{state:"available",created_at:$at,age_seconds:$age,size_bytes:$size}')"
+  fi
+  library_json="$(report_file_details "${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}")"
+  dump_json="$(report_file_details "$DOMUM_DATA_ROOT/immich/backup-staging/immich-postgres.dump.sql.gz")"
+
+  local backup_timer check_timer image_timer reboot=false
+  backup_timer="$(report_systemd_state domum-media-backup.timer domum-media-backup.service)"
+  check_timer="$(report_systemd_state domum-media-check.timer domum-media-check.service)"
+  image_timer="$(report_systemd_state domum-media-image-refresh.timer domum-media-image-refresh.service)"
+  [[ -e "${DOMUM_REPORT_REBOOT_REQUIRED:-/var/run/reboot-required}" ]] && reboot=true
+
+  local initial overall findings
+  initial="$(jq -cn \
+    --arg generated "$generated_at" --argjson uptime "${uptime_seconds:-null}" \
+    --argjson load1 "$load1" --argjson load5 "$load5" --argjson load15 "$load15" \
+    --argjson mem_total "$mem_total" --argjson mem_available "$mem_available" --argjson mem_used "$mem_used" --argjson mem_percent "$mem_percent" \
+    --argjson temperature "$temperature" --argjson reboot "$reboot" \
+    --arg failed_state "$failed_state" --argjson failed_count "$failed_count" \
+    --argjson failed_units "$(jq -s . "$failed_file")" --argjson containers "$(jq -s . "$containers_file")" \
+    --argjson filesystems "$(jq -s . "$fs_file")" --arg heartbeat_state "$heartbeat_state" \
+    --argjson heartbeat_at "$heartbeat_at" --argjson heartbeat_age "$heartbeat_age" \
+    --argjson backup_timer "$backup_timer" --argjson check_timer "$check_timer" --argjson image_timer "$image_timer" \
+    --argjson library "$library_json" --argjson dump "$dump_json" --argjson snapshots "$(jq -s . "$backups_file")" \
+    --argjson recovery "$recovery_json" --argjson candidates "$(jq -s . "$updates_file")" \
+    --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
+    '{schema_version:1,generated_at:$generated,overall:"unknown",
+      host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
+      filesystems:$filesystems,failed_systemd_units:{state:$failed_state,count:$failed_count,units:$failed_units},containers:$containers,
+      immich:{enabled:($library.state != "missing"),library:$library,database_dump:$dump},
+      backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots},
+      recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{services:$protection},findings:[]}')"
+  findings="$(jq -c '[
+    (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:(.count|tostring)+" failed systemd service unit(s)",action:"Run: systemctl --failed"}),
+    (.containers[] | select(.running == false) | {level:"critical",message:(.name+" is not running"),action:("Run: docker inspect "+.name)}),
+    (.containers[] | select(.health == "unhealthy") | {level:"critical",message:(.name+" is unhealthy"),action:("Run: docker logs "+.name)}),
+    (.snapshot_protection.services[] | select(.state == "unprotected") | {level:"critical",message:(.service+" state has no service-level snapshot protection"),action:("Migrate "+.path+" to a Btrfs subvolume before relying on snapshots")}),
+    (.snapshot_protection.services[] | select(.state == "unknown") | {level:"warning",message:(.service+" snapshot protection is unknown"),action:"Verify the state path and Btrfs tooling"}),
+    (.filesystems[] | select(.used_percent != null and .used_percent >= 90) | {level:"warning",message:(.path+" is "+(.used_percent|tostring)+"% full"),action:"Free space or expand the filesystem"}),
+    (select(.backups.heartbeat.state != "available") | {level:"critical",message:"No successful backup heartbeat is available",action:"Run and verify domum-media-backup"}),
+    (.backups.heartbeat | select(.age_seconds != null and .age_seconds > 172800) | {level:"critical",message:"Latest backup is older than 48 hours",action:"Inspect domum-media-backup.service"}),
+    (.backups.timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup timer is not enabled and active",action:"Inspect domum-media-backup.timer"}),
+    (.backups.check_timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup check timer is not enabled and active",action:"Inspect domum-media-check.timer"}),
+    (.updates.candidates[] | {level:"warning",message:(.service+" has a staged update candidate"),action:"Review: domum-media updates summary"})
+  ]' <<< "$initial")"
+  overall="$(jq -r 'if any(.[]; .level=="critical") then "critical" elif length>0 then "warning" else "healthy" end' <<< "$findings")"
+  jq --arg overall "$overall" --argjson findings "$findings" '.overall=$overall | .findings=$findings' <<< "$initial"
+}
+
+report_render_text() {
+  jq -r '
+    def age: if . == null then "unknown" elif . < 3600 then ((./60|floor|tostring)+"m") elif . < 86400 then ((./3600|floor|tostring)+"h") else ((./86400|floor|tostring)+"d") end;
+    "domum-media report: " + (.overall|ascii_upcase) + " (" + .generated_at + ")",
+    "",
+    "Host",
+    "  Uptime: " + (.host.uptime_seconds|age) + "  Load: " + ([.host.load.one,.host.load.five,.host.load.fifteen]|map(if .==null then "?" else tostring end)|join("/")) + "  Memory: " + (if .host.memory.used_percent==null then "unknown" else (.host.memory.used_percent|tostring)+"%" end) + "  Temp: " + (if .host.temperature_c==null then "unknown" else (.host.temperature_c|tostring)+"C" end) + "  Reboot: " + (.host.pending_reboot|tostring),
+    "  Filesystems: " + ([.filesystems[] | .path+"="+(if .used_percent==null then "unknown" else (.used_percent|tostring)+"%" end)]|join("  ")),
+    "  Failed systemd units: " + (if .failed_systemd_units.count==null then "unknown" else (.failed_systemd_units.count|tostring) end),
+    "",
+    "Containers",
+    (if (.containers|length)==0 then "  No enabled application containers" else (.containers[] | "  "+.name+": "+(if .running then .health else "not running" end)+"; restarts="+(if .restart_count==null then "unknown" else (.restart_count|tostring) end)+"; image="+(if .image.matches_available==null then "unknown" elif .image.matches_available then "current" else "staged" end)) end),
+    "",
+    "Immich",
+    "  Library: " + .immich.library.state + "; size=" + (if .immich.library.size_bytes==null then "unknown" else (.immich.library.size_bytes|tostring)+"B" end) + "; age=" + (.immich.library.age_seconds|age),
+    "  DB dump: " + .immich.database_dump.state + "; size=" + (if .immich.database_dump.size_bytes==null then "unknown" else (.immich.database_dump.size_bytes|tostring)+"B" end) + "; age=" + (.immich.database_dump.age_seconds|age),
+    "",
+    "Backups",
+    "  Heartbeat: " + .backups.heartbeat.state + "; age=" + (.backups.heartbeat.age_seconds|age),
+    "  Backup timer: " + .backups.timer.enabled + "/" + .backups.timer.active + "; service=" + .backups.timer.result,
+    "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
+    (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
+    "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
+    "",
+    "Updates",
+    "  Image refresh: policy=" + (.updates.image_refresh.policy_enabled|tostring) + "; timer=" + .updates.image_refresh.timer.enabled + "/" + .updates.image_refresh.timer.active,
+    (if (.updates.candidates|length)==0 then "  No staged candidates" else (.updates.candidates[] | "  "+.service+": "+.candidate+"; first seen "+(.age_seconds|age)+" ago") end),
+    "",
+    "Snapshot protection",
+    (if (.snapshot_protection.services|length)==0 then "  No enabled stateful service paths" else (.snapshot_protection.services[] | "  "+.service+": "+.state+" ("+.reason+")") end),
+    "",
+    "Findings/Actions",
+    (if (.findings|length)==0 then "  No immediate action required." else (.findings[] | "  ["+(.level|ascii_upcase)+"] "+.message+". "+.action) end)
+  '
+}
+
+report_cmd() {
+  local mode=text
+  case "$#:${1:-}" in
+    0:) ;;
+    1:--json) mode=json ;;
+    1:--write) mode=write ;;
+    *) die "Usage: domum-media report [--json|--write]" ;;
+  esac
+
+  if [[ -f "$CFG_FILE" ]]; then
+    load_cfg
+  else
+    DOMUM_DATA_ROOT="${DOMUM_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
+    DOMUM_MEDIA_ROOT="${DOMUM_MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
+    DOMUM_SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT:-$SNAPSHOT_ROOT_DEFAULT}"
+    DOMUM_LOG_DIR="${DOMUM_LOG_DIR:-$LOG_DIR_DEFAULT}"
+    DOMUM_STATE_ROOT="${DOMUM_STATE_ROOT:-$STATE_ROOT_DEFAULT}"
+    RECOVERY_PACK_DEST="${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}"
+  fi
+
+  local json_file text_file report_dir
+  json_file="$(mktemp)"; text_file="$(mktemp)"
+  trap 'rm -f "$json_file" "$text_file"' RETURN
+  report_generate_json > "$json_file"
+  report_render_text < "$json_file" > "$text_file"
+  case "$mode" in
+    json) cat "$json_file" ;;
+    text) cat "$text_file" ;;
+    write)
+      report_dir="$DOMUM_STATE_ROOT/reports"
+      install -d -m 0700 "$report_dir"
+      local json_tmp text_tmp
+      json_tmp="$(mktemp "$report_dir/.latest.json.XXXXXX")"
+      text_tmp="$(mktemp "$report_dir/.latest.txt.XXXXXX")"
+      install -m 0600 "$json_file" "$json_tmp"
+      install -m 0600 "$text_file" "$text_tmp"
+      mv -f "$json_tmp" "$report_dir/latest.json"
+      mv -f "$text_tmp" "$report_dir/latest.txt"
+      cat "$text_file"
+      ;;
+  esac
+}

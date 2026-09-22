@@ -1,0 +1,11 @@
+[Unit]
+Description=domum-media: schedule weekly operational report
+
+[Timer]
+OnCalendar=Sun *-*-* 08:00:00
+RandomizedDelaySec=45m
+Persistent=true
+Unit=domum-media-weekly-report.service
+
+[Install]
+WantedBy=timers.target

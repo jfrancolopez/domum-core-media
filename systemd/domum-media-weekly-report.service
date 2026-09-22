@@ -1,0 +1,9 @@
+[Unit]
+Description=domum-media: write weekly operational report
+Documentation=file:///opt/domum-core-media/docs/WEEKLY-REPORT.md
+ConditionPathExists=/usr/local/bin/domum-media
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/domum-media report --write
+TimeoutStartSec=10m

@@ -676,6 +676,7 @@ EOF
 converge_local_installation() {
   install -m 0755 "$DOMUM_DIR/bin/domum-media" /usr/local/bin/domum-media
   install -m 0755 "$DOMUM_DIR/bin/domum-media-backup" /usr/local/bin/domum-media-backup
+  install -D -m 0755 "$DOMUM_DIR/bin/domum-media-report" /usr/local/lib/domum-media/domum-media-report
   install -m 0644 "$DOMUM_DIR"/systemd/*.service /etc/systemd/system/
   install -m 0644 "$DOMUM_DIR"/systemd/*.timer /etc/systemd/system/
   systemctl daemon-reload
