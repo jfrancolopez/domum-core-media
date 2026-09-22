@@ -84,6 +84,14 @@ for t in cloud nas; do
   [ -n "$(field "$f" STARTED_TS)" ] || fail "A: $t has no start time"
   [ -n "$(field "$f" FINISHED_TS)" ] || fail "A: $t has no finish time"
 done
+# A success must say WHAT it backed up. A record that claims success without
+# naming its scope can overstate the protection it represents.
+for t in cloud nas; do
+  f="$d/state/backups/$t-run.env"
+  grep -q '^PATHS=' "$f" || fail "A: $t success record does not say what was backed up"
+  [ -n "$(field "$f" PATHS)" ] || fail "A: $t recorded an empty scope for a success"
+done
+
 # Repository identity must come from that target's own pinned metadata.
 [ "$(field "$d/state/backups/cloud-run.env" REPOSITORY_ID)" = "cloudrepo1111" ] \
   || fail "A: cloud recorded the wrong repository identity"
@@ -184,5 +192,27 @@ echo "$out" | jq -e '.last_run.state == "ok"' >/dev/null || fail "E: a stale suc
 age="$(echo "$out" | jq -r '.last_run.age_seconds')"
 [ "$age" != "null" ] && [ "$age" -gt 172800 ] \
   || fail "E: a stale success must carry an age the report can act on (got $age)"
+
+# ---------------------------------------------------------------------------
+# F. A configured include path that does not exist must be recorded, not
+#    silently dropped from a success, and must be surfaced as a finding.
+# ---------------------------------------------------------------------------
+d="$(run_scenario missing-path '
+backup_target_include_paths() { printf "%s" "/tmp /definitely/not/here"; }')"
+[ "$(cat "$d/rc")" = "0" ] || fail "F: a run with one usable path should still succeed"
+f="$d/state/backups/cloud-run.env"
+[ "$(field "$f" RESULT)" = "success" ] || fail "F: expected success with one usable path"
+echo "$(field "$f" PATHS_MISSING)" | grep -q 'not/here' \
+  || fail "F: a skipped configured path was not recorded: $(field "$f" PATHS_MISSING)"
+echo "$(field "$f" PATHS)" | grep -q '/tmp' || fail "F: the usable path was not recorded"
+
+# ...and no usable path at all must fail rather than record an empty success.
+d="$(run_scenario no-paths '
+backup_target_include_paths() { printf "%s" "/definitely/not/here"; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "F: a target with no existing include path must not succeed"
+[ "$(field "$d/state/backups/cloud-run.env" RESULT)" = "failure" ] \
+  || fail "F: a target with nothing to back up must be recorded as failure"
+[ ! -f "$d/log/last-success" ] \
+  || fail "F: the heartbeat must not be written when a target had nothing to back up"
 
 echo "PASS: backup evidence end-to-end smoke test"

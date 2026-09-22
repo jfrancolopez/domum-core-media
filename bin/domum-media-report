@@ -260,13 +260,13 @@ report_backup_target_state() {
   # heartbeat, which cannot attribute a result to one target.
   local last_run
   if [[ -r "$run_file" ]]; then
-    local r_result r_finished r_snapshot r_epoch=""
+    local r_result r_finished r_snapshot r_paths r_missing r_epoch=""
     eval "$(
-      unset RESULT FINISHED_TS SNAPSHOT_ID
+      unset RESULT FINISHED_TS SNAPSHOT_ID PATHS PATHS_MISSING
       # shellcheck disable=SC1090
       . "$run_file" >/dev/null 2>&1 || true
-      printf 'r_result=%q\nr_finished=%q\nr_snapshot=%q\n' \
-        "${RESULT:-}" "${FINISHED_TS:-}" "${SNAPSHOT_ID:-}"
+      printf 'r_result=%q\nr_finished=%q\nr_snapshot=%q\nr_paths=%q\nr_missing=%q\n' \
+        "${RESULT:-}" "${FINISHED_TS:-}" "${SNAPSHOT_ID:-}" "${PATHS:-}" "${PATHS_MISSING:-}"
     )"
     [[ -n "$r_finished" ]] && r_epoch="$(date -d "$r_finished" +%s 2>/dev/null || true)"
     case "$r_result" in
@@ -278,12 +278,16 @@ report_backup_target_state() {
       *)       r_result="unknown" ;;
     esac
     last_run="$(jq -cn --arg state "$r_result" --arg snapshot "$r_snapshot" \
+      --arg paths "$r_paths" --arg missing "$r_missing" \
       --argjson at "$(report_iso_from_epoch "$r_epoch")" \
       --argjson age "$(report_age_seconds "$r_epoch")" \
       '{state:$state,at:$at,age_seconds:$age,
-        snapshot_id:($snapshot|select(length>0) // null),reason:null}')"
+        snapshot_id:($snapshot|select(length>0) // null),
+        paths:(($paths|select(length>0)|split(" ")) // null),
+        paths_missing:(($missing|select(length>0)|split(" ")) // null),
+        reason:null}')"
   else
-    last_run='{"state":"unknown","at":null,"age_seconds":null,"snapshot_id":null,"reason":"no per-target run result has been recorded for this target yet"}'
+    last_run='{"state":"unknown","at":null,"age_seconds":null,"snapshot_id":null,"paths":null,"paths_missing":null,"reason":"no per-target run result has been recorded for this target yet"}'
   fi
 
   jq -cn --arg target "$target" --arg identity "$identity" --arg path "$meta" \
@@ -513,7 +517,8 @@ report_generate_json() {
     (.backups.targets[] | select(.last_run.state == "failed") | {level:"critical",message:("Backup target "+.target+" last run FAILED"),action:("Inspect: journalctl -u domum-media-backup.service, then retry that target")}),
     (.backups.targets[] | select(.last_run.state == "unknown") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"It will be recorded after the next scheduled backup run"}),
     (.backups.targets[] | select(.last_run.state == "incomplete") | {level:"warning",message:("Backup target "+.target+" has a run that started but recorded no outcome (in flight, or interrupted)"),action:"If no backup is running, inspect journalctl -u domum-media-backup.service"}),
-    (.backups.targets[] | select(.last_run.state == "ok" and .last_run.age_seconds != null and .last_run.age_seconds > 172800) | {level:"warning",message:("Backup target "+.target+" last succeeded more than 48 hours ago"),action:"Inspect domum-media-backup.service for that target"})
+    (.backups.targets[] | select(.last_run.state == "ok" and .last_run.age_seconds != null and .last_run.age_seconds > 172800) | {level:"warning",message:("Backup target "+.target+" last succeeded more than 48 hours ago"),action:"Inspect domum-media-backup.service for that target"}),
+    (.backups.targets[] | select(.last_run.paths_missing != null) | {level:"warning",message:("Backup target "+.target+" skipped configured paths that do not exist: "+(.last_run.paths_missing|join(", "))),action:"Fix the path, or remove it from the include list for that target"})
   ]' <<< "$initial")"
   # `info` records an absence that is known, accepted and not an active risk; it
   # must not move the verdict, or every report would read as degraded forever.
@@ -543,7 +548,7 @@ report_render_text() {
     "  Backup timer: " + .backups.timer.enabled + "/" + .backups.timer.active + "; service=" + .backups.timer.result,
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
-    (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)),
+    (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)+(if .last_run.paths==null then "" else "; scope: "+((.last_run.paths|length)|tostring)+" path(s)" end)),
     "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="verified" then " ("+(.backups.restore_verification.target // "?")+", "+(.backups.restore_verification.age_seconds|age)+" ago, checks: "+(.backups.restore_verification.checks // "?")+")" else " ("+(.backups.restore_verification.reason // "no detail")+")"+(if .backups.restore_verification.last_verified_at==null then "" else "; last passed "+(.backups.restore_verification.age_seconds|age)+" ago" end) end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",

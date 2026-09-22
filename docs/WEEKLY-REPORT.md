@@ -118,12 +118,20 @@ means recording new durable state, which is separate work.
 - **Per-target backup results** are now recorded. After each target the backup
   wrapper writes `/var/lib/domum-media/backups/<target>-run.env` atomically with
   the target name, result, start and finish times, the snapshot id it created,
-  and the pinned repository identity. The report reads it directly and never
-  infers a target's result from the aggregate heartbeat.
+  the pinned repository identity, and the **scope** — which configured include
+  paths were actually backed up, and which were skipped because they do not
+  exist. A success that cannot name its scope can overstate what it protected.
+
+  The attempt is marked `running` before anything that can abort, so a killed
+  or rejected run reads as `incomplete` rather than leaving the previous
+  success in place. The report reads the record directly and never infers a
+  target's result from the aggregate heartbeat.
 
   A target reports `unknown` until its first recorded run — evidence appears
   after the next scheduled backup. That is the honest state, not a defect.
-- **Restore verification** has a mechanism:
+- **Restore verification** records both what the most recent attempt did and
+  when verification last genuinely passed; a failure preserves the latter rather
+  than erasing it. The mechanism:
   `domum-media backup verify-restore <target>` restores the Immich dump into an
   isolated scratch directory, revalidates it, and records the result. See
   [RESTORE-VERIFICATION.md](RESTORE-VERIFICATION.md).
