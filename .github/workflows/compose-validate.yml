@@ -40,6 +40,9 @@ jobs:
       - name: Timer auto-enable safety smoke test
         run: tests/timer-auto-enable-safety-smoke.sh
 
+      - name: Snapshot safety gate smoke test
+        run: tests/snapshot-safety-gate-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/

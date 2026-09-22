@@ -1163,9 +1163,11 @@ snapshot_subvolumes() {
   done
 }
 
+# Returns non-zero when it created no snapshot at all. A run that protected
+# nothing must never read as success to its caller.
 snapshot_create() {
   local tag="${1:-manual}"
-  local stamp
+  local stamp created=0 skipped=0
   stamp="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$DOMUM_SNAPSHOT_ROOT"
   while IFS= read -r subvol; do
@@ -1177,10 +1179,14 @@ snapshot_create() {
       btrfs subvolume snapshot -r "$subvol" "$target"
       service="$name"
       record_rollback_entry "$service" "$tag" "$(basename "$target")" "" "" >/dev/null
+      created=$(( created + 1 ))
     else
       echo "[domum-media] Skipping non-subvolume path: $subvol"
+      skipped=$(( skipped + 1 ))
     fi
   done < <(snapshot_subvolumes)
+  echo "[domum-media] Snapshot '${tag}': ${created} created, ${skipped} skipped (not Btrfs subvolumes)."
+  (( created > 0 ))
 }
 
 snapshot_list() {
@@ -1275,6 +1281,37 @@ create_service_snapshot() {
     return 0
   fi
   return 1
+}
+
+# ---- snapshot safety gate --------------------------------------------------
+#
+# Principle: if an operation depends on a snapshot as a safety prerequisite,
+# failing to create that snapshot must not silently become success.
+#
+# Service state paths below $DOMUM_DATA_ROOT must be Btrfs subvolumes for
+# snapshots to work. Where they are ordinary directories the snapshot is
+# skipped, and an operation that would have relied on it has no rollback point.
+#
+# These helpers run in the CALLING shell, never inside a command substitution,
+# so that `die` actually stops the script instead of only the subshell.
+
+snapshot_policy() {
+  local policy="${SNAPSHOT_POLICY:-REQUIRED}"
+  printf '%s' "${policy^^}"
+}
+
+# $1 = what wanted the snapshot, $2 = why it was not created.
+snapshot_protection_unavailable() {
+  local what="$1" detail="$2"
+  if [[ "$(snapshot_policy)" == "WARN" ]]; then
+    warn "$what: $detail"
+    warn "Continuing because SNAPSHOT_POLICY=WARN — this operation has NO rollback point."
+    return 0
+  fi
+  die "$what: $detail
+Refusing to continue: this operation depends on a snapshot for rollback and none was created.
+Service state paths must be Btrfs subvolumes; see docs/SNAPSHOT-MODEL.md.
+To proceed deliberately without rollback protection, set SNAPSHOT_POLICY=WARN in $CFG_FILE."
 }
 
 snapshot_prune() {
@@ -2105,7 +2142,18 @@ refresh_images() {
     verify_backup_freshness "$logical_service"
     version_key="$(printf '%s_IMAGE' "$(uppercase_token "$logical_service")")"
     before_version="$(service_configured_version "$version_key")"
-    snapshot_name="$(create_service_snapshot "$logical_service" "pre-update" "$before_image" "$after_image" || true)"
+    # The snapshot IS the rollback mechanism for this update: if it was not
+    # created, auto-rollback below silently cannot run. Gate in the calling
+    # shell so a refusal actually stops the rollout.
+    snapshot_name=""
+    if ! snapshot_name="$(create_service_snapshot "$logical_service" "pre-update" "$before_image" "$after_image")"; then
+      snapshot_name=""
+    fi
+    if [[ -z "$snapshot_name" ]]; then
+      snapshot_protection_unavailable \
+        "Cannot snapshot $logical_service before updating it" \
+        "$(service_data_path "$logical_service" 2>/dev/null || printf '%s' "$logical_service") is not a Btrfs subvolume, so no pre-update snapshot exists and automatic rollback would be unavailable"
+    fi
     compose_svcs="$(service_compose_services "$logical_service" || true)"
     [[ -n "$compose_svcs" ]] || continue
     echo "[domum-media] Updating $logical_service (${compose_svcs})"
@@ -2385,7 +2433,18 @@ immich_refresh_bundle() {
   local old_redis="$IMMICH_REDIS_IMAGE"
   local old_postgres="$IMMICH_POSTGRES_IMAGE"
   local snapshot_name
-  snapshot_name="$(create_service_snapshot immich "pre-immich-bundle" "$old_server" "$server_image" || true)"
+  # A bundle apply can migrate the Immich database schema. Without a snapshot
+  # the only fallback below is re-pinning the old images against an already
+  # migrated database, which is not a data rollback.
+  snapshot_name=""
+  if ! snapshot_name="$(create_service_snapshot immich "pre-immich-bundle" "$old_server" "$server_image")"; then
+    snapshot_name=""
+  fi
+  if [[ -z "$snapshot_name" ]]; then
+    snapshot_protection_unavailable \
+      "Cannot snapshot Immich before applying the bundle" \
+      "$(service_data_path immich 2>/dev/null || printf 'the Immich state path') is not a Btrfs subvolume, so no pre-bundle snapshot exists and a failed rollout could not restore the database"
+  fi
 
   config_set IMMICH_SERVER_IMAGE "$server_image"
   config_set IMMICH_MACHINE_LEARNING_IMAGE "$ml_image"
@@ -2542,7 +2601,13 @@ apply() {
   validate_immich_compose_config
 
   echo "[domum-media] Pre-apply btrfs snapshot..."
-  snapshot_create "pre-apply" || echo "[domum-media] Snapshot step failed (continuing)."
+  # apply is routine convergence and does not itself depend on the snapshot for
+  # rollback, so this stays non-fatal -- but it must be loud rather than
+  # silently reporting a snapshot that never happened.
+  if ! snapshot_create "pre-apply"; then
+    warn "No pre-apply snapshot was created; this apply has no rollback point."
+    warn "Service state paths are not Btrfs subvolumes — see docs/SNAPSHOT-MODEL.md."
+  fi
 
   echo "[domum-media] Applying desired state..."
   compose_cmd up -d --remove-orphans
@@ -2663,7 +2728,14 @@ snapshot_cmd() {
   load_cfg
   local sub="${1:-}"
   case "$sub" in
-    create) shift; snapshot_create "${1:-manual}" ;;
+    create)
+      shift
+      # Propagate the real outcome: an operator who asked for a snapshot and got
+      # none must not see a success exit status.
+      if ! snapshot_create "${1:-manual}"; then
+        die "No snapshot was created. Service state paths are not Btrfs subvolumes; see docs/SNAPSHOT-MODEL.md."
+      fi
+      ;;
     list)   snapshot_list ;;
     prune)  snapshot_prune ;;
     *) die "Usage: domum-media snapshot {create [tag]|list|prune}" ;;
@@ -3550,7 +3622,12 @@ EOF
   compose_cmd rm -f immich_server immich_machine_learning immich_postgres immich_redis 2>/dev/null || true
 
   echo "[domum-media] Pre-reset btrfs snapshot..."
-  snapshot_create "pre-immich-reset" || echo "[domum-media] Snapshot step failed (continuing)."
+  # This snapshot is the only safety net before the rm -rf below.
+  if ! snapshot_create "pre-immich-reset"; then
+    snapshot_protection_unavailable \
+      "Cannot snapshot Immich state before resetting the database" \
+      "no Btrfs subvolume was snapshotted, so the data about to be deleted cannot be restored"
+  fi
 
   if [[ -d "$data_dir" ]]; then
     echo "[domum-media] Removing $data_dir"
