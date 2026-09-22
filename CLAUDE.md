@@ -58,6 +58,13 @@ Never:
 - treat snapshot success as proven merely because `/srv/data` itself is Btrfs;
 - use the current snapshot layer to justify a risky deployment.
 
+Operations that depend on a snapshot for rollback (stateful image update,
+Immich bundle apply, `immich reset-db`) **refuse to run** when no snapshot could
+be created. `SNAPSHOT_POLICY=WARN` is the deliberate, documented override; it
+lets the operation proceed without rollback protection and does not create any.
+Never re-introduce a call site that downgrades a failed snapshot to a warning or
+swallows it — `tests/snapshot-safety-gate-smoke.sh` enforces this.
+
 Btrfs migration or restructuring is a separate high-risk project requiring
 explicit operator approval. Do not start it opportunistically.
 

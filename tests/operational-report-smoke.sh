@@ -127,8 +127,10 @@ jq -e 'all(.snapshot_protection.services[]; .state != "protected")' "$report_jso
   || fail "an ordinary directory was reported as snapshot-protected"
 jq -e 'any(.snapshot_protection.services[]; .state == "unprotected")' "$report_json" >/dev/null \
   || fail "expected an unprotected snapshot entry for an ordinary directory"
-jq -e 'any(.findings[]; .level == "critical" and (.message | test("snapshot")))' "$report_json" >/dev/null \
+jq -e 'any(.findings[]; .message | test("snapshot protection"))' "$report_json" >/dev/null \
   || fail "missing snapshot protection finding"
+jq -e 'all(.snapshot_protection.services[]; .tier != null)' "$report_json" >/dev/null \
+  || fail "snapshot protection entries must carry a risk tier"
 
 # An uninspectable container must still APPEAR in the report. jq object
 # construction drops the whole object when an optional field selects nothing,
@@ -239,5 +241,45 @@ rm -f "$FAKE_BIN/docker"
 # ---------------------------------------------------------------------------
 grep -A6 '^ensure_dirs() {' "$REPO_ROOT/bin/domum-media-backup" | grep -qE '^\s*touch ' \
   && fail "ensure_dirs still touches the backup log, so a read-only report mutates its mtime"
+
+# ---------------------------------------------------------------------------
+# 11. Snapshot finding severity must follow actual risk, and must ESCALATE when
+#     the safety gate is disabled. Severity is never softened to look healthy.
+# ---------------------------------------------------------------------------
+sed 's/^ENABLE_IMMICH=1$/ENABLE_IMMICH=1\nSNAPSHOT_POLICY=WARN/' "$TMP_DIR/harness.sh" > "$TMP_DIR/harness-warn.sh"
+bash "$TMP_DIR/harness-warn.sh" > "$TMP_DIR/report-warn.json" 2>/dev/null \
+  || fail "report generation failed with SNAPSHOT_POLICY=WARN"
+
+jq -e '.snapshot_protection.enforced == false' "$TMP_DIR/report-warn.json" >/dev/null \
+  || fail "SNAPSHOT_POLICY=WARN must report the gate as not enforced"
+jq -e 'any(.findings[]; .level == "critical" and (.message | test("gate is disabled")))' "$TMP_DIR/report-warn.json" >/dev/null \
+  || fail "with the gate disabled, unprotected state must be critical"
+
+# With the gate enforcing, the same unprotected state must NOT be critical --
+# risky operations are refused rather than run unprotected.
+jq -e '.snapshot_protection.enforced == true' "$report_json" >/dev/null \
+  || fail "the default policy must report the gate as enforced"
+jq -e 'all(.findings[]; (.level == "critical" and (.message | test("snapshot protection"))) | not)' "$report_json" >/dev/null \
+  || fail "with the gate enforcing, unprotected state should not be critical"
+
+# The verdict rule itself is exercised directly, because the live fixture always
+# contains a critical finding and so cannot distinguish the rules on its own.
+# Extract the shipped jq program and run it against synthetic finding sets.
+overall_filter="$(sed -n 's/^  overall="\$(jq -r '"'"'\(.*\)'"'"' <<< "\$findings")"$/\1/p' "$REPO_ROOT/bin/domum-media-report")"
+[ -n "$overall_filter" ] || fail "could not extract the overall verdict rule from the report library"
+
+verdict_for() { jq -r "$overall_filter" <<< "$1"; }
+[ "$(verdict_for '[{"level":"info"}]')" = "healthy" ] \
+  || fail "an informational finding must not make the report look degraded"
+[ "$(verdict_for '[{"level":"info"},{"level":"warning"}]')" = "warning" ] \
+  || fail "a warning must still surface alongside informational findings"
+[ "$(verdict_for '[{"level":"info"},{"level":"critical"}]')" = "critical" ] \
+  || fail "a critical must still surface alongside informational findings"
+[ "$(verdict_for '[]')" = "healthy" ] \
+  || fail "no findings must read as healthy"
+
+# ...and the live report's own verdict must obey that same rule.
+[ "$(jq -r '.overall' "$report_json")" = "$(verdict_for "$(jq -c '.findings' "$report_json")")" ] \
+  || fail "the report's overall verdict does not match its own severity rule"
 
 echo "PASS: operational report smoke test"
