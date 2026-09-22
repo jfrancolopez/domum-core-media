@@ -5,7 +5,7 @@ Self-hosted media stack for Debian 13 with:
 - Compose-managed services
 - delayed container updates
 - Immich bundle management
-- btrfs snapshot tooling + rollback metadata (service-level protection requires subvolumes)
+- btrfs snapshot tooling + rollback metadata (event-driven, not scheduled; service-level protection requires subvolumes)
 - restic multi-target backups
 - unattended Debian security patches
 - encrypted recovery-pack generation
@@ -96,3 +96,4 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/SECURITY-PATCHES.md](docs/SECURITY-PATCHES.md)
 - [docs/P0-BACKUP-BASELINE.md](docs/P0-BACKUP-BASELINE.md)
 - [docs/CORE-MEDIA-OPERATIONS-AUDIT.md](docs/CORE-MEDIA-OPERATIONS-AUDIT.md)
+- [docs/SNAPSHOT-MODEL.md](docs/SNAPSHOT-MODEL.md)
