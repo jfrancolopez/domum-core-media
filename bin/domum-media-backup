@@ -489,11 +489,56 @@ restic_backup_to() {
     paths+=("$path")
   done
   log "restic backup -> $target"
-  restic_for_target "$target" backup \
+  # Capture the run so the snapshot it created can be recorded as evidence.
+  # Output is still appended to the log, just at the end of the run rather than
+  # streamed; restic emits no progress bar when stdout is not a terminal.
+  local out rc=0
+  BACKUP_LAST_SNAPSHOT_ID=""
+  out="$(restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
     --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
     --exclude "${DOMUM_MEDIA_ROOT}/.cache/*" \
-    "${paths[@]}"
+    "${paths[@]}" 2>&1)" || rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out" | tee -a "$LOG_FILE" >&2
+  BACKUP_LAST_SNAPSHOT_ID="$(printf '%s\n' "$out" \
+    | sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p' | tail -1)"
+  return "$rc"
+}
+
+# Durable per-target run evidence.
+#
+# The aggregate heartbeat says only that every enabled target succeeded; it
+# cannot attribute a result to one target, and a new target would silently
+# inherit its credibility. This records, per target, what actually happened.
+# Written atomically so a crashed run cannot leave a half-written record.
+record_backup_target_run() {
+  local target="$1" result="$2" started="$3" snapshot_id="${4:-}"
+  local dir meta file tmp repo_id=""
+  dir="$REPO_META_DIR"
+  mkdir -p "$dir"
+  meta="$(repo_meta_file "$target")"
+  if [[ -f "$meta" ]]; then
+    # Read the already-pinned identity; never re-query the repository for it.
+    repo_id="$(
+      unset REPOSITORY_ID
+      # shellcheck disable=SC1090
+      . "$meta" >/dev/null 2>&1 || true
+      printf '%s' "${REPOSITORY_ID:-}"
+    )"
+  fi
+  file="$dir/${target}-run.env"
+  tmp="$(mktemp "$dir/.${target}-run.env.XXXXXX")" || return 1
+  {
+    printf 'SCHEMA_VERSION=1\n'
+    printf 'TARGET=%s\n' "$target"
+    printf 'RESULT=%s\n' "$result"
+    printf 'STARTED_TS=%s\n' "$started"
+    printf 'FINISHED_TS=%s\n' "$(date -Iseconds)"
+    printf 'SNAPSHOT_ID=%s\n' "$snapshot_id"
+    printf 'REPOSITORY_ID=%s\n' "$repo_id"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$file"
 }
 
 restic_forget_for() {
@@ -560,10 +605,18 @@ do_daily_backup() {
     esac
   fi
 
+  local target_started
   while IFS= read -r target; do
     ran_any=1
-    check_repo_identity "$target"
-    restic_backup_to "$target"
+    target_started="$(date -Iseconds)"
+    if check_repo_identity "$target" && restic_backup_to "$target"; then
+      record_backup_target_run "$target" success "$target_started" "${BACKUP_LAST_SNAPSHOT_ID:-}" \
+        || log "WARNING: could not record run evidence for $target"
+    else
+      record_backup_target_run "$target" failure "$target_started" "" \
+        || log "WARNING: could not record run evidence for $target"
+      die "Backup failed for target: $target"
+    fi
   done < <(enabled_backup_targets)
 
   while IFS= read -r target; do

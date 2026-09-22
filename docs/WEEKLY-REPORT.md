@@ -115,11 +115,14 @@ sudo systemctl enable --now domum-media-weekly-report.timer
 These are reported honestly as `unknown` rather than guessed. Closing them
 means recording new durable state, which is separate work.
 
-- **Per-target backup results.** The daily backup writes a single aggregate
-  heartbeat and no per-target run record, so `backups.targets[].last_run` is
-  `unknown`. The aggregate heartbeat is written only after every enabled target
-  succeeds, so it is not a false-success signal — but it cannot attribute a
-  result to a specific target.
+- **Per-target backup results** are now recorded. After each target the backup
+  wrapper writes `/var/lib/domum-media/backups/<target>-run.env` atomically with
+  the target name, result, start and finish times, the snapshot id it created,
+  and the pinned repository identity. The report reads it directly and never
+  infers a target's result from the aggregate heartbeat.
+
+  A target reports `unknown` until its first recorded run — evidence appears
+  after the next scheduled backup. That is the honest state, not a defect.
 - **Restore verification.** Nothing on the host records a restore drill, so
   `backups.restore_verification` is `unknown`. The P0 scratch restore was
   performed and documented manually; it left no machine-readable state.

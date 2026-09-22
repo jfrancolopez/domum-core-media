@@ -243,9 +243,10 @@ report_latest_backup_snapshot() {
 # reported from the metadata file's presence only; its contents are never read
 # into the report.
 report_backup_target_state() {
-  local target="$1" meta meta_dir identity=unknown
+  local target="$1" meta meta_dir run_file identity=unknown
   meta_dir="${REPO_META_DIR:-$DOMUM_STATE_ROOT/backups}"
   meta="$meta_dir/$target-repo.env"
+  run_file="$meta_dir/$target-run.env"
   if [[ -r "$meta" ]]; then
     identity=pinned
   elif [[ -e "$meta" ]]; then
@@ -253,10 +254,40 @@ report_backup_target_state() {
   elif [[ -r "$meta_dir" ]]; then
     identity=missing
   fi
+
+  # Per-target run evidence, written by the backup wrapper after each target.
+  # Absent evidence stays "unknown"; it is never inferred from the aggregate
+  # heartbeat, which cannot attribute a result to one target.
+  local last_run
+  if [[ -r "$run_file" ]]; then
+    local r_result r_finished r_snapshot r_epoch=""
+    eval "$(
+      unset RESULT FINISHED_TS SNAPSHOT_ID
+      # shellcheck disable=SC1090
+      . "$run_file" >/dev/null 2>&1 || true
+      printf 'r_result=%q\nr_finished=%q\nr_snapshot=%q\n' \
+        "${RESULT:-}" "${FINISHED_TS:-}" "${SNAPSHOT_ID:-}"
+    )"
+    [[ -n "$r_finished" ]] && r_epoch="$(date -d "$r_finished" +%s 2>/dev/null || true)"
+    case "$r_result" in
+      success) r_result=ok ;;
+      failure) r_result=failed ;;
+      *)       r_result=unknown ;;
+    esac
+    last_run="$(jq -cn --arg state "$r_result" --arg snapshot "$r_snapshot" \
+      --argjson at "$(report_iso_from_epoch "$r_epoch")" \
+      --argjson age "$(report_age_seconds "$r_epoch")" \
+      '{state:$state,at:$at,age_seconds:$age,
+        snapshot_id:($snapshot|select(length>0) // null),reason:null}')"
+  else
+    last_run='{"state":"unknown","at":null,"age_seconds":null,"snapshot_id":null,"reason":"no per-target run result has been recorded for this target yet"}'
+  fi
+
   jq -cn --arg target "$target" --arg identity "$identity" --arg path "$meta" \
+    --argjson last_run "$last_run" \
     '{target:$target,
       repository_identity:{state:$identity,path:$path},
-      last_run:{state:"unknown",reason:"no per-target run result is recorded; only an aggregate backup heartbeat exists"}}'
+      last_run:$last_run}'
 }
 
 # Restore verification has no durable state on this host yet. Report unknown
@@ -418,7 +449,9 @@ report_generate_json() {
     (.updates.candidates[] | {level:"warning",message:(.service+" has a staged update candidate"),action:"Review: domum-media updates summary"}),
     (.backups.restore_verification | select(.state != "recorded") | {level:"warning",message:"No restore verification has been recorded",action:"Run a scratch restore drill; see docs/disaster-recovery.md"}),
     (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
-    (.backups.targets[] | select(.last_run.state != "ok") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"Backup success is only recorded as one aggregate heartbeat"})
+    (.backups.targets[] | select(.last_run.state == "failed") | {level:"critical",message:("Backup target "+.target+" last run FAILED"),action:("Inspect: journalctl -u domum-media-backup.service, then retry that target")}),
+    (.backups.targets[] | select(.last_run.state == "unknown") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"It will be recorded after the next scheduled backup run"}),
+    (.backups.targets[] | select(.last_run.state == "ok" and .last_run.age_seconds != null and .last_run.age_seconds > 172800) | {level:"warning",message:("Backup target "+.target+" last succeeded more than 48 hours ago"),action:"Inspect domum-media-backup.service for that target"})
   ]' <<< "$initial")"
   # `info` records an absence that is known, accepted and not an active risk; it
   # must not move the verdict, or every report would read as degraded forever.
@@ -448,7 +481,7 @@ report_render_text() {
     "  Backup timer: " + .backups.timer.enabled + "/" + .backups.timer.active + "; service=" + .backups.timer.result,
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
-    (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state),
+    (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)),
     "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="recorded" then "; age="+(.backups.restore_verification.age_seconds|age) else " ("+.backups.restore_verification.reason+")" end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",
