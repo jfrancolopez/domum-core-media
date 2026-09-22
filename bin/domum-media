@@ -4287,7 +4287,7 @@ Usage:
   domum-media refresh-images [--force] [--check-only] [--apply-now]
   domum-media host-upgrade [--force]
   domum-media logs <service>
-  domum-media backup {init <target> [--adopt-existing]|plan <target>|verify <target>|adopt-repo <target>|--check|--check-deep [repo]|--restore <snapshot> <target>}
+  domum-media backup {init <target> [--adopt-existing]|plan <target>|verify <target>|verify-restore <target>|adopt-repo <target>|--check|--check-deep [repo]|--restore <snapshot> <target>}
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
   domum-media checkup [--json]

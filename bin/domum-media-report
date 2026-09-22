@@ -292,21 +292,49 @@ report_backup_target_state() {
 
 # Restore verification has no durable state on this host yet. Report unknown
 # rather than implying the backups have been proven restorable.
+# Only a recorded, successful, isolated restore counts. A successful backup does
+# not, and neither does a repository check. Records are written solely by
+# `domum-media-backup verify-restore`.
 report_restore_verification() {
-  local dir="$DOMUM_STATE_ROOT/restore-verification" latest="" epoch=""
+  local dir="$DOMUM_STATE_ROOT/restore-verification"
+  local best_epoch="" best_target="" best_snapshot="" best_checks="" found_failure=0 f
   if [[ -d "$dir" ]]; then
-    latest="$(find "$dir" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null \
-      | sort -rn | head -1 | cut -d' ' -f2- || true)"
+    shopt -s nullglob
+    for f in "$dir"/*.env; do
+      local v_result v_ts v_target v_snapshot v_checks v_epoch=""
+      eval "$(
+        unset RESULT VERIFIED_TS TARGET SNAPSHOT_ID CHECKS
+        # shellcheck disable=SC1090
+        . "$f" >/dev/null 2>&1 || true
+        printf 'v_result=%q\nv_ts=%q\nv_target=%q\nv_snapshot=%q\nv_checks=%q\n' \
+          "${RESULT:-}" "${VERIFIED_TS:-}" "${TARGET:-}" "${SNAPSHOT_ID:-}" "${CHECKS:-}"
+      )"
+      if [[ "$v_result" != "success" ]]; then
+        found_failure=1
+        continue
+      fi
+      [[ -n "$v_ts" ]] && v_epoch="$(date -d "$v_ts" +%s 2>/dev/null || true)"
+      [[ "$v_epoch" =~ ^[0-9]+$ ]] || continue
+      if [[ -z "$best_epoch" ]] || (( v_epoch > best_epoch )); then
+        best_epoch="$v_epoch"; best_target="$v_target"
+        best_snapshot="$v_snapshot"; best_checks="$v_checks"
+      fi
+    done
+    shopt -u nullglob
   fi
-  if [[ -n "$latest" ]]; then
-    epoch="$(stat -c %Y -- "$latest" 2>/dev/null || true)"
-    jq -cn --arg path "$latest" \
-      --argjson at "$(report_iso_from_epoch "$epoch")" \
-      --argjson age "$(report_age_seconds "$epoch")" \
-      '{state:"recorded",path:$path,last_verified_at:$at,age_seconds:$age,reason:null}'
+
+  if [[ -n "$best_epoch" ]]; then
+    jq -cn --arg target "$best_target" --arg snapshot "$best_snapshot" --arg checks "$best_checks" \
+      --argjson at "$(report_iso_from_epoch "$best_epoch")" \
+      --argjson age "$(report_age_seconds "$best_epoch")" \
+      '{state:"verified",target:$target,snapshot_id:($snapshot|select(length>0) // null),
+        checks:($checks|select(length>0) // null),last_verified_at:$at,age_seconds:$age,reason:null}'
+  elif (( found_failure == 1 )); then
+    jq -cn '{state:"failed",target:null,snapshot_id:null,checks:null,last_verified_at:null,age_seconds:null,
+             reason:"the most recent restore verification did not pass"}'
   else
-    jq -cn '{state:"unknown",path:null,last_verified_at:null,age_seconds:null,
-             reason:"no restore verification result has been recorded on this host"}'
+    jq -cn '{state:"unknown",target:null,snapshot_id:null,checks:null,last_verified_at:null,age_seconds:null,
+             reason:"no successful restore verification has been recorded on this host"}'
   fi
 }
 
@@ -447,7 +475,9 @@ report_generate_json() {
     (.backups.timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup timer is not enabled and active",action:"Inspect domum-media-backup.timer"}),
     (.backups.check_timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup check timer is not enabled and active",action:"Inspect domum-media-check.timer"}),
     (.updates.candidates[] | {level:"warning",message:(.service+" has a staged update candidate"),action:"Review: domum-media updates summary"}),
-    (.backups.restore_verification | select(.state != "recorded") | {level:"warning",message:"No restore verification has been recorded",action:"Run a scratch restore drill; see docs/disaster-recovery.md"}),
+    (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
+    (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
+    (.backups.restore_verification | select(.state == "verified" and .age_seconds != null and .age_seconds > 2678400) | {level:"warning",message:"The last successful restore verification is over 31 days old",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
     (.backups.targets[] | select(.last_run.state == "failed") | {level:"critical",message:("Backup target "+.target+" last run FAILED"),action:("Inspect: journalctl -u domum-media-backup.service, then retry that target")}),
     (.backups.targets[] | select(.last_run.state == "unknown") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"It will be recorded after the next scheduled backup run"}),
@@ -482,7 +512,7 @@ report_render_text() {
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
     (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)),
-    "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="recorded" then "; age="+(.backups.restore_verification.age_seconds|age) else " ("+.backups.restore_verification.reason+")" end),
+    "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="verified" then " ("+(.backups.restore_verification.target // "?")+", "+(.backups.restore_verification.age_seconds|age)+" ago, checks: "+(.backups.restore_verification.checks // "?")+")" else " ("+(.backups.restore_verification.reason // "no detail")+")" end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",
     "Updates",

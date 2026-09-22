@@ -123,7 +123,7 @@ import path for the Immich dump, per-target status, automated restore proof.
 | 30 | [Per-target backup isolation + heartbeats](task-30-per-target-backup-isolation.md) **[shared-philosophy]** | PARTIAL — per-target run evidence recorded and reported; per-target isolation of failures remains | medium | low-med | — |
 | 31 | [Guided Immich DB restore](task-31-immich-db-restore.md) | pending | medium | medium | — |
 | 13 | [Enrich the recovery pack](task-13-enrich-recovery-pack.md) **[shared-philosophy]** | PARTIAL (`1da3f2c`; inventory/dry-run/inspect remain) | small-med | low | — |
-| 32 | [Monthly restore verification](task-32-restore-verification.md) **[shared-philosophy]** | PARTIAL — `report` exposes `restore_verification: unknown`; writing durable state remains | medium | low | yes |
+| 32 | [Monthly restore verification](task-32-restore-verification.md) **[shared-philosophy]** | PARTIAL — `verify-restore` records durable evidence; scheduling and first live run remain (operator) | medium | low | yes |
 
 ### Phase 5 — Catalog + health
 
