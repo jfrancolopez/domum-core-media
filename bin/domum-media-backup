@@ -718,16 +718,42 @@ restore_verification_dir() {
 
 record_restore_verification() {
   local target="$1" result="$2" snapshot_id="$3" artifact="$4" bytes="$5" checks="$6" reason="${7:-}"
-  local dir file tmp
+  local dir file tmp now
   dir="$(restore_verification_dir)"
   mkdir -p "$dir"
   file="$dir/${target}.env"
+  now="$(date -Iseconds)"
+
+  # A failed or interrupted verification must never erase the record of when
+  # verification last genuinely passed. Carry that forward.
+  local prev_ok_ts="" prev_ok_snap=""
+  if [[ -f "$file" ]]; then
+    eval "$(
+      unset RESULT VERIFIED_TS SNAPSHOT_ID LAST_SUCCESS_TS LAST_SUCCESS_SNAPSHOT_ID
+      # shellcheck disable=SC1090
+      . "$file" >/dev/null 2>&1 || true
+      if [[ "${RESULT:-}" == "success" ]]; then
+        printf 'prev_ok_ts=%q\nprev_ok_snap=%q\n' "${VERIFIED_TS:-}" "${SNAPSHOT_ID:-}"
+      else
+        printf 'prev_ok_ts=%q\nprev_ok_snap=%q\n' "${LAST_SUCCESS_TS:-}" "${LAST_SUCCESS_SNAPSHOT_ID:-}"
+      fi
+    )"
+  fi
+  local last_ok_ts last_ok_snap
+  if [[ "$result" == "success" ]]; then
+    last_ok_ts="$now"; last_ok_snap="$snapshot_id"
+  else
+    last_ok_ts="$prev_ok_ts"; last_ok_snap="$prev_ok_snap"
+  fi
+
   tmp="$(mktemp "$dir/.${target}.env.XXXXXX")" || return 1
   {
-    printf 'SCHEMA_VERSION=1\n'
+    printf 'SCHEMA_VERSION=2\n'
     printf 'TARGET=%s\n' "$target"
     printf 'RESULT=%s\n' "$result"
-    printf 'VERIFIED_TS=%s\n' "$(date -Iseconds)"
+    printf 'VERIFIED_TS=%s\n' "$now"
+    printf 'LAST_SUCCESS_TS=%s\n' "$last_ok_ts"
+    printf 'LAST_SUCCESS_SNAPSHOT_ID=%s\n' "$last_ok_snap"
     printf 'SNAPSHOT_ID=%s\n' "$snapshot_id"
     printf 'ARTIFACT=%s\n' "$artifact"
     printf 'BYTES=%s\n' "$bytes"
@@ -754,8 +780,14 @@ do_verify_restore() {
       die "Refusing to verify: the scratch location $vdir is inside a live data root." ;;
   esac
   scratch="$(mktemp -d "$vdir/scratch.XXXXXX")" || die "Cannot create a scratch directory"
-  # Always clean up, including on interruption.
-  trap 'rm -rf "$scratch"' EXIT INT TERM
+  # Always clean up, including on interruption. The signal traps must also
+  # TERMINATE: a cleanup-only trap deletes the scratch and then lets execution
+  # continue into validation, which would find the artefact missing and record a
+  # genuine-looking failure for a run that was merely interrupted.
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$scratch'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$scratch'; exit 143" HUP INT TERM
 
   local rel="$DOMUM_DATA_ROOT/immich/backup-staging/immich-postgres.dump.sql.gz"
   log "restore verification: $target -> $scratch (isolated; no live path is touched)"
