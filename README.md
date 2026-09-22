@@ -97,3 +97,4 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/P0-BACKUP-BASELINE.md](docs/P0-BACKUP-BASELINE.md)
 - [docs/CORE-MEDIA-OPERATIONS-AUDIT.md](docs/CORE-MEDIA-OPERATIONS-AUDIT.md)
 - [docs/SNAPSHOT-MODEL.md](docs/SNAPSHOT-MODEL.md)
+- [docs/RESTORE-VERIFICATION.md](docs/RESTORE-VERIFICATION.md)

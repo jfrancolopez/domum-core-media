@@ -123,9 +123,14 @@ means recording new durable state, which is separate work.
 
   A target reports `unknown` until its first recorded run — evidence appears
   after the next scheduled backup. That is the honest state, not a defect.
-- **Restore verification.** Nothing on the host records a restore drill, so
-  `backups.restore_verification` is `unknown`. The P0 scratch restore was
-  performed and documented manually; it left no machine-readable state.
+- **Restore verification** has a mechanism:
+  `domum-media backup verify-restore <target>` restores the Immich dump into an
+  isolated scratch directory, revalidates it, and records the result. See
+  [RESTORE-VERIFICATION.md](RESTORE-VERIFICATION.md).
+
+  It reports `unknown` until that command has actually run and passed. The P0
+  scratch restore is valid historical evidence but left no machine-readable
+  state, and is deliberately not converted into a record.
 
 ## Related
 
