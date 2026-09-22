@@ -529,6 +529,14 @@ list_latest_snapshots() {
   (( any == 1 )) || echo "(no enabled backup targets)"
 }
 
+latest_snapshot_json() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "Usage: domum-media-backup --latest-snapshot-json <target>"
+  backup_target_enabled "$target" || die "Backup target is not enabled: $target"
+  restic_for_target "$target" snapshots --latest 1 --json \
+    | jq -c 'if length == 0 then {id:null,time:null,hostname:null,tags:[]} else .[-1] | {id:(.short_id // (.id[0:8])),time,hostname,tags:(.tags // [])} end'
+}
+
 heartbeat() {
   date -Iseconds > "$HEARTBEAT_FILE"
   if [[ -n "${BACKUP_HEARTBEAT_URL:-}" ]]; then
@@ -793,6 +801,7 @@ main() {
     --weekly-cloud-forget) do_weekly_retention ;;
     --restore)            shift; do_restore "$@" ;;
     --snapshots)          list_latest_snapshots ;;
+    --latest-snapshot-json) shift; latest_snapshot_json "${1:-}" ;;
     init)                 shift; do_init_repo "$@" ;;
     plan)                 shift; do_plan_target "${1:-}" ;;
     verify)               shift; do_verify_target "${1:-}" ;;
@@ -810,6 +819,8 @@ Usage:
   domum-media-backup --weekly-retention     Run weekly retention targets
   domum-media-backup --restore <snap> <target> [--repo target-name]
   domum-media-backup --snapshots            Show latest snapshot per target
+  domum-media-backup --latest-snapshot-json <target>
+                                            Machine-readable latest snapshot
   domum-media-backup init <target> [--adopt-existing]
                                             Initialize restic repository
   domum-media-backup plan <target>          Show what would be backed up
