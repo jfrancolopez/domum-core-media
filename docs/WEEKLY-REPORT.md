@@ -53,6 +53,27 @@ four rules, each covered by `tests/operational-report-smoke.sh`:
    `unprotected` with the reason, and raises a critical finding. `/srv/data`
    being Btrfs is never treated as evidence that a service path is protected.
 
+## Finding severity
+
+Severity follows the actual operational risk, not the bare absence of a
+snapshot. The inputs are the snapshot gate's policy and the service's own risk
+tier (`service_strict_backup_required`, which the CLI already uses to decide
+whether a backup is mandatory before an update).
+
+| Condition | Level | Why |
+|---|---|---|
+| Unprotected, `SNAPSHOT_POLICY` **not** `REQUIRED` | `critical` | A stateful operation can proceed with no rollback point. |
+| Unprotected, gate enforcing, **strict** service (Immich) | `warning` | Degraded: risky operations are refused, but recovery would depend on restic alone. |
+| Unprotected, gate enforcing, standard service | `info` | Known absence for rebuildable state; risky operations are refused. |
+
+Severity therefore **escalates** if the gate is turned off. It is never softened
+to make the report look healthy.
+
+`overall` is `critical` if any finding is critical, `warning` if any is a
+warning, otherwise `healthy`. An `info` finding records a known, accepted
+absence and does not move the verdict — otherwise the report would read as
+degraded permanently and stop carrying information.
+
 ## Schema
 
 `--json` emits a stable document. Consumers should key off `schema_version`.
@@ -71,8 +92,8 @@ four rules, each covered by `tests/operational-report-smoke.sh`:
 | `backups` | Heartbeat, timers, latest snapshot per target, per-target state, restore verification. |
 | `recovery_pack` | Presence and age. |
 | `updates` | Image refresh policy and timer, plus staged candidates. |
-| `snapshot_protection.services[]` | Per-service `protected` / `unprotected` / `unknown`, with a reason. |
-| `findings[]` | `level`, `message`, `action`. |
+| `snapshot_protection` | `policy`, `enforced`, and per-service `protected` / `unprotected` / `unknown` with a reason and a risk `tier`. |
+| `findings[]` | `level` (`critical` / `warning` / `info`), `message`, `action`. |
 
 Every finding carries a remediation `action`. `overall` is `critical` if any
 finding is critical, `warning` if any finding exists, otherwise `healthy`.

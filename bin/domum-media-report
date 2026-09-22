@@ -171,8 +171,21 @@ report_filesystem() {
     '{path:$path,state:"available",total_bytes:$total,used_bytes:$used,available_bytes:$available,used_percent:$percent}'
 }
 
+# The CLI already encodes a risk tier: service_strict_backup_required is true
+# only for services whose loss is not acceptable (Immich). Reuse it rather than
+# inventing a second opinion about which state matters.
+report_service_tier() {
+  if declare -F service_strict_backup_required >/dev/null 2>&1 \
+     && service_strict_backup_required "$1" >/dev/null 2>&1; then
+    printf 'strict'
+  else
+    printf 'standard'
+  fi
+}
+
 report_snapshot_protection() {
-  local service="$1" path="$2" state reason latest="" latest_epoch=""
+  local service="$1" path="$2" state reason latest="" latest_epoch="" tier
+  tier="$(report_service_tier "$service")"
   if [[ ! -d "$path" ]]; then
     state=unknown; reason="state path is missing"
   elif ! cmd_exists btrfs; then
@@ -185,9 +198,10 @@ report_snapshot_protection() {
     state=unprotected; reason="state path is an ordinary directory, not a Btrfs subvolume"
   fi
   jq -cn --arg service "$service" --arg path "$path" --arg state "$state" --arg reason "$reason" \
+    --arg tier "$tier" \
     --arg latest "$latest" --argjson latest_at "$(report_iso_from_epoch "$latest_epoch")" \
     --argjson age "$(report_age_seconds "$latest_epoch")" \
-    '{service:$service,path:$path,state:$state,reason:$reason,latest_snapshot:($latest|select(length>0) // null),latest_snapshot_at:$latest_at,latest_snapshot_age_seconds:$age}'
+    '{service:$service,path:$path,state:$state,reason:$reason,tier:$tier,latest_snapshot:($latest|select(length>0) // null),latest_snapshot_at:$latest_at,latest_snapshot_age_seconds:$age}'
 }
 
 report_update_candidate() {
@@ -361,13 +375,14 @@ report_generate_json() {
     --argjson targets "$(jq -s . "$targets_file")" --argjson restore_verification "$(report_restore_verification)" \
     --argjson recovery "$recovery_json" --argjson candidates "$(jq -s . "$updates_file")" \
     --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
+    --arg snapshot_policy "${SNAPSHOT_POLICY:-REQUIRED}" \
     --arg immich_enabled "${ENABLE_IMMICH:-0}" \
     '{schema_version:2,generated_at:$generated,overall:"unknown",
       host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
       filesystems:$filesystems,failed_systemd_units:{state:$failed_state,count:$failed_count,units:$failed_units},containers:$containers,
       immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
       backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification},
-      recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{services:$protection},findings:[]}')"
+      recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{policy:($snapshot_policy|ascii_upcase),enforced:(($snapshot_policy|ascii_upcase)=="REQUIRED"),services:$protection},findings:[]}')"
   findings="$(jq -c '[
     (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:((.count|tostring)+" failed systemd service unit(s)"),action:"Run: systemctl --failed"}),
     (.failed_systemd_units | select(.count == null) | {level:"warning",message:"Failed systemd units could not be determined",action:"Verify systemctl is available to the reporting user"}),
@@ -375,7 +390,25 @@ report_generate_json() {
     (.containers[] | select(.running == null) | {level:"warning",message:(.name+" state could not be inspected"),action:"Verify Docker is available to the reporting user"}),
     (.containers[] | select(.health == "unhealthy") | {level:"critical",message:(.name+" is unhealthy"),action:("Run: docker logs "+.name)}),
     (.containers[] | select(.running == true and .health == "starting") | {level:"warning",message:(.name+" health check is still starting"),action:("Re-check: docker inspect "+.name)}),
-    (.snapshot_protection.services[] | select(.state == "unprotected") | {level:"critical",message:(.service+" state has no service-level snapshot protection"),action:("Migrate "+.path+" to a Btrfs subvolume before relying on snapshots")}),
+    # Severity follows the actual risk, not the mere absence of a snapshot.
+    #  - gate disabled  -> a stateful operation CAN run with no rollback point.
+    #  - gate enforcing -> risky operations are refused, so this is degraded but
+    #    not an active hazard; how bad it is then depends on whether the state
+    #    is recoverable by other means.
+    (.snapshot_protection as $sp | .snapshot_protection.services[] | select(.state == "unprotected") |
+      if ($sp.enforced | not) then
+        {level:"critical",
+         message:(.service+" has no snapshot protection and the snapshot gate is disabled (SNAPSHOT_POLICY="+$sp.policy+"), so a stateful operation can proceed with no rollback point"),
+         action:("Set SNAPSHOT_POLICY=REQUIRED, or migrate "+.path+" to a Btrfs subvolume")}
+      elif .tier == "strict" then
+        {level:"warning",
+         message:(.service+" has no service-level snapshot protection; recovery would depend on restic alone"),
+         action:("Migrate "+.path+" to a Btrfs subvolume; meanwhile risky operations are refused, not run unprotected")}
+      else
+        {level:"info",
+         message:(.service+" has no service-level snapshot protection (rebuildable state)"),
+         action:("Migrate "+.path+" to a Btrfs subvolume when convenient; meanwhile risky operations are refused")}
+      end),
     (.snapshot_protection.services[] | select(.state == "unknown") | {level:"warning",message:(.service+" snapshot protection is unknown"),action:"Verify the state path and Btrfs tooling"}),
     (.filesystems[] | select(.used_percent != null and .used_percent >= 90) | {level:"warning",message:(.path+" is "+(.used_percent|tostring)+"% full"),action:"Free space or expand the filesystem"}),
     (select(.backups.heartbeat.state != "available") | {level:"critical",message:"No successful backup heartbeat is available",action:"Run and verify domum-media-backup"}),
@@ -387,7 +420,9 @@ report_generate_json() {
     (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
     (.backups.targets[] | select(.last_run.state != "ok") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"Backup success is only recorded as one aggregate heartbeat"})
   ]' <<< "$initial")"
-  overall="$(jq -r 'if any(.[]; .level=="critical") then "critical" elif length>0 then "warning" else "healthy" end' <<< "$findings")"
+  # `info` records an absence that is known, accepted and not an active risk; it
+  # must not move the verdict, or every report would read as degraded forever.
+  overall="$(jq -r 'if any(.[]; .level=="critical") then "critical" elif any(.[]; .level=="warning") then "warning" else "healthy" end' <<< "$findings")"
   jq --arg overall "$overall" --argjson findings "$findings" '.overall=$overall | .findings=$findings' <<< "$initial"
 }
 
@@ -422,7 +457,8 @@ report_render_text() {
     (if (.updates.candidates|length)==0 then "  No staged candidates" else (.updates.candidates[] | "  "+.service+": "+.candidate+"; first seen "+(.age_seconds|age)+" ago") end),
     "",
     "Snapshot protection",
-    (if (.snapshot_protection.services|length)==0 then "  No enabled stateful service paths" else (.snapshot_protection.services[] | "  "+.service+": "+.state+" ("+.reason+")") end),
+    "  Gate: SNAPSHOT_POLICY=" + .snapshot_protection.policy + (if .snapshot_protection.enforced then " (risky operations are refused without a snapshot)" else " (risky operations may proceed WITHOUT a rollback point)" end),
+    (if (.snapshot_protection.services|length)==0 then "  No enabled stateful service paths" else (.snapshot_protection.services[] | "  "+.service+" ["+.tier+"]: "+.state+" ("+.reason+")") end),
     "",
     "Findings/Actions",
     (if (.findings|length)==0 then "  No immediate action required." else (.findings[] | "  ["+(.level|ascii_upcase)+"] "+.message+". "+.action) end)
