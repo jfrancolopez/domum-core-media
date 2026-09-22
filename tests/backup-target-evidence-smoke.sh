@@ -116,4 +116,44 @@ awk '/while IFS= read -r target; do/,/done < <\(enabled_backup_targets\)/' "$REP
   | grep -q 'die "Backup failed for target' \
   || fail "a failing target no longer aborts the backup run"
 
+# ---------------------------------------------------------------------------
+# 5. restic_backup_to must stream to the log, capture the snapshot id, and
+#    propagate restic's own exit status -- not tee's. A regression here would
+#    mark a failed backup as successful.
+# ---------------------------------------------------------------------------
+cat > "$TMP_DIR/backup-harness.sh" <<HARNESS
+set -uo pipefail
+LOG_FILE="$TMP_DIR/stream.log"
+DOMUM_DATA_ROOT=/tmp/domum-test-d
+DOMUM_MEDIA_ROOT=/tmp/domum-test-m
+REPO_SRC="$REPO_ROOT/bin/domum-media-backup"
+HARNESS
+cat >> "$TMP_DIR/backup-harness.sh" <<'HARNESS'
+die() { echo "ERR $*" >&2; exit 1; }
+log() { :; }
+backup_target_include_paths() { echo /tmp; }
+restic_for_target() { printf 'scanning...
+snapshot ab12cd34 saved
+'; return "${FAKE_RC:-0}"; }
+eval "$(awk '/^restic_backup_to\(\) \{/,/^\}/' "$REPO_SRC")"
+restic_backup_to cloud >/dev/null 2>&1
+echo "rc=$? id=${BACKUP_LAST_SNAPSHOT_ID:-}"
+HARNESS
+
+out="$(FAKE_RC=0 bash "$TMP_DIR/backup-harness.sh")"
+grep -q 'rc=0' <<< "$out" || fail "a successful backup did not return 0: $out"
+grep -q 'id=ab12cd34' <<< "$out" || fail "the snapshot id was not captured: $out"
+
+out="$(FAKE_RC=3 bash "$TMP_DIR/backup-harness.sh")"
+grep -q 'rc=3' <<< "$out" \
+  || fail "restic's exit status was not propagated (tee's status leaked through): $out"
+
+grep -q 'snapshot ab12cd34 saved' "$TMP_DIR/stream.log" \
+  || fail "backup output was not streamed to the log"
+
+# The implementation must read PIPESTATUS, not the pipeline's own status.
+awk '/^restic_backup_to\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup" \
+  | grep -q 'PIPESTATUS\[0\]' \
+  || fail "restic_backup_to must read PIPESTATUS[0] so tee cannot mask a failure"
+
 echo "PASS: backup target evidence smoke test"
