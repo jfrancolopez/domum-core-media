@@ -156,4 +156,15 @@ awk '/^restic_backup_to\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup" \
   | grep -q 'PIPESTATUS\[0\]' \
   || fail "restic_backup_to must read PIPESTATUS[0] so tee cannot mask a failure"
 
+# A killed run (systemd TimeoutStartSec is 18h) must not leave its capture file
+# behind, and the signal traps must terminate rather than letting the shell
+# continue after the signal.
+fn_backup="$(awk '/^restic_backup_to\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup")"
+grep -q "trap .*runlog.* EXIT" <<< "$fn_backup" \
+  || fail "restic_backup_to must clean its capture file on exit"
+grep -qE "trap .*runlog.*exit [0-9]+.* (HUP|INT|TERM)" <<< "$fn_backup" \
+  || fail "the signal traps must terminate, not merely clean up and continue"
+grep -q 'trap - EXIT' <<< "$fn_backup" \
+  || fail "the trap must be cleared once the capture file is gone"
+
 echo "PASS: backup target evidence smoke test"

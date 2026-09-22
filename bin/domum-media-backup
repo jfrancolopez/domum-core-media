@@ -496,6 +496,15 @@ restic_backup_to() {
   local runlog rc=0
   BACKUP_LAST_SNAPSHOT_ID=""
   runlog="$(mktemp)" || die "Cannot create a temporary file for the backup run"
+  # A scheduled backup can be killed (systemd TimeoutStartSec is 18h). Clean the
+  # capture file on the way out so a killed run leaves nothing in /tmp. No outer
+  # trap is active here: the pg_dump trap lives inside its own subshell.
+  # The signal traps must also terminate: a trap that only cleans up would let
+  # the shell carry on running after the signal.
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$runlog'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$runlog'; exit 143" HUP INT TERM
   restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
     --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
@@ -503,7 +512,8 @@ restic_backup_to() {
     "${paths[@]}" 2>&1 | tee -a "$LOG_FILE" "$runlog" >&2
   rc="${PIPESTATUS[0]}"
   BACKUP_LAST_SNAPSHOT_ID="$(sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p' "$runlog" | tail -1)"
-  rm -f "$runlog"
+  rm -f -- "$runlog"
+  trap - EXIT HUP INT TERM
   return "$rc"
 }
 
