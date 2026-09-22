@@ -489,19 +489,21 @@ restic_backup_to() {
     paths+=("$path")
   done
   log "restic backup -> $target"
-  # Capture the run so the snapshot it created can be recorded as evidence.
-  # Output is still appended to the log, just at the end of the run rather than
-  # streamed; restic emits no progress bar when stdout is not a terminal.
-  local out rc=0
+  # Stream output to the log as it happens -- a long backup must stay observable
+  # in the journal while it runs -- while also capturing it to a private file so
+  # the snapshot id can be recorded as evidence. `set -o pipefail` is in force,
+  # but read PIPESTATUS explicitly so restic's status is used, not tee's.
+  local runlog rc=0
   BACKUP_LAST_SNAPSHOT_ID=""
-  out="$(restic_for_target "$target" backup \
+  runlog="$(mktemp)" || die "Cannot create a temporary file for the backup run"
+  restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
     --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
     --exclude "${DOMUM_MEDIA_ROOT}/.cache/*" \
-    "${paths[@]}" 2>&1)" || rc=$?
-  [[ -n "$out" ]] && printf '%s\n' "$out" | tee -a "$LOG_FILE" >&2
-  BACKUP_LAST_SNAPSHOT_ID="$(printf '%s\n' "$out" \
-    | sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p' | tail -1)"
+    "${paths[@]}" 2>&1 | tee -a "$LOG_FILE" "$runlog" >&2
+  rc="${PIPESTATUS[0]}"
+  BACKUP_LAST_SNAPSHOT_ID="$(sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p' "$runlog" | tail -1)"
+  rm -f "$runlog"
   return "$rc"
 }
 
