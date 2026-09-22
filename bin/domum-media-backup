@@ -482,12 +482,25 @@ retention_targets() {
 
 restic_backup_to() {
   local target="$1"
-  local paths=()
+  local paths=() missing=()
   local path
   for path in $(backup_target_include_paths "$target"); do
-    [[ -e "$path" ]] || continue
-    paths+=("$path")
+    if [[ -e "$path" ]]; then
+      paths+=("$path")
+    else
+      # A configured path that does not exist is skipped. Record it: a success
+      # record that does not say what was actually backed up can overstate the
+      # protection it claims.
+      missing+=("$path")
+      log "WARNING: configured include path does not exist, skipping: $path"
+    fi
   done
+  BACKUP_LAST_PATHS="${paths[*]}"
+  BACKUP_LAST_PATHS_MISSING="${missing[*]}"
+  if (( ${#paths[@]} == 0 )); then
+    log "ERROR: no configured include path exists for target $target"
+    return 1
+  fi
   log "restic backup -> $target"
   # Stream output to the log as it happens -- a long backup must stay observable
   # in the journal while it runs -- while also capturing it to a private file so
@@ -525,6 +538,7 @@ restic_backup_to() {
 # Written atomically so a crashed run cannot leave a half-written record.
 record_backup_target_run() {
   local target="$1" result="$2" started="$3" snapshot_id="${4:-}"
+  local paths="${BACKUP_LAST_PATHS:-}" paths_missing="${BACKUP_LAST_PATHS_MISSING:-}"
   local dir meta file tmp repo_id=""
   dir="$REPO_META_DIR"
   mkdir -p "$dir"
@@ -548,6 +562,8 @@ record_backup_target_run() {
     printf 'FINISHED_TS=%s\n' "$(date -Iseconds)"
     printf 'SNAPSHOT_ID=%s\n' "$snapshot_id"
     printf 'REPOSITORY_ID=%s\n' "$repo_id"
+    printf 'PATHS=%q\n' "$paths"
+    printf 'PATHS_MISSING=%q\n' "$paths_missing"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   chmod 0600 "$tmp"
   mv -f "$tmp" "$file"
@@ -621,6 +637,9 @@ do_daily_backup() {
   while IFS= read -r target; do
     ran_any=1
     target_started="$(date -Iseconds)"
+    BACKUP_LAST_PATHS=""
+    BACKUP_LAST_PATHS_MISSING=""
+    BACKUP_LAST_SNAPSHOT_ID=""
     # Mark the attempt before anything can abort. check_repo_identity calls die
     # on a mismatch, and a killed run exits from a trap, so without this the
     # previous run's RESULT=success would linger and the report would show a
