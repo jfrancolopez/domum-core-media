@@ -304,8 +304,9 @@ report_backup_target_state() {
 # attempt must not erase the second.
 report_restore_verification() {
   local dir="$DOMUM_STATE_ROOT/restore-verification" f
-  local newest_epoch="" newest_result="" newest_target="" newest_reason=""
-  local newest_snapshot="" newest_checks=""
+  # Note: the snapshot reported is deliberately the last VERIFIED one
+  # (ok_snapshot), not the one a failed attempt was looking at.
+  local newest_epoch="" newest_result="" newest_target="" newest_reason="" newest_checks=""
   local ok_epoch="" ok_target="" ok_snapshot=""
 
   if [[ -d "$dir" ]]; then
@@ -325,7 +326,7 @@ report_restore_verification() {
       if [[ "$v_epoch" =~ ^[0-9]+$ ]]; then
         if [[ -z "$newest_epoch" ]] || (( v_epoch > newest_epoch )); then
           newest_epoch="$v_epoch"; newest_result="$v_result"; newest_target="$v_target"
-          newest_snapshot="$v_snapshot"; newest_checks="$v_checks"; newest_reason="$v_reason"
+          newest_checks="$v_checks"; newest_reason="$v_reason"
         fi
       fi
       # When did this target last genuinely pass?
