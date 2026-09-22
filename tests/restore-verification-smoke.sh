@@ -71,6 +71,49 @@ jq -e '.checks == "gzip,size,footer"' <<< "$out" >/dev/null || fail "the checks 
 jq -e '.age_seconds != null' <<< "$out" >/dev/null || fail "a verification must have a computable age"
 
 # ---------------------------------------------------------------------------
+# 4b. A failed verification must not erase when verification last PASSED, and
+#     must not let the failure masquerade as that success.
+# ---------------------------------------------------------------------------
+record_rv() {
+  bash -c "
+set -uo pipefail
+DOMUM_STATE_ROOT='$STATE'
+die() { echo \"ERR \$*\" >&2; exit 1; }
+eval \"\$(awk '/^restore_verification_dir\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media-backup')\"
+eval \"\$(awk '/^record_restore_verification\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media-backup')\"
+record_restore_verification $1
+"
+}
+
+rm -f "$VDIR"/*.env
+record_rv "cloud success snapok11 /a/b 4096 gzip,size,footer ''" \
+  || fail "recording a success failed"
+grep -q '^RESULT=success$' "$VDIR/cloud.env" || fail "success not recorded"
+ok_ts="$(grep '^LAST_SUCCESS_TS=' "$VDIR/cloud.env" | cut -d= -f2-)"
+[ -n "$ok_ts" ] || fail "a success must record LAST_SUCCESS_TS"
+[ "$(grep '^LAST_SUCCESS_SNAPSHOT_ID=' "$VDIR/cloud.env" | cut -d= -f2-)" = "snapok11" ] \
+  || fail "a success must record the snapshot it verified as the last success"
+
+# Now a failure over the top of it.
+record_rv "cloud failure snapbad2 /a/b 0 gzip 'gzip integrity failed'" \
+  || fail "recording a failure failed"
+grep -q '^RESULT=failure$' "$VDIR/cloud.env" || fail "failure not recorded"
+[ "$(grep '^LAST_SUCCESS_TS=' "$VDIR/cloud.env" | cut -d= -f2-)" = "$ok_ts" ] \
+  || fail "a failure erased the record of when verification last passed"
+[ "$(grep '^LAST_SUCCESS_SNAPSHOT_ID=' "$VDIR/cloud.env" | cut -d= -f2-)" = "snapok11" ] \
+  || fail "a failure overwrote the last successfully verified snapshot"
+
+out="$(report_rv)" || fail "report_restore_verification failed after a failure"
+jq -e '.state == "failed"' <<< "$out" >/dev/null \
+  || fail "the current state must be failed: $out"
+jq -e '.last_verified_at != null' <<< "$out" >/dev/null \
+  || fail "a failure must still report when verification last passed: $out"
+jq -e '.snapshot_id == "snapok11"' <<< "$out" >/dev/null \
+  || fail "the reported snapshot must be the last VERIFIED one, not the failed one: $out"
+
+rm -f "$VDIR"/*.env
+
+# ---------------------------------------------------------------------------
 # 5. The verification routine must be isolated and non-destructive by design.
 # ---------------------------------------------------------------------------
 fn="$(awk '/^do_verify_restore\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup")"
@@ -78,6 +121,10 @@ fn="$(awk '/^do_verify_restore\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup
 
 grep -q 'mktemp -d' <<< "$fn" || fail "verification must restore into a scratch directory"
 grep -q 'trap .*rm -rf .*scratch' <<< "$fn" || fail "the scratch directory must always be cleaned up"
+# A cleanup-only signal trap would delete the scratch and let execution carry on
+# into validation, recording a genuine-looking failure for an interrupted run.
+grep -qE 'trap .*scratch.*exit [0-9]+.*(HUP|INT|TERM)' <<< "$fn" \
+  || fail "the signal traps must terminate, not merely clean up and continue"
 grep -q 'Refusing to verify' <<< "$fn" || fail "verification must refuse a scratch path inside a live data root"
 grep -qE 'restore latest --target "\$scratch"' <<< "$fn" \
   || fail "verification must restore into the scratch directory, never a live path"

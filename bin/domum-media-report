@@ -298,47 +298,74 @@ report_backup_target_state() {
 # Only a recorded, successful, isolated restore counts. A successful backup does
 # not, and neither does a repository check. Records are written solely by
 # `domum-media-backup verify-restore`.
+#
+# Two separate questions are answered: what happened on the most recent
+# verification attempt, and when did verification last genuinely pass. A failed
+# attempt must not erase the second.
 report_restore_verification() {
-  local dir="$DOMUM_STATE_ROOT/restore-verification"
-  local best_epoch="" best_target="" best_snapshot="" best_checks="" found_failure=0 f
+  local dir="$DOMUM_STATE_ROOT/restore-verification" f
+  local newest_epoch="" newest_result="" newest_target="" newest_reason=""
+  local newest_snapshot="" newest_checks=""
+  local ok_epoch="" ok_target="" ok_snapshot=""
+
   if [[ -d "$dir" ]]; then
     shopt -s nullglob
     for f in "$dir"/*.env; do
-      local v_result v_ts v_target v_snapshot v_checks v_epoch=""
+      local v_result v_ts v_target v_snapshot v_checks v_reason v_ok_ts v_ok_snap
+      local v_epoch="" v_ok_epoch=""
       eval "$(
-        unset RESULT VERIFIED_TS TARGET SNAPSHOT_ID CHECKS
+        unset RESULT VERIFIED_TS TARGET SNAPSHOT_ID CHECKS REASON LAST_SUCCESS_TS LAST_SUCCESS_SNAPSHOT_ID
         # shellcheck disable=SC1090
         . "$f" >/dev/null 2>&1 || true
-        printf 'v_result=%q\nv_ts=%q\nv_target=%q\nv_snapshot=%q\nv_checks=%q\n' \
-          "${RESULT:-}" "${VERIFIED_TS:-}" "${TARGET:-}" "${SNAPSHOT_ID:-}" "${CHECKS:-}"
+        printf 'v_result=%q\nv_ts=%q\nv_target=%q\nv_snapshot=%q\nv_checks=%q\nv_reason=%q\nv_ok_ts=%q\nv_ok_snap=%q\n' \
+          "${RESULT:-}" "${VERIFIED_TS:-}" "${TARGET:-}" "${SNAPSHOT_ID:-}" "${CHECKS:-}" \
+          "${REASON:-}" "${LAST_SUCCESS_TS:-}" "${LAST_SUCCESS_SNAPSHOT_ID:-}"
       )"
-      if [[ "$v_result" != "success" ]]; then
-        found_failure=1
-        continue
-      fi
       [[ -n "$v_ts" ]] && v_epoch="$(date -d "$v_ts" +%s 2>/dev/null || true)"
-      [[ "$v_epoch" =~ ^[0-9]+$ ]] || continue
-      if [[ -z "$best_epoch" ]] || (( v_epoch > best_epoch )); then
-        best_epoch="$v_epoch"; best_target="$v_target"
-        best_snapshot="$v_snapshot"; best_checks="$v_checks"
+      if [[ "$v_epoch" =~ ^[0-9]+$ ]]; then
+        if [[ -z "$newest_epoch" ]] || (( v_epoch > newest_epoch )); then
+          newest_epoch="$v_epoch"; newest_result="$v_result"; newest_target="$v_target"
+          newest_snapshot="$v_snapshot"; newest_checks="$v_checks"; newest_reason="$v_reason"
+        fi
+      fi
+      # When did this target last genuinely pass?
+      if [[ "$v_result" == "success" ]]; then
+        v_ok_epoch="$v_epoch"
+      elif [[ -n "$v_ok_ts" ]]; then
+        v_ok_epoch="$(date -d "$v_ok_ts" +%s 2>/dev/null || true)"
+        v_snapshot="$v_ok_snap"
+      fi
+      if [[ "$v_ok_epoch" =~ ^[0-9]+$ ]]; then
+        if [[ -z "$ok_epoch" ]] || (( v_ok_epoch > ok_epoch )); then
+          ok_epoch="$v_ok_epoch"; ok_target="$v_target"; ok_snapshot="$v_snapshot"
+        fi
       fi
     done
     shopt -u nullglob
   fi
 
-  if [[ -n "$best_epoch" ]]; then
-    jq -cn --arg target "$best_target" --arg snapshot "$best_snapshot" --arg checks "$best_checks" \
-      --argjson at "$(report_iso_from_epoch "$best_epoch")" \
-      --argjson age "$(report_age_seconds "$best_epoch")" \
-      '{state:"verified",target:$target,snapshot_id:($snapshot|select(length>0) // null),
-        checks:($checks|select(length>0) // null),last_verified_at:$at,age_seconds:$age,reason:null}'
-  elif (( found_failure == 1 )); then
-    jq -cn '{state:"failed",target:null,snapshot_id:null,checks:null,last_verified_at:null,age_seconds:null,
-             reason:"the most recent restore verification did not pass"}'
-  else
-    jq -cn '{state:"unknown",target:null,snapshot_id:null,checks:null,last_verified_at:null,age_seconds:null,
-             reason:"no successful restore verification has been recorded on this host"}'
-  fi
+  local state reason=""
+  case "$newest_result" in
+    success) state="verified" ;;
+    failure) state="failed"; reason="${newest_reason:-the most recent restore verification did not pass}" ;;
+    "")      state="unknown"; reason="no restore verification has been recorded on this host" ;;
+    *)       state="unknown"; reason="the most recent restore verification record is not interpretable" ;;
+  esac
+
+  jq -cn \
+    --arg state "$state" --arg reason "$reason" \
+    --arg target "${ok_target:-$newest_target}" --arg snapshot "$ok_snapshot" --arg checks "$newest_checks" \
+    --argjson at "$(report_iso_from_epoch "$ok_epoch")" \
+    --argjson age "$(report_age_seconds "$ok_epoch")" \
+    --argjson attempted_at "$(report_iso_from_epoch "$newest_epoch")" \
+    '{state:$state,
+      target:($target|select(length>0) // null),
+      snapshot_id:($snapshot|select(length>0) // null),
+      checks:($checks|select(length>0) // null),
+      last_verified_at:$at,
+      age_seconds:$age,
+      last_attempt_at:$attempted_at,
+      reason:($reason|select(length>0) // null)}'
 }
 
 report_generate_json() {
@@ -516,7 +543,7 @@ report_render_text() {
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
     (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)),
-    "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="verified" then " ("+(.backups.restore_verification.target // "?")+", "+(.backups.restore_verification.age_seconds|age)+" ago, checks: "+(.backups.restore_verification.checks // "?")+")" else " ("+(.backups.restore_verification.reason // "no detail")+")" end),
+    "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="verified" then " ("+(.backups.restore_verification.target // "?")+", "+(.backups.restore_verification.age_seconds|age)+" ago, checks: "+(.backups.restore_verification.checks // "?")+")" else " ("+(.backups.restore_verification.reason // "no detail")+")"+(if .backups.restore_verification.last_verified_at==null then "" else "; last passed "+(.backups.restore_verification.age_seconds|age)+" ago" end) end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",
     "Updates",
