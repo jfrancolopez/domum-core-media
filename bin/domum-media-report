@@ -409,11 +409,11 @@ report_render_text() {
 }
 
 report_cmd() {
-  local mode=text
+  local mode="text"
   case "$#:${1:-}" in
     0:) ;;
-    1:--json) mode=json ;;
-    1:--write) mode=write ;;
+    1:--json) mode="json" ;;
+    1:--write) mode="write" ;;
     *) die "Usage: domum-media report [--json|--write]" ;;
   esac
 
