@@ -4149,6 +4149,37 @@ doctor_cmd() {
   esac
 }
 
+# ---- operational reporting -------------------------------------------------
+
+REPORT_LIB_DEFAULT="/usr/local/lib/domum-media/domum-media-report"
+
+# The report helpers live in a separate file so they can reuse this CLI's
+# canonical config and service inventory functions. Sourced lazily so a missing
+# helper cannot break unrelated commands.
+load_report_lib() {
+  local lib="${DOMUM_REPORT_LIB:-}"
+  if [[ -z "$lib" ]]; then
+    if [[ -r "$REPORT_LIB_DEFAULT" ]]; then
+      lib="$REPORT_LIB_DEFAULT"
+    elif [[ -r "$DOMUM_DIR/bin/domum-media-report" ]]; then
+      lib="$DOMUM_DIR/bin/domum-media-report"
+    fi
+  fi
+  [[ -n "$lib" && -r "$lib" ]] \
+    || die "Report library not found (looked in $REPORT_LIB_DEFAULT and $DOMUM_DIR/bin/domum-media-report)"
+  # shellcheck disable=SC1090
+  source "$lib"
+}
+
+# Reporting reads root-owned runtime state under $DOMUM_STATE_ROOT and the live
+# config, so it requires root. Running unprivileged would silently degrade every
+# probe to "unknown", which is worse than refusing.
+report_entry() {
+  need_root
+  load_report_lib
+  report_cmd "$@"
+}
+
 usage() {
   cat <<EOF
 domum-media (domum-core-media)
@@ -4167,6 +4198,7 @@ Usage:
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
   domum-media checkup [--json]
+  domum-media report [--json|--write]
   domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]
   domum-media recovery-pack {create [--no-email]|status}
   domum-media doctor {immich|traefik|backups|secrets|navidrome}
@@ -4194,6 +4226,7 @@ main() {
     snapshot)  shift; snapshot_cmd "$@" ;;
     rollback)  shift; rollback_cmd "$@" ;;
     checkup)   shift; checkup_cmd "$@" ;;
+    report)    shift; report_entry "$@" ;;
     cleanup)   shift; cleanup_cmd "$@" ;;
     recovery-pack) shift; recovery_pack_cmd "$@" ;;
     doctor)    shift; doctor_cmd "$@" ;;

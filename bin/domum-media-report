@@ -3,6 +3,25 @@
 # Read-only operational reporting helpers. This file is sourced by domum-media
 # so it can reuse the canonical config and service inventory functions.
 
+# Bash RETURN traps are global, not stacked: a trap set inside a nested
+# function replaces the caller's, leaking the caller's temporaries and then
+# re-firing with out-of-scope variables (fatal under `set -u`). Register
+# temporaries here and clean them from a single trap in report_cmd.
+REPORT_TMP_PATHS=()
+
+report_tmp_register() {
+  REPORT_TMP_PATHS+=("$1")
+  printf '%s' "$1"
+}
+
+report_tmp_cleanup() {
+  local path
+  for path in "${REPORT_TMP_PATHS[@]:-}"; do
+    [[ -n "$path" ]] && rm -rf -- "$path"
+  done
+  REPORT_TMP_PATHS=()
+}
+
 report_iso_from_epoch() {
   local epoch="${1:-}"
   [[ "$epoch" =~ ^[0-9]+$ ]] || { printf 'null'; return; }
@@ -10,10 +29,13 @@ report_iso_from_epoch() {
 }
 
 report_age_seconds() {
-  local epoch="${1:-}"
+  local epoch="${1:-}" now="${REPORT_NOW_EPOCH:-}"
   [[ "$epoch" =~ ^[0-9]+$ ]] || { printf 'null'; return; }
-  if (( REPORT_NOW_EPOCH >= epoch )); then
-    printf '%s' "$(( REPORT_NOW_EPOCH - epoch ))"
+  # Tolerate being called outside report_generate_json: an unset reference
+  # would be fatal under `set -u` and emit invalid JSON into --argjson.
+  [[ "$now" =~ ^[0-9]+$ ]] || now="$(date +%s)"
+  if (( now >= epoch )); then
+    printf '%s' "$(( now - epoch ))"
   else
     printf '0'
   fi
@@ -35,8 +57,21 @@ report_file_details() {
     '{state:"available",path:$path,size_bytes:$size,modified_at:$modified,age_seconds:$age}'
 }
 
+# Query exactly one property per call. `systemctl show` returns properties in
+# its own internal order, not the order they were requested, so parsing a
+# multi-property --value block positionally silently swaps fields.
+# NOTE on jq object construction below: `{a: (x|select(...))}` produces NO
+# output at all when the select matches nothing, silently discarding the entire
+# object. Every optional field therefore needs an explicit `// null` guard.
+report_systemd_property() {
+  local unit="$1" property="$2" value
+  value="$(systemctl show "$unit" --property="$property" --value 2>/dev/null || true)"
+  [[ "$value" == "n/a" ]] && value=""
+  printf '%s' "$value"
+}
+
 report_systemd_state() {
-  local timer="$1" service="$2" enabled active timer_show service_show
+  local timer="$1" service="$2" enabled active
   if ! cmd_exists systemctl; then
     jq -cn --arg timer "$timer" --arg service "$service" \
       '{timer:$timer,service:$service,enabled:"unknown",active:"unknown",last_trigger:null,next_trigger:null,result:"unknown",service_started_at:null,service_finished_at:null}'
@@ -44,20 +79,18 @@ report_systemd_state() {
   fi
   enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
   active="$(systemctl is-active "$timer" 2>/dev/null || true)"
-  timer_show="$(systemctl show "$timer" --property=LastTriggerUSec,NextElapseUSecRealtime --value 2>/dev/null || true)"
-  service_show="$(systemctl show "$service" --property=Result,ExecMainStartTimestamp,ExecMainExitTimestamp --value 2>/dev/null || true)"
   jq -cn \
     --arg timer "$timer" --arg service "$service" \
     --arg enabled "${enabled:-unknown}" --arg active "${active:-unknown}" \
-    --arg last "$(printf '%s\n' "$timer_show" | sed -n '1p')" \
-    --arg next "$(printf '%s\n' "$timer_show" | sed -n '2p')" \
-    --arg result "$(printf '%s\n' "$service_show" | sed -n '1p')" \
-    --arg started "$(printf '%s\n' "$service_show" | sed -n '2p')" \
-    --arg finished "$(printf '%s\n' "$service_show" | sed -n '3p')" \
+    --arg last "$(report_systemd_property "$timer" LastTriggerUSec)" \
+    --arg next "$(report_systemd_property "$timer" NextElapseUSecRealtime)" \
+    --arg result "$(report_systemd_property "$service" Result)" \
+    --arg started "$(report_systemd_property "$service" ExecMainStartTimestamp)" \
+    --arg finished "$(report_systemd_property "$service" ExecMainExitTimestamp)" \
     '{timer:$timer,service:$service,enabled:$enabled,active:$active,
-      last_trigger:($last|select(length>0 and .!="n/a")),next_trigger:($next|select(length>0 and .!="n/a")),
-      result:($result|select(length>0) // "unknown"),service_started_at:($started|select(length>0 and .!="n/a")),
-      service_finished_at:($finished|select(length>0 and .!="n/a"))}'
+      last_trigger:($last|select(length>0 and .!="n/a") // null),next_trigger:($next|select(length>0 and .!="n/a") // null),
+      result:($result|select(length>0) // "unknown"),service_started_at:($started|select(length>0 and .!="n/a") // null),
+      service_finished_at:($finished|select(length>0 and .!="n/a") // null)}'
 }
 
 report_container_specs() {
@@ -80,8 +113,9 @@ report_container_specs() {
 }
 
 report_container() {
-  local logical="$1" name="$2" configured="$3" inspect="" available_id="" running=false health=unknown restarts=null running_id=""
+  local logical="$1" name="$2" configured="$3" inspect="" available_id="" running=null health=unknown restarts=null running_id=""
   if cmd_exists docker; then
+    running=false
     inspect="$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}|{{.Image}}' "$name" 2>/dev/null || true)"
     if [[ -n "$inspect" ]]; then
       local status restart_raw
@@ -99,7 +133,7 @@ report_container() {
     --arg health "$health" --arg running_id "$running_id" --arg available_id "$available_id" \
     --argjson running "$running" --argjson restarts "$restarts" --argjson match "$match" \
     '{service:$service,name:$name,running:$running,health:$health,restart_count:$restarts,
-      image:{configured:$configured,running_id:($running_id|select(length>0)),available_id:($available_id|select(length>0)),matches_available:$match}}'
+      image:{configured:$configured,running_id:($running_id|select(length>0) // null),available_id:($available_id|select(length>0) // null),matches_available:$match}}'
 }
 
 report_filesystem() {
@@ -132,7 +166,7 @@ report_snapshot_protection() {
   jq -cn --arg service "$service" --arg path "$path" --arg state "$state" --arg reason "$reason" \
     --arg latest "$latest" --argjson latest_at "$(report_iso_from_epoch "$latest_epoch")" \
     --argjson age "$(report_age_seconds "$latest_epoch")" \
-    '{service:$service,path:$path,state:$state,reason:$reason,latest_snapshot:($latest|select(length>0)),latest_snapshot_at:$latest_at,latest_snapshot_age_seconds:$age}'
+    '{service:$service,path:$path,state:$state,reason:$reason,latest_snapshot:($latest|select(length>0) // null),latest_snapshot_at:$latest_at,latest_snapshot_age_seconds:$age}'
 }
 
 report_update_candidate() {
@@ -168,6 +202,48 @@ report_latest_backup_snapshot() {
   fi
 }
 
+# Per-target evidence. The daily backup writes a single aggregate heartbeat and
+# no per-target run result, so last_run is reported as unknown rather than
+# inferred from the aggregate. Repository identity pinning is real state and is
+# reported from the metadata file's presence only; its contents are never read
+# into the report.
+report_backup_target_state() {
+  local target="$1" meta meta_dir identity=unknown
+  meta_dir="${REPO_META_DIR:-$DOMUM_STATE_ROOT/backups}"
+  meta="$meta_dir/$target-repo.env"
+  if [[ -r "$meta" ]]; then
+    identity=pinned
+  elif [[ -e "$meta" ]]; then
+    identity=unreadable
+  elif [[ -r "$meta_dir" ]]; then
+    identity=missing
+  fi
+  jq -cn --arg target "$target" --arg identity "$identity" --arg path "$meta" \
+    '{target:$target,
+      repository_identity:{state:$identity,path:$path},
+      last_run:{state:"unknown",reason:"no per-target run result is recorded; only an aggregate backup heartbeat exists"}}'
+}
+
+# Restore verification has no durable state on this host yet. Report unknown
+# rather than implying the backups have been proven restorable.
+report_restore_verification() {
+  local dir="$DOMUM_STATE_ROOT/restore-verification" latest="" epoch=""
+  if [[ -d "$dir" ]]; then
+    latest="$(find "$dir" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | head -1 | cut -d' ' -f2- || true)"
+  fi
+  if [[ -n "$latest" ]]; then
+    epoch="$(stat -c %Y -- "$latest" 2>/dev/null || true)"
+    jq -cn --arg path "$latest" \
+      --argjson at "$(report_iso_from_epoch "$epoch")" \
+      --argjson age "$(report_age_seconds "$epoch")" \
+      '{state:"recorded",path:$path,last_verified_at:$at,age_seconds:$age,reason:null}'
+  else
+    jq -cn '{state:"unknown",path:null,last_verified_at:null,age_seconds:null,
+             reason:"no restore verification result has been recorded on this host"}'
+  fi
+}
+
 report_generate_json() {
   cmd_exists jq || die "jq is required for report output"
   REPORT_NOW_EPOCH="${DOMUM_REPORT_NOW_EPOCH:-$(date +%s)}"
@@ -196,11 +272,13 @@ report_generate_json() {
   done
   shopt -u nullglob
 
-  local work containers_file fs_file protection_file updates_file backups_file failed_file
-  work="$(mktemp -d)"; trap 'rm -rf "$work"' RETURN
+  local work containers_file fs_file protection_file updates_file backups_file failed_file targets_file
+  work="$(report_tmp_register "$(mktemp -d)")"
   containers_file="$work/containers"; fs_file="$work/filesystems"; protection_file="$work/protection"
   updates_file="$work/updates"; backups_file="$work/backups"; failed_file="$work/failed"
+  targets_file="$work/targets"
   : > "$containers_file"; : > "$fs_file"; : > "$protection_file"; : > "$updates_file"; : > "$backups_file"; : > "$failed_file"
+  : > "$targets_file"
 
   local logical name image path service enable_var data_path target file
   while IFS='|' read -r logical name image; do report_container "$logical" "$name" "$image" >> "$containers_file"; done < <(report_container_specs)
@@ -215,7 +293,10 @@ report_generate_json() {
   for file in "$DOMUM_STATE_ROOT"/image-updates/*.env; do report_update_candidate generic "$(basename "$file" .env)" "$file" >> "$updates_file"; done
   shopt -u nullglob
   [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]] && report_update_candidate immich immich "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" >> "$updates_file"
-  while IFS= read -r target; do report_latest_backup_snapshot "$target" >> "$backups_file"; done < <(enabled_backup_targets)
+  while IFS= read -r target; do
+    report_latest_backup_snapshot "$target" >> "$backups_file"
+    report_backup_target_state "$target" >> "$targets_file"
+  done < <(enabled_backup_targets)
 
   local failed_state=unknown failed_count=null
   if cmd_exists systemctl; then
@@ -256,18 +337,23 @@ report_generate_json() {
     --argjson heartbeat_at "$heartbeat_at" --argjson heartbeat_age "$heartbeat_age" \
     --argjson backup_timer "$backup_timer" --argjson check_timer "$check_timer" --argjson image_timer "$image_timer" \
     --argjson library "$library_json" --argjson dump "$dump_json" --argjson snapshots "$(jq -s . "$backups_file")" \
+    --argjson targets "$(jq -s . "$targets_file")" --argjson restore_verification "$(report_restore_verification)" \
     --argjson recovery "$recovery_json" --argjson candidates "$(jq -s . "$updates_file")" \
     --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
+    --arg immich_enabled "${ENABLE_IMMICH:-0}" \
     '{schema_version:1,generated_at:$generated,overall:"unknown",
       host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
       filesystems:$filesystems,failed_systemd_units:{state:$failed_state,count:$failed_count,units:$failed_units},containers:$containers,
-      immich:{enabled:($library.state != "missing"),library:$library,database_dump:$dump},
-      backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots},
+      immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
+      backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification},
       recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{services:$protection},findings:[]}')"
   findings="$(jq -c '[
-    (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:(.count|tostring)+" failed systemd service unit(s)",action:"Run: systemctl --failed"}),
+    (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:((.count|tostring)+" failed systemd service unit(s)"),action:"Run: systemctl --failed"}),
+    (.failed_systemd_units | select(.count == null) | {level:"warning",message:"Failed systemd units could not be determined",action:"Verify systemctl is available to the reporting user"}),
     (.containers[] | select(.running == false) | {level:"critical",message:(.name+" is not running"),action:("Run: docker inspect "+.name)}),
+    (.containers[] | select(.running == null) | {level:"warning",message:(.name+" state could not be inspected"),action:"Verify Docker is available to the reporting user"}),
     (.containers[] | select(.health == "unhealthy") | {level:"critical",message:(.name+" is unhealthy"),action:("Run: docker logs "+.name)}),
+    (.containers[] | select(.running == true and .health == "starting") | {level:"warning",message:(.name+" health check is still starting"),action:("Re-check: docker inspect "+.name)}),
     (.snapshot_protection.services[] | select(.state == "unprotected") | {level:"critical",message:(.service+" state has no service-level snapshot protection"),action:("Migrate "+.path+" to a Btrfs subvolume before relying on snapshots")}),
     (.snapshot_protection.services[] | select(.state == "unknown") | {level:"warning",message:(.service+" snapshot protection is unknown"),action:"Verify the state path and Btrfs tooling"}),
     (.filesystems[] | select(.used_percent != null and .used_percent >= 90) | {level:"warning",message:(.path+" is "+(.used_percent|tostring)+"% full"),action:"Free space or expand the filesystem"}),
@@ -275,7 +361,10 @@ report_generate_json() {
     (.backups.heartbeat | select(.age_seconds != null and .age_seconds > 172800) | {level:"critical",message:"Latest backup is older than 48 hours",action:"Inspect domum-media-backup.service"}),
     (.backups.timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup timer is not enabled and active",action:"Inspect domum-media-backup.timer"}),
     (.backups.check_timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup check timer is not enabled and active",action:"Inspect domum-media-check.timer"}),
-    (.updates.candidates[] | {level:"warning",message:(.service+" has a staged update candidate"),action:"Review: domum-media updates summary"})
+    (.updates.candidates[] | {level:"warning",message:(.service+" has a staged update candidate"),action:"Review: domum-media updates summary"}),
+    (.backups.restore_verification | select(.state != "recorded") | {level:"warning",message:"No restore verification has been recorded",action:"Run a scratch restore drill; see docs/disaster-recovery.md"}),
+    (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
+    (.backups.targets[] | select(.last_run.state != "ok") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"Backup success is only recorded as one aggregate heartbeat"})
   ]' <<< "$initial")"
   overall="$(jq -r 'if any(.[]; .level=="critical") then "critical" elif length>0 then "warning" else "healthy" end' <<< "$findings")"
   jq --arg overall "$overall" --argjson findings "$findings" '.overall=$overall | .findings=$findings' <<< "$initial"
@@ -292,7 +381,7 @@ report_render_text() {
     "  Failed systemd units: " + (if .failed_systemd_units.count==null then "unknown" else (.failed_systemd_units.count|tostring) end),
     "",
     "Containers",
-    (if (.containers|length)==0 then "  No enabled application containers" else (.containers[] | "  "+.name+": "+(if .running then .health else "not running" end)+"; restarts="+(if .restart_count==null then "unknown" else (.restart_count|tostring) end)+"; image="+(if .image.matches_available==null then "unknown" elif .image.matches_available then "current" else "staged" end)) end),
+    (if (.containers|length)==0 then "  No enabled application containers" else (.containers[] | "  "+.name+": "+(if .running == null then "not inspected" elif .running then .health else "not running" end)+"; restarts="+(if .restart_count==null then "unknown" else (.restart_count|tostring) end)+"; image="+(if .image.matches_available==null then "unknown" elif .image.matches_available then "current" else "staged" end)) end),
     "",
     "Immich",
     "  Library: " + .immich.library.state + "; size=" + (if .immich.library.size_bytes==null then "unknown" else (.immich.library.size_bytes|tostring)+"B" end) + "; age=" + (.immich.library.age_seconds|age),
@@ -303,6 +392,8 @@ report_render_text() {
     "  Backup timer: " + .backups.timer.enabled + "/" + .backups.timer.active + "; service=" + .backups.timer.result,
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
+    (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state),
+    "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="recorded" then "; age="+(.backups.restore_verification.age_seconds|age) else " ("+.backups.restore_verification.reason+")" end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",
     "Updates",
@@ -338,8 +429,9 @@ report_cmd() {
   fi
 
   local json_file text_file report_dir
-  json_file="$(mktemp)"; text_file="$(mktemp)"
-  trap 'rm -f "$json_file" "$text_file"' RETURN
+  json_file="$(report_tmp_register "$(mktemp)")"
+  text_file="$(report_tmp_register "$(mktemp)")"
+  trap 'report_tmp_cleanup' RETURN
   report_generate_json > "$json_file"
   report_render_text < "$json_file" > "$text_file"
   case "$mode" in
