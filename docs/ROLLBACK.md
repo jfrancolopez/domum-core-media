@@ -43,9 +43,13 @@ before Compose starts the service. Therefore rollback metadata is not proof of
 a usable rollback point.
 
 Do not run `rollback apply` against production until the snapshot exists and
-the previous-image restoration path has been corrected. The current
-plain-directory branch removes the live directory before restoration; that is
-a data-risk boundary, not a safe fallback.
+the previous-image restoration path has been corrected.
+
+The restore itself no longer deletes live state. Whatever is at the service
+path is **moved aside** to `<path>.rollback-<timestamp>` first, whatever its
+type, and if the restore then fails it is **put back**. The preserved copy is
+deliberately not removed automatically — it is the only way back if the
+restored state turns out to be wrong. Remove it once satisfied.
 
 The snapshot model itself — event-driven creation, time-driven pruning, and
 why the weekly unit only prunes — is described in
