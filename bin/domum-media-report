@@ -509,7 +509,26 @@ report_generate_json() {
     (.backups.heartbeat | select(.age_seconds != null and .age_seconds > 172800) | {level:"critical",message:"Latest backup is older than 48 hours",action:"Inspect domum-media-backup.service"}),
     (.backups.timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup timer is not enabled and active",action:"Inspect domum-media-backup.timer"}),
     (.backups.check_timer | select(.enabled != "enabled" or .active != "active") | {level:"warning",message:"Backup check timer is not enabled and active",action:"Inspect domum-media-check.timer"}),
-    (.updates.candidates[] | {level:"warning",message:(.service+" has a staged update candidate"),action:"Review: domum-media updates summary"}),
+    (select((.updates.candidates|length) > 0) |
+      (.updates.candidates | map(select(.age_seconds != null) | .age_seconds) | max) as $oldest |
+      (.updates.image_refresh.timer.enabled != "enabled") as $frozen |
+      {level:"warning",
+       message:(((.updates.candidates|length)|tostring)+" staged update candidate(s) awaiting deployment"
+                + (if $oldest == null then "" else ", oldest seen "+(($oldest/86400)|floor|tostring)+" days ago" end)
+                + (if $frozen then " (image refresh is frozen, so these will not deploy on their own)"
+                   else " (image refresh is ENABLED, so these can deploy automatically)" end)),
+       action:"Review: domum-media updates summary"}),
+    # The freeze is enforced by the timer, not by this policy flag. If they
+    # disagree, say so: someone reading only the config would conclude image
+    # refresh is live.
+    (.updates.image_refresh | select(.policy_enabled and .timer.enabled != "enabled") |
+      {level:"warning",
+       message:"IMAGE_AUTO_UPDATE_ENABLED is set in the config while the image-refresh timer is disabled",
+       action:"The freeze holds because the timer is disabled. Set IMAGE_AUTO_UPDATE_ENABLED=0 so the config matches intent"}),
+    (.updates.image_refresh.timer | select(.enabled == "enabled") |
+      {level:"critical",
+       message:"The image-refresh timer is ENABLED; automatic image deployment is no longer frozen",
+       action:"Disable it: systemctl disable --now domum-media-image-refresh.timer"}),
     (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "verified" and .age_seconds != null and .age_seconds > 2678400) | {level:"warning",message:"The last successful restore verification is over 31 days old",action:"Run: domum-media backup verify-restore <target>"}),
@@ -554,7 +573,7 @@ report_render_text() {
     "",
     "Updates",
     "  Image refresh: policy=" + (.updates.image_refresh.policy_enabled|tostring) + "; timer=" + .updates.image_refresh.timer.enabled + "/" + .updates.image_refresh.timer.active,
-    (if (.updates.candidates|length)==0 then "  No staged candidates" else (.updates.candidates[] | "  "+.service+": "+.candidate+"; first seen "+(.age_seconds|age)+" ago") end),
+    (if (.updates.candidates|length)==0 then "  No staged candidates" else (.updates.candidates[] | "  "+.service+": "+.candidate+(if .age_seconds==null then "; first seen: unknown" else "; first seen "+(.age_seconds|age)+" ago" end)) end),
     "",
     "Snapshot protection",
     "  Gate: SNAPSHOT_POLICY=" + .snapshot_protection.policy + (if .snapshot_protection.enforced then " (risky operations are refused without a snapshot)" else " (risky operations may proceed WITHOUT a rollback point)" end),
