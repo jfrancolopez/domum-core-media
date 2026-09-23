@@ -4455,9 +4455,14 @@ storage_migrate_subvolume() {
     migrate_stage stop "stopping $compose_svcs"
     # shellcheck disable=SC2086
     compose_cmd stop $compose_svcs || die "Could not stop $compose_svcs; nothing has been changed."
-    local still
-    # shellcheck disable=SC2086
-    still="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx -- $(printf '%s\n' $compose_svcs) || true)"
+    # Confirm each intended container is actually gone, one at a time: a
+    # command-substituted pattern list would word-split unpredictably.
+    local still="" svc
+    for svc in $compose_svcs; do
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$svc"; then
+        still+="${still:+ }$svc"
+      fi
+    done
     [[ -z "$still" ]] || die "Still running after stop: $still. Nothing has been changed."
     started=1
   fi
