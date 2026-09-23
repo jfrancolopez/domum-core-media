@@ -165,13 +165,72 @@ but so trivial it would prove less.
 Then calibre-web → kavita → navidrome → plex → **Immich last**, and only after
 the pilot has demonstrated both a real snapshot and a real rollback.
 
+## 6b. Empirically proven on this filesystem
+
+Measured on `/dev/sda1` with disposable fixtures under `/srv/data`, all removed
+afterwards. No service data was used.
+
+**Reflink works across the ordinary-directory → nested-subvolume boundary.**
+A/B on the same 256 MB incompressible file:
+
+| Copy | Free-space cost |
+|---|---|
+| `cp -a --reflink=always` into a nested subvolume | **0 KiB** |
+| `cp -a --reflink=never` (same file) | **262,144 KiB** |
+
+Content compared identical, permissions and mtime preserved, and the copy
+remained valid after the source directory was renamed — which is exactly the
+`.premigration` step.
+
+**`btrfs subvolume snapshot` is NOT recursive.** A parent subvolume containing a
+child subvolume was snapshotted read-only; the parent's own file appeared in the
+snapshot, and the child appeared as an **empty directory**:
+
+```
+parent file present in snapshot : YES
+child directory present         : YES
+child FILE present              : NO    (child dir entry count: 0)
+```
+
+Consequence for this design: snapshotting each service subvolume individually —
+which is what the code does — is correct. But anything that snapshots `@data`
+itself would silently capture every service as an empty directory. That is a
+landmine for any future "snapshot the whole data root" idea.
+
+**Subvolumes report distinct device ids.** `/srv/data` is `st_dev=45`,
+`/srv/snapshots` is `46`. Tooling that uses `--one-file-system` or compares
+device ids would treat a nested service subvolume as a separate filesystem and
+skip it. Verified that the backup wrapper does **not** pass
+`--one-file-system`, so restic will continue to traverse into service
+subvolumes after migration. Any future tooling must preserve that.
+
+**Privilege boundary.** An unprivileged owner of `/srv/data` can *create* a
+subvolume, but `btrfs subvolume delete` returns EPERM (the filesystem is not
+mounted `user_subvol_rm_allowed`). An empty subvolume can be removed with
+`rmdir`; a non-empty one cannot without root. A **read-only** snapshot cannot be
+emptied at all until its `ro` property is cleared. The migration helper must
+therefore run as root, and any failure that leaves a populated `.new` subvolume
+needs root to clean up.
+
 ## 7. Known gaps this migration does not close
 
-- **uptime-kuma has no protection at all.** Its state is the Docker named volume
-  `domum-media_uptime-kuma-data`, which is neither under `/srv/data` (so it
-  cannot be snapshotted) nor under any restic include path (so it is not backed
-  up). `traefik` likewise has no state directory. Both are listed as snapshot
-  candidates that can never match.
+- **Two services keep writable state outside the durable tier**, so it is
+  neither snapshottable nor backed up. A full container-mount inventory found
+  one I had missed:
+
+  | Container | Volume | Contents | Consequence if lost |
+  |---|---|---|---|
+  | traefik | `domum-media_traefik-letsencrypt` | `acme.json`, 116 KB, mode 0600 | ACME account key and all issued certificates; re-issuable but rate-limited |
+  | uptime-kuma | `domum-media_uptime-kuma-data` | `kuma.db` 287 KB (+ 8 KB WAL) | monitor definitions and history |
+
+  Neither is under `/srv/data`, and neither is inside any backup include path.
+  Immich's Redis (`dump.rdb`, anonymous volume) and machine-learning cache are
+  genuinely ephemeral/regenerable, and `immich_server`'s anonymous volume is
+  empty.
+
+  `domum-media report` now detects this class dynamically from the containers
+  themselves rather than from a hand-written list, so a volume added later
+  cannot hide — a static inventory is exactly what missed Traefik.
 - **Pre-update snapshots are taken with containers running**, so they are
   crash-consistent rather than clean. PostgreSQL and SQLite both recover from
   that, but stopping the service first would be correct for stateful updates.

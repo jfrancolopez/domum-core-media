@@ -302,4 +302,50 @@ awk '/image-refresh timer is ENABLED/{found=1} /level:"critical"/{lvl=1} END{exi
 grep -q '.updates.candidates\[\] | {level:"warning"' "$REPO_ROOT/bin/domum-media-report" \
   && fail "staged update candidates must be aggregated into a single finding"
 
+# ---------------------------------------------------------------------------
+# 13. Writable container state outside the durable data root is neither
+#     snapshottable nor backed up, and must be detected from the containers
+#     themselves -- a hand-written inventory missed Traefik's ACME store.
+# ---------------------------------------------------------------------------
+cat > "$FAKE_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "inspect" ]; then
+  name="$2"
+  case "$*" in
+    *Mounts*)
+      case "$name" in
+        immich_server) printf 'volume|some-named-volume|/letsencrypt|true
+bind|DATA_ROOT_PLACEHOLDER/immich/library|/upload|true
+bind|/etc/localtime|/etc/localtime|false
+bind|/srv/media|/media|false
+' ;;
+      esac ;;
+    *) printf 'running|healthy|0|sha256:x
+' ;;
+  esac
+  exit 0
+fi
+exit 1
+EOF
+# The stub must reference the harness's own data root, not a literal /srv/data.
+sed -i "s|DATA_ROOT_PLACEHOLDER|$DOMUM_DATA_ROOT|" "$FAKE_BIN/docker"
+chmod +x "$FAKE_BIN/docker"
+sed 's/\[\[ "\$1" == "docker" \]\] && return 1//' "$TMP_DIR/harness.sh" > "$TMP_DIR/harness-exposure.sh"
+bash "$TMP_DIR/harness-exposure.sh" > "$TMP_DIR/report-exposure.json" 2>/dev/null \
+  || fail "report generation failed while detecting container state exposure"
+
+jq -e '.unprotected_container_state | length > 0' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "a writable Docker volume must be detected as unprotected state"
+jq -e 'any(.unprotected_container_state[].unprotected_state[]; test("some-named-volume"))' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "the named volume was not reported"
+# A writable bind UNDER the data root is protected and must not be flagged.
+jq -e 'all(.unprotected_container_state[].unprotected_state[]; test("immich/library") | not)' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "a bind under the durable data root must not be flagged as unprotected"
+# Read-only mounts hold no state and must not be flagged.
+jq -e 'all(.unprotected_container_state[].unprotected_state[]; test("localtime|/srv/media") | not)' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "read-only mounts must not be flagged as unprotected state"
+jq -e 'any(.findings[]; .message | test("outside the durable data root"))' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "unprotected container state must raise a finding"
+rm -f "$FAKE_BIN/docker"
+
 echo "PASS: operational report smoke test"
