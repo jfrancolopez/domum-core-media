@@ -95,3 +95,34 @@ covers determinism, type diversity, both size caps, extensionless-file typing,
 the scratch-location refusal, and — most importantly — that a single appended
 byte in the restored data fails the run. Every check was confirmed non-vacuous
 by mutation testing (six mutants, six killed).
+
+## Reporting
+
+The weekly report carries this as `backups.asset_sample`, next to but never
+merged with `backups.restore_verification`:
+
+```
+  Sampled originals:    sampled (7 file(s), heic/mov, 1h ago; a sample, not the whole library)
+  Restore verification: verified (cloud, 3d ago, checks: gzip,size,footer)
+```
+
+The passing state is called **`sampled`**, never `verified`. A reader who sees
+`verified` must be able to assume the dump-restore claim; a sample is weaker
+and stays lexically distinct.
+
+Findings raised:
+
+| condition | level |
+|---|---|
+| any sampled file did not restore to identical bytes | critical |
+| no sampled verification recorded | info |
+| last sampled verification older than 90 days | info |
+
+A missing sample is `info`, not a warning: the dump restore verification is the
+load-bearing check, and sampling is an additional assurance rather than a
+gate. A **mismatch** is critical, because it means stored bytes differ from the
+originals.
+
+A manifest whose timestamps are unreadable is reported using its mtime rather
+than being silently indistinguishable from "never sampled" — a truncated or
+corrupt manifest must not read as a clean slate.

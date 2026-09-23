@@ -155,4 +155,72 @@ grep -qE '^ +verify-restore\)' "$REPO_ROOT/bin/domum-media-backup" \
 grep -q 'verify-restore' "$REPO_ROOT/bin/domum-media" \
   || fail "domum-media usage does not mention verify-restore"
 
+
+# ---------------------------------------------------------------------------
+# Sampled asset verification is reported SEPARATELY from the dump restore
+# verification, and never borrows its language.
+# ---------------------------------------------------------------------------
+report_sample() {
+  bash -c "
+set -uo pipefail
+cmd_exists() { command -v \"\$1\" >/dev/null 2>&1; }
+DOMUM_STATE_ROOT='$STATE'
+REPORT_NOW_EPOCH=\$(date +%s)
+source '$REPO_ROOT/bin/domum-media-report'
+report_asset_sample_verification
+"
+}
+
+SAMPLE="$VDIR/cloud-sample.jsonl"
+rm -f "$SAMPLE"
+
+# No manifest -> unknown, with a reason, and never "verified".
+out="$(report_sample)" || fail "report_asset_sample_verification failed with no manifest"
+jq -e '.state == "unknown" and .reason != null' <<< "$out" >/dev/null \
+  || fail "with no sample manifest the state must be unknown: $out"
+
+now="$(date -Iseconds)"
+row() { # result, type, size
+  jq -cn --arg r "$1" --arg m "$2" --argjson b "$3" --arg ts "$now" \
+    '{target:"cloud",snapshot_id:"deadbeef",path:"/srv/data/immich/library/x",
+      media_type:$m,size_bytes:$b,source_sha256:"a",restored_sha256:"a",
+      result:$r,verified_at:$ts}'
+}
+
+# All matched -> "sampled". It must NOT be called "verified": a sample is a
+# weaker claim than the dump restore verification and must stay distinguishable.
+{ row match heic 100; row match mov 200; } > "$SAMPLE"
+out="$(report_sample)"
+jq -e '.state == "sampled"' <<< "$out" >/dev/null \
+  || fail "a fully matching sample must report state 'sampled': $out"
+jq -e '.state != "verified"' <<< "$out" >/dev/null \
+  || fail "a sample must never report itself as 'verified': $out"
+jq -e '.sampled_files == 2 and .matched == 2 and .mismatched == 0
+       and .sampled_bytes == 300 and (.media_types | sort) == ["heic","mov"]
+       and .snapshot_id == "deadbeef" and .age_seconds != null' <<< "$out" >/dev/null \
+  || fail "sample summary lost its evidence: $out"
+
+# One mismatch -> failed. If this reports anything else, the command is theatre.
+{ row match heic 100; row MISMATCH mov 200; } > "$SAMPLE"
+out="$(report_sample)"
+jq -e '.state == "failed" and .mismatched == 1 and .reason != null' <<< "$out" >/dev/null \
+  || fail "a mismatching sample must report state 'failed': $out"
+
+# An empty manifest is not a pass, and it is distinguishable from never having
+# sampled at all -- otherwise a truncated manifest looks like a clean slate.
+: > "$SAMPLE"
+out="$(report_sample)"
+jq -e '.state == "unknown" and (.reason | test("empty"))' <<< "$out" >/dev/null \
+  || fail "an empty manifest must report itself as empty, not as never-sampled: $out"
+
+# A manifest whose timestamps are unusable must still be reported, not silently
+# treated as "no sampling has ever run".
+jq -cn '{target:"cloud",snapshot_id:"deadbeef",path:"/x",media_type:"heic",
+         size_bytes:1,source_sha256:"a",restored_sha256:"a",result:"match",
+         verified_at:""}' > "$SAMPLE"
+out="$(report_sample)"
+jq -e '.state == "sampled" and .last_sampled_at != null' <<< "$out" >/dev/null \
+  || fail "a manifest with unusable timestamps must still be reported: $out"
+rm -f "$SAMPLE"
+
 echo "PASS: restore verification smoke test"
