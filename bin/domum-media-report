@@ -157,44 +157,92 @@ report_container() {
       image:{configured:$configured,running_id:($running_id|select(length>0) // null),available_id:($available_id|select(length>0) // null),matches_available:$match}}'
 }
 
-# Persistent container state that lives OUTSIDE the durable data root is
-# invisible to both protection systems: it cannot be snapshotted (not on the
-# Btrfs data root) and it is not covered by any backup include path.
+# Persistent container state that lives outside the durable data root.
 #
-# Detected dynamically from the containers themselves rather than from a static
-# list, so a volume added later cannot hide. Traefik's ACME store was missed by
-# a hand-written inventory exactly this way.
+# A writable mount outside /srv/data does NOT automatically mean a recovery
+# risk. Classifying it is the whole point: warning on a transcode cache is
+# alert fatigue, and alert fatigue is how a real gap (Traefik's ACME store)
+# stays unnoticed.
+#
+# Classes:
+#   durable       real recovery cost if lost          -> warning
+#   media         the replaceable tier, by architecture -> info
+#   cache         regenerable                          -> info
+#   ephemeral     nothing meaningful to protect        -> not a finding
+#
+# Detection stays dynamic so nothing can hide; only the CLASS uses a small
+# declared table, and anything unrecognised defaults to `durable` so a new
+# volume fails loud rather than silent.
+
+# container:destination entries whose contents are known to be disposable even
+# though they are non-empty. Keep this short, and justify every line.
+state_class_declared() {
+  case "$1" in
+    # Redis RDB for Immich's job queue; Immich re-derives it. The volume is
+    # anonymous because redis:alpine declares VOLUME /data in the image.
+    immich_redis:/data) printf 'ephemeral' ;;
+    # immich-app declares VOLUME /data too, but Immich writes to the
+    # bind-mounted upload path; this volume is an unused image artefact.
+    immich_server:/data) printf 'ephemeral' ;;
+    *) printf '' ;;
+  esac
+}
+
+# Is a Docker volume empty? Reported as unknown when it cannot be inspected.
+state_volume_is_empty() {
+  local vol="$1" mp
+  cmd_exists docker || return 2
+  mp="$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null || true)"
+  [[ -n "$mp" && -d "$mp" ]] || return 2
+  [[ -z "$(ls -A "$mp" 2>/dev/null)" ]]
+}
+
 report_container_state_exposure() {
-  local name="$1" data_root="${DOMUM_DATA_ROOT%/}" mounts=""
+  local name="$1" data_root="${DOMUM_DATA_ROOT%/}" media_root="${DOMUM_MEDIA_ROOT%/}" mounts=""
   if cmd_exists docker; then
-    # type|source-or-volume-name|destination|rw
     mounts="$(docker inspect "$name" --format \
       '{{range .Mounts}}{{.Type}}|{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' \
       2>/dev/null || true)"
   fi
-  local exposed=()
-  local mtype msrc mdst mrw
+
+  local entries="" mtype msrc mdst mrw class
   while IFS='|' read -r mtype msrc mdst mrw; do
     [[ -n "${mtype:-}" ]] || continue
-    [[ "${mrw:-false}" == "true" ]] || continue          # read-only mounts hold no state
+    [[ "${mrw:-false}" == "true" ]] || continue      # read-only mounts hold no state
+    class=""
     case "$mtype" in
-      volume)
-        # A named or anonymous Docker volume is never under the data root.
-        exposed+=("$msrc:$mdst") ;;
       bind)
         case "$msrc" in
-          "$data_root"/*|"$data_root") ;;                 # protected tier
-          /etc/localtime|/var/run/docker.sock) ;;         # not state
-          *) exposed+=("$msrc:$mdst") ;;
+          "$data_root"/*|"$data_root") continue ;;   # protected tier
+          /etc/localtime|/var/run/docker.sock) continue ;;
+          *"/.cache/"*) class=cache ;;
+          "$media_root"/*|"$media_root") class=media ;;
+          *) class=durable ;;
         esac ;;
+      volume)
+        class="$(state_class_declared "$name:$mdst")"
+        if [[ -z "$class" ]]; then
+          if state_volume_is_empty "$msrc"; then
+            class=ephemeral                           # nothing to protect
+          else
+            class=durable                             # unrecognised and non-empty: fail loud
+          fi
+        fi ;;
+      *) continue ;;
     esac
+    entries+="${entries:+ }${class}:${msrc}:${mdst}"
   done <<< "$mounts"
 
-  local list="" e
-  for e in ${exposed[@]+"${exposed[@]}"}; do list+="${list:+,}$e"; done
-  jq -cn --arg name "$name" --arg exposed "$list" \
-    '{container:$name,
-      unprotected_state:(($exposed|select(length>0)|split(",")) // null)}'
+  local jqentries="[]" e
+  if [[ -n "$entries" ]]; then
+    jqentries="$(
+      for e in $entries; do
+        printf '%s\n' "$e"
+      done | jq -R 'split(":") | {class:.[0], source:(.[1:-1]|join(":")), destination:.[-1]}' | jq -s .
+    )"
+  fi
+  jq -cn --arg name "$name" --argjson mounts "$jqentries" \
+    '{container:$name, state:$mounts}'
 }
 
 report_filesystem() {
@@ -521,7 +569,7 @@ report_generate_json() {
       immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
       backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification},
       recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{policy:($snapshot_policy|ascii_upcase),enforced:(($snapshot_policy|ascii_upcase)=="REQUIRED"),services:$protection},
-      unprotected_container_state:[$exposure[]|select(.unprotected_state != null)],findings:[]}')"
+      container_state:[$exposure[]|select((.state|length) > 0)],findings:[]}')"
   findings="$(jq -c '[
     (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:((.count|tostring)+" failed systemd service unit(s)"),action:"Run: systemctl --failed"}),
     (.failed_systemd_units | select(.count == null) | {level:"warning",message:"Failed systemd units could not be determined",action:"Verify systemctl is available to the reporting user"}),
@@ -574,9 +622,12 @@ report_generate_json() {
       {level:"critical",
        message:"The image-refresh timer is ENABLED; automatic image deployment is no longer frozen",
        action:"Disable it: systemctl disable --now domum-media-image-refresh.timer"}),
-    (.unprotected_container_state[] |
+    # Only genuinely durable state is a finding. Caches, the replaceable media
+    # tier and ephemeral runtime state are listed in the report but are not
+    # problems, and warning about them would bury the ones that matter.
+    (.container_state[] as $c | $c.state[] | select(.class == "durable") |
       {level:"warning",
-       message:(.container+" keeps writable state outside the durable data root, so it is neither snapshotted nor backed up: "+(.unprotected_state|join(", "))),
+       message:($c.container+" keeps durable state outside the protected tier, so it is neither snapshotted nor backed up: "+.source+" -> "+.destination),
        action:"Bind-mount it under the data root, or add it to a backup target include path"}),
     (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
@@ -624,8 +675,8 @@ report_render_text() {
     "  Image refresh: policy=" + (.updates.image_refresh.policy_enabled|tostring) + "; timer=" + .updates.image_refresh.timer.enabled + "/" + .updates.image_refresh.timer.active,
     (if (.updates.candidates|length)==0 then "  No staged candidates" else (.updates.candidates[] | "  "+.service+": "+.candidate+(if .age_seconds==null then "; first seen: unknown" else "; first seen "+(.age_seconds|age)+" ago" end)) end),
     "",
-    "Unprotected container state",
-    (if (.unprotected_container_state|length)==0 then "  None — all writable state is under the durable data root" else (.unprotected_container_state[] | "  "+.container+": "+(.unprotected_state|join(", "))) end),
+    "Container state outside the protected tier",
+    (if (.container_state|length)==0 then "  None" else (.container_state[] as $c | $c.state[] | "  ["+.class+"] "+$c.container+": "+.source+" -> "+.destination) end),
     "",
     "Snapshot protection",
     "  Gate: SNAPSHOT_POLICY=" + .snapshot_protection.policy + (if .snapshot_protection.enforced then " (risky operations are refused without a snapshot)" else " (risky operations may proceed WITHOUT a rollback point)" end),
