@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Failure injection for `domum-media storage migrate-subvolume`.
+#
+# The invariant under test, for EVERY failure mode:
+#
+#   A migration failure must never leave less recoverable state than existed
+#   before it started.
+#
+# Concretely: the original service data must still be readable, either at its
+# original path or at the preserved .premigration path, and nothing may be
+# deleted. Btrfs primitives are stubbed -- their real behaviour is proven
+# separately in docs/BTRFS-MIGRATION-PLAN.md; what is exercised here is the
+# algorithm, its guards, and its recovery paths.
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP_DIR="$(mktemp -d)"
+trap '[ -n "${KEEP:-}" ] && echo "kept: $TMP_DIR" || rm -rf "$TMP_DIR"' EXIT
+
+CANARY='the-original-bytes-that-must-survive'
+
+# $1 = scenario dir, $2 = extra stub overrides
+run_migration() {
+  local dir="$TMP_DIR/$1" stubs="${2:-}"
+  rm -rf "$dir"; mkdir -p "$dir/data/jellyfin/config" "$dir/snapshots"
+  printf '%s\n' "$CANARY" > "$dir/data/jellyfin/config/jellyfin.db"
+  printf 'more\n' > "$dir/data/jellyfin/config/settings.xml"
+
+  cat > "$dir/harness.sh" <<EOF
+set -uo pipefail
+DOMUM_DIR="$REPO_ROOT"
+CFG_FILE="$dir/absent.conf"
+source "$REPO_ROOT/bin/domum-media"
+DOMUM_DATA_ROOT="$dir/data"
+DOMUM_MEDIA_ROOT="$dir/media"
+DOMUM_SNAPSHOT_ROOT="$dir/snapshots"
+need_root() { :; }
+load_cfg() { :; }
+export_env_for_compose() { :; }
+service_data_path() { printf '%s' "$dir/data/\$1"; }
+service_compose_services() { printf 'jellyfin'; }
+compose_cmd() { :; }
+docker() { :; }
+wait_for_service_health() { return 0; }
+create_service_snapshot() { printf 'jellyfin-stub-snap'; }
+# Track subvolume-ness out of band: a marker file inside the directory would
+# inflate the file/byte counts that migrate_verify compares.
+SUBVOL_REG="$dir/.subvols"
+path_is_subvolume() { grep -qxF "\$1" "\$SUBVOL_REG" 2>/dev/null; }
+btrfs() { case "\$1" in subvolume) mkdir -p "\${!#}" && printf '%s\\n' "\${!#}" >> "\$SUBVOL_REG";; esac; }
+mv() {
+  local src="\${@: -2:1}" dst="\${@: -1}"
+  command mv "\$@" || return 1
+  if grep -qxF "\$src" "\$SUBVOL_REG" 2>/dev/null; then
+    printf '%s\\n' "\$dst" >> "\$SUBVOL_REG"
+  fi
+}
+migrate_assert_same_btrfs() { :; }
+# The fixture lives on /tmp, which is not Btrfs, so --reflink=always cannot
+# work here. Reflink behaviour is proven separately against the real filesystem
+# (see docs/BTRFS-MIGRATION-PLAN.md); this suite exercises the algorithm, its
+# guards and its recovery paths.
+cp() { command cp -a "\${@: -2:1}" "\${@: -1}"; }
+$stubs
+storage_migrate_subvolume jellyfin
+EOF
+  bash "$dir/harness.sh" >"$dir/out.txt" 2>&1
+  printf '%s' "$?" > "$dir/rc"
+  printf '%s' "$dir"
+}
+
+# The canary must be findable somewhere, and nothing may have been destroyed.
+assert_data_survives() {
+  local dir="$1" label="$2" found
+  found="$(grep -rl "$CANARY" "$dir/data" 2>/dev/null | head -1)"
+  [ -n "$found" ] || fail "$label: the original data was DESTROYED — no copy of the canary remains"
+  printf '    %-42s data survives at %s\n' "$label" "${found#"$dir/data/"}"
+}
+
+# ---------------------------------------------------------------------------
+# Guards: refusals that must happen before anything changes.
+# ---------------------------------------------------------------------------
+echo "  guards:"
+
+d="$(run_migration guard-unknown '' )"
+out="$(bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'; CFG_FILE='$d/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+need_root() { :; }; load_cfg() { :; }; export_env_for_compose() { :; }
+storage_migrate_subvolume definitely-not-a-service" 2>&1 || true)"
+grep -qi 'not in the migration allowlist' <<< "$out" || fail "an unknown service must be refused: $out"
+echo "    unknown service                            refused"
+
+d="$(run_migration guard-already-subvol 'path_is_subvolume() { return 0; }')"
+grep -qi 'already a Btrfs subvolume' "$d/out.txt" || fail "an existing subvolume must be refused"
+[ "$(cat "$d/rc")" != "0" ] || fail "refusal must exit non-zero"
+assert_data_survives "$d" "already a subvolume"
+
+d="$(run_migration guard-premigration 'mkdir -p "'"$TMP_DIR"'/guard-premigration/data/jellyfin.premigration"')"
+grep -qi 'premigration already exists' "$d/out.txt" || fail "an existing .premigration must be refused"
+assert_data_survives "$d" "premigration already exists"
+
+d="$(run_migration guard-newsub 'mkdir -p "'"$TMP_DIR"'/guard-newsub/data/jellyfin.new"')"
+grep -qi 'already exists from an interrupted run' "$d/out.txt" || fail "a leftover .new must be refused"
+assert_data_survives "$d" "leftover .new from an interrupted run"
+
+d="$(run_migration guard-media 'service_data_path() { printf "%s" "'"$TMP_DIR"'/guard-media/media/jellyfin"; }
+mkdir -p "'"$TMP_DIR"'/guard-media/media/jellyfin"')"
+grep -qi 'media tier' "$d/out.txt" || fail "a path inside the media tier must be refused: $(cat "$d/out.txt")"
+echo "    path inside the media tier                 refused"
+
+# ---------------------------------------------------------------------------
+# Failure injection: every stage that can fail.
+# ---------------------------------------------------------------------------
+echo "  failure injection:"
+
+d="$(run_migration fail-stop 'compose_cmd() { return 1; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a service that refuses to stop must abort the migration"
+grep -qi 'could not stop' "$d/out.txt" || fail "the stop failure must be reported"
+assert_data_survives "$d" "service refuses to stop"
+
+d="$(run_migration fail-wal 'printf "wal" > "'"$TMP_DIR"'/fail-wal/data/jellyfin/config/jellyfin.db-wal"')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a non-empty WAL must abort the migration"
+grep -qi 'write-ahead log' "$d/out.txt" || fail "the WAL condition must be reported"
+assert_data_survives "$d" "non-empty SQLite WAL remains"
+
+d="$(run_migration fail-create 'btrfs() { return 1; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a failed subvolume creation must abort"
+assert_data_survives "$d" "subvolume creation fails"
+
+d="$(run_migration fail-copy 'cp() { return 1; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a failed copy must abort"
+grep -qi 'nothing was lost' "$d/out.txt" || fail "the copy failure must state that nothing was lost"
+assert_data_survives "$d" "copy fails"
+[ ! -e "$d/data/jellyfin.new" ] || fail "copy failure: the partial copy was not cleaned up"
+
+d="$(run_migration fail-verify 'migrate_verify() { return 1; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a verification mismatch must abort"
+assert_data_survives "$d" "verification mismatch"
+[ ! -e "$d/data/jellyfin.new" ] || fail "verify failure: the unverified copy was not cleaned up"
+[ -d "$d/data/jellyfin" ] || fail "verify failure: the original is no longer at its original path"
+
+# Cutover: the second rename fails, so the original must be put BACK.
+# The real call is `mv -- SRC DST`, so inspect the LAST two arguments.
+d="$(run_migration fail-cutover '
+mv() {
+  local src="${@: -2:1}" dst="${@: -1}"
+  case "$src" in *.new) return 1 ;; esac
+  command mv "$@"
+}')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a failed cutover must abort"
+assert_data_survives "$d" "cutover rename fails"
+[ -d "$d/data/jellyfin" ] || fail "cutover failure: the original was NOT restored to its path"
+grep -qi 'original was restored' "$d/out.txt" || fail "the cutover recovery must be reported"
+
+d="$(run_migration fail-health 'wait_for_service_health() { return 1; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "an unhealthy service must be reported as a failure"
+grep -qi 'previous state is intact' "$d/out.txt" || fail "the health failure must point at the preserved state"
+assert_data_survives "$d" "service unhealthy after migration"
+[ -d "$d/data/jellyfin.premigration" ] || fail "health failure: the premigration copy is missing"
+
+d="$(run_migration fail-snapshot 'create_service_snapshot() { return 1; }')"
+grep -qi 'could NOT be created' "$d/out.txt" || fail "a failed proof snapshot must be reported"
+assert_data_survives "$d" "proof snapshot fails"
+
+# ---------------------------------------------------------------------------
+# Success path.
+# ---------------------------------------------------------------------------
+echo "  success path:"
+d="$(run_migration success '')"
+[ "$(cat "$d/rc")" = "0" ] || fail "the success path failed: $(cat "$d/out.txt")"
+grep -qxF "$d/data/jellyfin" "$d/.subvols" || fail "success: the service path is not a subvolume"
+[ -d "$d/data/jellyfin.premigration" ] || fail "success: the previous state was not preserved"
+grep -q "$CANARY" "$d/data/jellyfin/config/jellyfin.db" || fail "success: content did not survive the migration"
+grep -q "$CANARY" "$d/data/jellyfin.premigration/config/jellyfin.db" || fail "success: the preserved copy is wrong"
+grep -qi 'retained deliberately' "$d/out.txt" || fail "success: the operator was not told the previous state is kept"
+echo "    migrated, verified, premigration retained  OK"
+
+# Nothing in the implementation may delete a premigration copy.
+grep -nE 'rm -rf.*premigration|rm -r .*premigration' "$REPO_ROOT/bin/domum-media" \
+  && fail "the implementation deletes a premigration copy"
+
+echo "PASS: storage migration failure smoke test"

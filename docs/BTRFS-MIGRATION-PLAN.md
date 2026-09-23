@@ -125,6 +125,19 @@ recommended initially.
 
 ## 5. Migration procedure, per service
 
+It is implemented as a guarded command rather than a sequence of pasted
+shell — `domum-media storage migrate-subvolume <service>` — so that the guards
+are reviewable and testable rather than depending on careful typing. It refuses
+any service outside an explicit allowlist, any path outside the durable data
+root, anything inside the media tier, a path that is already a subvolume, and a
+leftover `.premigration` or `.new` from an earlier attempt.
+
+Verification scales with the service: every file is hashed and the manifests
+compared when the service has at most `MIGRATE_FULL_HASH_MAX_FILES` (20,000)
+files — which covers all five small services — and a deterministic sample is
+hashed above that, which is the Immich case at 64,190 files.
+
+
 `cp --reflink=always` shares extents rather than duplicating them, so the copy
 is metadata-bound and costs almost no additional space.
 

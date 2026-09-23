@@ -4294,6 +4294,272 @@ doctor_cmd() {
   esac
 }
 
+# ---- storage: directory -> Btrfs subvolume migration -----------------------
+#
+# Converts one service state directory into a Btrfs subvolume so that
+# service-level snapshots can work at all. See docs/BTRFS-MIGRATION-PLAN.md.
+#
+# The invariant this is built around:
+#
+#   A migration failure must never leave less recoverable state than existed
+#   before it started.
+#
+# Live state is therefore never deleted -- only ever renamed aside -- and every
+# stage that can fail has an explicit recovery.
+
+MIGRATE_FULL_HASH_MAX_FILES="${MIGRATE_FULL_HASH_MAX_FILES:-20000}"
+
+migrate_stage() { echo "[domum-media] migrate[$1] $2"; }
+
+# Services whose state directory may be migrated. Anything else is refused.
+migrate_allowed_service() {
+  case "$1" in
+    jellyfin|plex|navidrome|calibre-web|kavita|immich) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A Btrfs subvolume root always has inode 256.
+path_is_subvolume() {
+  [[ -d "$1" ]] || return 1
+  [[ "$(stat -c %i "$1" 2>/dev/null)" == "256" ]]
+}
+
+# Refuse to touch anything that is not on the durable Btrfs data root.
+migrate_assert_same_btrfs() {
+  local path="$1" data_fs snap_fs path_fs
+  path_fs="$(stat -f -c %T "$path" 2>/dev/null || true)"
+  [[ "$path_fs" == "btrfs" ]] || die "$path is not on a Btrfs filesystem ($path_fs)"
+  data_fs="$(findmnt -no SOURCE -T "$DOMUM_DATA_ROOT" 2>/dev/null | sed 's/\[.*//')"
+  snap_fs="$(findmnt -no SOURCE -T "$DOMUM_SNAPSHOT_ROOT" 2>/dev/null | sed 's/\[.*//')"
+  [[ -n "$data_fs" && "$data_fs" == "$snap_fs" ]] \
+    || die "Snapshot root and data root are on different filesystems ($data_fs vs $snap_fs); snapshots cannot work"
+}
+
+# SQLite in WAL mode cannot be copied file-by-file while a writer is live: .db
+# and .db-wal would be captured at different instants. A clean shutdown
+# checkpoints and removes them.
+migrate_assert_quiesced() {
+  local path="$1" leftovers
+  leftovers="$(find "$path" -name '*-wal' -size +0 2>/dev/null || true)"
+  if [[ -n "$leftovers" ]]; then
+    die "Non-empty SQLite write-ahead logs remain after stopping the service:
+$leftovers
+The application did not shut down cleanly. Investigate before migrating."
+  fi
+  if [[ -e "$path/postgres/postmaster.pid" ]]; then
+    die "PostgreSQL is still running or did not shut down cleanly ($path/postgres/postmaster.pid exists)."
+  fi
+}
+
+migrate_measure() {
+  local path="$1"
+  printf '%s %s' \
+    "$(find "$path" -type f 2>/dev/null | wc -l)" \
+    "$(du -sb --apparent-size "$path" 2>/dev/null | awk '{print $1}')"
+}
+
+# Deterministic content manifest, relative to the given root so the two sides
+# are comparable.
+migrate_manifest() {
+  local root="$1"
+  ( cd "$root" && find . -type f -print0 2>/dev/null | sort -z \
+      | xargs -0 -r sha256sum 2>/dev/null )
+}
+
+migrate_verify() {
+  local src="$1" dst="$2" files
+  local s_count s_bytes d_count d_bytes
+  read -r s_count s_bytes <<< "$(migrate_measure "$src")"
+  read -r d_count d_bytes <<< "$(migrate_measure "$dst")"
+  migrate_stage verify "files: $s_count -> $d_count, bytes: $s_bytes -> $d_bytes"
+  [[ "$s_count" == "$d_count" ]] || { warn "file count mismatch"; return 1; }
+  [[ "$s_bytes" == "$d_bytes" ]] || { warn "byte count mismatch"; return 1; }
+
+  files="$s_count"
+  if (( files <= MIGRATE_FULL_HASH_MAX_FILES )); then
+    migrate_stage verify "hashing all $files file(s)"
+    if ! diff <(migrate_manifest "$src") <(migrate_manifest "$dst") >/dev/null; then
+      warn "content manifest mismatch"
+      return 1
+    fi
+    migrate_stage verify "content manifest identical"
+  else
+    # Too many files to hash inline. Sample deterministically: first, last and
+    # every Nth path, plus the largest file.
+    migrate_stage verify "$files files exceeds $MIGRATE_FULL_HASH_MAX_FILES; hashing a deterministic sample"
+    local sample step
+    step=$(( files / 200 )); (( step > 0 )) || step=1
+    sample="$( ( cd "$src" && find . -type f 2>/dev/null | sort | awk -v s="$step" 'NR%s==1' ) )"
+    local rel bad=0
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] || continue
+      local a b
+      a="$(sha256sum "$src/$rel" 2>/dev/null | cut -d" " -f1)"
+      b="$(sha256sum "$dst/$rel" 2>/dev/null | cut -d" " -f1)"
+      [[ -n "$a" && "$a" == "$b" ]] || { warn "sample mismatch: $rel"; bad=1; }
+    done <<< "$sample"
+    (( bad == 0 )) || return 1
+    migrate_stage verify "sampled content identical ($(printf '%s' "$sample" | grep -c . ) file(s))"
+  fi
+  return 0
+}
+
+storage_migrate_subvolume() {
+  need_root
+  load_cfg
+  export_env_for_compose
+
+  local service="${1:-}"
+  [[ -n "$service" ]] || die "Usage: domum-media storage migrate-subvolume <service>"
+  migrate_allowed_service "$service" \
+    || die "Refusing: '$service' is not in the migration allowlist (jellyfin, plex, navidrome, calibre-web, kavita, immich)"
+
+  local path premigration newsub compose_svcs
+  path="$(service_data_path "$service")" || die "No data path mapping for $service"
+  [[ -n "$path" && "$path" != "/" ]] || die "Refusing: resolved an unsafe path for $service"
+  [[ -d "$path" ]] || die "Refusing: $path does not exist"
+
+  # Never touch the replaceable media tier, whatever the config says.
+  case "$path" in
+    "${DOMUM_MEDIA_ROOT%/}"/*|"${DOMUM_MEDIA_ROOT%/}")
+      die "Refusing: $path is inside the media tier ($DOMUM_MEDIA_ROOT), which is not Btrfs and is out of scope" ;;
+    "${DOMUM_DATA_ROOT%/}"/*) ;;
+    *) die "Refusing: $path is outside the durable data root ($DOMUM_DATA_ROOT)" ;;
+  esac
+
+  path_is_subvolume "$path" && die "Nothing to do: $path is already a Btrfs subvolume."
+  migrate_assert_same_btrfs "$path"
+
+  premigration="${path}.premigration"
+  newsub="${path}.new"
+  [[ -e "$premigration" ]] \
+    && die "Refusing: $premigration already exists. A previous migration left rollback material; review and move it aside before migrating again."
+  [[ -e "$newsub" ]] \
+    && die "Refusing: $newsub already exists from an interrupted run. Review and remove it before retrying."
+
+  # Space: reflink makes the copy nearly free, but refuse if the filesystem is
+  # close to full, since a failed copy mid-way is the worst outcome.
+  local avail_kb
+  avail_kb="$(df --output=avail -k "$DOMUM_DATA_ROOT" | tail -1 | tr -d ' ')"
+  (( avail_kb > 1048576 )) || die "Refusing: less than 1 GiB free on $DOMUM_DATA_ROOT"
+
+  compose_svcs="$(service_compose_services "$service" || true)"
+  migrate_stage preflight "service=$service path=$path"
+  migrate_stage preflight "compose services: ${compose_svcs:-none}"
+  migrate_stage preflight "free space: $(( avail_kb / 1024 )) MiB"
+
+  # ---- stage 1: stop --------------------------------------------------------
+  local started=0
+  if [[ -n "$compose_svcs" ]]; then
+    migrate_stage stop "stopping $compose_svcs"
+    # shellcheck disable=SC2086
+    compose_cmd stop $compose_svcs || die "Could not stop $compose_svcs; nothing has been changed."
+    # Confirm each intended container is actually gone, one at a time: a
+    # command-substituted pattern list would word-split unpredictably.
+    local still="" svc
+    for svc in $compose_svcs; do
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$svc"; then
+        still+="${still:+ }$svc"
+      fi
+    done
+    [[ -z "$still" ]] || die "Still running after stop: $still. Nothing has been changed."
+    started=1
+  fi
+
+  migrate_restart() {
+    if (( started == 1 )) && [[ -n "$compose_svcs" ]]; then
+      # shellcheck disable=SC2086
+      compose_cmd up -d $compose_svcs >/dev/null 2>&1 || warn "Could not restart $compose_svcs"
+    fi
+  }
+
+  migrate_assert_quiesced "$path" || { migrate_restart; exit 1; }
+  migrate_stage stop "quiesced: no non-empty WAL, no postmaster.pid"
+
+  # ---- stage 2: create the new subvolume ------------------------------------
+  if ! btrfs subvolume create "$newsub" >/dev/null; then
+    migrate_restart
+    die "Could not create subvolume $newsub. Nothing has been changed."
+  fi
+  migrate_stage create "created subvolume $newsub"
+
+  # ---- stage 3: reflink copy ------------------------------------------------
+  if ! cp -a --reflink=always "$path/." "$newsub/"; then
+    warn "Copy failed; removing the partial copy. The original at $path is untouched."
+    rm -rf -- "$newsub"
+    migrate_restart
+    die "Migration aborted during copy. Nothing was lost."
+  fi
+  migrate_stage copy "reflink copy complete"
+
+  # ---- stage 4: verify ------------------------------------------------------
+  if ! migrate_verify "$path" "$newsub"; then
+    warn "Verification failed; removing the unverified copy. The original at $path is untouched."
+    rm -rf -- "$newsub"
+    migrate_restart
+    die "Migration aborted: the copy did not verify. Nothing was lost."
+  fi
+
+  # ---- stage 5+6: cutover ---------------------------------------------------
+  if ! mv -- "$path" "$premigration"; then
+    rm -rf -- "$newsub"
+    migrate_restart
+    die "Could not move the original aside. Nothing has been changed."
+  fi
+  migrate_stage cutover "original preserved at $premigration"
+
+  if ! mv -- "$newsub" "$path"; then
+    warn "Could not move the new subvolume into place; restoring the original."
+    mv -- "$premigration" "$path" \
+      || die "CRITICAL: the original could not be restored. It is at $premigration."
+    rm -rf -- "$newsub"
+    migrate_restart
+    die "Migration aborted at cutover. The original was restored."
+  fi
+  migrate_stage cutover "$path is now a Btrfs subvolume"
+
+  # ---- stage 7: restart and health -----------------------------------------
+  migrate_restart
+  if [[ -n "$compose_svcs" ]]; then
+    if wait_for_service_health "$service" 120 5; then
+      migrate_stage health "$service is healthy"
+    else
+      warn "$service did not become healthy after migration."
+      warn "The previous state is intact at $premigration."
+      warn "To roll back: stop the service, mv '$path' aside, mv '$premigration' '$path', start it."
+      die "Migration completed but the service is unhealthy. Nothing was deleted."
+    fi
+  fi
+
+  # ---- stage 8: prove a snapshot can now be taken ---------------------------
+  # Not `|| true`: a swallowed snapshot failure is the exact pattern the
+  # snapshot gate forbids. This one is genuinely non-fatal -- the migration has
+  # already succeeded and the proof is confirmatory -- but it must be reported,
+  # never discarded.
+  local proof=""
+  if proof="$(create_service_snapshot "$service" "post-migration" "" "")" && [[ -n "$proof" ]]; then
+    migrate_stage proof "snapshot created: $DOMUM_SNAPSHOT_ROOT/$proof"
+  else
+    proof=""
+    warn "Migration succeeded but a snapshot could NOT be created; investigate before relying on rollback."
+  fi
+
+  echo
+  echo "[domum-media] Migration complete for $service."
+  echo "  now a subvolume : $path"
+  echo "  previous state  : $premigration   (retained deliberately; remove it yourself when satisfied)"
+  [[ -n "$proof" ]] && echo "  proof snapshot  : $proof"
+}
+
+storage_cmd() {
+  local sub="${1:-}"
+  case "$sub" in
+    migrate-subvolume) shift; storage_migrate_subvolume "$@" ;;
+    *) die "Usage: domum-media storage migrate-subvolume <service>" ;;
+  esac
+}
+
 # ---- operational reporting -------------------------------------------------
 
 REPORT_LIB_DEFAULT="/usr/local/lib/domum-media/domum-media-report"
@@ -4344,6 +4610,7 @@ Usage:
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
   domum-media checkup [--json]
   domum-media report [--json|--write]
+  domum-media storage migrate-subvolume <service>
   domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]
   domum-media recovery-pack {create [--no-email]|status}
   domum-media doctor {immich|traefik|backups|secrets|navidrome}
@@ -4372,6 +4639,7 @@ main() {
     rollback)  shift; rollback_cmd "$@" ;;
     checkup)   shift; checkup_cmd "$@" ;;
     report)    shift; report_entry "$@" ;;
+    storage)   shift; storage_cmd "$@" ;;
     cleanup)   shift; cleanup_cmd "$@" ;;
     recovery-pack) shift; recovery_pack_cmd "$@" ;;
     doctor)    shift; doctor_cmd "$@" ;;
