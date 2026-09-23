@@ -4560,7 +4560,17 @@ storage_migrate_subvolume() {
   migrate_restart
   if [[ -n "$compose_svcs" ]]; then
     if wait_for_service_health "$service" 120 5; then
-      migrate_stage health "$service is healthy"
+      # Be precise about what that actually proved. For a service with no
+      # healthcheck and no configured health URL, service_is_healthy means the
+      # container is running -- not that the application works.
+      local health_url
+      health_url="$(service_health_url "$service" 2>/dev/null || true)"
+      if [[ -n "$health_url" ]]; then
+        migrate_stage health "$service container running and $health_url responded"
+      else
+        migrate_stage health "$service container is running (no healthcheck or health URL configured)"
+        migrate_stage health "content was verified byte-for-byte; confirm the application itself before removing $premigration"
+      fi
     else
       warn "$service did not become healthy after migration."
       warn "The previous state is intact at $premigration."
