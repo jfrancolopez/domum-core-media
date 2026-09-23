@@ -61,6 +61,9 @@ jobs:
       - name: Storage migration failure smoke test
         run: tests/storage-migration-failure-smoke.sh
 
+      - name: Sample verification smoke test
+        run: tests/sample-verification-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/
