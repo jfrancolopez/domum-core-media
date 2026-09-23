@@ -29,6 +29,7 @@ mk a/clip.mov   9000
 mk b/pic.jpeg   1500
 mk b/raw.dng    7000
 mk b/shot.png    120
+mk b/noext       500     # no extension at all
 mk b/huge.mp4  40000     # over the per-file cap below
 
 # The stubs live in a file so the test never has to nest quoting levels.
@@ -80,22 +81,22 @@ $1
 # ---------------------------------------------------------------------------
 # 1. Selection is deterministic and diverse, and honours the per-file cap.
 # ---------------------------------------------------------------------------
-sel1="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 6')" \
+sel1="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 7')" \
   || fail "sample_select_paths failed"
-sel2="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 6')"
+sel2="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 7')"
 [[ "$sel1" == "$sel2" ]] || fail "selection is not deterministic"
 
 grep -q 'huge.mp4' <<< "$sel1" && fail "a file above the per-file cap was selected: $sel1"
 
 for ext in heic mov jpeg dng png; do
   grep -q "\.$ext\$" <<< "$sel1" \
-    || fail "media type '$ext' is absent from a 6-file sample of 5 types: $sel1"
+    || fail "media type '$ext' is absent from a 7-file sample of 6 types: $sel1"
 done
 
 # ---------------------------------------------------------------------------
 # 2. A faithful restore verifies, and the manifest carries the evidence.
 # ---------------------------------------------------------------------------
-out="$(harness 'do_verify_sample cloud 6' 2>&1)" \
+out="$(harness 'do_verify_sample cloud 7' 2>&1)" \
   || fail "verify-sample failed on an identical restore: $out"
 
 MANIFEST="$TMP_DIR/state/restore-verification/cloud-sample.jsonl"
@@ -103,7 +104,7 @@ MANIFEST="$TMP_DIR/state/restore-verification/cloud-sample.jsonl"
 [[ "$(stat -c '%a' "$MANIFEST")" == 600 ]] || fail "manifest must be mode 0600"
 
 n="$(wc -l < "$MANIFEST")"
-(( n == 6 )) || fail "expected 6 manifest rows, got $n"
+(( n == 7 )) || fail "expected 7 manifest rows, got $n"
 
 while read -r row; do
   jq -e '
@@ -122,11 +123,18 @@ done < "$MANIFEST"
 types="$(jq -r '.media_type' "$MANIFEST" | sort -u | tr '\n' ' ')"
 (( $(wc -w <<< "$types") >= 5 )) || fail "sample is not diverse: $types"
 
+# An extensionless file must be typed "none" -- never its own path, which would
+# both leak the tree into the type column and fake extra diversity.
+grep -q '"media_type":"none"' "$MANIFEST" \
+  || fail "the extensionless file was not typed as 'none': $types"
+jq -e 'select(.media_type | test("/"))' "$MANIFEST" >/dev/null \
+  && fail "a media type contains a path separator: $types"
+
 # ---------------------------------------------------------------------------
 # 3. Corruption in the restored bytes MUST fail. If this passes, the whole
 #    command is decorative.
 # ---------------------------------------------------------------------------
-out="$(harness 'RESTORE_CORRUPT=1; do_verify_sample cloud 6' 2>&1)"
+out="$(harness 'RESTORE_CORRUPT=1; do_verify_sample cloud 7' 2>&1)"
 rc=$?
 (( rc != 0 )) || fail "a corrupted restore was reported as verified: $out"
 grep -qi 'mismatch' <<< "$out" || fail "failure did not name the mismatch: $out"
@@ -135,7 +143,7 @@ grep -q 'MISMATCH' "$MANIFEST" || fail "the mismatch was not recorded in the man
 # ---------------------------------------------------------------------------
 # 4. The total-byte cap is enforced, not just the per-file cap.
 # ---------------------------------------------------------------------------
-out="$(harness 'SAMPLE_MAX_TOTAL_BYTES=2600; do_verify_sample cloud 6' 2>&1)" \
+out="$(harness 'SAMPLE_MAX_TOTAL_BYTES=2600; do_verify_sample cloud 7' 2>&1)" \
   || fail "verify-sample failed under a tight total cap: $out"
 total="$(jq -s 'map(.size_bytes) | add' "$MANIFEST")"
 (( total <= 2600 )) || fail "the total-byte cap was exceeded: $total"

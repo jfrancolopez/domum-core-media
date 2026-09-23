@@ -903,7 +903,8 @@ sample_select_paths() {
     | awk -F'\t' -v want="$want" '
         {
           size[NR]=$1; path[NR]=$2
-          ext=tolower($2); sub(/.*\./, "", ext)
+          base=$2; sub(/.*\//, "", base)
+          if (base ~ /\./) { ext=tolower(base); sub(/.*\./, "", ext) } else { ext="none" }
           n[ext]++; byext[ext, n[ext]]=NR
         }
         END {
@@ -966,19 +967,19 @@ do_verify_sample() {
     | jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' 2>/dev/null || true)"
   [[ -n "$snapshot_id" ]] || die "Could not determine the latest snapshot for $target"
 
-  local -a paths=() sizes=()
+  local -a sample_paths=() sample_sizes=()
   local size path
   while IFS=$'\t' read -r size path; do
     [[ -n "$path" ]] || continue
     (( total + size > SAMPLE_MAX_TOTAL_BYTES )) && continue
-    paths+=("$path"); sizes+=("$size"); total=$(( total + size ))
+    sample_paths+=("$path"); sample_sizes+=("$size"); total=$(( total + size ))
   done < <(sample_select_paths "$lib" "$want")
 
-  (( ${#paths[@]} > 0 )) || die "No sample candidates found under $lib within the size caps"
-  log "sample verification: $target snapshot $snapshot_id, ${#paths[@]} file(s), $total bytes"
+  (( ${#sample_paths[@]} > 0 )) || die "No sample candidates found under $lib within the size caps"
+  log "sample verification: $target snapshot $snapshot_id, ${#sample_paths[@]} file(s), $total bytes"
 
   local -a include_args=()
-  for path in "${paths[@]}"; do include_args+=(--include "$path"); done
+  for path in "${sample_paths[@]}"; do include_args+=(--include "$path"); done
   if ! restic_for_target "$target" restore latest --target "$scratch" "${include_args[@]}" >/dev/null 2>&1; then
     die "Sample restore failed for $target"
   fi
@@ -986,9 +987,10 @@ do_verify_sample() {
   manifest="$(sample_manifest_file "$target")"
   local tmp; tmp="$(mktemp "${manifest}.XXXXXX")" || die "Cannot stage the manifest"
   local ok=0 bad=0 i ext src_hash dst_hash verdict
-  for i in "${!paths[@]}"; do
-    path="${paths[$i]}"; size="${sizes[$i]}"
-    ext="${path##*.}"; ext="$(printf '%s' "$ext" | tr 'A-Z' 'a-z')"
+  for i in "${!sample_paths[@]}"; do
+    path="${sample_paths[$i]}"; size="${sample_sizes[$i]}"
+    ext="${path##*/}"
+    if [[ "$ext" == *.* ]]; then ext="${ext##*.}"; ext="${ext,,}"; else ext="none"; fi
     src_hash="$(sha256sum "$path" 2>/dev/null | cut -d" " -f1)"
     dst_hash="$(sha256sum "$scratch$path" 2>/dev/null | cut -d" " -f1)"
     if [[ -n "$src_hash" && "$src_hash" == "$dst_hash" ]]; then
@@ -1009,7 +1011,7 @@ do_verify_sample() {
   echo
   echo "[domum-media-backup] Sample verification for $target"
   echo "  snapshot : $snapshot_id"
-  echo "  sampled  : ${#paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
+  echo "  sampled  : ${#sample_paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
   echo "  manifest : $manifest"
   echo "  NOTE: this proves the SAMPLED objects only. It does not prove the whole"
   echo "        library, nor that a rebuilt Immich can serve it."

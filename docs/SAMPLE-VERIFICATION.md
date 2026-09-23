@@ -38,7 +38,8 @@ so two runs are comparable and a regression is visible.
    first. The library's largest object is ~1.4 GB; restoring it on every run
    would dominate the cost without adding information.
 2. One representative per distinct extension, in sorted extension order,
-   choosing that extension's **median-sized** file.
+   choosing that extension's **median-sized** file. A file with no extension is
+   typed `none` rather than being given a type derived from its path.
 3. The smallest and the largest remaining eligible files, to exercise both
    ends of the size distribution.
 4. The remainder filled by even stride across the path-sorted list, then a
@@ -90,7 +91,7 @@ kept in the manifest.
 ## Test coverage
 
 `tests/sample-verification-smoke.sh` is hermetic (no restic, no network) and
-covers determinism, type diversity, both size caps, the scratch-location
-refusal, and — most importantly — that a single appended byte in the restored
-data fails the run. All five checks were confirmed non-vacuous by mutation
-testing.
+covers determinism, type diversity, both size caps, extensionless-file typing,
+the scratch-location refusal, and — most importantly — that a single appended
+byte in the restored data fails the run. Every check was confirmed non-vacuous
+by mutation testing (six mutants, six killed).
