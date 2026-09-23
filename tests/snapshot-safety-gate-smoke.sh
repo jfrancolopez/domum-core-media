@@ -160,4 +160,38 @@ if snapshot_create lyingtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
 grep -q 'RC=1' <<< "$out" \
   || fail "snapshot_create trusted btrfs's exit status without verifying the snapshot exists: $out"
 
+# ---------------------------------------------------------------------------
+# 6. Every mapped service must resolve a data path with NO config loaded.
+#    A missing *_CONFIG_DIR previously made this fail with "unbound variable"
+#    under `set -u` -- on a host bootstrapped from the example config, and on
+#    the disaster-recovery rebuild path.
+# ---------------------------------------------------------------------------
+for svc in traefik immich jellyfin plex navidrome calibre-web kavita uptime-kuma; do
+  out="$( { bash -c "set -uo pipefail
+DOMUM_DATA_ROOT=/srv/data
+eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+service_data_path $svc" ; } 2>&1 )"     || fail "service_data_path $svc failed with no config loaded: $out"
+  case "$out" in
+    /*) ;;
+    *) fail "service_data_path $svc returned a non-absolute path with no config: [$out]" ;;
+  esac
+done
+
+# An unmapped service must still be rejected rather than returning something.
+if bash -c "set -uo pipefail
+DOMUM_DATA_ROOT=/srv/data
+eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+service_data_path definitely-not-a-service" >/dev/null 2>&1; then
+  fail "service_data_path accepted an unknown service"
+fi
+
+# Every service the snapshot code iterates must also be resolvable.
+while read -r cand; do
+  svc="$(basename "$cand")"
+  bash -c "set -uo pipefail
+DOMUM_DATA_ROOT=/srv/data
+eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+service_data_path $svc" >/dev/null 2>&1     || fail "snapshot candidate '$svc' has no service_data_path mapping"
+done < <(awk '/^snapshot_subvolumes\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media"          | grep -oE 'DOMUM_DATA_ROOT/[a-z-]+' | sed 's|.*/||')
+
 echo "PASS: snapshot safety gate smoke test"
