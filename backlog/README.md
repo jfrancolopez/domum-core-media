@@ -73,7 +73,7 @@ nothing else is safe to iterate on top of.
 
 | # | Task | Status | Complexity | Risk | Operator |
 |---|------|--------|-----------|------|----------|
-| 01 | [Fix rm -rf branch in snapshot restore](task-01-fix-restore-rm-rf.md) | pending | trivial | low | — |
+| 01 | [Fix rm -rf branch in snapshot restore](task-01-fix-restore-rm-rf.md) | DONE — live state is moved aside, never deleted, and put back if the restore fails | trivial | low | — |
 | 05 | [Guard git reset --hard against local drift](task-05-reset-hard-drift-guard.md) **[shared-philosophy]** | pending | small | low | — |
 | 19 | [Atomic Immich pg_dump](task-19-atomic-pg-dump.md) | DONE (`07289a8`, live verified) | small | low | — |
 | 20 | [Operation locking (flock)](task-20-operation-locking.md) | pending | small-med | low | — |

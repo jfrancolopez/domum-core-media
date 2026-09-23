@@ -1360,7 +1360,8 @@ list_service_snapshots() {
 restore_snapshot_for_service() {
   local service="$1"
   local snapshot_name="$2"
-  local data_path current_backup compose_svcs
+  local data_path compose_svcs
+  local current_backup=""
 
   data_path="$(service_data_path "$service")" || die "No data path mapping for $service"
   [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || die "Snapshot not found: $snapshot_name"
@@ -1369,15 +1370,39 @@ restore_snapshot_for_service() {
   # shellcheck disable=SC2086
   [[ -n "$compose_svcs" ]] && compose_cmd stop $compose_svcs 2>/dev/null || true
 
-  if [[ -d "$data_path" ]] && is_btrfs_subvol "$data_path"; then
+  # Preserve whatever is there now, whatever its type. The previous code moved a
+  # subvolume aside but `rm -rf`'d an ordinary directory, so restoring onto a
+  # non-subvolume path destroyed the live state before the replacement existed:
+  # if the snapshot then failed to materialise, there was nothing to go back to.
+  # Live state is never deleted here -- only moved.
+  if [[ -e "$data_path" ]]; then
     current_backup="${data_path}.rollback-$(date +%Y%m%d-%H%M%S)"
-    mv "$data_path" "$current_backup"
-  elif [[ -e "$data_path" ]]; then
-    rm -rf "$data_path"
+    [[ -e "$current_backup" ]] && die "Refusing to restore: $current_backup already exists"
+    mv -- "$data_path" "$current_backup" \
+      || die "Refusing to restore: could not preserve the current state of $data_path"
+    echo "[domum-media] Preserved current state at $current_backup"
   fi
 
   echo "[domum-media] Restoring $service from $snapshot_name"
-  btrfs subvolume snapshot "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" "$data_path"
+  if ! btrfs subvolume snapshot "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" "$data_path"; then
+    # The restore failed. Put the preserved state back rather than leaving the
+    # service with nothing.
+    if [[ -n "$current_backup" && -e "$current_backup" ]]; then
+      # Only ever removes a partial restore we just created, never live state.
+      [[ -e "$data_path" ]] && rm -rf -- "$data_path"
+      mv -- "$current_backup" "$data_path" \
+        || die "Restore failed AND the preserved state could not be put back. It is at: $current_backup"
+      echo "[domum-media] Restore failed; previous state put back from $current_backup" >&2
+    fi
+    die "Restore failed for $service from $snapshot_name"
+  fi
+
+  # The preserved copy is deliberately NOT deleted: it is the only way back if
+  # the restored state turns out to be wrong. Remove it when satisfied.
+  if [[ -n "$current_backup" ]]; then
+    echo "[domum-media] Previous state kept at $current_backup (remove it once satisfied)"
+  fi
+
   # shellcheck disable=SC2086
   [[ -n "$compose_svcs" ]] && compose_cmd up -d $compose_svcs
 }

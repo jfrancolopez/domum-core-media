@@ -52,6 +52,9 @@ jobs:
       - name: Restore verification smoke test
         run: tests/restore-verification-smoke.sh
 
+      - name: Restore preserves state smoke test
+        run: tests/restore-preserves-state-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/
