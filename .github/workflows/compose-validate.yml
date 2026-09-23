@@ -58,6 +58,9 @@ jobs:
       - name: Log hygiene smoke test
         run: tests/log-hygiene-smoke.sh
 
+      - name: Storage migration failure smoke test
+        run: tests/storage-migration-failure-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/
