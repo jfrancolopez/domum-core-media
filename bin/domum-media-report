@@ -157,6 +157,46 @@ report_container() {
       image:{configured:$configured,running_id:($running_id|select(length>0) // null),available_id:($available_id|select(length>0) // null),matches_available:$match}}'
 }
 
+# Persistent container state that lives OUTSIDE the durable data root is
+# invisible to both protection systems: it cannot be snapshotted (not on the
+# Btrfs data root) and it is not covered by any backup include path.
+#
+# Detected dynamically from the containers themselves rather than from a static
+# list, so a volume added later cannot hide. Traefik's ACME store was missed by
+# a hand-written inventory exactly this way.
+report_container_state_exposure() {
+  local name="$1" data_root="${DOMUM_DATA_ROOT%/}" mounts=""
+  if cmd_exists docker; then
+    # type|source-or-volume-name|destination|rw
+    mounts="$(docker inspect "$name" --format \
+      '{{range .Mounts}}{{.Type}}|{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' \
+      2>/dev/null || true)"
+  fi
+  local exposed=()
+  local mtype msrc mdst mrw
+  while IFS='|' read -r mtype msrc mdst mrw; do
+    [[ -n "${mtype:-}" ]] || continue
+    [[ "${mrw:-false}" == "true" ]] || continue          # read-only mounts hold no state
+    case "$mtype" in
+      volume)
+        # A named or anonymous Docker volume is never under the data root.
+        exposed+=("$msrc:$mdst") ;;
+      bind)
+        case "$msrc" in
+          "$data_root"/*|"$data_root") ;;                 # protected tier
+          /etc/localtime|/var/run/docker.sock) ;;         # not state
+          *) exposed+=("$msrc:$mdst") ;;
+        esac ;;
+    esac
+  done <<< "$mounts"
+
+  local list="" e
+  for e in ${exposed[@]+"${exposed[@]}"}; do list+="${list:+,}$e"; done
+  jq -cn --arg name "$name" --arg exposed "$list" \
+    '{container:$name,
+      unprotected_state:(($exposed|select(length>0)|split(",")) // null)}'
+}
+
 report_filesystem() {
   local path="$1" row
   row="$(df -B1 -P -- "$path" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $2, $3, $4, $5}' || true)"
@@ -401,16 +441,19 @@ report_generate_json() {
   done
   shopt -u nullglob
 
-  local work containers_file fs_file protection_file updates_file backups_file failed_file targets_file
+  local work containers_file fs_file protection_file updates_file backups_file failed_file targets_file exposure_file
   work="$(report_tmp_register "$(mktemp -d)")"
   containers_file="$work/containers"; fs_file="$work/filesystems"; protection_file="$work/protection"
   updates_file="$work/updates"; backups_file="$work/backups"; failed_file="$work/failed"
-  targets_file="$work/targets"
+  targets_file="$work/targets"; exposure_file="$work/exposure"
   : > "$containers_file"; : > "$fs_file"; : > "$protection_file"; : > "$updates_file"; : > "$backups_file"; : > "$failed_file"
-  : > "$targets_file"
+  : > "$targets_file"; : > "$exposure_file"
 
   local logical name image path service enable_var data_path target file
-  while IFS='|' read -r logical name image; do report_container "$logical" "$name" "$image" >> "$containers_file"; done < <(report_container_specs)
+  while IFS='|' read -r logical name image; do
+    report_container "$logical" "$name" "$image" >> "$containers_file"
+    report_container_state_exposure "$name" >> "$exposure_file"
+  done < <(report_container_specs)
   for path in / /srv/data /srv/media /srv/snapshots; do report_filesystem "$path" >> "$fs_file"; done
   while IFS='|' read -r service enable_var _ _ _ _ _; do
     [[ "${!enable_var:-0}" == "1" ]] || continue
@@ -470,13 +513,15 @@ report_generate_json() {
     --argjson recovery "$recovery_json" --argjson candidates "$(jq -s . "$updates_file")" \
     --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
     --arg snapshot_policy "${SNAPSHOT_POLICY:-REQUIRED}" \
+    --argjson exposure "$(jq -s . "$exposure_file")" \
     --arg immich_enabled "${ENABLE_IMMICH:-0}" \
     '{schema_version:2,generated_at:$generated,overall:"unknown",
       host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
       filesystems:$filesystems,failed_systemd_units:{state:$failed_state,count:$failed_count,units:$failed_units},containers:$containers,
       immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
       backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification},
-      recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{policy:($snapshot_policy|ascii_upcase),enforced:(($snapshot_policy|ascii_upcase)=="REQUIRED"),services:$protection},findings:[]}')"
+      recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{policy:($snapshot_policy|ascii_upcase),enforced:(($snapshot_policy|ascii_upcase)=="REQUIRED"),services:$protection},
+      unprotected_container_state:[$exposure[]|select(.unprotected_state != null)],findings:[]}')"
   findings="$(jq -c '[
     (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:((.count|tostring)+" failed systemd service unit(s)"),action:"Run: systemctl --failed"}),
     (.failed_systemd_units | select(.count == null) | {level:"warning",message:"Failed systemd units could not be determined",action:"Verify systemctl is available to the reporting user"}),
@@ -529,6 +574,10 @@ report_generate_json() {
       {level:"critical",
        message:"The image-refresh timer is ENABLED; automatic image deployment is no longer frozen",
        action:"Disable it: systemctl disable --now domum-media-image-refresh.timer"}),
+    (.unprotected_container_state[] |
+      {level:"warning",
+       message:(.container+" keeps writable state outside the durable data root, so it is neither snapshotted nor backed up: "+(.unprotected_state|join(", "))),
+       action:"Bind-mount it under the data root, or add it to a backup target include path"}),
     (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "verified" and .age_seconds != null and .age_seconds > 2678400) | {level:"warning",message:"The last successful restore verification is over 31 days old",action:"Run: domum-media backup verify-restore <target>"}),
@@ -574,6 +623,9 @@ report_render_text() {
     "Updates",
     "  Image refresh: policy=" + (.updates.image_refresh.policy_enabled|tostring) + "; timer=" + .updates.image_refresh.timer.enabled + "/" + .updates.image_refresh.timer.active,
     (if (.updates.candidates|length)==0 then "  No staged candidates" else (.updates.candidates[] | "  "+.service+": "+.candidate+(if .age_seconds==null then "; first seen: unknown" else "; first seen "+(.age_seconds|age)+" ago" end)) end),
+    "",
+    "Unprotected container state",
+    (if (.unprotected_container_state|length)==0 then "  None — all writable state is under the durable data root" else (.unprotected_container_state[] | "  "+.container+": "+(.unprotected_state|join(", "))) end),
     "",
     "Snapshot protection",
     "  Gate: SNAPSHOT_POLICY=" + .snapshot_protection.policy + (if .snapshot_protection.enforced then " (risky operations are refused without a snapshot)" else " (risky operations may proceed WITHOUT a rollback point)" end),
