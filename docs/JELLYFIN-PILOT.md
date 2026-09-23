@@ -1,0 +1,110 @@
+# Jellyfin subvolume pilot — runbook
+
+The first directory → Btrfs subvolume conversion on this host. Jellyfin is the
+pilot because it is small, fully rebuildable, exercises the real mechanics (a
+database, a container bind mount, the snapshot and rollback cycle), and its
+valuable data — the media library — lives on `/srv/media`, which this does not
+touch.
+
+**Nothing in this document has been executed.**
+
+## Verified before writing this
+
+| Item | Evidence |
+|---|---|
+| Data path | `service_data_path jellyfin` → `/srv/data/jellyfin` (inode 269, ordinary directory) |
+| Size | 600 KB, 37 files |
+| Database | `config/data/data/jellyfin.db`, no `-wal`/`-shm` present |
+| Container | `jellyfin`, from `service_compose_services` |
+| Bind mounts | `/srv/data/jellyfin/config` → `/config` (rw); `/srv/media` → `/media` (ro); `/srv/media/.cache/jellyfin` → `/cache` (rw) |
+| Untouched by migration | both `/srv/media` mounts — the media tier is not Btrfs and is out of scope |
+| Filesystem | `/srv/data` and `/srv/snapshots` are subvolumes of the same `/dev/sda1` |
+| Free space | 717 GB against a 600 KB copy |
+| Reflink | proven on this filesystem: 0 KiB vs 262,144 KiB for the same file |
+| Health semantics | Jellyfin defines no healthcheck and no health URL, so `service_is_healthy` means **container running** |
+
+## What the migration proves, and what it does not
+
+`storage migrate-subvolume` hashes **every one of the 37 files** and compares
+manifests before cutover, so a successful migration proves the content is
+byte-identical. Combined with the container starting, that is strong.
+
+It does **not** prove the application works. With no healthcheck and no health
+URL, "healthy" means the container is running. **Open Jellyfin and confirm your
+libraries are intact before removing the `.premigration` copy.**
+
+## Step 1 — migrate
+
+```bash
+sudo domum-media storage migrate-subvolume jellyfin
+```
+
+Expect, in order: preflight → stop → quiesce check → subvolume created →
+reflink copy → all 37 files hashed and matched → original preserved at
+`/srv/data/jellyfin.premigration` → cutover → restart → container running →
+proof snapshot created.
+
+Refuses before changing anything if: the path is already a subvolume, a
+`.premigration` or `.new` exists, the snapshot root is on another filesystem,
+free space is under 1 GiB, the container will not stop, or a non-empty SQLite
+WAL survives the stop.
+
+## Step 2 — confirm the migration
+
+```bash
+sudo domum-media report
+```
+
+`jellyfin` must move from `unprotected` to `protected` in the snapshot section.
+Then open Jellyfin and confirm the libraries load.
+
+## Step 3 — prove rollback, not just snapshots
+
+Creating a snapshot and having a working rollback are **different claims**. This
+step exercises the real `domum-media rollback` implementation.
+
+```bash
+# a. record the snapshot the migration created
+sudo domum-media rollback list
+
+# b. make a harmless, observable change
+#    (for example, rename a Jellyfin display collection, or simply:)
+sudo touch /srv/data/jellyfin/PILOT-MARKER
+
+# c. confirm the marker exists
+ls -l /srv/data/jellyfin/PILOT-MARKER
+
+# d. roll back through the real implementation
+sudo domum-media rollback apply <id-from-step-a> --dry-run
+sudo domum-media rollback apply <id-from-step-a>
+
+# e. the marker must be GONE, and Jellyfin must start and stay running
+ls -l /srv/data/jellyfin/PILOT-MARKER      # expected: No such file
+sudo domum-media report
+```
+
+The rollback moves the current state aside to
+`/srv/data/jellyfin.rollback-<timestamp>` rather than deleting it, so step (e)
+is reversible too.
+
+## If anything fails
+
+Every failure path leaves the original readable. The helper cleans up its own
+partial artefacts and, if the cutover itself fails, moves the original back.
+
+Manual recovery, if ever needed:
+
+```bash
+sudo docker compose -p domum-media stop jellyfin
+sudo mv /srv/data/jellyfin /srv/data/jellyfin.failed
+sudo mv /srv/data/jellyfin.premigration /srv/data/jellyfin
+sudo docker compose -p domum-media up -d jellyfin
+```
+
+## Afterwards
+
+`/srv/data/jellyfin.premigration` is retained deliberately and is **never**
+removed automatically. Delete it yourself only once Jellyfin has been confirmed
+working — it is the only copy of the pre-migration state.
+
+Expected downtime: **seconds**.
