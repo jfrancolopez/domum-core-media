@@ -135,6 +135,11 @@ install_cli() {
   install -D -m 0755 "${INSTALL_DIR}/bin/domum-media-report" "${REPORT_BIN_PATH}"
 }
 
+install_logrotate() {
+  echo "[domum-media] Installing logrotate config..."
+  install -D -m 0644 "${INSTALL_DIR}/logrotate/domum-media" /etc/logrotate.d/domum-media
+}
+
 install_systemd_units() {
   echo "[domum-media] Installing systemd units..."
   install -m 0644 "${INSTALL_DIR}"/systemd/*.service /etc/systemd/system/
@@ -202,6 +207,7 @@ main() {
   clone_or_update_repo
   ensure_layout
   install_cli
+  install_logrotate
   install_systemd_units
   print_next_steps
 }

@@ -169,6 +169,15 @@ inspect → reproduce → develop → test → focused commit → push branch �
 - **Never discard another agent's uncommitted work.** Before changing an
   unfamiliar dirty worktree, understand it and preserve it. Prefer a separate
   `git worktree` over stashing, resetting, or discarding.
+- **Never wait on CI with an unbounded loop.** `gh pr checks <n>` returns an
+  empty result once a PR is merged, so a loop waiting for `SUCCESS` or
+  `FAILURE` never terminates and leaks a polling shell that outlives the task.
+  Poll the run instead (`gh run view <id> --json status`), which reaches
+  `completed`, and treat an empty or missing result as terminal rather than as
+  "keep waiting".
+- **Take the backup before the mutation, unconditionally.** When mutation-testing,
+  `cp` the file on its own line — not chained after the command being tested. A
+  short-circuited `&&` chain leaves the mutation applied and no way back.
 
 ---
 
