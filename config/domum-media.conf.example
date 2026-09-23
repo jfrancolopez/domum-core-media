@@ -156,9 +156,15 @@ CALIBRE_WEB_IMAGE=lscr.io/linuxserver/calibre-web:latest
 CALIBRE_WEB_AUTO_UPDATE=1
 CALIBRE_WEB_AUTO_UPDATE_DELAY_DAYS=21
 
+# Config/state lives on the durable tier. The service's snapshot unit is the
+# PARENT of this directory, so keep the trailing /config.
+CALIBRE_WEB_CONFIG_DIR="/srv/data/calibre-web/config"
+
 KAVITA_IMAGE=jvmilazz0/kavita:latest
 KAVITA_AUTO_UPDATE=1
 KAVITA_AUTO_UPDATE_DELAY_DAYS=21
+
+KAVITA_CONFIG_DIR="/srv/data/kavita/config"
 
 # ============================================================
 # SECTION: Update policy — Class C (bundle-managed)

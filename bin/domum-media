@@ -782,15 +782,25 @@ immich|ENABLE_IMMICH|C|21|immich_server immich_machine_learning immich_postgres 
 EOF
 }
 
+# Every case carries a default. Without one, a config that omits a *_CONFIG_DIR
+# makes this fail with "unbound variable" under `set -u` -- which is what a host
+# bootstrapped from config/domum-media.conf.example would have done for
+# calibre-web and kavita, including on the disaster-recovery rebuild path.
 service_data_path() {
+  local dir
   case "$1" in
     traefik) echo "$DOMUM_DATA_ROOT/traefik" ;;
-    immich) echo "$DOMUM_DATA_ROOT/immich" ;;
-    jellyfin) echo "${JELLYFIN_CONFIG_DIR%/config}" ;;
-    plex) echo "${PLEX_CONFIG_DIR%/config}" ;;
-    navidrome) echo "$NAVIDROME_DATA_DIR" ;;
-    calibre-web) echo "${CALIBRE_WEB_CONFIG_DIR%/config}" ;;
-    kavita) echo "${KAVITA_CONFIG_DIR%/config}" ;;
+    immich)  echo "$DOMUM_DATA_ROOT/immich" ;;
+    jellyfin)
+      dir="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"; echo "${dir%/config}" ;;
+    plex)
+      dir="${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"; echo "${dir%/config}" ;;
+    navidrome)
+      echo "${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}" ;;
+    calibre-web)
+      dir="${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"; echo "${dir%/config}" ;;
+    kavita)
+      dir="${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"; echo "${dir%/config}" ;;
     uptime-kuma) echo "$DOMUM_DATA_ROOT/uptime-kuma" ;;
     *) return 1 ;;
   esac
