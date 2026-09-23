@@ -69,6 +69,21 @@ whether a backup is mandatory before an update).
 Severity therefore **escalates** if the gate is turned off. It is never softened
 to make the report look healthy.
 
+The same principle applies to the image-refresh freeze. The freeze is enforced
+by the **timer**, not by `IMAGE_AUTO_UPDATE_ENABLED`, so the report reads the
+timer:
+
+| Condition | Level |
+|---|---|
+| Image-refresh timer enabled | `critical` — automatic deployment is no longer frozen |
+| Policy set but timer disabled | `warning` — the freeze holds, but the config disagrees with intent |
+
+Staged update candidates are reported as **one** aggregate finding with a count
+and the oldest age, not one warning per image. A deliberate freeze must not
+generate seven warnings every week; that is the alert fatigue the severity model
+exists to prevent. The wording says whether they can actually deploy, derived
+from the timer rather than assumed.
+
 `overall` is `critical` if any finding is critical, `warning` if any is a
 warning, otherwise `healthy`. An `info` finding records a known, accepted
 absence and does not move the verdict — otherwise the report would read as

@@ -282,4 +282,24 @@ verdict_for() { jq -r "$overall_filter" <<< "$1"; }
 [ "$(jq -r '.overall' "$report_json")" = "$(verdict_for "$(jq -c '.findings' "$report_json")")" ] \
   || fail "the report's overall verdict does not match its own severity rule"
 
+# ---------------------------------------------------------------------------
+# 12. The image-refresh freeze must be reported from the TIMER, which enforces
+#     it, and the report must never describe it as frozen when it is not.
+# ---------------------------------------------------------------------------
+grep -q 'image_refresh.timer.enabled != "enabled") as $frozen' "$REPO_ROOT/bin/domum-media-report" \
+  || fail "the frozen/not-frozen wording must be derived from the timer state, not assumed"
+grep -q 'image refresh is ENABLED' "$REPO_ROOT/bin/domum-media-report" \
+  || fail "the report must say so when image refresh is NOT frozen"
+
+grep -q 'automatic image deployment is no longer frozen' "$REPO_ROOT/bin/domum-media-report" \
+  || fail "an enabled image-refresh timer must raise a finding"
+awk '/image-refresh timer is ENABLED/{found=1} /level:"critical"/{lvl=1} END{exit (found&&lvl)?0:1}' \
+  "$REPO_ROOT/bin/domum-media-report" \
+  || fail "an enabled image-refresh timer must be critical"
+
+# Staged candidates are reported as ONE aggregate finding, not one per service:
+# a deliberate freeze must not generate a warning per image every week.
+grep -q '.updates.candidates\[\] | {level:"warning"' "$REPO_ROOT/bin/domum-media-report" \
+  && fail "staged update candidates must be aggregated into a single finding"
+
 echo "PASS: operational report smoke test"
