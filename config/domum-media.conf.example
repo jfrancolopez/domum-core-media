@@ -330,6 +330,12 @@ RECOVERY_PACK_AGE_PUBKEY_FILE="/etc/domum-core-media/secrets/recovery_pack_pubke
 RECOVERY_PACK_DEST="/var/lib/domum-media/recovery-pack"
 RECOVERY_PACK_REMINDER_DAYS=30
 
+# Traefik's ACME store (Let's Encrypt account key + issued certificates) lives
+# in a Docker volume, so it is neither snapshotted nor inside a backup include
+# path. It is small and essentially secret, so the recovery pack carries it.
+# Set to an empty value to opt out.
+TRAEFIK_ACME_VOLUME="domum-media_traefik-letsencrypt"
+
 # Optional SMTP delivery for the encrypted archive.
 RECOVERY_PACK_EMAIL_ENABLED=0
 RECOVERY_PACK_EMAIL_TO=""
