@@ -146,4 +146,39 @@ if compgen -G "$RECOVERY_PACK_DEST/.recovery-pack-*.tmp" >/dev/null; then
   fail "temporary encrypted artifact remains"
 fi
 
+
+# ---------------------------------------------------------------------------
+# Traefik's ACME store holds the Let's Encrypt ACCOUNT KEY, not just reissuable
+# certificates. It lives in a Docker volume, outside both protection systems,
+# so the recovery pack must carry it -- at 0600, and never in the clear.
+# ---------------------------------------------------------------------------
+fn="$(awk '/^recovery_pack_create\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+[ -n "$fn" ] || fail "could not extract recovery_pack_create"
+
+grep -q 'state/traefik/acme.json' <<< "$fn" \
+  || fail "the recovery pack does not include the Traefik ACME store"
+grep -qE 'install -m 0600 "\$acme_src"' <<< "$fn" \
+  || fail "the ACME store must be staged with mode 0600"
+grep -q 'ENABLE_TRAEFIK' <<< "$fn" \
+  || fail "the ACME store should only be collected when Traefik is enabled"
+
+# A missing store must warn, not silently produce a pack that looks complete.
+grep -qi 'will NOT contain it' <<< "$fn" \
+  || fail "a missing ACME store must be reported, not silently skipped"
+
+# It must be resolvable with Traefik stopped, i.e. by volume name rather than
+# by inspecting the running container.
+resolver="$(awk '/^traefik_acme_source\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+[ -n "$resolver" ] || fail "no traefik_acme_source resolver"
+grep -q 'docker volume inspect' <<< "$resolver" \
+  || fail "the ACME store must be resolved by volume name so it works when Traefik is stopped"
+grep -q 'docker inspect traefik' <<< "$resolver" \
+  && fail "resolving via the running container would fail when Traefik is stopped"
+
+# The restore notes must explain the account-key consequence.
+notes="$(awk '/^recovery_pack_restore_instructions\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+grep -q 'acme.json' <<< "$notes" || fail "restore notes do not mention the ACME store"
+grep -qi 'account key' <<< "$notes" || fail "restore notes must explain why the account key matters"
+grep -q '0600' <<< "$notes" || fail "restore notes must state the required mode"
+
 echo "PASS: recovery-pack contents and restore ordering smoke test"

@@ -3038,6 +3038,24 @@ cleanup_cmd() {
   esac
 }
 
+# Traefik's ACME store holds the Let's Encrypt account key and every issued
+# certificate. It lives in a Docker volume, so it is neither on the Btrfs data
+# root (no snapshots) nor inside any backup include path (no restic). It is
+# ~100KB of essentially secret material, which is exactly what the recovery
+# pack is for: small, critical, encrypted, and already swept into the cloud
+# target via RECOVERY_PACK_DEST.
+#
+# Resolved by volume name rather than by inspecting the container, so it still
+# works when Traefik is stopped.
+traefik_acme_source() {
+  local vol="${TRAEFIK_ACME_VOLUME:-domum-media_traefik-letsencrypt}" mp
+  [[ -n "$vol" ]] || return 1
+  cmd_exists docker || return 1
+  mp="$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null || true)"
+  [[ -n "$mp" && -f "$mp/acme.json" ]] || return 1
+  printf '%s' "$mp/acme.json"
+}
+
 recovery_pack_manifest() {
   local stage_dir="$1"
   local manifest="$stage_dir/MANIFEST.txt"
@@ -3058,6 +3076,13 @@ Recovery pack restore notes
 4. Restore state/backups/*-repo.env to $DOMUM_STATE_ROOT/backups with owner root:root.
 5. Restore state/immich/db_password.sha256 to
    $DOMUM_STATE_ROOT/immich/db_password.sha256 before restoring Immich data.
+6. If state/traefik/acme.json is present, restore it into the Traefik ACME
+   volume before starting Traefik, as mode 0600 owned by root:root:
+     docker volume create ${TRAEFIK_ACME_VOLUME:-domum-media_traefik-letsencrypt}
+     install -m 0600 state/traefik/acme.json \
+       "\$(docker volume inspect ${TRAEFIK_ACME_VOLUME:-domum-media_traefik-letsencrypt} --format '{{.Mountpoint}}')/acme.json"
+   This preserves the ACME account key. Without it Traefik registers a new
+   account and re-issues every certificate, which Let's Encrypt rate-limits.
 6. Restore /srv/data from restic using domum-media-backup --restore.
    Do not start Immich or restore live PostgreSQL files as a substitute for pg_dump.
 7. After persistent state and the fingerprint are restored, run:
@@ -3206,6 +3231,7 @@ recovery_pack_create() {
     "$stage_dir/secrets" \
     "$stage_dir/state/backups" \
     "$stage_dir/state/immich" \
+    "$stage_dir/state/traefik" \
     "$stage_dir/meta"
   [[ -f "$CFG_FILE" ]] && install -m 0600 "$CFG_FILE" "$stage_dir/config/domum-media.conf"
   while IFS= read -r secret_file; do
@@ -3227,6 +3253,17 @@ recovery_pack_create() {
     [[ -f "$fingerprint_file" ]] \
       || die "Immich password fingerprint is missing: $fingerprint_file"
     install -m 0600 "$fingerprint_file" "$stage_dir/state/immich/db_password.sha256"
+  fi
+  # Traefik ACME store, when present. Absence is not fatal: Traefik may be
+  # disabled, or the volume may not exist yet on a fresh host.
+  if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
+    local acme_src
+    if acme_src="$(traefik_acme_source)"; then
+      install -m 0600 "$acme_src" "$stage_dir/state/traefik/acme.json"
+      echo "[domum-media] recovery-pack: included Traefik ACME store"
+    else
+      warn "Traefik is enabled but its ACME store could not be located; the recovery pack will NOT contain it."
+    fi
   fi
   git -C "$DOMUM_DIR" rev-parse HEAD > "$stage_dir/meta/git-revision.txt" 2>/dev/null || true
   compose_cmd config > "$stage_dir/meta/rendered-compose.yml" 2>/dev/null || true
