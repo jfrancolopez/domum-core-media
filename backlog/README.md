@@ -149,6 +149,7 @@ bugs; health probes make "update succeeded" mean the app works.
 | 39 | [Jellyfin/Plex QuickSync](task-39-quicksync.md) | pending | small | low | yes |
 | 17 | [Adopt shared git-workflow conventions doc](task-17-git-conventions.md) **[shared-philosophy]** | pending | trivial | none | — |
 | 40 | [FUTURE: Network segmentation](task-40-future-network-segmentation.md) | pending | large | high | yes |
+| 41 | [Align IMAGE_AUTO_UPDATE_ENABLED with the freeze](task-41-align-image-auto-update-flag.md) | NEW — surfaced by the live report 2026-09-23 | trivial | none | yes |
 
 ## Deliberately NOT tasks (leave alone)
 
