@@ -67,10 +67,15 @@ ensure_dirs() {
   mkdir -p "$DOMUM_LOG_DIR"
   LOG_FILE="$DOMUM_LOG_DIR/backup.log"
   HEARTBEAT_FILE="$DOMUM_LOG_DIR/last-success"
-  # Deliberately no `touch`: log() appends with `tee -a`, which creates the file
-  # on first write. Touching here bumped backup.log's mtime on every read-only
-  # invocation -- including the latest-snapshot query that `domum-media report`
-  # makes -- which made a read-only report look like backup activity.
+  # Create the log restrictively if it does not exist yet. restic prints paths
+  # from the photo library on error, so it must not be world-readable; `tee -a`
+  # would otherwise create it with the ambient umask.
+  #
+  # An EXISTING file is deliberately never touched: doing so bumped backup.log's
+  # mtime on every read-only invocation -- including the latest-snapshot query
+  # that `domum-media report` makes -- which made a read-only report look like
+  # backup activity.
+  [[ -e "$LOG_FILE" ]] || install -m 0640 /dev/null "$LOG_FILE" 2>/dev/null || true
 }
 
 require_files() {

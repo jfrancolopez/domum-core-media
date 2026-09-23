@@ -1,0 +1,19 @@
+# Bounded growth and restrictive permissions for domum-media logs.
+#
+# backup.log receives restic's per-run output. On error restic prints file
+# paths from the photo library, so the log must not be world-readable.
+#
+# Installed to /etc/logrotate.d/domum-media.
+
+/var/log/domum-media/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # Rotation is the point at which permissions are corrected on hosts whose
+    # log predates this config.
+    create 0640 root root
+    su root root
+}
