@@ -109,5 +109,6 @@ created cannot silently authorise a risky stateful operation.
 ## Follow-up work, not done here
 
 - Rename the unit to reflect that it prunes (operator runbook required).
-- Decide the subvolume layout for service paths (backlog task 26; high-risk,
-  explicit approval required).
+- Decide the subvolume layout for service paths — designed in
+  [BTRFS-MIGRATION-PLAN.md](BTRFS-MIGRATION-PLAN.md); execution still requires
+  explicit operator approval (backlog task 26).
