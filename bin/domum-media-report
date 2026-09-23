@@ -173,7 +173,7 @@ report_container_state_exposure() {
       2>/dev/null || true)"
   fi
   local exposed=()
-  local line mtype msrc mdst mrw
+  local mtype msrc mdst mrw
   while IFS='|' read -r mtype msrc mdst mrw; do
     [[ -n "${mtype:-}" ]] || continue
     [[ "${mrw:-false}" == "true" ]] || continue          # read-only mounts hold no state
