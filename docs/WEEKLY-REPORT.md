@@ -53,6 +53,31 @@ four rules, each covered by `tests/operational-report-smoke.sh`:
    `unprotected` with the reason, and raises a critical finding. `/srv/data`
    being Btrfs is never treated as evidence that a service path is protected.
 
+## Container state outside the protected tier
+
+A writable mount outside `/srv/data` does **not** automatically mean a recovery
+risk, so the report classifies rather than flags. Warning about a transcode
+cache is alert fatigue, and alert fatigue is how a real gap goes unnoticed —
+Traefik's ACME store sat unprotected precisely because nothing distinguished it
+from noise.
+
+| Class | Meaning | Finding |
+|---|---|---|
+| `durable` | real recovery cost if lost | **warning** |
+| `media` | the replaceable tier, by architecture | listed only |
+| `cache` | regenerable (`*/.cache/*`) | listed only |
+| `ephemeral` | nothing meaningful to protect | listed only |
+
+Detection is dynamic — every writable mount on every expected container — so a
+volume added later cannot hide. Only the *class* consults a short declared
+table, and **anything unrecognised defaults to `durable`**, so a new volume
+fails loud rather than silent. An empty volume is classified `ephemeral`
+because there is demonstrably nothing in it; that is measured, not assumed.
+
+Current durable gaps on this host: Traefik's `acme.json` (ACME account key and
+issued certificates) and Uptime Kuma's `kuma.db` (monitor definitions and
+history). Neither is under the data root nor inside a backup include path.
+
 ## Finding severity
 
 Severity follows the actual operational risk, not the bare absence of a

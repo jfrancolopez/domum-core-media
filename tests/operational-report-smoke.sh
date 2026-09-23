@@ -18,6 +18,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 command -v jq >/dev/null 2>&1 || fail "jq is required for this test"
 
 DOMUM_DATA_ROOT="$TMP_DIR/data"
+DOMUM_MEDIA_ROOT="$TMP_DIR/media"
 DOMUM_STATE_ROOT="$TMP_DIR/state"
 DOMUM_SNAPSHOT_ROOT="$TMP_DIR/snapshots"
 FAKE_BIN="$TMP_DIR/bin"
@@ -303,49 +304,58 @@ grep -q '.updates.candidates\[\] | {level:"warning"' "$REPO_ROOT/bin/domum-media
   && fail "staged update candidates must be aggregated into a single finding"
 
 # ---------------------------------------------------------------------------
-# 13. Writable container state outside the durable data root is neither
-#     snapshottable nor backed up, and must be detected from the containers
-#     themselves -- a hand-written inventory missed Traefik's ACME store.
+# 13. State outside the protected tier must be CLASSIFIED, not merely flagged.
+#     A warning on a transcode cache is alert fatigue, and alert fatigue is how
+#     a real gap (Traefik's ACME store) stays unnoticed. Only durable state is
+#     a finding; anything unrecognised defaults to durable so nothing hides.
 # ---------------------------------------------------------------------------
-cat > "$FAKE_BIN/docker" <<'EOF'
+mkdir -p "$TMP_DIR/vol-full" "$TMP_DIR/vol-empty" "$DOMUM_MEDIA_ROOT/.cache/x" "$DOMUM_MEDIA_ROOT/books"
+printf 'secret\n' > "$TMP_DIR/vol-full/acme.json"
+
+cat > "$FAKE_BIN/docker" <<EOF
 #!/usr/bin/env bash
-if [ "${1:-}" = "inspect" ]; then
-  name="$2"
-  case "$*" in
+if [ "\${1:-}" = "volume" ]; then
+  case "\$3" in
+    full-volume) echo "$TMP_DIR/vol-full" ;;
+    *)           echo "$TMP_DIR/vol-empty" ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "inspect" ]; then
+  case "\$*" in
     *Mounts*)
-      case "$name" in
-        immich_server) printf 'volume|some-named-volume|/letsencrypt|true
-bind|DATA_ROOT_PLACEHOLDER/immich/library|/upload|true
-bind|/etc/localtime|/etc/localtime|false
-bind|/srv/media|/media|false
-' ;;
-      esac ;;
-    *) printf 'running|healthy|0|sha256:x
-' ;;
+      printf 'volume|full-volume|/letsencrypt|true\n'
+      printf 'volume|empty-volume|/unlisted-empty|true\n'
+      printf 'bind|$DOMUM_MEDIA_ROOT/.cache/x|/cache|true\n'
+      printf 'bind|$DOMUM_MEDIA_ROOT/books|/books|true\n'
+      printf 'bind|$DOMUM_DATA_ROOT/immich/library|/upload|true\n'
+      printf 'bind|/etc/localtime|/etc/localtime|false\n' ;;
+    *) printf 'running|healthy|0|sha256:x\n' ;;
   esac
   exit 0
 fi
 exit 1
 EOF
-# The stub must reference the harness's own data root, not a literal /srv/data.
-sed -i "s|DATA_ROOT_PLACEHOLDER|$DOMUM_DATA_ROOT|" "$FAKE_BIN/docker"
 chmod +x "$FAKE_BIN/docker"
 sed 's/\[\[ "\$1" == "docker" \]\] && return 1//' "$TMP_DIR/harness.sh" > "$TMP_DIR/harness-exposure.sh"
 bash "$TMP_DIR/harness-exposure.sh" > "$TMP_DIR/report-exposure.json" 2>/dev/null \
-  || fail "report generation failed while detecting container state exposure"
+  || fail "report generation failed while classifying container state"
 
-jq -e '.unprotected_container_state | length > 0' "$TMP_DIR/report-exposure.json" >/dev/null \
-  || fail "a writable Docker volume must be detected as unprotected state"
-jq -e 'any(.unprotected_container_state[].unprotected_state[]; test("some-named-volume"))' "$TMP_DIR/report-exposure.json" >/dev/null \
-  || fail "the named volume was not reported"
-# A writable bind UNDER the data root is protected and must not be flagged.
-jq -e 'all(.unprotected_container_state[].unprotected_state[]; test("immich/library") | not)' "$TMP_DIR/report-exposure.json" >/dev/null \
-  || fail "a bind under the durable data root must not be flagged as unprotected"
-# Read-only mounts hold no state and must not be flagged.
-jq -e 'all(.unprotected_container_state[].unprotected_state[]; test("localtime|/srv/media") | not)' "$TMP_DIR/report-exposure.json" >/dev/null \
-  || fail "read-only mounts must not be flagged as unprotected state"
-jq -e 'any(.findings[]; .message | test("outside the durable data root"))' "$TMP_DIR/report-exposure.json" >/dev/null \
-  || fail "unprotected container state must raise a finding"
+cls() { jq -r --arg d "$1" '[.container_state[].state[]|select(.destination==$d)|.class]|first // "absent"' "$TMP_DIR/report-exposure.json"; }
+
+[ "$(cls /letsencrypt)" = "durable" ] || fail "a non-empty unrecognised volume must classify as durable, got $(cls /letsencrypt)"
+[ "$(cls /unlisted-empty)" = "ephemeral" ] \
+  || fail "an EMPTY volume has nothing to protect, got $(cls /unlisted-empty)"
+[ "$(cls /cache)" = "cache" ]         || fail "a .cache path must classify as a regenerable cache, got $(cls /cache)"
+[ "$(cls /books)" = "media" ]         || fail "the replaceable media tier must classify as media, got $(cls /books)"
+[ "$(cls /upload)" = "absent" ]       || fail "a bind under the protected tier must not be listed at all"
+[ "$(cls /etc/localtime)" = "absent" ] || fail "read-only mounts must not be listed"
+
+# Only durable state may raise a finding.
+jq -e 'any(.findings[]; .message | test("durable state outside"))' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "durable state outside the protected tier must raise a finding"
+jq -e '[.findings[]|select(.message|test("durable state outside"))]|length == 1' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "exactly one durable finding was expected; caches and media must not warn"
 rm -f "$FAKE_BIN/docker"
 
 echo "PASS: operational report smoke test"
