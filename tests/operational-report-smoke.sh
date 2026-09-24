@@ -304,10 +304,21 @@ grep -q '.updates.candidates\[\] | {level:"warning"' "$REPO_ROOT/bin/domum-media
   && fail "staged update candidates must be aggregated into a single finding"
 
 # ---------------------------------------------------------------------------
-# 13. State outside the protected tier must be CLASSIFIED, not merely flagged.
+# 13. State outside the protected tier must be CLASSIFIED, not merely flagged,
+#     and not all durable state costs the same to lose.
+#
 #     A warning on a transcode cache is alert fatigue, and alert fatigue is how
-#     a real gap (Traefik's ACME store) stays unnoticed. Only durable state is
-#     a finding; anything unrecognised defaults to durable so nothing hides.
+#     a real gap (Traefik's ACME store) stays unnoticed. But flattening
+#     everything durable into one severity has the same effect from the other
+#     direction: a re-issuable certificate and an irreplaceable photo library
+#     are not the same finding.
+#
+#     irreplaceable   -> critical   (no one can recreate it)
+#     reconstructable -> warning    (recoverable by re-issuing or re-entering)
+#     media/cache/ephemeral -> no finding
+#
+#     Anything unrecognised defaults to reconstructable: visible, but not
+#     claimed to be irreplaceable without evidence.
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP_DIR/vol-full" "$TMP_DIR/vol-empty" "$DOMUM_MEDIA_ROOT/.cache/x" "$DOMUM_MEDIA_ROOT/books"
 printf 'secret\n' > "$TMP_DIR/vol-full/acme.json"
@@ -343,7 +354,8 @@ bash "$TMP_DIR/harness-exposure.sh" > "$TMP_DIR/report-exposure.json" 2>/dev/nul
 
 cls() { jq -r --arg d "$1" '[.container_state[].state[]|select(.destination==$d)|.class]|first // "absent"' "$TMP_DIR/report-exposure.json"; }
 
-[ "$(cls /letsencrypt)" = "durable" ] || fail "a non-empty unrecognised volume must classify as durable, got $(cls /letsencrypt)"
+[ "$(cls /letsencrypt)" = "reconstructable" ] \
+  || fail "a non-empty unrecognised volume must be visible as reconstructable, got $(cls /letsencrypt)"
 [ "$(cls /unlisted-empty)" = "ephemeral" ] \
   || fail "an EMPTY volume has nothing to protect, got $(cls /unlisted-empty)"
 [ "$(cls /cache)" = "cache" ]         || fail "a .cache path must classify as a regenerable cache, got $(cls /cache)"
@@ -351,11 +363,130 @@ cls() { jq -r --arg d "$1" '[.container_state[].state[]|select(.destination==$d)
 [ "$(cls /upload)" = "absent" ]       || fail "a bind under the protected tier must not be listed at all"
 [ "$(cls /etc/localtime)" = "absent" ] || fail "read-only mounts must not be listed"
 
-# Only durable state may raise a finding.
+# Only the two costly classes may raise a finding, and at different severities.
 jq -e 'any(.findings[]; .message | test("durable state outside"))' "$TMP_DIR/report-exposure.json" >/dev/null \
   || fail "durable state outside the protected tier must raise a finding"
-jq -e '[.findings[]|select(.message|test("durable state outside"))]|length == 1' "$TMP_DIR/report-exposure.json" >/dev/null \
-  || fail "exactly one durable finding was expected; caches and media must not warn"
+jq -e '[.findings[]|select(.message|test("state outside the protected tier"))]|length == 1' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "exactly one state finding was expected; caches and media must not warn"
+jq -e '[.findings[]|select(.message|test("state outside the protected tier"))|.level]|first == "warning"' \
+  "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "an unrecognised volume must warn, not raise a critical; crying wolf is how real findings get ignored"
+jq -e 'any(.findings[]; .message | test("reconstructable"))' "$TMP_DIR/report-exposure.json" >/dev/null \
+  || fail "the finding must say the state is reconstructable, so the operator knows what losing it costs"
+
+# Irreplaceable state is a CRITICAL, and must be distinguishable from the above.
+cat > "$FAKE_BIN/docker" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "volume" ]; then echo "$TMP_DIR/vol-full"; exit 0; fi
+if [ "\${1:-}" = "inspect" ]; then
+  case "\$*" in
+    *Mounts*) printf 'bind|$TMP_DIR/vol-full|/irreplaceable-probe|true\n' ;;
+    *) printf 'running|healthy|0|sha256:x\n' ;;
+  esac
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_BIN/docker"
+# Nothing outside the protected tier classifies as irreplaceable today -- which
+# is correct, and also means the critical path would never be exercised. Declare
+# it for the probe mount so the SEVERITY WIRING is actually tested; an untested
+# critical finding is one that can regress to a warning unnoticed.
+# The override has to land AFTER the report library is sourced, or the library's
+# own definition wins. Insert it between the source line and the call.
+awk '/^report_generate_json$/ {
+       print "state_class_declared() { case \"$1\" in *:/irreplaceable-probe) printf irreplaceable ;; *) printf \"\" ;; esac; }"
+     } { print }' \
+  "$TMP_DIR/harness-exposure.sh" > "$TMP_DIR/harness-irrep.sh"
+grep -q 'irreplaceable-probe' "$TMP_DIR/harness-irrep.sh" \
+  || fail "the irreplaceable override was not injected; the checks below would prove nothing"
+bash "$TMP_DIR/harness-irrep.sh" > "$TMP_DIR/report-irrep.json" 2>/dev/null \
+  || fail "report generation failed while classifying irreplaceable state"
+got="$(jq -r '[.container_state[].state[]|select(.destination=="/irreplaceable-probe")|.class]|first // "absent"' "$TMP_DIR/report-irrep.json")"
+[ "$got" = "irreplaceable" ] \
+  || fail "the irreplaceable probe did not classify as irreplaceable (got $got); the severity check below would prove nothing"
+jq -e '[.findings[]|select(.message|test("IRREPLACEABLE"))|.level]|first == "critical"' "$TMP_DIR/report-irrep.json" >/dev/null \
+  || fail "irreplaceable state outside the protected tier must be critical, not a warning"
+jq -e '[.findings[]|select(.message|test("IRREPLACEABLE"))]|length == 1' "$TMP_DIR/report-irrep.json" >/dev/null \
+  || fail "expected exactly one irreplaceable finding"
+rm -f "$FAKE_BIN/docker"
+
+# ---------------------------------------------------------------------------
+# 13b. State that IS protected, just not by snapshots or a backup target, must
+#      not be reported as unprotected.
+#
+#      The Traefik ACME store is copied into the recovery pack on every run, so
+#      "neither snapshotted nor backed up" was simply false -- and a false
+#      warning standing next to a true one devalues both. But a missing or
+#      stale pack must not launder an uncovered gap into a covered one, so the
+#      claim is checked against the live recovery-pack state.
+# ---------------------------------------------------------------------------
+cat > "$FAKE_BIN/docker" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "volume" ]; then echo "$TMP_DIR/vol-full"; exit 0; fi
+if [ "\${1:-}" = "inspect" ]; then
+  case "\$*" in
+    *Mounts*) printf 'volume|acme-vol|/letsencrypt|true\n' ;;
+    *) printf 'running|healthy|0|sha256:x\n' ;;
+  esac
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_BIN/docker"
+awk '/^report_generate_json$/ {
+       print "state_class_declared() { case \"$1\" in *:/letsencrypt) printf reconstructable ;; *) printf \"\" ;; esac; }"
+       print "state_recovery_coverage() { case \"$1\" in *:/letsencrypt) printf recovery-pack ;; *) printf \"\" ;; esac; }"
+     } { print }' "$TMP_DIR/harness-exposure.sh" > "$TMP_DIR/harness-cover.sh"
+grep -q 'recovery-pack' "$TMP_DIR/harness-cover.sh" || fail "the coverage override was not injected"
+
+bash "$TMP_DIR/harness-cover.sh" > "$TMP_DIR/report-cover.json" 2>/dev/null \
+  || fail "report generation failed while classifying covered state"
+
+jq -e '[.container_state[].state[]|select(.destination=="/letsencrypt")|.covered_by]|first == "recovery-pack"' \
+  "$TMP_DIR/report-cover.json" >/dev/null \
+  || fail "covered state must record what covers it"
+
+# Both branches are driven deterministically. An `if` on the fixture's own state
+# would leave whichever branch did not run completely untested -- and it did:
+# two mutations of the coverage logic survived until this was split.
+PACK="$DOMUM_STATE_ROOT/recovery-pack.env"
+
+# (a) recovery pack AVAILABLE -> covered state is info, and says what covers it.
+printf 'TS=%s\nSIZE=1234\n' "$(date +%s)" > "$PACK"
+bash "$TMP_DIR/harness-cover.sh" > "$TMP_DIR/report-cover.json" 2>/dev/null \
+  || fail "report generation failed with a recovery pack present"
+[ "$(jq -r '.recovery_pack.state' "$TMP_DIR/report-cover.json")" = "available" ] \
+  || fail "fixture is wrong: the recovery pack should be available here"
+jq -e '[.findings[]|select(.message|test("/letsencrypt"))|.level]|first == "info"' "$TMP_DIR/report-cover.json" >/dev/null \
+  || fail "state covered by an available recovery pack must be info, not a warning"
+jq -e 'any(.findings[]; .message|test("covered by the recovery-pack"))' "$TMP_DIR/report-cover.json" >/dev/null \
+  || fail "the info finding must name the covering mechanism"
+jq -e '[.findings[]|select(.message|test("/letsencrypt"))]|length == 1' "$TMP_DIR/report-cover.json" >/dev/null \
+  || fail "covered state must raise exactly one finding, not both an info and a warning"
+
+# (b) recovery pack ABSENT -> the gap is real again and must warn, saying why.
+#     A stale or missing pack must never launder an uncovered gap into a covered one.
+rm -f "$PACK"
+bash "$TMP_DIR/harness-cover.sh" > "$TMP_DIR/report-uncover.json" 2>/dev/null \
+  || fail "report generation failed with no recovery pack"
+[ "$(jq -r '.recovery_pack.state' "$TMP_DIR/report-uncover.json")" != "available" ] \
+  || fail "fixture is wrong: the recovery pack should be unavailable here"
+jq -e '[.findings[]|select(.message|test("/letsencrypt"))|.level]|first == "warning"' "$TMP_DIR/report-uncover.json" >/dev/null \
+  || fail "with no recovery pack, covered state must warn"
+jq -e 'any(.findings[]; .message|test("not available"))' "$TMP_DIR/report-uncover.json" >/dev/null \
+  || fail "the warning must say the covering mechanism is unavailable, not repeat the generic text"
+# Exactly one. Without this, an info clause that forgot to check the pack state
+# would emit a reassuring "covered by the recovery-pack" alongside the warning --
+# and the reassurance is the line an operator remembers.
+jq -e '[.findings[]|select(.message|test("/letsencrypt"))]|length == 1' "$TMP_DIR/report-uncover.json" >/dev/null \
+  || fail "an uncovered gap raised more than one finding; a stale pack must not also claim coverage"
+# The warning legitimately mentions the covering mechanism ("normally covered by
+# the recovery-pack, but that is not available"). What must NOT exist is an
+# INFO finding presenting the state as protected.
+jq -e '[.findings[]|select(.level=="info" and (.message|test("/letsencrypt")))]|length == 0' \
+  "$TMP_DIR/report-uncover.json" >/dev/null \
+  || fail "coverage was presented as protection while the recovery pack was unavailable"
 rm -f "$FAKE_BIN/docker"
 
 echo "PASS: operational report smoke test"
