@@ -37,6 +37,7 @@ source "$REPO_ROOT/bin/domum-media"
 DOMUM_DATA_ROOT="$dir/data"
 DOMUM_MEDIA_ROOT="$dir/media"
 DOMUM_SNAPSHOT_ROOT="$dir/snapshots"
+DOMUM_STATE_ROOT="$dir/state"
 need_root() { :; }
 load_cfg() { :; }
 export_env_for_compose() { :; }
@@ -344,5 +345,28 @@ rmdir "$TMP_DIR/vmeta/dst/empty"
 out="$(run_verify vmeta 10000)"
 rc=$?
 (( rc != 0 )) || fail "migrate_verify missed a missing empty directory: $out"
+
+# A migration must refuse while another operation holds the lock -- and must
+# refuse BEFORE touching anything, so the refusal is free.
+lockdir="$TMP_DIR/locked"
+rm -rf "$lockdir"; mkdir -p "$lockdir/state"
+(
+  exec 9>>"$lockdir/state/operation.lock"
+  flock -n 9 || exit 1
+  printf '999 now other-operation\n' > "$lockdir/state/operation.lock.holder"
+  while [[ ! -e "$lockdir/release" ]]; do sleep 0.05; done
+) &
+lock_pid=$!
+for _ in $(seq 1 100); do [[ -e "$lockdir/state/operation.lock.holder" ]] && break; sleep 0.05; done
+
+d="$(run_migration locked-out 'DOMUM_STATE_ROOT="'"$lockdir"'/state"')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a migration ran while another operation held the lock"
+grep -qi 'holds the lock' "$d/out.txt" || fail "the lock refusal was not reported: $(cat "$d/out.txt")"
+grep -qi 'other-operation' "$d/out.txt" || fail "the refusal did not name the lock holder"
+assert_data_survives "$d" "another operation holds the lock"
+[ ! -e "$d/data/jellyfin.new" ] || fail "a lock refusal still staged a copy"
+
+touch "$lockdir/release"
+wait "$lock_pid" 2>/dev/null
 
 echo "PASS: storage migration failure smoke test"
