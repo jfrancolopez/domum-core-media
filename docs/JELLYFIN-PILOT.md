@@ -117,6 +117,21 @@ working — it is the only copy of the pre-migration state.
 
 Expected downtime: **seconds**.
 
+## What the proof snapshot proves
+
+The migration's last act before restarting Jellyfin is to take a snapshot of the
+newly created subvolume. That is the point of the whole exercise: the service
+path could not be snapshotted before, and now it can.
+
+It is taken **while the service is still stopped**, so it is a snapshot of a
+cleanly quiesced tree. (It used to be taken after the restart, which made it
+crash-consistent — recoverable, since btrfs snapshots are atomic and SQLite
+replays its WAL, but weaker than the clean copy for no reason.)
+
+If that snapshot cannot be created the migration still succeeded and the data is
+safe, but rollback protection was not established — the command says so and exits
+non-zero.
+
 ## If the migration aborts
 
 Every abort path restarts the service before exiting, and says so. Nothing is
