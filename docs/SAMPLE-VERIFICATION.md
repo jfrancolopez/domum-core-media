@@ -46,6 +46,13 @@ so two runs are comparable and a regression is visible.
    sequential sweep so the quota is always met.
 5. Accumulated size is capped by `SAMPLE_MAX_TOTAL_BYTES` (default 1 GiB).
 
+Files whose names contain glob metacharacters (`*`, `?`, `[`, `]`, `\`) are
+excluded, because restic's `--include` takes a **pattern**, not a literal path:
+such a name would silently select the wrong objects, or none — and a file that
+restored perfectly would then be reported as a mismatch. The command prints how
+many files were excluded for this reason, so the blind spot is visible rather
+than silent.
+
 The library profile that motivated these defaults (20,000 sampled entries):
 
 | type | count |   | percentile | bytes |

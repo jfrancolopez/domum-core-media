@@ -892,12 +892,24 @@ sample_manifest_file() {
   printf '%s/%s-sample.jsonl' "$(restore_verification_dir)" "$1"
 }
 
+# restic's --include takes a GLOB PATTERN, not a literal path, so a filename
+# containing * ? [ ] or a backslash would silently select the wrong objects --
+# or none, which would then be reported as a mismatch against a file that is
+# actually fine. Such paths are excluded from sampling and counted, so the
+# blind spot is visible rather than silent.
+sample_unsamplable_count() {
+  find "$1" -type f \( -name '*[*?]*' -o -name '*[][]*' -o -name '*\\*' \) \
+    -printf '.\n' 2>/dev/null | wc -l
+}
+
 # Deterministic and diverse: the median-sized file of each distinct extension,
 # then the smallest and largest that fit under the per-file cap, then every
 # k-th path to fill the quota. Sorted throughout so repeated runs agree.
 sample_select_paths() {
   local root="$1" want="$2"
-  find "$root" -type f -printf '%s\t%p\n' 2>/dev/null \
+  find "$root" -type f \
+    ! -name '*[*?]*' ! -name '*[][]*' ! -name '*\\*' \
+    -printf '%s\t%p\n' 2>/dev/null \
     | awk -F'\t' -v cap="$SAMPLE_MAX_FILE_BYTES" '$1 > 0 && $1 <= cap' \
     | sort -t"$(printf '\t')" -k2,2 \
     | awk -F'\t' -v want="$want" '
@@ -1013,6 +1025,11 @@ do_verify_sample() {
   echo "  snapshot : $snapshot_id"
   echo "  sampled  : ${#sample_paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
   echo "  manifest : $manifest"
+  local unsamplable; unsamplable="$(sample_unsamplable_count "$lib")"
+  if [[ "$unsamplable" =~ ^[0-9]+$ ]] && (( unsamplable > 0 )); then
+    echo "  excluded : $unsamplable file(s) whose names contain glob metacharacters"
+    echo "             (restic --include is a pattern, so these cannot be sampled safely)"
+  fi
   echo "  NOTE: this proves the SAMPLED objects only. It does not prove the whole"
   echo "        library, nor that a rebuilt Immich can serve it."
   (( bad == 0 )) || die "Sample verification FAILED for $target: $bad mismatch(es)"
