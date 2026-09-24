@@ -189,4 +189,54 @@ probe_leak "$TMP_DIR/noleak" closed  || fail "the closed-fd probe could not acqu
 [[ "$(held_after_parent_exit "$TMP_DIR/noleak")" == "no" ]] \
   || fail "a child spawned with the lock descriptor closed still holds the lock"
 
+# ---------------------------------------------------------------------------
+# 6. host-upgrade must take the lock.
+#
+# It runs `apt-get install --only-upgrade docker-ce containerd.io btrfs-progs …`
+# on Mondays at 05:45 (+45m) and can then reboot the host. Upgrading docker-ce
+# RESTARTS the Docker daemon, which restarts containers -- and a migration has
+# those containers deliberately stopped while it copies and then renames their
+# data directory. The daemon would bring a service back up onto a half-copied
+# .new, or during the cutover rename itself.
+#
+# It waits rather than skipping: giving up would silently miss a week of
+# security updates.
+# ---------------------------------------------------------------------------
+grep -q 'domum_acquire_lock "host-upgrade"' "$REPO_ROOT/bin/domum-media" \
+  || fail "host-upgrade does not take the operation lock; a Docker daemon restart could land mid-migration"
+grep -q 'domum_acquire_lock "host-upgrade" "${HOST_UPGRADE_LOCK_WAIT_SECONDS:-1800}"' "$REPO_ROOT/bin/domum-media" \
+  || fail "host-upgrade must wait for the lock, not fail immediately"
+
+# The lock must be taken only AFTER the enable gate, so a disabled upgrade stays
+# a cheap no-op that cannot block anything.
+gate_line="$(grep -n 'Scheduled host package upgrades disabled' "$REPO_ROOT/bin/domum-media" | head -1 | cut -d: -f1)"
+lock_line="$(grep -n 'domum_acquire_lock "host-upgrade"' "$REPO_ROOT/bin/domum-media" | head -1 | cut -d: -f1)"
+[[ -n "$gate_line" && -n "$lock_line" && "$gate_line" -lt "$lock_line" ]] \
+  || fail "host-upgrade takes the lock before checking whether it is enabled (gate=$gate_line lock=$lock_line)"
+
+# And it must actually refuse while the lock is held.
+hudir="$TMP_DIR/hu"; mkdir -p "$hudir"
+setsid bash -c 'exec 9>>"$1/operation.lock"; flock 9; echo $$ > "$1/holder.pid"; exec sleep 30' \
+  _ "$hudir" >/dev/null 2>&1 &
+for _ in $(seq 1 40); do [[ -s "$hudir/holder.pid" ]] && break; sleep 0.05; done
+huholder="$(cat "$hudir/holder.pid" 2>/dev/null || true)"
+[[ -n "$huholder" ]] || fail "could not start a competing lock holder"
+out="$(bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'
+CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+DOMUM_STATE_ROOT='$hudir'
+HOST_UPGRADE_LOCK_WAIT_SECONDS=1
+need_root() { :; }
+load_cfg() { :; }
+export_env_for_compose() { :; }
+apt-get() { echo 'APT RAN'; }
+host_upgrade --force" 2>&1)"
+rc=$?
+kill "$huholder" 2>/dev/null; wait 2>/dev/null
+(( rc != 0 )) || fail "host-upgrade ran while the operation lock was held: $out"
+grep -q 'APT RAN' <<< "$out" && fail "apt was invoked despite the lock being held: $out"
+grep -qi 'Timed out waiting' <<< "$out" || fail "the lock refusal did not explain itself: $out"
+
 echo "PASS: operation lock smoke test"

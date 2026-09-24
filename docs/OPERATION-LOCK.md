@@ -29,6 +29,7 @@ Immich migration would be copying.
 | daily backup | **wait**, default 1800s (`BACKUP_LOCK_WAIT_SECONDS`) | unattended and never retried by a human — giving up would silently skip a night |
 | `snapshot prune` | **wait**, default 900s (`SNAPSHOT_LOCK_WAIT_SECONDS`) | weekly timer; it *deletes* snapshots, and a rollback checks its snapshot exists and then creates from it — a prune landing between those turns a routine restore into a failure |
 | `snapshot create` | **wait**, default 900s | same timer family; snapshotting a tree a migration is renaming is the race the lock exists for |
+| `host-upgrade` | **wait**, default 1800s (`HOST_UPGRADE_LOCK_WAIT_SECONDS`) | upgrading `docker-ce`/`containerd` **restarts the Docker daemon**, which restarts containers a migration has deliberately stopped — and this unit can go on to reboot the host |
 
 `rollback apply --dry-run` takes no lock: it changes nothing.
 
@@ -74,6 +75,28 @@ identical resolved lock paths, genuine mutual exclusion, the holder being named
 in a refusal, a bounded wait that really waits and then fails, automatic release
 after `SIGKILL`, and that each operation takes the lock with the intended
 blocking behaviour. Five mutants, five killed.
+
+### The `host-upgrade` case is the sharpest
+
+`domum-media-host-update.timer` fires Mondays at 05:45 (+45m) and runs:
+
+```
+apt-get install -y --only-upgrade docker-ce docker-ce-cli containerd.io … btrfs-progs …
+```
+
+Upgrading `docker-ce` restarts the Docker daemon, which restarts containers. A
+migration has those containers **deliberately stopped** while it copies and then
+renames their data directory — so the daemon would bring a service back up onto
+a half-copied `.new`, or during the cutover rename itself. `btrfs-progs` is in
+the same package list, and the unit can then `shutdown -r +1`.
+
+05:45 does not overlap the 02:30 backup. It very much can overlap an **attended**
+migration, which is exactly when an operator is not expecting the Docker daemon
+to restart underneath them.
+
+The lock is taken *after* the `HOST_PACKAGE_AUTO_UPDATE_ENABLED` gate, so a
+disabled upgrade stays a cheap no-op that cannot block anything. The test pins
+that ordering.
 
 ## The descriptor is not inheritable by design
 
