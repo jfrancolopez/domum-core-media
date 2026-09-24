@@ -1523,6 +1523,26 @@ restore_snapshot_for_service() {
   local current_backup=""
 
   data_path="$(service_data_path "$service")" || die "No data path mapping for $service"
+
+  # A rollback entry is a root-owned file, but it is still DATA -- it can be
+  # hand-edited, truncated, or corrupted. Two things are checked before it is
+  # used to decide what gets overwritten:
+  #
+  #  * the name must be a single path component. "../data/immich" passes a bare
+  #    `[[ -d ]]` test against the snapshot root and would restore something
+  #    entirely different over this service's path.
+  #  * the snapshot must belong to THIS service. Snapshots are named
+  #    "<data dir basename>-<stamp>-<tag>", so a mismatched entry means the
+  #    index and the snapshot store disagree -- and restoring one service's
+  #    state onto another's path is an operation that would SUCCEED.
+  case "$snapshot_name" in
+    ""|*/*|.|..) die "Refusing: '$snapshot_name' is not a valid snapshot name" ;;
+  esac
+  local expect; expect="$(basename "$data_path")"
+  [[ "$snapshot_name" == "$expect"-* ]] \
+    || die "Refusing: snapshot '$snapshot_name' does not belong to $service (expected '$expect-<timestamp>-<tag>').
+The rollback index and the snapshot store disagree; investigate before restoring."
+
   [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || die "Snapshot not found: $snapshot_name"
 
   compose_svcs="$(service_compose_services "$service" || true)"
@@ -2953,18 +2973,40 @@ rollback_entries() {
   find "$(rollback_index_dir)" -type f -name '*.env' | sort
 }
 
+# The recorded STATUS says what this index believes. The snapshot store is what
+# is actually true, and the two drift: `snapshot_prune` runs on Sundays at 04:30
+# and deletes snapshots without touching the index, so entries go on advertising
+# themselves as "available" while pointing at nothing. The operator then picks
+# one and only finds out at restore time.
+#
+# Resolved against the filesystem at read time rather than by keeping prune in
+# sync, because the filesystem is truthful about every cause of disappearance --
+# pruning, a manual `btrfs subvolume delete`, a restored-from-backup index.
+rollback_entry_effective_status() {
+  local recorded="$1" snapshot_name="$2"
+  if [[ "$recorded" == "available" ]]; then
+    case "$snapshot_name" in
+      ""|*/*|.|..) printf 'invalid'; return 0 ;;
+    esac
+    [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || { printf 'missing'; return 0; }
+  fi
+  printf '%s' "$recorded"
+}
+
 rollback_list_cmd() {
   printf '%-28s %-12s %-18s %-10s %-10s\n' "ID" "SERVICE" "EVENT" "AGE" "STATUS"
   rollback_entries | while IFS= read -r file; do
-    unset ID SERVICE EVENT TS STATUS
+    unset ID SERVICE EVENT TS STATUS SNAPSHOT SNAPSHOT_NAME
     # shellcheck disable=SC1090
     source "$file"
+    local name
+    name="${SNAPSHOT_NAME:-$(basename "${SNAPSHOT:-}")}"
     printf '%-28s %-12s %-18s %-10s %-10s\n' \
       "${ID:-unknown}" \
       "${SERVICE:-unknown}" \
       "${EVENT:-unknown}" \
       "$(human_age_from_epoch "${TS:-0}")" \
-      "${STATUS:-unknown}"
+      "$(rollback_entry_effective_status "${STATUS:-unknown}" "$name")"
   done
 }
 
@@ -2994,9 +3036,13 @@ Refusing to roll back while it runs."
   unset ID SERVICE EVENT SNAPSHOT SNAPSHOT_NAME IMAGE_BEFORE IMAGE_AFTER TS STATUS
   # shellcheck disable=SC1090
   source "$file"
-  [[ "${STATUS:-available}" == "available" ]] || die "Rollback point is not available: ${STATUS:-unknown}"
   snapshot_name="${SNAPSHOT_NAME:-$(basename "${SNAPSHOT:-}")}"
   [[ -n "$snapshot_name" ]] || die "Rollback point $rollback_id has no snapshot path."
+  # Resolved the same way `rollback list` displays it, so what the operator was
+  # shown is what is enforced here.
+  local effective
+  effective="$(rollback_entry_effective_status "${STATUS:-available}" "$snapshot_name")"
+  [[ "$effective" == "available" ]] || die "Rollback point is not available: $effective"
 
   if (( dry_run == 1 )); then
     echo "[domum-media] Would restore ${SERVICE:-unknown} from ${snapshot_name}"
