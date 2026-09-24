@@ -320,14 +320,13 @@ it is actually fixed; keep the detail in `docs/`.
   reached by `apply`, `init`, `configure`, and therefore by `update`, so a
   hardcoded list there lets routine convergence silently resume deployment.
   `tests/timer-auto-enable-safety-smoke.sh` enforces this.
-- **Scheduled snapshot creation and pruning do not take the operation lock.**
-  `storage migrate-subvolume`, `rollback apply`, and the daily backup do (see
-  `docs/OPERATION-LOCK.md`). Snapshot work neither moves nor deletes service
-  data, so it cannot corrupt a migration, but a snapshot taken mid-migration
-  captures a transient state. Revisit; not a blocker.
-- **`domum-media-btrfs-snapshot.service` appears to run `snapshot prune`
-  rather than creating snapshots.** Investigate and document this before
-  changing it; do not silently "fix" it as a side effect of other work.
+- **`domum-media-btrfs-snapshot.service` runs `snapshot prune`, not
+  `snapshot create`** — confirmed, and deliberately left that way for now.
+  Its timer is enabled and fires weekly (Sun 04:30 +20m). It has never deleted
+  anything, because no service path is a subvolume and the snapshot root is
+  empty. **The first migration turns it into a live deleting job.** It now takes
+  the operation lock, reports what it deleted, and fails when a delete fails.
+  Do not repurpose it to create snapshots as a side effect of other work.
 - Documentation may still describe protection that production does not have
   (snapshot coverage, backup targets that are not enabled). Verify claims
   against live evidence before repeating them.

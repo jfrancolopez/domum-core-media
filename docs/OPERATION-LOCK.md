@@ -27,6 +27,8 @@ Immich migration would be copying.
 | `storage migrate-subvolume` | refuse immediately | attended; the right answer is "come back later", not a silent wait |
 | `rollback apply` | refuse immediately | attended; stops containers and moves live state |
 | daily backup | **wait**, default 1800s (`BACKUP_LOCK_WAIT_SECONDS`) | unattended and never retried by a human — giving up would silently skip a night |
+| `snapshot prune` | **wait**, default 900s (`SNAPSHOT_LOCK_WAIT_SECONDS`) | weekly timer; it *deletes* snapshots, and a rollback checks its snapshot exists and then creates from it — a prune landing between those turns a routine restore into a failure |
+| `snapshot create` | **wait**, default 900s | same timer family; snapshotting a tree a migration is renaming is the race the lock exists for |
 
 `rollback apply --dry-run` takes no lock: it changes nothing.
 
@@ -73,9 +75,15 @@ in a refusal, a bounded wait that really waits and then fails, automatic release
 after `SIGKILL`, and that each operation takes the lock with the intended
 blocking behaviour. Five mutants, five killed.
 
-## Not covered
+## The descriptor is not inheritable by design
 
-Scheduled snapshot creation and pruning (`domum-media-btrfs-snapshot.service`,
-Sundays 04:30) do not yet take the lock. They neither move nor delete service
-data, so they cannot corrupt a migration — but a snapshot taken mid-migration
-would capture a transient state. Worth revisiting; not a blocker.
+The lock lives in an open file descriptor, and **every child process inherits
+it**. A service started under the lock and left running keeps holding it after
+the acquiring process is gone — and since there is deliberately no stale-lock
+reaper, the next backup would wait its full timeout and fail, every night, until
+reboot.
+
+`compose_cmd` therefore closes the descriptor for the command it runs, which is
+the one place a locked operation execs something that starts long-lived
+processes. This was found by the real-Btrfs integration test, not by reasoning:
+see `docs/BTRFS-INTEGRATION-TEST.md`.

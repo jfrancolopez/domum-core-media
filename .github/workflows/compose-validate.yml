@@ -73,6 +73,9 @@ jobs:
       - name: Subvolume detection smoke test
         run: tests/subvolume-detection-smoke.sh
 
+      - name: Snapshot prune safety smoke test
+        run: tests/snapshot-prune-safety-smoke.sh
+
       - name: Captured stdout purity smoke test
         run: tests/captured-stdout-purity-smoke.sh
 
