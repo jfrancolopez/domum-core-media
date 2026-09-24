@@ -394,6 +394,62 @@ report_backup_target_state() {
 # Two separate questions are answered: what happened on the most recent
 # verification attempt, and when did verification last genuinely pass. A failed
 # attempt must not erase the second.
+# Sampled asset verification is a SEPARATE, WEAKER claim than the dump restore
+# verification and must never be merged into it. The success state is
+# deliberately called "sampled", not "verified", so no reader can mistake a
+# passing sample for a verified library.
+report_asset_sample_verification() {
+  local dir="$DOMUM_STATE_ROOT/restore-verification" f
+  local newest_epoch="" newest_file="" newest_target=""
+
+  if [[ -d "$dir" ]]; then
+    shopt -s nullglob
+    for f in "$dir"/*-sample.jsonl; do
+      local f_epoch f_ts
+      f_ts="$(jq -sr 'if length == 0 then "" else ([.[].verified_at] | max // "") end' "$f" 2>/dev/null || true)"
+      f_epoch=""
+      [[ -n "$f_ts" && "$f_ts" != "null" ]] && f_epoch="$(date -d "$f_ts" +%s 2>/dev/null || true)"
+      # A manifest whose timestamps are missing or unreadable is still evidence
+      # that sampling ran. Fall back to its mtime so it is reported as a broken
+      # manifest rather than silently indistinguishable from "never sampled".
+      [[ "$f_epoch" =~ ^[0-9]+$ ]] || f_epoch="$(stat -c %Y "$f" 2>/dev/null || true)"
+      if [[ "$f_epoch" =~ ^[0-9]+$ ]] && { [[ -z "$newest_epoch" ]] || (( f_epoch > newest_epoch )); }; then
+        newest_epoch="$f_epoch"; newest_file="$f"
+        newest_target="$(basename "$f")"; newest_target="${newest_target%-sample.jsonl}"
+      fi
+    done
+    shopt -u nullglob
+  fi
+
+  if [[ -z "$newest_file" ]]; then
+    jq -cn --argjson age null       '{state:"unknown",target:null,snapshot_id:null,sampled_files:null,
+        matched:null,mismatched:null,sampled_bytes:null,media_types:null,
+        last_sampled_at:null,age_seconds:$age,
+        reason:"no sampled asset verification has been recorded on this host"}'
+    return 0
+  fi
+
+  jq -s --arg target "$newest_target"      --argjson at "$(report_iso_from_epoch "$newest_epoch")"      --argjson age "$(report_age_seconds "$newest_epoch")"      '(map(select(.result == "match")) | length) as $ok
+      | (map(select(.result != "match")) | length) as $bad
+      | {state: (if length == 0 then "unknown" elif $bad > 0 then "failed" else "sampled" end),
+         target: $target,
+         snapshot_id: ((map(.snapshot_id) | unique | .[0]) // null),
+         sampled_files: length,
+         matched: $ok,
+         mismatched: $bad,
+         sampled_bytes: (map(.size_bytes) | add // 0),
+         media_types: (map(.media_type) | unique),
+         last_sampled_at: $at,
+         age_seconds: $age,
+         reason: (if $bad > 0
+                  then ($bad|tostring) + " sampled file(s) did not match the live originals"
+                  elif length == 0 then "the sample manifest is empty"
+                  else null end)}' "$newest_file" 2>/dev/null     || jq -cn '{state:"unknown",target:null,snapshot_id:null,sampled_files:null,
+                matched:null,mismatched:null,sampled_bytes:null,media_types:null,
+                last_sampled_at:null,age_seconds:null,
+                reason:"the sample manifest is not interpretable"}'
+}
+
 report_restore_verification() {
   local dir="$DOMUM_STATE_ROOT/restore-verification" f
   # Note: the snapshot reported is deliberately the last VERIFIED one
@@ -558,6 +614,7 @@ report_generate_json() {
     --argjson backup_timer "$backup_timer" --argjson check_timer "$check_timer" --argjson image_timer "$image_timer" \
     --argjson library "$library_json" --argjson dump "$dump_json" --argjson snapshots "$(jq -s . "$backups_file")" \
     --argjson targets "$(jq -s . "$targets_file")" --argjson restore_verification "$(report_restore_verification)" \
+    --argjson asset_sample "$(report_asset_sample_verification)" \
     --argjson recovery "$recovery_json" --argjson candidates "$(jq -s . "$updates_file")" \
     --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
     --arg snapshot_policy "${SNAPSHOT_POLICY:-REQUIRED}" \
@@ -567,7 +624,7 @@ report_generate_json() {
       host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
       filesystems:$filesystems,failed_systemd_units:{state:$failed_state,count:$failed_count,units:$failed_units},containers:$containers,
       immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
-      backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification},
+      backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification,asset_sample:$asset_sample},
       recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{policy:($snapshot_policy|ascii_upcase),enforced:(($snapshot_policy|ascii_upcase)=="REQUIRED"),services:$protection},
       container_state:[$exposure[]|select((.state|length) > 0)],findings:[]}')"
   findings="$(jq -c '[
@@ -632,6 +689,11 @@ report_generate_json() {
     (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "verified" and .age_seconds != null and .age_seconds > 2678400) | {level:"warning",message:"The last successful restore verification is over 31 days old",action:"Run: domum-media backup verify-restore <target>"}),
+    # A sampled-asset mismatch means stored bytes differ from the originals.
+    # That is a data-integrity signal, not a scheduling nag.
+    (.backups.asset_sample | select(.state == "failed") | {level:"critical",message:((.mismatched|tostring)+" sampled Immich original(s) did not restore to identical bytes"),action:"Run: domum-media-backup verify-sample <target> and inspect the sample manifest"}),
+    (.backups.asset_sample | select(.state == "unknown") | {level:"info",message:"No sampled verification of the Immich originals has been recorded; only the database dump restore is proven",action:"Run: domum-media-backup verify-sample <target>"}),
+    (.backups.asset_sample | select(.state == "sampled" and .age_seconds != null and .age_seconds > 7776000) | {level:"info",message:"The last sampled verification of the Immich originals is over 90 days old",action:"Run: domum-media-backup verify-sample <target>"}),
     (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
     (.backups.targets[] | select(.last_run.state == "failed") | {level:"critical",message:("Backup target "+.target+" last run FAILED"),action:("Inspect: journalctl -u domum-media-backup.service, then retry that target")}),
     (.backups.targets[] | select(.last_run.state == "unknown") | {level:"warning",message:("Backup target "+.target+" has no per-target run evidence"),action:"It will be recorded after the next scheduled backup run"}),
@@ -668,6 +730,7 @@ report_render_text() {
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
     (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)+(if .last_run.paths==null then "" else "; scope: "+((.last_run.paths|length)|tostring)+" path(s)" end)),
+    "  Sampled originals:    " + .backups.asset_sample.state + (if .backups.asset_sample.state=="sampled" then " ("+(.backups.asset_sample.sampled_files|tostring)+" file(s), "+((.backups.asset_sample.media_types // [])|join("/"))+", "+(.backups.asset_sample.age_seconds|age)+" ago; a sample, not the whole library)" else " ("+(.backups.asset_sample.reason // "no detail")+")" end),
     "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="verified" then " ("+(.backups.restore_verification.target // "?")+", "+(.backups.restore_verification.age_seconds|age)+" ago, checks: "+(.backups.restore_verification.checks // "?")+")" else " ("+(.backups.restore_verification.reason // "no detail")+")"+(if .backups.restore_verification.last_verified_at==null then "" else "; last passed "+(.backups.restore_verification.age_seconds|age)+" ago" end) end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",
