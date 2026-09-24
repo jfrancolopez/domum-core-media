@@ -176,6 +176,20 @@ report_container() {
 
 # container:destination entries whose contents are known to be disposable even
 # though they are non-empty. Keep this short, and justify every line.
+# Not all writable state is equally important, and treating it as if it were
+# buries the cases that matter. Five classes, ordered by what losing them costs:
+#
+#   irreplaceable   no one can recreate it. The family photo library.
+#   reconstructable durable and worth protecting, but recoverable with effort or
+#                   automation -- re-issued certificates, re-entered monitor
+#                   definitions, a re-scanned metadata database.
+#   media           replaceable/reacquirable by design (CLAUDE.md §2).
+#   cache           regenerated automatically; losing it costs CPU, not data.
+#   ephemeral       has no meaning across a restart.
+#
+# Only the first two raise findings, at different severities. An unrecognised
+# non-empty volume is classed `reconstructable` rather than silently ignored:
+# unknown state must be visible, but calling it irreplaceable would cry wolf.
 state_class_declared() {
   case "$1" in
     # Redis RDB for Immich's job queue; Immich re-derives it. The volume is
@@ -184,6 +198,50 @@ state_class_declared() {
     # immich-app declares VOLUME /data too, but Immich writes to the
     # bind-mounted upload path; this volume is an unused image artefact.
     immich_server:/data) printf 'ephemeral' ;;
+    # ML model weights: downloaded on demand, several GB, no user data.
+    immich_machine_learning:/cache) printf 'cache' ;;
+    # ACME account key and issued certificates. Losing acme.json costs a
+    # re-issue, which Traefik does automatically -- but Let's Encrypt rate
+    # limits make that a real outage, not a free operation.
+    traefik:/letsencrypt) printf 'reconstructable' ;;
+    # Monitor definitions, notification targets and uptime history, all entered
+    # by hand. Nothing regenerates them; the operator retypes them. Costly, but
+    # not irreplaceable in the sense the photo library is.
+    uptime-kuma:/app/data) printf 'reconstructable' ;;
+    *) printf '' ;;
+  esac
+}
+
+# Does this class represent state whose loss actually costs something?
+state_class_is_protected_tier_concern() {
+  case "$1" in
+    irreplaceable|reconstructable) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Some state outside the protected tier IS protected, just not by snapshots or a
+# backup target. Traefik's ACME store is copied into the recovery pack on every
+# run -- so reporting it as "neither snapshotted nor backed up" was simply false,
+# and a false warning next to a true one devalues both.
+#
+# Only the mechanism is named here. Whether it actually holds anything is
+# decided against the live recovery-pack state when the finding is raised, so a
+# missing or stale pack cannot launder an uncovered gap into a covered one.
+# Emits one entry as JSON. `covered_by` names the mechanism that protects this
+# state when it is not the protected tier -- null when nothing does.
+state_emit_entry() {
+  local name="$1" class="$2" src="$3" dst="$4" covered
+  covered="$(state_recovery_coverage "$name:$dst")"
+  jq -cn --arg class "$class" --arg source "$src" --arg destination "$dst" \
+    --arg covered "$covered" \
+    '{class:$class, source:$source, destination:$destination,
+      covered_by:(($covered|select(length>0)) // null)}'
+}
+
+state_recovery_coverage() {
+  case "$1" in
+    traefik:/letsencrypt) printf 'recovery-pack' ;;
     *) printf '' ;;
   esac
 }
@@ -205,11 +263,29 @@ report_container_state_exposure() {
       2>/dev/null || true)"
   fi
 
-  local entries="" mtype msrc mdst mrw class
+  # One JSON object per entry, built by jq rather than joined into a
+  # "class:source:destination" string and split back apart. A bind source
+  # containing a colon would have been reassembled wrongly, and there is now a
+  # fourth field to carry.
+  local entries_file mtype msrc mdst mrw class
+  # report_tmp_register is a PASSTHROUGH: it echoes the path it registered, so
+  # calling it as a statement would print that path into this function's own
+  # stdout -- which is its return value. Same shape as the create_service_snapshot
+  # defect; caught here by the JSON failing to parse.
+  entries_file="$(report_tmp_register "$(mktemp)")"
   while IFS='|' read -r mtype msrc mdst mrw; do
     [[ -n "${mtype:-}" ]] || continue
     [[ "${mrw:-false}" == "true" ]] || continue      # read-only mounts hold no state
-    class=""
+    # A declared class wins whatever the mount type. Previously only volumes
+    # could be declared, so a bind mount could never be classified explicitly --
+    # if Traefik's ACME store were bind-mounted somewhere unusual there would
+    # have been no way to say what it is.
+    class="$(state_class_declared "$name:$mdst")"
+    if [[ -n "$class" ]]; then
+      state_emit_entry "$name" "$class" "$msrc" "$mdst" >> "$entries_file"
+      continue
+    fi
+
     case "$mtype" in
       bind)
         case "$msrc" in
@@ -217,32 +293,30 @@ report_container_state_exposure() {
           /etc/localtime|/var/run/docker.sock) continue ;;
           *"/.cache/"*) class=cache ;;
           "$media_root"/*|"$media_root") class=media ;;
-          *) class=durable ;;
+          # An unrecognised bind mount outside every known tier. Visible, but
+          # not claimed to be irreplaceable without evidence.
+          *) class=reconstructable ;;
         esac ;;
       volume)
-        class="$(state_class_declared "$name:$mdst")"
-        if [[ -z "$class" ]]; then
+        if true; then
           if state_volume_is_empty "$msrc"; then
             class=ephemeral                           # nothing to protect
           else
-            class=durable                             # unrecognised and non-empty: fail loud
+            # Unrecognised and non-empty: never silently ignored. Classed
+            # reconstructable rather than irreplaceable -- it must be visible,
+            # but an unknown volume is not evidence of irreplaceable data, and
+            # crying wolf is how real findings get ignored.
+            class=reconstructable
           fi
         fi ;;
       *) continue ;;
     esac
-    entries+="${entries:+ }${class}:${msrc}:${mdst}"
+    state_emit_entry "$name" "$class" "$msrc" "$mdst" >> "$entries_file"
   done <<< "$mounts"
 
-  local jqentries="[]" e
-  if [[ -n "$entries" ]]; then
-    jqentries="$(
-      for e in $entries; do
-        printf '%s\n' "$e"
-      done | jq -R 'split(":") | {class:.[0], source:(.[1:-1]|join(":")), destination:.[-1]}' | jq -s .
-    )"
-  fi
-  jq -cn --arg name "$name" --argjson mounts "$jqentries" \
+  jq -cn --arg name "$name" --argjson mounts "$(jq -s . "$entries_file")" \
     '{container:$name, state:$mounts}'
+  rm -f "$entries_file"
 }
 
 report_filesystem() {
@@ -717,10 +791,37 @@ report_generate_json() {
     # Only genuinely durable state is a finding. Caches, the replaceable media
     # tier and ephemeral runtime state are listed in the report but are not
     # problems, and warning about them would bury the ones that matter.
-    (.container_state[] as $c | $c.state[] | select(.class == "durable") |
-      {level:"warning",
-       message:($c.container+" keeps durable state outside the protected tier, so it is neither snapshotted nor backed up: "+.source+" -> "+.destination),
+    # Severity follows what losing it actually costs. Media, cache and ephemeral
+    # state are listed but raise nothing: warning about them would bury the two
+    # classes that matter.
+    # "Covered" is only claimed when the covering mechanism is actually present.
+    # The Traefik ACME store is copied into the recovery pack on every run, so
+    # calling it "neither snapshotted nor backed up" was false -- but a stale or
+    # missing pack must not launder an uncovered gap into a covered one, so the
+    # live recovery-pack state decides.
+    # (No apostrophes in this block: it lives inside a single-quoted jq program.)
+    (.recovery_pack.state as $rp | .container_state[] as $c | $c.state[] |
+      select(.class == "irreplaceable") |
+      select(.covered_by == null or $rp != "available") |
+      {level:"critical",
+       message:($c.container+" keeps IRREPLACEABLE state outside the protected tier, so it is neither snapshotted nor backed up: "+.source+" -> "+.destination),
        action:"Bind-mount it under the data root, or add it to a backup target include path"}),
+    (.recovery_pack.state as $rp | .container_state[] as $c | $c.state[] |
+      select(.class == "reconstructable") |
+      select(.covered_by == null or $rp != "available") |
+      {level:"warning",
+       message:($c.container+" keeps durable state outside the protected tier: "+.source+" -> "+.destination+
+                (if .covered_by == null
+                 then " (reconstructable, but only by re-issuing or re-entering it by hand)"
+                 else " (normally covered by the "+.covered_by+", but that is not available)" end)),
+       action:"Bind-mount it under the data root, or add it to a backup target include path"}),
+    # Covered state is reported, not warned about -- the operator should be able
+    # to see WHY it is not a finding without having to remember.
+    (.recovery_pack.state as $rp | .container_state[] as $c | $c.state[] |
+      select(.covered_by != null and $rp == "available") |
+      {level:"info",
+       message:($c.container+" keeps durable state outside the protected tier, covered by the "+.covered_by+": "+.source+" -> "+.destination),
+       action:"No action needed; verify with: domum-media recovery-pack status"}),
     (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "verified" and .age_seconds != null and .age_seconds > 2678400) | {level:"warning",message:"The last successful restore verification is over 31 days old",action:"Run: domum-media backup verify-restore <target>"}),
