@@ -108,3 +108,26 @@ removed automatically. Delete it yourself only once Jellyfin has been confirmed
 working — it is the only copy of the pre-migration state.
 
 Expected downtime: **seconds**.
+
+## If the migration aborts
+
+Every abort path restarts the service before exiting, and says so. Nothing is
+lost in any of them — the original is at its usual path, or preserved at
+`.premigration`.
+
+The one worth expecting is the **quiesce check**. It runs after the containers
+have stopped, and refuses if a non-empty SQLite `-wal` remains or
+`postgres/postmaster.pid` is still present — evidence the application did not
+shut down cleanly. Jellyfin has no `-wal`/`-shm` today, so this is unlikely for
+the pilot; Plex (169 KB) and Navidrome (20 KB) carry non-empty WALs while
+running, so it is very likely on their turn.
+
+Earlier this check called `die`, which exits the shell outright — so the
+recovery branch next to it was unreachable and the service stayed down until
+someone noticed. It now returns a failure the caller handles, and the service is
+restarted before the command exits. If you ever see the abort message without
+the service coming back, start it by hand:
+
+```
+cd /opt/domum-core-media && docker compose up -d jellyfin
+```

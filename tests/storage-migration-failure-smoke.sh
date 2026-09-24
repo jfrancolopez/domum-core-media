@@ -123,10 +123,20 @@ d="$(run_migration fail-stop 'compose_cmd() { return 1; }')"
 grep -qi 'could not stop' "$d/out.txt" || fail "the stop failure must be reported"
 assert_data_survives "$d" "service refuses to stop"
 
-d="$(run_migration fail-wal 'printf "wal" > "'"$TMP_DIR"'/fail-wal/data/jellyfin/config/jellyfin.db-wal"')"
+# The quiesce check runs AFTER the service has been stopped, so aborting is only
+# half the job: the service must also be put back. `migrate_assert_quiesced` used
+# to call `die`, which exits the shell outright and made the caller's
+# `|| { migrate_restart; exit 1; }` unreachable -- the migration refused, and
+# left the service down until someone noticed.
+d="$(run_migration fail-wal 'printf "wal" > "'"$TMP_DIR"'/fail-wal/data/jellyfin/config/jellyfin.db-wal"
+compose_cmd() { printf "compose %s\n" "$*" >> "'"$TMP_DIR"'/fail-wal/compose.log"; return 0; }')"
 [ "$(cat "$d/rc")" != "0" ] || fail "a non-empty WAL must abort the migration"
 grep -qi 'write-ahead log' "$d/out.txt" || fail "the WAL condition must be reported"
 assert_data_survives "$d" "non-empty SQLite WAL remains"
+grep -q 'compose stop' "$d/compose.log" 2>/dev/null \
+  || fail "the WAL scenario never reached the stop, so the restart assertion below proves nothing"
+grep -q 'compose up -d' "$d/compose.log" 2>/dev/null \
+  || fail "the migration aborted on a non-empty WAL and left the service stopped"
 
 d="$(run_migration fail-create 'btrfs() { return 1; }')"
 [ "$(cat "$d/rc")" != "0" ] || fail "a failed subvolume creation must abort"

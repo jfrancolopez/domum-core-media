@@ -4485,17 +4485,25 @@ migrate_assert_same_btrfs() {
 # SQLite in WAL mode cannot be copied file-by-file while a writer is live: .db
 # and .db-wal would be captured at different instants. A clean shutdown
 # checkpoints and removes them.
+# Returns non-zero rather than calling `die`, because by the time this runs the
+# service has already been STOPPED. `die` exits the shell outright, which made
+# the caller's `|| { migrate_restart; exit 1; }` unreachable dead code and left
+# the service down until someone noticed and ran `docker compose up -d` by hand.
+# Refusing to migrate is correct; refusing and walking away is not.
 migrate_assert_quiesced() {
   local path="$1" leftovers
   leftovers="$(find "$path" -name '*-wal' -size +0 2>/dev/null || true)"
   if [[ -n "$leftovers" ]]; then
-    die "Non-empty SQLite write-ahead logs remain after stopping the service:
+    warn "Non-empty SQLite write-ahead logs remain after stopping the service:
 $leftovers
 The application did not shut down cleanly. Investigate before migrating."
+    return 1
   fi
   if [[ -e "$path/postgres/postmaster.pid" ]]; then
-    die "PostgreSQL is still running or did not shut down cleanly ($path/postgres/postmaster.pid exists)."
+    warn "PostgreSQL is still running or did not shut down cleanly ($path/postgres/postmaster.pid exists)."
+    return 1
   fi
+  return 0
 }
 
 migrate_measure() {
@@ -4644,7 +4652,10 @@ storage_migrate_subvolume() {
     fi
   }
 
-  migrate_assert_quiesced "$path" || { migrate_restart; exit 1; }
+  if ! migrate_assert_quiesced "$path"; then
+    migrate_restart
+    die "Migration aborted: the service is not quiesced. Nothing has been changed, and $service has been restarted."
+  fi
   migrate_stage stop "quiesced: no non-empty WAL, no postmaster.pid"
 
   # ---- stage 2: create the new subvolume ------------------------------------
@@ -4657,7 +4668,7 @@ storage_migrate_subvolume() {
   # ---- stage 3: reflink copy ------------------------------------------------
   if ! cp -a --reflink=always "$path/." "$newsub/"; then
     warn "Copy failed; removing the partial copy. The original at $path is untouched."
-    rm -rf -- "$newsub"
+    rm -rf -- "$newsub" || warn "Could not remove the partial copy at $newsub"
     migrate_restart
     die "Migration aborted during copy. Nothing was lost."
   fi
@@ -4666,14 +4677,14 @@ storage_migrate_subvolume() {
   # ---- stage 4: verify ------------------------------------------------------
   if ! migrate_verify "$path" "$newsub"; then
     warn "Verification failed; removing the unverified copy. The original at $path is untouched."
-    rm -rf -- "$newsub"
+    rm -rf -- "$newsub" || warn "Could not remove the unverified copy at $newsub"
     migrate_restart
     die "Migration aborted: the copy did not verify. Nothing was lost."
   fi
 
   # ---- stage 5+6: cutover ---------------------------------------------------
   if ! mv -- "$path" "$premigration"; then
-    rm -rf -- "$newsub"
+    rm -rf -- "$newsub" || warn "Could not remove the staged copy at $newsub"
     migrate_restart
     die "Could not move the original aside. Nothing has been changed."
   fi
@@ -4683,7 +4694,7 @@ storage_migrate_subvolume() {
     warn "Could not move the new subvolume into place; restoring the original."
     mv -- "$premigration" "$path" \
       || die "CRITICAL: the original could not be restored. It is at $premigration."
-    rm -rf -- "$newsub"
+    rm -rf -- "$newsub" || warn "Could not remove the staged copy at $newsub"
     migrate_restart
     die "Migration aborted at cutover. The original was restored."
   fi
