@@ -131,4 +131,62 @@ grep -q 'domum_acquire_lock "daily backup" "${BACKUP_LOCK_WAIT_SECONDS:-1800}"' 
   "$REPO_ROOT/bin/domum-media-backup" \
   || fail "the daily backup must wait for the lock, not fail immediately"
 
+# ---------------------------------------------------------------------------
+# 5. The lock must not be inheritable by a child that outlives the acquirer.
+#
+# The lock lives in an open file descriptor, and every child inherits it. A
+# service started under the lock and left running keeps holding it after the
+# acquiring process is long gone -- and because there is deliberately no
+# stale-lock reaper, the next backup waits its full timeout and fails, every
+# night, until reboot.
+#
+# Found by the real-Btrfs integration test: `compose_cmd up -d` starts
+# long-lived processes while a migration holds the lock. compose_cmd therefore
+# drops the descriptor for that command.
+# ---------------------------------------------------------------------------
+grep -q 'DOMUM_LOCK_FD}>&-' "$REPO_ROOT/bin/domum-media" \
+  || fail "compose_cmd does not close the lock descriptor; a started service would inherit and hold the lock"
+
+# A child WITHOUT the fd closed keeps the lock after its parent exits; with the
+# fd closed it does not. Holders record their own PID and are killed by PID --
+# `pkill -f` on a live host can match the test's own shell (it did).
+probe_leak() {  # $1 = state dir, $2 = "inherit" | "closed"
+  local d="$1" mode="$2"
+  mkdir -p "$d"
+  if [[ "$mode" == "closed" ]]; then
+    bash -c "
+set -uo pipefail
+DOMUM_STATE_ROOT='$d'
+$lock_helper
+domum_acquire_lock 'probe' 0 || exit 9
+setsid bash -c 'echo \$\$ > \"\$1\"; exec sleep 20' _ '$d/holder.pid' >/dev/null 2>&1 {DOMUM_LOCK_FD}>&- &
+for _ in \$(seq 1 40); do [[ -s '$d/holder.pid' ]] && break; sleep 0.05; done
+"
+  else
+    bash -c "
+set -uo pipefail
+DOMUM_STATE_ROOT='$d'
+$lock_helper
+domum_acquire_lock 'probe' 0 || exit 9
+setsid bash -c 'echo \$\$ > \"\$1\"; exec sleep 20' _ '$d/holder.pid' >/dev/null 2>&1 &
+for _ in \$(seq 1 40); do [[ -s '$d/holder.pid' ]] && break; sleep 0.05; done
+"
+  fi
+}
+
+held_after_parent_exit() {  # $1 = state dir -> prints yes/no, then cleans up
+  local d="$1" pid
+  if bash -c "exec 9>>'$d/operation.lock'; flock -n 9"; then printf 'no'; else printf 'yes'; fi
+  pid="$(cat "$d/holder.pid" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+}
+
+probe_leak "$TMP_DIR/leak" inherit   || fail "the inherit probe could not acquire the lock"
+[[ "$(held_after_parent_exit "$TMP_DIR/leak")" == "yes" ]] \
+  || fail "fixture is wrong: an inheriting child should have held the lock, so the next check proves nothing"
+
+probe_leak "$TMP_DIR/noleak" closed  || fail "the closed-fd probe could not acquire the lock"
+[[ "$(held_after_parent_exit "$TMP_DIR/noleak")" == "no" ]] \
+  || fail "a child spawned with the lock descriptor closed still holds the lock"
+
 echo "PASS: operation lock smoke test"

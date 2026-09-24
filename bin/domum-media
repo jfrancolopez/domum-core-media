@@ -1162,7 +1162,21 @@ compose_cmd() {
   export_env_for_compose
   mapfile -t args < <(compose_files_for_enabled_services)
   cd "$DOMUM_DIR"
-  docker compose "${args[@]}" "$@"
+  # Close the operation lock's descriptor for this command.
+  #
+  # The lock lives in an open fd, which every child INHERITS. A child that
+  # outlives the process that acquired the lock therefore keeps holding it --
+  # and because there is deliberately no stale-lock reaper, the next backup
+  # would wait its full timeout and then fail, every night, until reboot.
+  #
+  # `docker compose up -d` is the one place a locked operation execs something
+  # that starts long-lived processes, so the fd is dropped here rather than
+  # relying on every future caller to remember.
+  if [[ -n "${DOMUM_LOCK_FD:-}" ]]; then
+    docker compose "${args[@]}" "$@" {DOMUM_LOCK_FD}>&-
+  else
+    docker compose "${args[@]}" "$@"
+  fi
 }
 
 # ---- btrfs snapshots ------------------------------------------------------
@@ -1408,11 +1422,30 @@ create_service_snapshot() {
   snapshot_name="$(basename "$data_path")-$(date +%Y%m%d-%H%M%S)-${tag}"
   if is_btrfs_subvol "$data_path"; then
     mkdir -p "$DOMUM_SNAPSHOT_ROOT"
-    echo "[domum-media] Snapshot: $data_path -> $DOMUM_SNAPSHOT_ROOT/$snapshot_name"
+    # STDERR, not stdout. This function RETURNS the snapshot name on stdout, and
+    # every caller captures it with $(...). A progress line on stdout is
+    # therefore part of the return value: callers received
+    #
+    #   "[domum-media] Snapshot: /srv/data/jellyfin -> /srv/snapshots/jellyfin-...
+    #    jellyfin-20260924-125809-pre-update"
+    #
+    # and then passed that to restore_snapshot_for_service, which cannot find it.
+    # The auto-rollback after a failed health check would refuse -- leaving the
+    # service on the broken image with a perfectly good snapshot sitting unused --
+    # and record_update_history would store the mangled name as the rollback
+    # pointer. Unreachable while no service path was a subvolume (the function
+    # returns 1 before printing anything), and armed by the first migration.
+    echo "[domum-media] Snapshot: $data_path -> $DOMUM_SNAPSHOT_ROOT/$snapshot_name" >&2
     # Report failure unless the snapshot actually exists afterwards. Returning
     # the name for a snapshot that was never created would let the caller's gate
     # pass and record rollback metadata pointing at nothing.
-    if ! btrfs subvolume snapshot -r "$data_path" "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" \
+    # `btrfs subvolume snapshot` prints "Create readonly snapshot of ..." on
+    # STDOUT. Inside this function that is the return value, so the caller would
+    # capture the tool's chatter as part of the snapshot name -- the same defect
+    # as the log line above, arriving from an external command instead of from
+    # us. Stubbed btrfs in the unit tests printed nothing and hid it; the real
+    # tool on real Btrfs is what exposed it.
+    if ! btrfs subvolume snapshot -r "$data_path" "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" >&2 \
        || [[ ! -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]]; then
       echo "[domum-media] Snapshot FAILED for $data_path" >&2
       return 1
