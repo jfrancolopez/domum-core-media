@@ -29,6 +29,60 @@ live files.
 
 Never describe a passing sample as "the library is verified".
 
+## What "originals" means
+
+The Immich library root is **not** a directory of originals. Measured on this
+host:
+
+| subtree | files | what it is |
+|---|---|---|
+| `upload/` | 22,856 | **the originals** |
+| `thumbs/` | 32,295 | generated thumbnails and previews |
+| `encoded-video/` | 9,029 | transcodes |
+| `backups/` | 15 | database dumps |
+| `library/`, `profile/` | 1 each | markers |
+
+An earlier version sampled the whole tree, so "a deterministic sample of real
+Immich originals" was mostly thumbnails, transcodes and a `.sql.gz` — derived
+data Immich regenerates. It spent the sample budget on files whose loss costs
+nothing, and inflated the apparent type diversity while doing it.
+
+Sampling is now restricted to `upload/` (override with `IMMICH_ORIGINALS_DIR`).
+Where there is no `upload/` subtree the whole library is used and the command
+says so: a narrower claim stated plainly beats a broader one that is not true.
+
+## Seeing the sample without restoring
+
+```
+domum-media-backup sample-plan [count]
+```
+
+Read-only. It restores nothing, contacts no repository, and records nothing —
+so the selection can be inspected, its determinism checked, and its cost known
+before anyone spends a restore on it. Against the real library today:
+
+```
+  TYPE                BYTES  PATH
+  jpeg              3471512  …/34236809-….jpeg
+  png                241940  …/3cb0a97a-….PNG
+  mov               4050465  …/46513cd0-….MOV
+  heic              1915008  …/5aa95089-….HEIC
+  cr2              31532206  …/5c5f873e-….CR2
+  gif               3259737  …/5dd7f6ef-….gif
+  jpg               1579439  …/6bf49cce-….jpg
+  mp4               6369448  …/7da14870-….mp4
+  dng              27129035  …/80d2ec31-….DNG
+  m4v             179997704  …/9aae0961-….m4v
+  webp               105306  …/a8b1ab8e-….WEBP
+  immich                 13  .immich
+
+  files : 12   total bytes : 259,651,813
+```
+
+Eleven distinct media types across five orders of magnitude, and byte-identical
+output across runs. A plan is **not** evidence, and the command says so on every
+run.
+
 ## Selection
 
 Selection is deterministic: the same library and count produce the same sample,

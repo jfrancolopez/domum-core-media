@@ -1011,14 +1011,94 @@ sample_select_paths() {
         }'
 }
 
+# The Immich library root is not a directory of originals. It holds:
+#
+#   upload/         the ORIGINALS -- 22,856 files here
+#   thumbs/         generated thumbnails and previews -- 32,295
+#   encoded-video/  transcodes -- 9,029
+#   backups/        database dumps
+#   library/ profile/
+#
+# Sampling the whole tree meant "a deterministic sample of real Immich
+# originals" was mostly thumbnails, transcodes and a .sql.gz dump: derived data
+# that Immich regenerates, spending the sample budget on files whose loss costs
+# nothing and inflating the apparent type diversity while doing it.
+#
+# Falls back to the library root when there is no upload/ (a different layout),
+# and the caller says which was used -- a narrower claim stated plainly beats a
+# broader one that is not true.
+immich_originals_dir() {
+  local lib="$1"
+  if [[ -n "${IMMICH_ORIGINALS_DIR:-}" ]]; then
+    printf '%s' "$IMMICH_ORIGINALS_DIR"
+  elif [[ -d "$lib/upload" ]]; then
+    printf '%s' "$lib/upload"
+  else
+    printf '%s' "$lib"
+  fi
+}
+
+# What WOULD be sampled, without restoring anything.
+#
+# `verify-sample` needs root and a live repository, so until it runs there is no
+# way to see what it would pick. This shows exactly that -- read-only, against
+# the real library -- so the selection can be inspected, its determinism checked,
+# and its cost known before anyone spends a restore on it.
+#
+# It deliberately does NOT contact the repository or record anything: a plan is
+# not evidence, and must never be mistaken for a verification.
+do_sample_plan() {
+  local want="${1:-$SAMPLE_DEFAULT_COUNT}"
+  [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || die "Sample count must be a positive integer"
+
+  local lib originals
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  [[ -d "$lib" ]] || die "Immich library not found at $lib"
+  originals="$(immich_originals_dir "$lib")"
+  [[ -d "$originals" ]] || die "Immich originals not found at $originals"
+
+  local total=0 n=0 size path ext
+  echo "[domum-media-backup] Sample plan for $originals"
+  [[ "$originals" == "$lib" ]] \
+    && echo "  NOTE: no upload/ subtree; sampling the whole library, which includes derived files."
+  echo
+  printf '  %-10s %14s  %s\n' "TYPE" "BYTES" "PATH"
+  while IFS=$'\t' read -r size path; do
+    [[ -n "$path" ]] || continue
+    (( total + size > SAMPLE_MAX_TOTAL_BYTES )) && continue
+    ext="${path##*/}"
+    if [[ "$ext" == *.* ]]; then ext="${ext##*.}"; ext="${ext,,}"; else ext="none"; fi
+    printf '  %-10s %14s  %s\n' "$ext" "$size" "${path#"$originals"/}"
+    total=$(( total + size )); n=$(( n + 1 ))
+  done < <(sample_select_paths "$originals" "$want")
+
+  (( n > 0 )) || die "No sample candidates found under $originals within the size caps"
+
+  local unsamplable; unsamplable="$(sample_unsamplable_count "$originals")"
+  echo
+  echo "  files        : $n"
+  echo "  total bytes  : $total"
+  echo "  per-file cap : $SAMPLE_MAX_FILE_BYTES"
+  echo "  total cap    : $SAMPLE_MAX_TOTAL_BYTES"
+  if [[ "$unsamplable" =~ ^[0-9]+$ ]] && (( unsamplable > 0 )); then
+    echo "  excluded     : $unsamplable file(s) whose names contain glob metacharacters"
+  fi
+  echo
+  echo "  This is a PLAN. Nothing was restored, nothing was contacted, and no"
+  echo "  evidence was recorded. Run verify-sample <target> to actually verify."
+}
+
 do_verify_sample() {
   local target="${1:-}" want="${2:-$SAMPLE_DEFAULT_COUNT}"
   [[ -n "$target" ]] || die "Usage: domum-media-backup verify-sample <target> [count]"
   backup_target_enabled "$target" || die "Backup target is not enabled: $target"
   [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || die "Sample count must be a positive integer"
 
-  local lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  local lib originals
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
   [[ -d "$lib" ]] || die "Immich library not found at $lib"
+  originals="$(immich_originals_dir "$lib")"
+  [[ -d "$originals" ]] || die "Immich originals not found at $originals"
 
   local vdir scratch manifest snapshot_id total=0
   vdir="$(restore_verification_dir)"
@@ -1043,9 +1123,9 @@ do_verify_sample() {
     [[ -n "$path" ]] || continue
     (( total + size > SAMPLE_MAX_TOTAL_BYTES )) && continue
     sample_paths+=("$path"); sample_sizes+=("$size"); total=$(( total + size ))
-  done < <(sample_select_paths "$lib" "$want")
+  done < <(sample_select_paths "$originals" "$want")
 
-  (( ${#sample_paths[@]} > 0 )) || die "No sample candidates found under $lib within the size caps"
+  (( ${#sample_paths[@]} > 0 )) || die "No sample candidates found under $originals within the size caps"
   log "sample verification: $target snapshot $snapshot_id, ${#sample_paths[@]} file(s), $total bytes"
 
   local -a include_args=()
@@ -1074,7 +1154,7 @@ do_verify_sample() {
       '{target:$t,snapshot_id:$s,path:$p,media_type:$e,size_bytes:$b,
         source_sha256:($sh|select(length>0)),restored_sha256:($dh|select(length>0)),
         result:$v,verified_at:$ts}' >> "$tmp"
-    printf '  %-9s %-6s %12s  %s\n' "$verdict" "$ext" "$size" "${path#"$lib"/}"
+    printf '  %-9s %-6s %12s  %s\n' "$verdict" "$ext" "$size" "${path#"$originals"/}"
   done
   chmod 0600 "$tmp"; mv -f "$tmp" "$manifest"
 
@@ -1082,8 +1162,9 @@ do_verify_sample() {
   echo "[domum-media-backup] Sample verification for $target"
   echo "  snapshot : $snapshot_id"
   echo "  sampled  : ${#sample_paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
+  echo "  sampled  : from $originals"
   echo "  manifest : $manifest"
-  local unsamplable; unsamplable="$(sample_unsamplable_count "$lib")"
+  local unsamplable; unsamplable="$(sample_unsamplable_count "$originals")"
   if [[ "$unsamplable" =~ ^[0-9]+$ ]] && (( unsamplable > 0 )); then
     echo "  excluded : $unsamplable file(s) whose names contain glob metacharacters"
     echo "             (restic --include is a pattern, so these cannot be sampled safely)"
@@ -1273,6 +1354,7 @@ main() {
     adopt-repo)           shift; do_adopt_repo "${1:-}" ;;
     verify-restore)       shift; do_verify_restore "${1:-}" ;;
     verify-sample)        shift; do_verify_sample "${1:-}" "${2:-}" ;;
+    sample-plan)          shift; do_sample_plan "${1:-}" ;;
     -h|--help)
       cat <<EOF
 domum-media-backup — restic wrapper
@@ -1301,6 +1383,10 @@ Usage:
                                             Restore a deterministic, diverse
                                             sample of Immich originals and
                                             compare them byte-for-byte
+  domum-media-backup sample-plan [count]    Show which originals verify-sample
+                                            would pick. Read-only: restores
+                                            nothing, contacts nothing, records
+                                            nothing
 EOF
       ;;
     *)
