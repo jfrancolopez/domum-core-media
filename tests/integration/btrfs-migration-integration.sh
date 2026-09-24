@@ -601,6 +601,41 @@ out="$(run "restore_snapshot_for_service jellyfin '$(basename "$COLLIDE" | sed '
 [[ "$(fingerprint "$SVC")" == "$LIVE_FP" ]] || fail "a refused rollback disturbed live state"
 ok "rollback against a foreign snapshot name refused"
 
+# --- a nested subvolume must refuse the snapshot -----------------------------
+# Btrfs snapshots are not recursive: a nested subvolume is an EMPTY DIRECTORY in
+# the parent's snapshot. A gate that accepted such a snapshot would report
+# protection for state that is not in it. Proven here against real Btrfs.
+NESTED="$SVC/config/nested-state"
+btrfs subvolume create "$NESTED" >/dev/null 2>&1 || fail "could not create a nested subvolume"
+printf 'THE-DATA-THAT-WOULD-BE-LOST
+' > "$NESTED/important.db"
+
+# First: demonstrate the hazard itself, with btrfs directly.
+DEMO="$SNAPS/demo-nested-$$"
+btrfs subvolume snapshot -r "$SVC" "$DEMO" >/dev/null 2>&1 || fail "could not stage the demo snapshot"
+[[ -z "$(ls -A "$DEMO/config/nested-state" 2>/dev/null)" ]]   || fail "fixture is wrong: the nested subvolume was NOT empty in the snapshot, so this proves nothing"
+ok "a nested subvolume really is empty in the parent's snapshot" "important.db absent"
+btrfs property set -ts "$DEMO" ro false >/dev/null 2>&1
+rmdir "$DEMO/config/nested-state" 2>/dev/null
+find "$DEMO" -mindepth 1 -depth -exec rm -rf {} + 2>/dev/null; rmdir "$DEMO" 2>/dev/null
+
+# Then: the implementation must refuse rather than produce that snapshot.
+out="$(run "create_service_snapshot jellyfin nested-probe '' ''")"; rc=$?
+(( rc != 0 )) || fail "a snapshot was taken despite a nested subvolume: $out"
+grep -qi 'nested subvolume' <<< "$out" || fail "the refusal did not name the cause: $out"
+grep -q 'nested-state' <<< "$out" || fail "the refusal did not name the nested path: $out"
+ok "create_service_snapshot refuses a tree with a nested subvolume"
+
+# And the fleet-wide helper must count it as a FAILURE, not a skip -- a skip
+# would let the aggregate gate pass on other services' snapshots.
+out="$(run "snapshot_subvolumes() { printf '%s\n' '$SVC'; }
+snapshot_create nested-fleet && echo RC=0 || echo RC=1")"
+grep -q 'RC=1' <<< "$out" || fail "snapshot_create succeeded despite a nested subvolume: $out"
+grep -q '1 failed' <<< "$out" || fail "the nested subvolume was not counted as a failure: $out"
+ok "snapshot_create counts a nested subvolume as a failure, not a skip"
+
+rm -f "$NESTED"/*; rmdir "$NESTED"
+
 # --- the lock must never be leaked to a surviving child ----------------------
 # The lock lives in an open descriptor, which every child inherits. A service
 # started under the lock and left running would hold it forever -- and there is
