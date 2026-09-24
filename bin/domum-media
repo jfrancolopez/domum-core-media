@@ -1541,6 +1541,7 @@ To proceed deliberately without rollback protection, set SNAPSHOT_POLICY=WARN in
 
 snapshot_prune() {
   local keep="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
+  local pruned=0 failed=0
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
   local names
   names="$(find "$DOMUM_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
@@ -1555,10 +1556,23 @@ snapshot_prune() {
       for (( i = 0; i < drop; i++ )); do
         local victim="$DOMUM_SNAPSHOT_ROOT/${snaps[$i]}"
         echo "[domum-media] Pruning snapshot: $victim"
-        btrfs subvolume delete "$victim" || true
+        # Not `|| true`. A delete that fails means the snapshot root never
+        # converges on the retention policy, and swallowing it means nobody
+        # finds out: the operator sees a clean weekly run while the count grows.
+        # Report it, keep pruning the rest, and fail at the end so the systemd
+        # unit records the failure.
+        if btrfs subvolume delete "$victim" >&2; then
+          pruned=$(( pruned + 1 ))
+        else
+          warn "Could not delete snapshot: $victim"
+          failed=$(( failed + 1 ))
+        fi
       done
     fi
   done <<< "$names"
+
+  echo "[domum-media] Snapshot prune: ${pruned} deleted, ${failed} failed (keeping ${keep} per subvolume)."
+  (( failed == 0 ))
 }
 
 list_service_snapshots() {
@@ -3038,6 +3052,11 @@ snapshot_cmd() {
   case "$sub" in
     create)
       shift
+      # Snapshotting a tree a migration is renaming underneath us is exactly the
+      # race the lock exists for. Unattended (the weekly timer), so it waits
+      # rather than giving up.
+      domum_acquire_lock "snapshot create" "${SNAPSHOT_LOCK_WAIT_SECONDS:-900}" \
+        || die "Timed out waiting for another domum-media operation: $(domum_lock_holder)"
       # Propagate the real outcome: an operator who asked for a snapshot and got
       # none must not see a success exit status.
       if ! snapshot_create "${1:-manual}"; then
@@ -3045,7 +3064,18 @@ snapshot_cmd() {
       fi
       ;;
     list)   snapshot_list ;;
-    prune)  snapshot_prune ;;
+    prune)
+      # `snapshot prune` DELETES snapshots, and its timer is enabled and runs
+      # weekly (Sun 04:30 +20m). While no service path was a subvolume the
+      # snapshot root stayed empty, so it has never actually deleted anything.
+      # The first migration makes it a live deleting job -- which is precisely
+      # when it must stop racing migrations and rollbacks: a rollback checks its
+      # snapshot exists and then creates from it, and a prune landing between
+      # those two steps turns a routine restore into a failure.
+      domum_acquire_lock "snapshot prune" "${SNAPSHOT_LOCK_WAIT_SECONDS:-900}" \
+        || die "Timed out waiting for another domum-media operation: $(domum_lock_holder)"
+      snapshot_prune
+      ;;
     *) die "Usage: domum-media snapshot {create [tag]|list|prune}" ;;
   esac
 }
