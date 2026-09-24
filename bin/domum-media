@@ -4513,6 +4513,21 @@ migrate_manifest() {
       | xargs -0 -r sha256sum 2>/dev/null )
 }
 
+# Content hashes say nothing about ownership, permissions, or where a symlink
+# points. `cp -a --reflink` preserves all three, so a difference means the copy
+# is wrong -- and BTRFS-MIGRATION-PLAN.md has always claimed these are verified.
+#
+# Covers every entry type, not just regular files: directories (including empty
+# ones), symlinks with their targets, and anything else that turns up. Sorted
+# and NUL-delimited so the comparison is stable and newline-safe.
+migrate_metadata_manifest() {
+  local root="$1"
+  (
+    cd "$root" || exit 1
+    find . -printf '%y %m %U %G %p -> %l\0' 2>/dev/null | sort -z | tr '\0' '\n'
+  )
+}
+
 migrate_verify() {
   local src="$1" dst="$2" files
   local s_count s_bytes d_count d_bytes
@@ -4581,6 +4596,17 @@ migrate_verify() {
     (( sampled > 0 )) || { warn "the verification sample was empty; nothing was compared"; return 1; }
     migrate_stage verify "sampled content identical ($sampled of $files file(s))"
   fi
+
+  # Always compared in full, whichever content branch ran: this is cheap
+  # (metadata only, no reads) and it is the only check that sees empty
+  # directories, permissions, ownership, and symlink targets.
+  if ! diff <(migrate_metadata_manifest "$src") <(migrate_metadata_manifest "$dst") >/dev/null; then
+    warn "metadata mismatch (type, mode, owner, group, or symlink target)"
+    diff <(migrate_metadata_manifest "$src") <(migrate_metadata_manifest "$dst") \
+      | head -20 >&2
+    return 1
+  fi
+  migrate_stage verify "type, mode, owner, group and symlink targets identical"
   return 0
 }
 

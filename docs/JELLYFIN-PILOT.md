@@ -20,7 +20,7 @@ touch.
 | Untouched by migration | both `/srv/media` mounts — the media tier is not Btrfs and is out of scope |
 | Filesystem | `/srv/data` and `/srv/snapshots` are subvolumes of the same `/dev/sda1` |
 | Free space | 717 GB against a 600 KB copy |
-| Reflink | proven on this filesystem: 0 KiB vs 262,144 KiB for the same file |
+| Reflink | proven on this filesystem for one 256 MB file: 0 KiB vs 262,144 KiB. Not proven for the small inline-extent files that make up most of this service — see BTRFS-MIGRATION-PLAN.md |
 | Health semantics | Jellyfin defines no healthcheck and no health URL, so `service_is_healthy` means **container running** |
 
 ## What the migration proves, and what it does not
@@ -40,7 +40,8 @@ sudo domum-media storage migrate-subvolume jellyfin
 ```
 
 Expect, in order: preflight → stop → quiesce check → subvolume created →
-reflink copy → all 37 files hashed and matched → original preserved at
+reflink copy → all 37 files hashed and matched, and type/mode/owner/group and
+symlink targets compared across every entry → original preserved at
 `/srv/data/jellyfin.premigration` → cutover → restart → container running →
 proof snapshot created.
 
