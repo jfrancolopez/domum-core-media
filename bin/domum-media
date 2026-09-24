@@ -786,21 +786,33 @@ EOF
 # makes this fail with "unbound variable" under `set -u` -- which is what a host
 # bootstrapped from config/domum-media.conf.example would have done for
 # calibre-web and kavita, including on the disaster-recovery rebuild path.
+# These services' config values point at the CONFIG directory; the service's
+# state root is its parent. A plain `${dir%/config}` does not strip when the
+# value carries a trailing slash ("…/jellyfin/config/"), so the resolved path
+# stayed at the config directory -- and a migration would then have converted
+# that subdirectory into a subvolume while its parent remained an ordinary
+# directory, leaving `report` still saying "unprotected" after a migration that
+# claimed success.
+strip_config_suffix() {
+  local dir="${1%/}"
+  printf '%s' "${dir%/config}"
+}
+
 service_data_path() {
   local dir
   case "$1" in
     traefik) echo "$DOMUM_DATA_ROOT/traefik" ;;
     immich)  echo "$DOMUM_DATA_ROOT/immich" ;;
     jellyfin)
-      dir="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"; echo "${dir%/config}" ;;
+      dir="${JELLYFIN_CONFIG_DIR:-$DOMUM_DATA_ROOT/jellyfin/config}"; strip_config_suffix "$dir" ;;
     plex)
-      dir="${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"; echo "${dir%/config}" ;;
+      dir="${PLEX_CONFIG_DIR:-$DOMUM_DATA_ROOT/plex/config}"; strip_config_suffix "$dir" ;;
     navidrome)
-      echo "${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}" ;;
+      dir="${NAVIDROME_DATA_DIR:-$DOMUM_DATA_ROOT/navidrome}"; printf '%s' "${dir%/}" ;;
     calibre-web)
-      dir="${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"; echo "${dir%/config}" ;;
+      dir="${CALIBRE_WEB_CONFIG_DIR:-$DOMUM_DATA_ROOT/calibre-web/config}"; strip_config_suffix "$dir" ;;
     kavita)
-      dir="${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"; echo "${dir%/config}" ;;
+      dir="${KAVITA_CONFIG_DIR:-$DOMUM_DATA_ROOT/kavita/config}"; strip_config_suffix "$dir" ;;
     uptime-kuma) echo "$DOMUM_DATA_ROOT/uptime-kuma" ;;
     *) return 1 ;;
   esac
@@ -4721,6 +4733,22 @@ migrate_verify() {
   return 0
 }
 
+# A hand-built `docker compose` command is wrong here, and wrong in a way that
+# only shows up during recovery. This project has no compose.yml: the stack is
+# assembled from fragments chosen by which services are enabled, so a bare
+# `docker compose -p domum-media up -d jellyfin` in /opt/domum-core-media fails
+# with "no configuration file provided: not found".
+#
+# Runbooks therefore point at this passthrough instead of spelling out an -f
+# list that will drift. It layers exactly what every other command layers.
+compose_passthrough() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  (( $# > 0 )) || die "Usage: domum-media compose <docker compose arguments...>"
+  compose_cmd "$@"
+}
+
 storage_migrate_subvolume() {
   need_root
   load_cfg
@@ -4881,7 +4909,20 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   echo "[domum-media] Migration complete for $service."
   echo "  now a subvolume : $path"
   echo "  previous state  : $premigration   (retained deliberately; remove it yourself when satisfied)"
-  [[ -n "$proof" ]] && echo "  proof snapshot  : $proof"
+  if [[ -n "$proof" ]]; then
+    echo "  proof snapshot  : $proof"
+  else
+    # The migration itself succeeded and the data is safe, but rollback
+    # protection was not established. Exit non-zero so a script or a systemd
+    # unit driving this does not read it as a clean result -- and say why,
+    # rather than leaving the caller to infer it from an exit code that used to
+    # be set by accident (the old `[[ -n "$proof" ]] && echo` was the function's
+    # last statement, so an empty proof returned 1 silently, right after
+    # printing "Migration complete").
+    echo "  proof snapshot  : NONE -- rollback protection was not established"
+    return 1
+  fi
+  return 0
 }
 
 storage_cmd() {
@@ -4943,6 +4984,11 @@ Usage:
   domum-media checkup [--json]
   domum-media report [--json|--write]
   domum-media storage migrate-subvolume <service>
+  domum-media compose <docker compose arguments...>
+                                            Run docker compose with this
+                                            installation's fragment layering
+                                            (there is no compose.yml to use
+                                            directly)
   domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]
   domum-media recovery-pack {create [--no-email]|status}
   domum-media doctor {immich|traefik|backups|secrets|navidrome}
@@ -4972,6 +5018,7 @@ main() {
     checkup)   shift; checkup_cmd "$@" ;;
     report)    shift; report_entry "$@" ;;
     storage)   shift; storage_cmd "$@" ;;
+    compose)   shift; compose_passthrough "$@" ;;
     cleanup)   shift; cleanup_cmd "$@" ;;
     recovery-pack) shift; recovery_pack_cmd "$@" ;;
     doctor)    shift; doctor_cmd "$@" ;;

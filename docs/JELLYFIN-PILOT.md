@@ -96,11 +96,18 @@ partial artefacts and, if the cutover itself fails, moves the original back.
 Manual recovery, if ever needed:
 
 ```bash
-sudo docker compose -p domum-media stop jellyfin
+sudo domum-media compose stop jellyfin
 sudo mv /srv/data/jellyfin /srv/data/jellyfin.failed
 sudo mv /srv/data/jellyfin.premigration /srv/data/jellyfin
-sudo docker compose -p domum-media up -d jellyfin
+sudo domum-media compose up -d jellyfin
 ```
+
+> This deliberately does **not** say `docker compose -p domum-media …`. There is
+> no `compose.yml` in `/opt/domum-core-media`: the stack is assembled from
+> fragments chosen by which services are enabled, so a bare `docker compose`
+> there fails with `no configuration file provided: not found` — which is
+> exactly the wrong moment to discover that. `domum-media compose` is a
+> passthrough that applies the same fragment layering every other command uses.
 
 ## Afterwards
 
@@ -130,5 +137,5 @@ restarted before the command exits. If you ever see the abort message without
 the service coming back, start it by hand:
 
 ```
-cd /opt/domum-core-media && docker compose up -d jellyfin
+sudo domum-media compose up -d jellyfin
 ```

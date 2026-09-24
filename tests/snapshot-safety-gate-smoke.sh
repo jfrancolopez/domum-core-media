@@ -169,6 +169,7 @@ grep -q 'RC=1' <<< "$out" \
 for svc in traefik immich jellyfin plex navidrome calibre-web kavita uptime-kuma; do
   out="$( { bash -c "set -uo pipefail
 DOMUM_DATA_ROOT=/srv/data
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
 eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
 service_data_path $svc" ; } 2>&1 )"     || fail "service_data_path $svc failed with no config loaded: $out"
   case "$out" in
@@ -177,9 +178,45 @@ service_data_path $svc" ; } 2>&1 )"     || fail "service_data_path $svc failed w
   esac
 done
 
+# A trailing slash on a config value must not change the resolved state root.
+#
+# `${dir%/config}` does not strip when the value ends "…/config/", so the
+# resolved path stayed at the CONFIG directory -- and a migration would then
+# convert that subdirectory into a subvolume while its parent stayed an ordinary
+# directory, leaving `report` saying "unprotected" after a migration that
+# reported success.
+for svc_var in "jellyfin JELLYFIN_CONFIG_DIR" "plex PLEX_CONFIG_DIR" \
+               "calibre-web CALIBRE_WEB_CONFIG_DIR" "kavita KAVITA_CONFIG_DIR"; do
+  set -- $svc_var
+  svc="$1"; var="$2"
+  for suffix in "" "/"; do
+    got="$(bash -c "set -uo pipefail
+DOMUM_DATA_ROOT=/srv/data
+$var='/srv/data/$svc/config$suffix'
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+service_data_path $svc")"
+    [[ "$got" == "/srv/data/$svc" ]] \
+      || fail "service_data_path $svc with $var='/srv/data/$svc/config$suffix' resolved to [$got], not the service root"
+  done
+done
+
+# The same for a data dir given with a trailing slash.
+got="$(bash -c "set -uo pipefail
+DOMUM_DATA_ROOT=/srv/data
+NAVIDROME_DATA_DIR='/srv/data/navidrome/'
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
+service_data_path navidrome")"
+[[ "$got" == "/srv/data/navidrome" ]] \
+  || fail "service_data_path navidrome kept a trailing slash: [$got]"
+
 # An unmapped service must still be rejected rather than returning something.
 if bash -c "set -uo pipefail
 DOMUM_DATA_ROOT=/srv/data
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
 eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
 service_data_path definitely-not-a-service" >/dev/null 2>&1; then
   fail "service_data_path accepted an unknown service"
@@ -190,6 +227,7 @@ while read -r cand; do
   svc="$(basename "$cand")"
   bash -c "set -uo pipefail
 DOMUM_DATA_ROOT=/srv/data
+eval \"\$(awk '/^strip_config_suffix\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
 eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\"
 service_data_path $svc" >/dev/null 2>&1     || fail "snapshot candidate '$svc' has no service_data_path mapping"
 done < <(awk '/^snapshot_subvolumes\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media"          | grep -oE 'DOMUM_DATA_ROOT/[a-z-]+' | sed 's|.*/||')
