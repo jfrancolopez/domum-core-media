@@ -287,4 +287,52 @@ out="$(run_verify vnl 100)"
 rc=$?
 (( rc != 0 )) || fail "migrate_verify PASSED despite a differing file whose name contains a newline: $out"
 
+# ---------------------------------------------------------------------------
+# migrate_verify must compare metadata, not only content.
+#
+# BTRFS-MIGRATION-PLAN.md has always claimed ownership and permissions are
+# verified; they were not. `cp -a --reflink` preserves type, mode, owner, group
+# and symlink targets, so any difference means the copy is wrong -- and the
+# content manifest, which only hashes regular files, cannot see any of it.
+#
+# /srv/data really does contain symlinks (7, under plex/…/Drivers), so this is
+# not hypothetical.
+# ---------------------------------------------------------------------------
+meta_fixture() {
+  rm -rf "$TMP_DIR/vmeta"; mkdir -p "$TMP_DIR/vmeta/src/sub" "$TMP_DIR/vmeta/src/empty"
+  printf 'content\n' > "$TMP_DIR/vmeta/src/a"
+  ln -s a "$TMP_DIR/vmeta/src/link"
+  mkdir -p "$TMP_DIR/vmeta/dst"
+  cp -a "$TMP_DIR/vmeta/src/." "$TMP_DIR/vmeta/dst/"
+}
+
+meta_fixture
+out="$(run_verify vmeta 10000)"
+rc=$?
+(( rc == 0 )) || fail "migrate_verify failed on a faithful copy: $out"
+grep -q 'symlink targets identical' <<< "$out" \
+  || fail "migrate_verify did not report that it checked metadata: $out"
+
+# A symlink retargeted to a name of the SAME LENGTH: identical file count,
+# identical byte total, identical content hashes. Only the metadata check sees it.
+meta_fixture
+rm "$TMP_DIR/vmeta/dst/link"; ln -s b "$TMP_DIR/vmeta/dst/link"
+out="$(run_verify vmeta 10000)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify missed a retargeted symlink: $out"
+
+# Permissions.
+meta_fixture
+chmod 700 "$TMP_DIR/vmeta/dst/sub"
+out="$(run_verify vmeta 10000)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify missed a permissions difference: $out"
+
+# An empty directory that never arrived: no files, no bytes, nothing to hash.
+meta_fixture
+rmdir "$TMP_DIR/vmeta/dst/empty"
+out="$(run_verify vmeta 10000)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify missed a missing empty directory: $out"
+
 echo "PASS: storage migration failure smoke test"
