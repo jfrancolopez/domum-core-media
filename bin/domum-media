@@ -1396,6 +1396,55 @@ snapshot_policy() {
 }
 
 # $1 = what wanted the snapshot, $2 = why it was not created.
+# ---- operation locking ------------------------------------------------------
+# BEGIN SHARED LOCK HELPER
+# Kept byte-identical between bin/domum-media and bin/domum-media-backup, and
+# tests/operation-lock-smoke.sh fails if they drift. Duplicated rather than
+# sourced from a new file on purpose: a shared library is one more artefact a
+# partial deployment can leave missing, and the failure mode there is a CLI that
+# will not start at all. Two scripts that already exist, pinned by a test, is
+# the smaller risk.
+#
+# Why this exists: the nightly backup fires at 02:30 (+15m jitter) and reads all
+# of /srv/data with no exclude for .new / .premigration / .rollback-*. A
+# migration overlapping it has restic walking a tree that is being renamed
+# underneath it -- it captures a half-copied .new, hits vanished paths, exits
+# non-zero, and the last-success marker is not refreshed. Fail-safe, but the
+# operator is left with a failed backup and no obvious cause.
+#
+# The lock lives in an open file descriptor, so the kernel releases it when the
+# process exits for ANY reason, SIGKILL included. There is no stale lock file to
+# detect or clean up, which is the usual way lock schemes become the outage.
+domum_lock_file() {
+  printf '%s/operation.lock' "${DOMUM_STATE_ROOT:-/var/lib/domum-media}"
+}
+
+# $1 = label recorded for diagnostics, $2 = seconds to wait (0 = fail at once)
+domum_acquire_lock() {
+  local label="$1" wait_seconds="${2:-0}" lock_file
+  [[ -n "${DOMUM_LOCK_FD:-}" ]] && return 0
+  lock_file="$(domum_lock_file)"
+  mkdir -p "$(dirname "$lock_file")" || return 1
+  exec {DOMUM_LOCK_FD}>>"$lock_file" || return 1
+  if (( wait_seconds > 0 )); then
+    flock -w "$wait_seconds" "$DOMUM_LOCK_FD" || return 1
+  else
+    flock -n "$DOMUM_LOCK_FD" || return 1
+  fi
+  # Diagnostic only -- never consulted to decide whether the lock is held. That
+  # decision belongs to flock alone; a file that says who owns it is for the
+  # operator reading a refusal, and may be stale or absent without consequence.
+  printf '%s %s %s\n' "$$" "$(date -Iseconds)" "$label" > "${lock_file}.holder" 2>/dev/null || true
+  return 0
+}
+
+domum_lock_holder() {
+  local h
+  h="$(cat "$(domum_lock_file).holder" 2>/dev/null || true)"
+  printf '%s' "${h:-unknown}"
+}
+# END SHARED LOCK HELPER
+
 snapshot_protection_unavailable() {
   local what="$1" detail="$2"
   if [[ "$(snapshot_policy)" == "WARN" ]]; then
@@ -2930,6 +2979,14 @@ rollback_show_cmd() {
 rollback_apply_entry() {
   local rollback_id="$1"
   local dry_run="${2:-0}"
+
+  # A rollback stops containers and moves live state aside. Doing that while a
+  # backup walks the same tree gets both wrong.
+  if (( dry_run == 0 )); then
+    domum_acquire_lock "rollback apply $rollback_id" 0 \
+      || die "Another domum-media operation holds the lock: $(domum_lock_holder)
+Refusing to roll back while it runs."
+  fi
   local file snapshot_name
   file="$(rollback_index_dir)/${rollback_id}.env"
   [[ -f "$file" ]] || die "Rollback point not found: $rollback_id"
@@ -4632,6 +4689,18 @@ storage_migrate_subvolume() {
   path="$(service_data_path "$service")" || die "No data path mapping for $service"
   [[ -n "$path" && "$path" != "/" ]] || die "Refusing: resolved an unsafe path for $service"
   [[ -d "$path" ]] || die "Refusing: $path does not exist"
+
+  # Taken here rather than at the top of the function: a usage error or an
+  # unknown service should be refused without touching runtime state at all.
+  #
+  # Refuse immediately rather than wait. A migration is attended, and the right
+  # answer to "a backup is running" is for the operator to come back in half an
+  # hour -- not for the CLI to sit there silently for thirty minutes.
+  domum_acquire_lock "storage migrate-subvolume $service" 0 \
+    || die "Another domum-media operation holds the lock: $(domum_lock_holder)
+Refusing to migrate while it runs. The nightly backup starts at 02:30 (+15m jitter)
+and reads all of ${DOMUM_DATA_ROOT:-/srv/data}; a migration renaming directories
+underneath it would make that backup fail. Wait for it to finish and retry."
 
   # Never touch the replaceable media tier, whatever the config says.
   case "$path" in
