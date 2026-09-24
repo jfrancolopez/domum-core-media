@@ -369,4 +369,34 @@ assert_data_survives "$d" "another operation holds the lock"
 touch "$lockdir/release"
 wait "$lock_pid" 2>/dev/null
 
+# A migration that completes but cannot establish rollback protection must not
+# report a clean exit status. The old `[[ -n "$proof" ]] && echo …` was the
+# function's last statement, so an empty proof returned 1 SILENTLY, immediately
+# after printing "Migration complete" -- correct by accident, and unexplained.
+d="$(run_migration no-proof 'create_service_snapshot() { return 1; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "a migration with no proof snapshot reported success"
+grep -qi 'rollback protection was not established' "$d/out.txt" \
+  || fail "the missing proof snapshot was not explained: $(cat "$d/out.txt")"
+grep -qi 'migration complete' "$d/out.txt" \
+  || fail "the migration did not actually complete, so this proves nothing"
+[ -d "$d/data/jellyfin.premigration" ] \
+  || fail "the premigration copy is missing after a completed migration"
+
+# ...and the success path, with a proof snapshot, must exit zero.
+d="$(run_migration with-proof)"
+[ "$(cat "$d/rc")" = "0" ] \
+  || fail "a fully successful migration did not exit zero: $(cat "$d/out.txt")"
+
+# The runbooks must not tell an operator to run a bare `docker compose`. There is
+# no compose.yml in the installation -- the stack is assembled from fragments --
+# so it fails with "no configuration file provided", during recovery, which is
+# the worst possible time to find out.
+# Only command lines count -- prose explaining what the CLI does internally, or
+# explaining why this rule exists, is fine.
+if grep -rnE '^[[:space:]]*(sudo[[:space:]]+)?docker[[:space:]]+compose[[:space:]]' "$REPO_ROOT/docs"/*.md; then
+  fail "a runbook still tells the operator to run docker compose directly"
+fi
+grep -q 'compose)   shift; compose_passthrough' "$REPO_ROOT/bin/domum-media" \
+  || fail "domum-media compose is not wired into the dispatcher"
+
 echo "PASS: storage migration failure smoke test"
