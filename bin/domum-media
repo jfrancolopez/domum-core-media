@@ -4918,7 +4918,7 @@ underneath it would make that backup fail. Wait for it to finish and retry."
     migrate_restart
     die "Migration aborted: the service is not quiesced. Nothing has been changed, and $service has been restarted."
   fi
-  migrate_stage stop "quiesced: no non-empty WAL, no postmaster.pid"
+  migrate_stage stop "quiesced: nothing holding files open, no non-empty WAL, no postmaster.pid"
 
   # ---- stage 2: create the new subvolume ------------------------------------
   if ! btrfs subvolume create "$newsub" >/dev/null; then
@@ -4962,7 +4962,28 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   fi
   migrate_stage cutover "$path is now a Btrfs subvolume"
 
-  # ---- stage 7: restart and health -----------------------------------------
+  # ---- stage 7: prove a snapshot can now be taken ---------------------------
+  # Taken BEFORE the service restarts, while the tree is still quiesced, so the
+  # proof snapshot is of a cleanly stopped service rather than a running one.
+  # Previously this ran after the restart, which made it crash-consistent --
+  # recoverable, since btrfs snapshots are atomic and SQLite replays its WAL,
+  # but weaker than the clean copy the plan's reasoning assumes, and weaker for
+  # no reason: the service is already stopped at this point and one btrfs
+  # snapshot is near-instant.
+  #
+  # Not `|| true`: a swallowed snapshot failure is the exact pattern the
+  # snapshot gate forbids. This one is genuinely non-fatal -- the migration has
+  # already succeeded and the proof is confirmatory -- but it must be reported,
+  # never discarded.
+  local proof=""
+  if proof="$(create_service_snapshot "$service" "post-migration" "" "")" && [[ -n "$proof" ]]; then
+    migrate_stage proof "snapshot created: $DOMUM_SNAPSHOT_ROOT/$proof"
+  else
+    proof=""
+    warn "Migration succeeded but a snapshot could NOT be created; investigate before relying on rollback."
+  fi
+
+  # ---- stage 8: restart and health -----------------------------------------
   migrate_restart
   if [[ -n "$compose_svcs" ]]; then
     if wait_for_service_health "$service" 120 5; then
@@ -4983,19 +5004,6 @@ underneath it would make that backup fail. Wait for it to finish and retry."
       warn "To roll back: stop the service, mv '$path' aside, mv '$premigration' '$path', start it."
       die "Migration completed but the service is unhealthy. Nothing was deleted."
     fi
-  fi
-
-  # ---- stage 8: prove a snapshot can now be taken ---------------------------
-  # Not `|| true`: a swallowed snapshot failure is the exact pattern the
-  # snapshot gate forbids. This one is genuinely non-fatal -- the migration has
-  # already succeeded and the proof is confirmatory -- but it must be reported,
-  # never discarded.
-  local proof=""
-  if proof="$(create_service_snapshot "$service" "post-migration" "" "")" && [[ -n "$proof" ]]; then
-    migrate_stage proof "snapshot created: $DOMUM_SNAPSHOT_ROOT/$proof"
-  else
-    proof=""
-    warn "Migration succeeded but a snapshot could NOT be created; investigate before relying on rollback."
   fi
 
   echo

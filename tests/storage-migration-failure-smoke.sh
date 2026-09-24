@@ -483,4 +483,19 @@ rc=$?
 (( rc == 0 )) || fail "a hot rollback journal must not block the migration: $out"
 grep -qi 'rollback journal' <<< "$out" || fail "the hot journal was not recorded: $out"
 
+# The proof snapshot must be taken while the service is still stopped, so it is
+# a snapshot of a cleanly quiesced tree rather than a running one. Ordering is
+# asserted from the stage log, because that is what an operator reads too.
+# migrate_restart sends compose output to /dev/null, so the stubs record their
+# order in a file rather than on stderr.
+d="$(run_migration proof-order 'ORDER="'"$TMP_DIR"'/proof-order/order.log"
+create_service_snapshot() { printf "proof\n" >> "$ORDER"; printf "jellyfin-stub-snap"; }
+compose_cmd() { [[ "${1:-}" == "up" ]] && printf "restart\n" >> "$ORDER"; return 0; }')"
+[ "$(cat "$d/rc")" = "0" ] || fail "the ordering scenario did not complete: $(cat "$d/out.txt")"
+[ -f "$d/order.log" ] || fail "neither the proof snapshot nor the restart happened"
+grep -q '^proof$' "$d/order.log" || fail "the proof snapshot was never taken"
+grep -q '^restart$' "$d/order.log" || fail "the service was never restarted"
+[ "$(head -1 "$d/order.log")" = "proof" ] \
+  || fail "the proof snapshot was taken AFTER the restart, so it is crash-consistent rather than clean: $(cat "$d/order.log")"
+
 echo "PASS: storage migration failure smoke test"
