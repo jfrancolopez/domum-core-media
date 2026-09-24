@@ -184,4 +184,107 @@ echo "    migrated, verified, premigration retained  OK"
 grep -nE 'rm -rf.*premigration|rm -r .*premigration' "$REPO_ROOT/bin/domum-media" \
   && fail "the implementation deletes a premigration copy"
 
+# ---------------------------------------------------------------------------
+# migrate_verify must never pass having hashed nothing.
+#
+# The sampling branch selected `NR % step == 1`, which for step == 1 is never
+# true. The sample came out EMPTY, the comparison loop never ran, and
+# verification reported success on a copy it had not looked at. Reachable
+# whenever MIGRATE_FULL_HASH_MAX_FILES < files < 400, which a config line
+# lowering that knob is enough to arm.
+# ---------------------------------------------------------------------------
+verify_fixture() {  # $1 = dir, $2 = n files, $3 = dst content
+  rm -rf "$TMP_DIR/$1"; mkdir -p "$TMP_DIR/$1/src" "$TMP_DIR/$1/dst"
+  local i
+  for i in $(seq 1 "$2"); do
+    printf 'AAAAAAAA\n' > "$TMP_DIR/$1/src/f$i"
+    printf '%s\n' "$3"   > "$TMP_DIR/$1/dst/f$i"
+  done
+}
+
+run_verify() {  # $1 = dir, $2 = cap
+  bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'
+CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+MIGRATE_FULL_HASH_MAX_FILES=$2
+migrate_verify '$TMP_DIR/$1/src' '$TMP_DIR/$1/dst'
+" 2>&1
+}
+
+# 250 files with a cap of 100 puts step at 1 -- the degenerate case. Byte totals
+# match exactly, so nothing earlier in migrate_verify can catch this: only the
+# content comparison can, and it must.
+verify_fixture vzero 250 BBBBBBBB
+out="$(run_verify vzero 100)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify PASSED on a copy whose content is 100% different: $out"
+grep -q 'mismatch' <<< "$out" || fail "migrate_verify failed without naming a mismatch: $out"
+
+# The same fixture with identical content must still pass, and must SAY how many
+# files it actually hashed -- a verification that reports no count can hide a
+# sample of zero.
+verify_fixture vsame 250 AAAAAAAA
+out="$(run_verify vsame 100)"
+rc=$?
+(( rc == 0 )) || fail "migrate_verify failed on identical trees: $out"
+grep -qE 'sampled content identical \([1-9][0-9]* of [0-9]+ file' <<< "$out" \
+  || fail "migrate_verify did not report a non-zero sample size: $out"
+
+# Pin the selector: first, last, every Nth, and the largest file.
+#
+# 501 files put the stride at 2, so EVEN positions are the strided ones. f001,
+# f501 and f249 all sit at ODD positions, which means each is reachable only via
+# its own rule -- drop that rule and the differing file goes unnoticed. f249 is
+# made the largest so "largest" cannot be satisfied by accident: when every file
+# is the same size the first one is trivially the largest, and a first/largest
+# mix-up would hide behind that.
+rm -rf "$TMP_DIR/vstride"; mkdir -p "$TMP_DIR/vstride/src" "$TMP_DIR/vstride/dst"
+for i in $(seq -w 1 501); do
+  printf 'AAAAAAAA\n' > "$TMP_DIR/vstride/src/f$i"
+done
+printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n' > "$TMP_DIR/vstride/src/f249"
+cp -a "$TMP_DIR/vstride/src/." "$TMP_DIR/vstride/dst/"
+
+out="$(run_verify vstride 100)"
+rc=$?
+(( rc == 0 )) || fail "migrate_verify failed on 501 identical files: $out"
+sampled="$(sed -n 's/.*sampled content identical (\([0-9]*\) of .*/\1/p' <<< "$out")"
+[[ "$sampled" =~ ^[0-9]+$ ]] || fail "could not read the sample size from: $out"
+(( sampled > 150 && sampled < 350 )) \
+  || fail "step-2 sampling of 501 files hashed $sampled file(s); the stride is not working"
+
+# Each of the four selection rules, isolated.
+# The corruption must be the SAME SIZE as the original, or migrate_verify stops
+# at the byte-count check and never reaches the sampling code this is testing --
+# which would make every assertion below pass for the wrong reason.
+check_caught() {  # $1 = file, $2 = which rule
+  cp -a "$TMP_DIR/vstride/src/." "$TMP_DIR/vstride/dst/"
+  local f="$TMP_DIR/vstride/dst/$1" n o rc
+  n="$(stat -c %s "$f")"
+  head -c "$n" /dev/zero | tr '\0' 'B' > "$f"
+  [[ "$(stat -c %s "$f")" == "$n" ]] || fail "test bug: corruption changed the size of $1"
+  o="$(run_verify vstride 100)"; rc=$?
+  (( rc != 0 )) || fail "migrate_verify missed a differing $2 file ($1): $o"
+  grep -q "mismatch: ./$1" <<< "$o" \
+    || fail "migrate_verify failed but did not name $1 as the mismatch: $o"
+}
+check_caught f001 FIRST
+check_caught f501 LAST
+check_caught f249 LARGEST
+check_caught f002 STRIDED
+cp -a "$TMP_DIR/vstride/src/." "$TMP_DIR/vstride/dst/"
+
+# A filename containing a newline must be compared, not split into two paths
+# that both fail to hash -- and not silently skipped.
+verify_fixture vnl 250 AAAAAAAA
+printf 'AAAAAAAA\n' > "$TMP_DIR/vnl/src/od
+d"
+printf 'BBBBBBBB\n' > "$TMP_DIR/vnl/dst/od
+d"
+out="$(run_verify vnl 100)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify PASSED despite a differing file whose name contains a newline: $out"
+
 echo "PASS: storage migration failure smoke test"

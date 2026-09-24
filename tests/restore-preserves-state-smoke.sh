@@ -26,6 +26,10 @@ DOMUM_SNAPSHOT_ROOT="$TMP_DIR/snapshots"
 service_data_path() { printf '%s' "$TMP_DIR/data/\$1"; }
 service_compose_services() { printf 'plex'; }
 compose_cmd() { :; }
+# The restore path now PROVES the container stopped before touching anything, so
+# the harness must model the container lifecycle rather than leaking through to
+# the host's real docker ps -- which, on this machine, really is running plex.
+docker() { :; }
 is_btrfs_subvol() { return 1; }
 EOF
 }
@@ -96,5 +100,42 @@ grep -qE 'elif \[\[ -e "\$data_path" \]\]; then' <<< "$fn" \
 
 grep -q 'mv -- "$data_path" "$current_backup"' <<< "$fn" \
   || fail "3: live state must be moved aside rather than deleted"
+
+# ---------------------------------------------------------------------------
+# A restore must REFUSE while the service is still running. Restoring under a
+# live container is invisible to the application: it keeps writing through its
+# existing mount into the directory that was renamed aside, so the drill reports
+# success while the application never experienced the rollback -- and the tree
+# the container is actually using is the one the operator is told to delete.
+# ---------------------------------------------------------------------------
+setup
+out="$( { bash -c "$(harness)
+docker() { [[ \"\$1\" == ps ]] && printf 'plex\n'; }
+restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+rc=$?
+(( rc != 0 )) || fail "a restore was allowed while the container was still running: $out"
+grep -qi 'could not be confirmed stopped' <<< "$out" \
+  || fail "the refusal did not explain that the container is still running: $out"
+[[ "$(cat "$TMP_DIR/data/plex/important.db")" == "LIVE DATA THAT MUST NOT BE LOST" ]] \
+  || fail "live data was disturbed by a restore that should have refused outright"
+[[ -z "$(find "$TMP_DIR/data" -maxdepth 1 -name 'plex.rollback-*' -print -quit)" ]] \
+  || fail "the refused restore still moved live state aside"
+
+# A stop that fails outright must refuse just as firmly.
+setup
+out="$( { bash -c "$(harness)
+compose_cmd() { [[ \"\$1\" == stop ]] && return 1; return 0; }
+restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+rc=$?
+(( rc != 0 )) || fail "a restore proceeded after the stop command failed: $out"
+# It must refuse for the RIGHT reason. Without this the test also passes when
+# the stop failure is ignored and the restore merely fails later on its own --
+# which is a very different, and much worse, code path.
+grep -qi 'could not be confirmed stopped' <<< "$out" \
+  || fail "a failed stop did not refuse the restore; it failed later instead: $out"
+[[ -z "$(find "$TMP_DIR/data" -maxdepth 1 -name 'plex.rollback-*' -print -quit)" ]] \
+  || fail "a failed stop still moved live state aside"
+[[ "$(cat "$TMP_DIR/data/plex/important.db")" == "LIVE DATA THAT MUST NOT BE LOST" ]] \
+  || fail "live data was disturbed after a failed stop"
 
 echo "PASS: restore preserves state smoke test"
