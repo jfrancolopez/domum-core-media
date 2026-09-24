@@ -37,7 +37,7 @@ Subvolume detection without root: a Btrfs subvolume root has **inode 256**.
 
 | Service | Path | inode | Size | Files | Database | Class |
 |---|---|---|---|---|---|---|
-| immich | `/srv/data/immich` | 273 | 213G | 64,190 | PostgreSQL | durable |
+| immich | `/srv/data/immich` | 273 | 213G | ≥64,190 | PostgreSQL | durable |
 | plex | `/srv/data/plex` | 4373 | 256M | 121 | SQLite (WAL) | rebuildable |
 | navidrome | `/srv/data/navidrome` | 272 | 51M | 1,006 | SQLite (WAL) | rebuildable |
 | kavita | `/srv/data/kavita` | 4377 | 4.6M | 82 | SQLite (WAL) | rebuildable |
@@ -47,8 +47,35 @@ Subvolume detection without root: a Btrfs subvolume root has **inode 256**.
 All six are ordinary directories. `/srv/data` (256) and `/srv/snapshots` (256)
 are the only subvolumes.
 
-No hardlinks, extended attributes, ACLs or symlinks exist anywhere under
-`/srv/data`, which removes the usual copy-fidelity hazards.
+**The Immich file count is a lower bound.** It was taken without root, and
+`/srv/data/immich/postgres` is mode `drwx------` (owner uid 999), so an
+unprivileged `find` contributes **zero** files from the entire PostgreSQL data
+directory. The root-run migration will see a larger number. Anything derived
+from this figure — including the `files / 200` sampling stride — must be
+recomputed under root, not read off this table.
+
+`/srv/data` also contains `backups/`, `containers/`, `media/` and `staging/`,
+which are not services, are not snapshot candidates, and are not listed above —
+but they *are* inside the nas/archive backup include path.
+
+### Copy-fidelity hazards
+
+| Hazard | Status |
+|---|---|
+| Hardlinks | **None.** `find /srv/data -type f -links +1` returns 0 entries. |
+| Symlinks | **7 exist**, all under `plex/config/…/Drivers/` and `…/Cache/va-dri-linux-x86_64/` (`libiga64.so → libiga64.so.2` and similar). |
+| Extended attributes | **Unproven.** `getfattr` is not installed on this host. |
+| ACLs | **Unproven.** `getfacl` is not installed on this host. |
+
+An earlier revision of this document asserted that none of the four existed.
+That was wrong for symlinks and unverifiable for xattrs and ACLs. The symlinks
+do not affect Jellyfin, but they do affect Plex — and `migrate_manifest` hashes
+only `-type f`, so a symlink's target is invisible to the content check.
+
+`migrate_verify` therefore also compares a metadata manifest (`type`, `mode`,
+`owner`, `group`, and the symlink target) across every entry, including empty
+directories. That check is what makes the verification claim below true; it is
+cheap, reads no file contents, and runs on both the full-hash and sampled paths.
 
 `uptime-kuma` and `traefik` are listed as snapshot candidates but have no state
 directory. See *Known gaps*.
@@ -135,7 +162,13 @@ leftover `.premigration` or `.new` from an earlier attempt.
 Verification scales with the service: every file is hashed and the manifests
 compared when the service has at most `MIGRATE_FULL_HASH_MAX_FILES` (20,000)
 files — which covers all five small services — and a deterministic sample is
-hashed above that, which is the Immich case at 64,190 files.
+hashed above that, which is the Immich case.
+
+The sample is the first and last paths in sorted order, every Nth in between,
+and the largest file. Metadata is compared in full regardless. An earlier
+implementation selected `NR % step == 1`, which is never true when the stride is
+1: the sample came out empty and verification passed having compared nothing.
+A sample of zero is now a failure.
 
 
 `cp --reflink=always` shares extents rather than duplicating them, so the copy
@@ -146,7 +179,8 @@ is metadata-bound and costs almost no additional space.
 2. confirm no non-empty *-wal remains (and for Immich, no postmaster.pid)
 3. btrfs subvolume create   /srv/data/<svc>.new
 4. cp -a --reflink=always   /srv/data/<svc>/.  →  /srv/data/<svc>.new/
-5. verify: file count, total bytes, ownership, permissions, sampled hashes
+5. verify: file count, total bytes, content hashes (all or sampled),
+   and in full: type, mode, owner, group, symlink targets
 6. mv /srv/data/<svc>      → /srv/data/<svc>.premigration     (retained)
 7. mv /srv/data/<svc>.new  → /srv/data/<svc>
 8. start containers; verify health
@@ -194,6 +228,16 @@ A/B on the same 256 MB incompressible file:
 Content compared identical, permissions and mtime preserved, and the copy
 remained valid after the source directory was renamed — which is exactly the
 `.premigration` step.
+
+**Scope of that proof: one 256 MB file.** It does not cover small files. 31 of
+Jellyfin's 37 files are under 2048 bytes (median 211 B), which on btrfs with the
+default `max_inline=2048` are likely stored as *inline* extents, and
+`cp --reflink=always` does not fall back — if the clone refuses an inline extent,
+`cp` fails outright. Modern kernels handle whole-file clones of inline extents,
+and the failure mode is fail-safe (stage 3 aborts, the original is untouched and
+`.new` is removed), but the measured experiment does not cover the case the
+pilot will actually hit. Treat a stage-3 failure on small files as expected-and-
+handled rather than as a surprise.
 
 **`btrfs subvolume snapshot` is NOT recursive.** A parent subvolume containing a
 child subvolume was snapshotted read-only; the parent's own file appeared in the
