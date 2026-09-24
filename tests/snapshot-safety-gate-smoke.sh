@@ -341,4 +341,41 @@ create_service_snapshot immich pre-test2 a b" 2>&1 >/dev/null )"
 grep -q 'Snapshot:' <<< "$snaperr" \
   || fail "the progress line was not written to stderr: [$snaperr]"
 
+# ---------------------------------------------------------------------------
+# A snapshot that would silently omit part of the tree must be refused.
+#
+# Btrfs snapshots are not recursive, so a nested subvolume appears as an EMPTY
+# DIRECTORY in the parent's snapshot. "A snapshot of the service was created"
+# therefore does not mean "the service's state is recoverable": if
+# /srv/data/immich/postgres were ever a nested subvolume, the pre-update and
+# pre-bundle gates would both pass on a snapshot holding an empty database.
+# Verified against real Btrfs in tests/integration/btrfs-migration-integration.sh.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP_DIR/data/immich/postgres"
+nested_probe() {  # $1 = extra shell
+  bash -c "$(harness)
+is_btrfs_subvol() { return 0; }
+btrfs() { mkdir -p \"\${!#}\"; }
+record_service_snapshot_metadata() { :; }
+record_rollback_entry() { :; }
+subvolume_nested_children() { printf '%s\n' '$TMP_DIR/data/immich/postgres'; }
+$1" 2>&1
+}
+out="$(nested_probe "create_service_snapshot immich nestedtag a b && echo RC=0 || echo RC=1")"
+grep -q 'RC=1' <<< "$out" || fail "a snapshot was taken despite a nested subvolume: $out"
+grep -qi 'nested subvolume' <<< "$out" || fail "the refusal did not name the cause: $out"
+grep -qi 'not recursive' <<< "$out" || fail "the refusal did not explain why it matters: $out"
+
+# It must refuse BEFORE creating anything: a snapshot that exists but omits part
+# of the tree is worse than none, because every gate would accept it.
+[[ -z "$(find "$TMP_DIR/snapshots" -maxdepth 1 -name 'immich-*-nestedtag' 2>/dev/null)" ]] \
+  || fail "a misleading snapshot was created before the refusal"
+
+# The fleet-wide helper must count it as a FAILURE, not a skip. A skip would let
+# the aggregate gate pass on some other service's snapshot.
+out="$(nested_probe "snapshot_subvolumes() { printf '%s\n' '$TMP_DIR/data/immich'; }
+snapshot_create nested && echo RC=0 || echo RC=1")"
+grep -q 'RC=1' <<< "$out" || fail "snapshot_create succeeded despite a nested subvolume: $out"
+grep -q '1 failed' <<< "$out" || fail "a nested subvolume was counted as a skip, not a failure: $out"
+
 echo "PASS: snapshot safety gate smoke test"

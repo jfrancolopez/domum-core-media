@@ -1248,6 +1248,14 @@ snapshot_create() {
     name="$(basename "$subvol")"
     target="$DOMUM_SNAPSHOT_ROOT/${name}-${stamp}-${tag}"
     if is_btrfs_subvol "$subvol"; then
+      local nested_children
+      nested_children="$(subvolume_nested_children "$subvol")"
+      if [[ -n "$nested_children" ]]; then
+        echo "[domum-media] Snapshot FAILED for $subvol: it contains nested subvolume(s), which would be empty in the snapshot" >&2
+        printf '  %s\n' $nested_children >&2
+        failed=$(( failed + 1 ))
+        continue
+      fi
       echo "[domum-media] Snapshot: $subvol -> $target"
       # Count a SUCCESS, never an attempt: `btrfs subvolume snapshot` can fail
       # (ENOSPC, target exists) on a path that really is a subvolume, and a gate
@@ -1410,6 +1418,26 @@ assert_service_snapshot_covers() {
   printf '%s' "$name"
 }
 
+# Btrfs snapshots are NOT recursive: a snapshot of S contains an EMPTY DIRECTORY
+# wherever a nested subvolume used to be. Proven on this host -- a parent
+# holding a nested subvolume with data.db in it was snapshotted read-only, and
+# the snapshot's copy of that directory was empty.
+#
+# So "a snapshot of the service was created" does not mean "the service's state
+# is recoverable". If /srv/data/immich/postgres were ever a nested subvolume,
+# create_service_snapshot would succeed, every gate built on it would pass, and
+# the pre-update snapshot would hold an empty database directory. A rollback
+# from it would restore nothing.
+#
+# `-xdev` makes this cheap: nested subvolumes have their own st_dev, so find
+# reports the boundary and never descends into it. No full-tree walk, even for
+# the 213 GB Immich library.
+subvolume_nested_children() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  find "$root" -xdev -mindepth 1 -type d -inum 256 2>/dev/null
+}
+
 create_service_snapshot() {
   local service="$1"
   local tag="$2"
@@ -1421,6 +1449,16 @@ create_service_snapshot() {
   [[ -d "$data_path" ]] || return 1
   snapshot_name="$(basename "$data_path")-$(date +%Y%m%d-%H%M%S)-${tag}"
   if is_btrfs_subvol "$data_path"; then
+    # Refuse BEFORE creating anything: a snapshot that silently omits part of
+    # the tree is worse than no snapshot, because every gate would accept it.
+    local nested
+    nested="$(subvolume_nested_children "$data_path")"
+    if [[ -n "$nested" ]]; then
+      echo "[domum-media] Refusing to snapshot $data_path: it contains nested subvolume(s):" >&2
+      printf '  %s\n' $nested >&2
+      echo "[domum-media] Btrfs snapshots are not recursive, so those would be EMPTY in the snapshot." >&2
+      return 1
+    fi
     mkdir -p "$DOMUM_SNAPSHOT_ROOT"
     # STDERR, not stdout. This function RETURNS the snapshot name on stdout, and
     # every caller captures it with $(...). A progress line on stdout is

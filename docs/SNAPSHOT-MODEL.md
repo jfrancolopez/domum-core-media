@@ -141,10 +141,11 @@ does not:
 (`/dev/sda1`), same UUID (`211e06b3-6aaf-40d8-8646-9361b8399eb2`), `subvol=/@data`
 and `subvol=/@snapshots` — and their `st_dev` values differ (45 vs 46).
 
-That proves the premise for separately **mounted** subvolumes. The nested,
-unmounted case the migration creates is documented btrfs behaviour but is **not
-yet demonstrated on this host**, because no nested subvolume exists here. The
-inode-256 check is what makes that gap non-load-bearing.
+**The nested, unmounted case is now demonstrated too.** The real-Btrfs
+integration test creates a subvolume nested inside another under `/srv/data`
+and measures it: parent `st_dev` 45, nested child 75. The premise holds for the
+exact topology the migration produces, not only for separately mounted
+subvolumes. The inode-256 check remains as a second, independent signal.
 
 Both checks fail closed: if either cannot establish coverage, the path counts as
 unprotected and the operation refuses.
@@ -188,3 +189,34 @@ remain as names the call sites read well with, both delegating to it.
 It is duplicated byte-identically into `bin/domum-media-report` for the same
 reason the operation lock is (see `docs/OPERATION-LOCK.md`), and
 `tests/subvolume-detection-smoke.sh` fails if the two copies differ.
+
+## A snapshot that omits part of the tree is refused
+
+Btrfs snapshots are not recursive. A snapshot of S contains an **empty
+directory** wherever a nested subvolume used to be — measured on this host:
+
+```
+parent/nested contents : important.db
+snap/nested contents   : []          <- EMPTY
+snap/normal/deep       : file        <- ordinary directories copy fine
+```
+
+So "a snapshot of the service was created" does **not** mean "the service's
+state is recoverable". If `/srv/data/immich/postgres` were ever a nested
+subvolume, `create_service_snapshot` would have succeeded, the pre-update and
+pre-bundle gates would both have passed, and the snapshot would hold an empty
+database directory. A rollback from it would restore nothing.
+
+`create_service_snapshot` now refuses **before creating anything** when the
+service root contains a nested subvolume, and `snapshot_create` counts that as a
+**failure** rather than a skip — a skip would let the aggregate gate pass on
+some other service's snapshot, which is the same defect as the original
+`reset-db` bug.
+
+Detection is `find "$root" -xdev -mindepth 1 -type d -inum 256`. `-xdev` makes
+it cheap: nested subvolumes have their own `st_dev`, so find reports the
+boundary and never descends into it. Measured at **0.38 s** against the real
+213 GB Immich tree.
+
+There are no nested subvolumes under `/srv/data` today. This is a guard against
+the topology becoming reachable, not a description of it.
