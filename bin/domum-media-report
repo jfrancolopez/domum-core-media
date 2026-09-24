@@ -271,6 +271,41 @@ report_service_tier() {
   fi
 }
 
+# BEGIN SHARED SUBVOLUME HELPER
+# Kept byte-identical between bin/domum-media and bin/domum-media-report;
+# tests/subvolume-detection-smoke.sh fails if they drift.
+#
+# There used to be THREE different answers to "is this a subvolume?":
+#
+#   * `btrfs subvolume show` in snapshot_create and create_service_snapshot
+#   * inode == 256 in the migration path
+#   * `btrfs subvolume show` again, inline, in the report
+#
+# They agree for a real nested subvolume, but not everywhere:
+#
+#   * `btrfs subvolume show` needs the btrfs tool AND root. Unprivileged, it
+#     answers "no" for a genuine subvolume.
+#   * inode 256 is a NECESSARY condition for a btrfs subvolume root, but not a
+#     sufficient one: inode 256 is perfectly ordinary on ext4. `/srv/media` is
+#     ext4, so that false positive is reachable on this host.
+#
+# One function, both signals, and the fallback no longer guesses across
+# filesystems. The tool is authoritative when it can answer; otherwise inode 256
+# is accepted only on a filesystem that is actually btrfs.
+domum_is_subvolume() {
+  local path="$1"
+  [[ -n "$path" && -d "$path" ]] || return 1
+
+  if command -v btrfs >/dev/null 2>&1 && [[ "$(id -u)" == "0" ]]; then
+    btrfs subvolume show "$path" >/dev/null 2>&1
+    return $?
+  fi
+
+  [[ "$(stat -f -c %T "$path" 2>/dev/null)" == "btrfs" ]] || return 1
+  [[ "$(stat -c %i "$path" 2>/dev/null)" == "256" ]]
+}
+# END SHARED SUBVOLUME HELPER
+
 report_snapshot_protection() {
   local service="$1" path="$2" state reason latest="" latest_epoch="" tier
   tier="$(report_service_tier "$service")"
@@ -278,7 +313,7 @@ report_snapshot_protection() {
     state=unknown; reason="state path is missing"
   elif ! cmd_exists btrfs; then
     state=unknown; reason="btrfs tool unavailable"
-  elif btrfs subvolume show "$path" >/dev/null 2>&1; then
+  elif domum_is_subvolume "$path"; then
     state=protected; reason="state path is a Btrfs subvolume"
     latest="$(latest_snapshot_for_service "$service" 2>/dev/null || true)"
     [[ -n "$latest" ]] && latest_epoch="$(snapshot_path_mtime "$DOMUM_SNAPSHOT_ROOT/$latest" 2>/dev/null || true)"

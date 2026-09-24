@@ -70,6 +70,9 @@ jobs:
       - name: Rollback entry integrity smoke test
         run: tests/rollback-entry-integrity-smoke.sh
 
+      - name: Subvolume detection smoke test
+        run: tests/subvolume-detection-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/

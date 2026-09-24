@@ -164,3 +164,27 @@ operator was then told to delete the tree the live container was actually using.
 The stop is now verified the same way the migration verifies it — non-zero exit
 is fatal, and each container is confirmed absent from `docker ps` — and it
 happens **before** anything is moved, so a refusal changes nothing.
+
+## One answer to "is this a subvolume?"
+
+There used to be three, and they could disagree:
+
+| where | test | weakness |
+|---|---|---|
+| `snapshot_create`, `create_service_snapshot` | `btrfs subvolume show` | needs the btrfs tool **and root**; unprivileged it answers "no" for a real subvolume |
+| migration path | inode == 256 | inode 256 is *necessary* for a btrfs subvolume root but not *sufficient* — it is ordinary on ext4, and `/srv/media` is ext4 |
+| the report | `btrfs subvolume show`, inline again | a third copy to drift |
+
+A detector that answers differently in the CLI and in the report is worse than
+either answer alone: the report would claim "protected" while the gate refused,
+or the reverse.
+
+`domum_is_subvolume` is now the only implementation. It uses `btrfs subvolume
+show` when the tool is present and we are root — authoritative — and otherwise
+falls back to inode 256 **on a filesystem that `stat -f` says is btrfs**, which
+removes the ext4 false positive. `is_btrfs_subvol` and `path_is_subvolume`
+remain as names the call sites read well with, both delegating to it.
+
+It is duplicated byte-identically into `bin/domum-media-report` for the same
+reason the operation lock is (see `docs/OPERATION-LOCK.md`), and
+`tests/subvolume-detection-smoke.sh` fails if the two copies differ.
