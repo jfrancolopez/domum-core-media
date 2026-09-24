@@ -73,6 +73,15 @@ jobs:
       - name: Subvolume detection smoke test
         run: tests/subvolume-detection-smoke.sh
 
+      - name: Captured stdout purity smoke test
+        run: tests/captured-stdout-purity-smoke.sh
+
+      # Skips cleanly where there is no Btrfs (as on the CI runner). It is the
+      # real-primitives test and is meant to be run on the host:
+      #   tests/integration/btrfs-migration-integration.sh
+      - name: Btrfs migration integration test (skips without Btrfs)
+        run: tests/integration/btrfs-migration-integration.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/

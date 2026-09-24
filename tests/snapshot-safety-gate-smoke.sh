@@ -302,4 +302,43 @@ path_is_subvolume() { [[ \"\$1\" == *postgres ]]; }
 path_covered_by_subvolume '$TMP_DIR/data/immich' '$TMP_DIR/data/immich/postgres'" \
   && fail "a nested subvolume was treated as covered by its parent's snapshot"
 
+# ---------------------------------------------------------------------------
+# create_service_snapshot RETURNS the snapshot name on stdout. Anything else it
+# writes there becomes part of the return value.
+#
+# It used to `echo "[domum-media] Snapshot: ..."` to stdout, so every caller
+# captured two lines and passed the pair to restore_snapshot_for_service, which
+# cannot find it. The auto-rollback after a failed health check would refuse --
+# leaving the service on the broken image with a good snapshot unused -- and
+# update history would record the mangled name as the rollback pointer.
+#
+# Unreachable while no service path was a subvolume, because the function
+# returns 1 before printing anything. Armed by the first migration.
+# ---------------------------------------------------------------------------
+snapname="$( bash -c "$(harness)
+is_btrfs_subvol() { return 0; }
+btrfs() { mkdir -p \"\${!#}\"; }
+record_service_snapshot_metadata() { :; }
+record_rollback_entry() { :; }
+create_service_snapshot immich pre-test a b" 2>/dev/null )"
+
+[[ "$snapname" == *$'"'"'\n'"'"'* ]] \
+  && fail "create_service_snapshot returned more than one line: [$snapname]"
+[[ "$snapname" == immich-* ]] \
+  || fail "create_service_snapshot did not return a bare snapshot name: [$snapname]"
+[[ "$snapname" != *"domum-media"* ]] \
+  || fail "a log line leaked into the returned snapshot name: [$snapname]"
+[[ -d "$TMP_DIR/snapshots/$snapname" ]] \
+  || fail "the returned name does not resolve to a snapshot, so a rollback could not find it: [$snapname]"
+
+# And the progress line must still be produced -- on stderr.
+snaperr="$( bash -c "$(harness)
+is_btrfs_subvol() { return 0; }
+btrfs() { mkdir -p \"\${!#}\"; }
+record_service_snapshot_metadata() { :; }
+record_rollback_entry() { :; }
+create_service_snapshot immich pre-test2 a b" 2>&1 >/dev/null )"
+grep -q 'Snapshot:' <<< "$snaperr" \
+  || fail "the progress line was not written to stderr: [$snaperr]"
+
 echo "PASS: snapshot safety gate smoke test"
