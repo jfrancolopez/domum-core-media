@@ -399,4 +399,88 @@ fi
 grep -q 'compose)   shift; compose_passthrough' "$REPO_ROOT/bin/domum-media" \
   || fail "domum-media compose is not wired into the dispatcher"
 
+# ---------------------------------------------------------------------------
+# "The containers are stopped" is not "nothing is writing".
+#
+# A leftover process, a manual `docker run`, an editor, a stray rsync -- none of
+# them appear in `docker ps`, and the migration's whole safety argument rests on
+# the tree being still. Read from /proc rather than lsof/fuser: fuser is NOT
+# installed on this host, and a check that degrades to "no tool, assume fine" is
+# worse than no check.
+# ---------------------------------------------------------------------------
+oh() {
+  bash -c "
+set -uo pipefail
+$(awk '/^migrate_process_group\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")
+$(awk '/^migrate_open_handles\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")
+$1"
+}
+
+ohdir="$TMP_DIR/openhandles"
+mkdir -p "$ohdir"
+printf 'x\n' > "$ohdir/file"
+
+# Nothing open -> nothing reported.
+[[ -z "$(oh "migrate_open_handles '$ohdir'")" ]] \
+  || fail "a quiet directory reported open handles"
+
+# Our OWN inherited descriptors must stay invisible. Excluding only the shell PID is not
+# enough: every subshell and pipeline member inherits the parent's descriptors,
+# so a PID-only exclusion reports the checker itself as a foreign writer.
+out="$(oh "exec 7>'$ohdir/file'; migrate_open_handles '$ohdir'")"
+[[ -z "$out" ]] || fail "the check reported its own inherited descriptors: $out"
+
+# A process in a DIFFERENT process group must be seen.
+# `setsid` forks, so $! is setsid's PID, not the sleep's. The holder records its
+# own PID instead, and is killed by PID rather than by pattern: this runs on a
+# live host where a pattern match could take out something unrelated.
+setsid bash -c 'echo $$ > "$1"; exec sleep 30' _ "$ohdir/holder.pid" < "$ohdir/file" &
+for _ in $(seq 1 40); do [[ -s "$ohdir/holder.pid" ]] && break; sleep 0.05; done
+holder="$(cat "$ohdir/holder.pid" 2>/dev/null || true)"
+[[ -n "$holder" ]] || fail "the test holder process never started"
+sleep 0.5
+out="$(oh "migrate_open_handles '$ohdir'")"
+[[ -n "$holder" ]] && kill "$holder" 2>/dev/null
+wait 2>/dev/null || true
+rm -f "$ohdir/holder.pid"
+[[ -n "$out" ]] || fail "a foreign process holding a file open was not detected"
+grep -q 'sleep' <<< "$out" || fail "the open handle was not attributed to a process: $out"
+
+# And the quiesce check must refuse on it rather than migrating over a live writer.
+# `setsid` forks, so $! is setsid's PID, not the sleep's. The holder records its
+# own PID instead, and is killed by PID rather than by pattern: this runs on a
+# live host where a pattern match could take out something unrelated.
+setsid bash -c 'echo $$ > "$1"; exec sleep 30' _ "$ohdir/holder.pid" < "$ohdir/file" &
+for _ in $(seq 1 40); do [[ -s "$ohdir/holder.pid" ]] && break; sleep 0.05; done
+holder="$(cat "$ohdir/holder.pid" 2>/dev/null || true)"
+[[ -n "$holder" ]] || fail "the test holder process never started"
+sleep 0.5
+out="$( { bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'
+CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+migrate_assert_quiesced '$ohdir'" ; } 2>&1 )"
+rc=$?
+[[ -n "$holder" ]] && kill "$holder" 2>/dev/null
+wait 2>/dev/null || true
+rm -f "$ohdir/holder.pid"
+(( rc != 0 )) || fail "the quiesce check passed while a process held a file open: $out"
+grep -qi 'still has files open' <<< "$out" || fail "the refusal did not explain itself: $out"
+
+# A hot rollback journal is NOT a refusal: with the writer stopped the journal is
+# copied alongside its database and SQLite recovers from the pair. It is recorded,
+# not treated as an error.
+rm -rf "$ohdir"; mkdir -p "$ohdir"
+printf 'j\n' > "$ohdir/app.db-journal"
+out="$( { bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'
+CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+migrate_assert_quiesced '$ohdir'" ; } 2>&1 )"
+rc=$?
+(( rc == 0 )) || fail "a hot rollback journal must not block the migration: $out"
+grep -qi 'rollback journal' <<< "$out" || fail "the hot journal was not recorded: $out"
+
 echo "PASS: storage migration failure smoke test"

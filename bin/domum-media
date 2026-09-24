@@ -4605,8 +4605,70 @@ migrate_assert_same_btrfs() {
 # the caller's `|| { migrate_restart; exit 1; }` unreachable dead code and left
 # the service down until someone noticed and ran `docker compose up -d` by hand.
 # Refusing to migrate is correct; refusing and walking away is not.
+# "The containers are stopped" is not the same as "nothing is writing". A
+# leftover process, a manual `docker run`, an editor, a stray backup script, or
+# an rsync all keep file handles that no `docker ps` check can see -- and the
+# migration's entire safety argument rests on the tree being still.
+#
+# Read from /proc rather than lsof or fuser: /proc is always there on Linux and
+# needs no package, whereas fuser is NOT installed on this host. A check that
+# silently degrades to "no tool, assume fine" is worse than no check.
+#
+# Self-exclusion is by PROCESS GROUP, not by PID. Excluding only $$ is not
+# enough: every command substitution, pipeline member and subshell this check
+# spawns INHERITS the parent's open descriptors, so each would be reported as a
+# foreign writer. They all share our process group; an unrelated service or
+# another operator's shell does not.
+migrate_process_group() {
+  local stat
+  stat="$(cat "/proc/${1}/stat" 2>/dev/null)" || return 1
+  # The comm field can contain spaces and parentheses, so split after the LAST
+  # ')' and count from there: pgrp is the 3rd field of the remainder.
+  stat="${stat##*) }"
+  printf '%s' "$(printf '%s' "$stat" | cut -d" " -f3)"
+}
+
+migrate_open_handles() {
+  local path="$1" fd link pid mygrp grp
+  mygrp="$(migrate_process_group "$$" || true)"
+  for fd in /proc/[0-9]*/fd/* /proc/[0-9]*/cwd; do
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    if [[ -n "$mygrp" ]]; then
+      grp="$(migrate_process_group "$pid" || true)"
+      [[ "$grp" == "$mygrp" ]] && continue
+    fi
+    link="$(readlink "$fd" 2>/dev/null)" || continue
+    case "$link" in
+      "$path"|"$path"/*)
+        printf '%s %s %s\n' "$pid" "$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')" "$link"
+        ;;
+    esac
+  done
+}
+
 migrate_assert_quiesced() {
-  local path="$1" leftovers
+  local path="$1" leftovers handles journals
+
+  handles="$(migrate_open_handles "$path" | sort -u)"
+  if [[ -n "$handles" ]]; then
+    warn "Something still has files open under $path:
+$handles
+The containers are stopped, so this is an unexpected writer. Migrating while it
+holds handles risks copying a torn state. Investigate before migrating."
+    return 1
+  fi
+
+  # A hot rollback journal is NOT a refusal. With the writer stopped, the journal
+  # is copied alongside its database and SQLite recovers from the pair on open --
+  # that is what the journal is for. Recorded because it is evidence about how
+  # the service shut down, and because a reader of the log should not have to
+  # wonder whether it was noticed.
+  journals="$(find "$path" -name '*-journal' -size +0 2>/dev/null || true)"
+  if [[ -n "$journals" ]]; then
+    migrate_stage stop "hot SQLite rollback journal(s) present; copied with their databases:
+$journals"
+  fi
+
   leftovers="$(find "$path" -name '*-wal' -size +0 2>/dev/null || true)"
   if [[ -n "$leftovers" ]]; then
     warn "Non-empty SQLite write-ahead logs remain after stopping the service:

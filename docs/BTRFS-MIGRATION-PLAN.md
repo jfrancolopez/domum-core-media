@@ -80,6 +80,32 @@ cheap, reads no file contents, and runs on both the full-hash and sampled paths.
 `uptime-kuma` and `traefik` are listed as snapshot candidates but have no state
 directory. See *Known gaps*.
 
+### What "quiesced" actually checks
+
+Stopping the containers is not the same as nothing writing. Before copying, the
+migration refuses if:
+
+| condition | why |
+|---|---|
+| any process outside our process group holds a file open under the path | a leftover process, a manual `docker run`, an editor or a stray rsync appears in none of the container checks |
+| a non-empty `*-wal` remains | the application did not check its WAL back in; it did not shut down cleanly |
+| `postgres/postmaster.pid` exists | PostgreSQL is running, or did not shut down cleanly |
+
+Open handles are read from `/proc/[0-9]*/fd` and `/proc/[0-9]*/cwd`, not from
+`lsof` or `fuser`. **`fuser` is not installed on this host**, and a check that
+degrades to "no tool, assume fine" is worse than no check at all. `/proc` is
+always present and needs no package.
+
+Self-exclusion is by **process group**, not PID: every subshell and pipeline
+member of the check inherits the parent's descriptors, so excluding only the
+shell's own PID would report the checker as a foreign writer. Processes outside
+the group — another service, another operator's shell — are not excluded.
+
+A hot SQLite **rollback journal** (`*-journal`) is deliberately *not* a refusal.
+With the writer stopped, the journal is copied alongside its database and SQLite
+recovers from the pair on open — that is what the journal is for. It is recorded
+in the stage log so a reader does not have to wonder whether it was noticed.
+
 ## 3. SQLite: why every service must be stopped before it is copied
 
 Live evidence, taken with the containers running:
