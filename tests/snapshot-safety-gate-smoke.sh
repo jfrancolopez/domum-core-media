@@ -194,4 +194,74 @@ eval \"\$(awk '/^service_data_path\(\) \{/,/^\}/' '$REPO_ROOT/bin/domum-media')\
 service_data_path $svc" >/dev/null 2>&1     || fail "snapshot candidate '$svc' has no service_data_path mapping"
 done < <(awk '/^snapshot_subvolumes\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media"          | grep -oE 'DOMUM_DATA_ROOT/[a-z-]+' | sed 's|.*/||')
 
+# ---------------------------------------------------------------------------
+# A snapshot of SOME OTHER SERVICE must never authorise destroying this one.
+#
+# `snapshot_create` succeeds on a global count. The moment any single service
+# path becomes a Btrfs subvolume -- which the Jellyfin pilot is designed to do
+# -- a Jellyfin snapshot would have satisfied the gate that guards
+# `rm -rf /srv/data/immich/postgres`. The gate must be service-scoped.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP_DIR/data/immich/postgres" "$TMP_DIR/data/jellyfin"
+
+# Only jellyfin is a subvolume -- exactly the post-pilot production state.
+only_jellyfin_is_subvol() {
+  cat <<EOF
+$(harness)
+is_btrfs_subvol() { [[ "\$1" == *"/jellyfin"* ]]; }
+btrfs() { mkdir -p "\${!#}"; }
+record_rollback_entry() { :; }
+record_service_snapshot_metadata() { :; }
+EOF
+}
+
+# Sanity: the global helper really does pass in this state. If this ever stops
+# being true the rest of this section is testing nothing.
+out="$( { bash -c "$(only_jellyfin_is_subvol); if snapshot_create t; then echo RC=0; else echo RC=1; fi"; } 2>&1 )"
+grep -q 'RC=0' <<< "$out" \
+  || fail "fixture is wrong: snapshot_create should succeed when jellyfin is a subvolume: $out"
+
+# The service-scoped gate must REFUSE for immich in that same state.
+out="$( { bash -c "$(only_jellyfin_is_subvol); if assert_service_snapshot_covers immich pre-immich-reset '$TMP_DIR/data/immich/postgres'; then echo RC=0; else echo RC=1; fi"; } 2>&1 )"
+grep -q 'RC=1' <<< "$out" \
+  || fail "a jellyfin snapshot authorised destroying immich state: $out"
+grep -q 'Not covered' <<< "$out" \
+  || fail "the refusal did not name the uncovered path: $out"
+
+# ...and it must PASS for jellyfin, so the gate is not simply always-refuse.
+out="$( { bash -c "$(only_jellyfin_is_subvol); if assert_service_snapshot_covers jellyfin pre-test '$TMP_DIR/data/jellyfin'; then echo RC=0; else echo RC=1; fi"; } 2>&1 )"
+grep -q 'RC=0' <<< "$out" \
+  || fail "the gate refused a service that really was snapshotted: $out"
+
+# Btrfs snapshots are not recursive: a nested subvolume is an EMPTY DIRECTORY in
+# the parent's snapshot. A differing st_dev proves the boundary, so a path that
+# lives in a nested subvolume must not count as covered by the parent snapshot.
+out="$( { bash -c "$(only_jellyfin_is_subvol)
+path_covered_by_subvolume() { return 1; }
+if assert_service_snapshot_covers jellyfin pre-test '$TMP_DIR/data/jellyfin'; then echo RC=0; else echo RC=1; fi"; } 2>&1 )"
+grep -q 'RC=1' <<< "$out" \
+  || fail "a path outside the snapshotted subvolume was treated as covered: $out"
+
+# The real st_dev check must agree with itself on a path that is genuinely
+# inside the subvolume, and reject one that is outside it entirely.
+bash -c "$(harness); path_covered_by_subvolume '$TMP_DIR/data/immich' '$TMP_DIR/data/immich/postgres'" \
+  || fail "path_covered_by_subvolume rejected a path plainly inside the subvolume"
+bash -c "$(harness); path_covered_by_subvolume '$TMP_DIR/data/immich' '$TMP_DIR/data/jellyfin'" \
+  && fail "path_covered_by_subvolume accepted a path outside the subvolume"
+
+# A differing st_dev means a subvolume boundary was crossed somewhere between
+# the two paths. The fixture is one filesystem, so the boundary is simulated by
+# stubbing stat -- the logic under test is the comparison, not stat itself.
+bash -c "$(harness)
+stat() { if [[ \"\${*: -1}\" == *postgres ]]; then echo 99; else echo 45; fi; }
+path_covered_by_subvolume '$TMP_DIR/data/immich' '$TMP_DIR/data/immich/postgres'" \
+  && fail "a path on a different st_dev was treated as covered by the parent snapshot"
+
+# ...and a nested subvolume must be rejected even if st_dev were to match, since
+# the st_dev premise is only demonstrated for separately mounted subvolumes.
+bash -c "$(harness)
+path_is_subvolume() { [[ \"\$1\" == *postgres ]]; }
+path_covered_by_subvolume '$TMP_DIR/data/immich' '$TMP_DIR/data/immich/postgres'" \
+  && fail "a nested subvolume was treated as covered by its parent's snapshot"
+
 echo "PASS: snapshot safety gate smoke test"

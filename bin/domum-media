@@ -1280,6 +1280,74 @@ EOF
   chmod 600 "$meta_file"
 }
 
+# Btrfs snapshots are NOT recursive. A snapshot of subvolume S contains an
+# EMPTY DIRECTORY wherever a nested subvolume used to be, so "S was snapshotted"
+# does not imply "everything under S is recoverable".
+#
+# Two independent checks, because each has a blind spot the other covers:
+#
+#  1. st_dev. Each btrfs subvolume gets its own anonymous device, so a differing
+#     st_dev proves a boundary was crossed somewhere between the two paths --
+#     including deep inside, where a leaf check would see nothing. Verified on
+#     this host: /srv/data (45) and /srv/snapshots (46) are two subvolumes of
+#     ONE filesystem (/dev/sda1, UUID 211e06b3-…) and their st_dev differs.
+#     Verified only for separately MOUNTED subvolumes; the nested unmounted case
+#     is documented btrfs behaviour but is not yet demonstrated on this host,
+#     which is why it is not the only check.
+#
+#  2. inode 256. A btrfs subvolume root always has inode 256, so if the target
+#     path is itself a subvolume root distinct from the one snapshotted, it is a
+#     nested subvolume and its contents are NOT in the parent's snapshot. This
+#     holds whether or not the st_dev premise does.
+#
+# Either check failing means "not covered". Fail closed.
+path_covered_by_subvolume() {
+  local subvol="$1" path="$2" dev_root dev_path
+  [[ -n "$subvol" && -n "$path" ]] || return 1
+  [[ "$path" == "$subvol" || "$path" == "$subvol"/* ]] || return 1
+
+  dev_root="$(stat -c %d "$subvol" 2>/dev/null)" || return 1
+  dev_path="$(stat -c %d "$path" 2>/dev/null)" || return 1
+  [[ -n "$dev_root" && "$dev_root" == "$dev_path" ]] || return 1
+
+  if [[ "$path" != "$subvol" ]] && path_is_subvolume "$path"; then
+    return 1
+  fi
+  return 0
+}
+
+# Gate a destructive operation on a snapshot that actually covers the paths it
+# is about to destroy.
+#
+# `snapshot_create` returns success on a GLOBAL count: once ANY service path is
+# a subvolume, it succeeds even when the service being wiped was skipped. Using
+# it as the gate for `immich reset-db` meant a Jellyfin snapshot could authorise
+# `rm -rf` of the Immich database. Gate on the service, never on the fleet.
+#
+# Echoes the snapshot name on success; the caller decides what to do on failure
+# so `die` fires in the calling shell.
+assert_service_snapshot_covers() {
+  local service="$1" tag="$2"; shift 2
+  local root name p
+  local -a uncovered=()
+
+  root="$(service_data_path "$service")" || return 1
+  name="$(create_service_snapshot "$service" "$tag")" || name=""
+
+  for p in "$@"; do
+    [[ -e "$p" ]] || continue
+    if [[ -z "$name" ]] || ! path_covered_by_subvolume "$root" "$p"; then
+      uncovered+=("$p")
+    fi
+  done
+
+  if (( ${#uncovered[@]} > 0 )); then
+    printf '%s\n' "[domum-media] Not covered by any snapshot: ${uncovered[*]}" >&2
+    return 1
+  fi
+  printf '%s' "$name"
+}
+
 create_service_snapshot() {
   local service="$1"
   local tag="$2"
@@ -1368,6 +1436,37 @@ list_service_snapshots() {
   list_snapshots_for_base "$(service_snapshot_base_name "$1")"
 }
 
+# Stop compose services and PROVE they are gone.
+#
+# The rollback path used to run `compose_cmd stop $svcs 2>/dev/null || true`,
+# discarding both stderr and the exit status. A container that kept running
+# would keep writing through its existing mount into the directory that was then
+# renamed aside: the restore "succeeds", the application never experiences it,
+# and the operator goes on to delete the tree the live container is using.
+# A stop that cannot be proven is a failed stop.
+stop_compose_services_verified() {
+  local svcs="$1"
+  [[ -n "$svcs" ]] || return 0
+  # shellcheck disable=SC2086
+  compose_cmd stop $svcs || {
+    echo "[domum-media] Could not stop: $svcs" >&2
+    return 1
+  }
+  # Confirm each intended container is actually gone, one at a time: a
+  # command-substituted pattern list would word-split unpredictably.
+  local still="" svc
+  for svc in $svcs; do
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$svc"; then
+      still+="${still:+ }$svc"
+    fi
+  done
+  [[ -z "$still" ]] || {
+    echo "[domum-media] Still running after stop: $still" >&2
+    return 1
+  }
+  return 0
+}
+
 restore_snapshot_for_service() {
   local service="$1"
   local snapshot_name="$2"
@@ -1378,8 +1477,12 @@ restore_snapshot_for_service() {
   [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || die "Snapshot not found: $snapshot_name"
 
   compose_svcs="$(service_compose_services "$service" || true)"
-  # shellcheck disable=SC2086
-  [[ -n "$compose_svcs" ]] && compose_cmd stop $compose_svcs 2>/dev/null || true
+  # Nothing has been moved yet, so failing here is completely safe -- and far
+  # safer than restoring underneath a container that is still writing.
+  stop_compose_services_verified "$compose_svcs" \
+    || die "Refusing to restore $service: its containers could not be confirmed stopped.
+A restore under a running container is invisible to the application and would leave
+the live tree in the preserved copy. Nothing has been changed."
 
   # Preserve whatever is there now, whatever its type. The previous code moved a
   # subvolume aside but `rm -rf`'d an ordinary directory, so restoring onto a
@@ -1414,8 +1517,11 @@ restore_snapshot_for_service() {
     echo "[domum-media] Previous state kept at $current_backup (remove it once satisfied)"
   fi
 
-  # shellcheck disable=SC2086
-  [[ -n "$compose_svcs" ]] && compose_cmd up -d $compose_svcs
+  if [[ -n "$compose_svcs" ]]; then
+    # shellcheck disable=SC2086
+    compose_cmd up -d $compose_svcs
+  fi
+  return 0
 }
 
 latest_snapshot_for_service() {
@@ -3711,11 +3817,14 @@ EOF
   compose_cmd rm -f immich_server immich_machine_learning immich_postgres immich_redis 2>/dev/null || true
 
   echo "[domum-media] Pre-reset btrfs snapshot..."
-  # This snapshot is the only safety net before the rm -rf below.
-  if ! snapshot_create "pre-immich-reset"; then
+  # This snapshot is the only safety net before the rm -rf below, so it must
+  # cover THESE paths -- not merely "some subvolume somewhere succeeded".
+  local -a wipe_paths=("$data_dir")
+  (( wipe_uploads == 1 )) && wipe_paths+=("$uploads_dir")
+  if ! assert_service_snapshot_covers immich "pre-immich-reset" "${wipe_paths[@]}" >/dev/null; then
     snapshot_protection_unavailable \
       "Cannot snapshot Immich state before resetting the database" \
-      "no Btrfs subvolume was snapshotted, so the data about to be deleted cannot be restored"
+      "no Btrfs snapshot covers ${wipe_paths[*]}, so the data about to be deleted cannot be restored"
   fi
 
   if [[ -d "$data_dir" ]]; then
@@ -4422,22 +4531,55 @@ migrate_verify() {
     fi
     migrate_stage verify "content manifest identical"
   else
-    # Too many files to hash inline. Sample deterministically: first, last and
-    # every Nth path, plus the largest file.
+    # Too many files to hash inline, so hash a deterministic sample: the first
+    # and last paths in sorted order, every Nth in between, and the largest file.
+    #
+    # The previous selector was `awk 'NR%s==1'`, which for step==1 is NEVER
+    # true: the sample came out empty, the loop body never ran, `bad` stayed 0
+    # and verification PASSED having compared nothing. That was reachable
+    # whenever MIGRATE_FULL_HASH_MAX_FILES < files < 400. A sample of zero is
+    # now a failure, so the degenerate case cannot masquerade as a pass.
     migrate_stage verify "$files files exceeds $MIGRATE_FULL_HASH_MAX_FILES; hashing a deterministic sample"
-    local sample step
+    local step sample_file sampled=0 bad=0 rel
     step=$(( files / 200 )); (( step > 0 )) || step=1
-    sample="$( ( cd "$src" && find . -type f 2>/dev/null | sort | awk -v s="$step" 'NR%s==1' ) )"
-    local rel bad=0
-    while IFS= read -r rel; do
+    sample_file="$(mktemp)" || { warn "could not stage the verification sample"; return 1; }
+    # NUL-delimited throughout: a filename containing a newline must not split
+    # one path into two unreadable ones.
+    (
+      cd "$src" || exit 1
+      find . -type f -printf '%s\t%p\0' 2>/dev/null | sort -z -t"$(printf '\t')" -k2,2
+    ) | awk -v RS='\0' -v ORS='\0' -v s="$step" '
+        {
+          rec[NR] = $0
+          split($0, f, "\t"); sz = f[1] + 0
+          if (maxn == 0 || sz > maxsz) { maxsz = sz; maxn = NR }
+          if (NR == 1 || NR % s == 0) pick[NR] = 1
+        }
+        END {
+          if (NR == 0) exit
+          pick[NR] = 1           # last
+          if (maxn) pick[maxn] = 1  # largest
+          for (i = 1; i <= NR; i++)
+            if (i in pick) { p = rec[i]; sub(/^[^\t]*\t/, "", p); print p }
+        }' > "$sample_file"
+
+    while IFS= read -r -d "" rel; do
       [[ -n "$rel" ]] || continue
       local a b
       a="$(sha256sum "$src/$rel" 2>/dev/null | cut -d" " -f1)"
       b="$(sha256sum "$dst/$rel" 2>/dev/null | cut -d" " -f1)"
       [[ -n "$a" && "$a" == "$b" ]] || { warn "sample mismatch: $rel"; bad=1; }
-    done <<< "$sample"
+      sampled=$(( sampled + 1 ))
+    done < "$sample_file"
+    rm -f -- "$sample_file"
+
     (( bad == 0 )) || return 1
-    migrate_stage verify "sampled content identical ($(printf '%s' "$sample" | grep -c . ) file(s))"
+    # A verification that hashed nothing has verified nothing. With the selector
+    # above this is unreachable (first and last are always picked), so it is
+    # defence in depth against a future change to the selection rules rather
+    # than a tested path -- mutation testing confirms nothing exercises it.
+    (( sampled > 0 )) || { warn "the verification sample was empty; nothing was compared"; return 1; }
+    migrate_stage verify "sampled content identical ($sampled of $files file(s))"
   fi
   return 0
 }
@@ -4490,17 +4632,8 @@ storage_migrate_subvolume() {
   local started=0
   if [[ -n "$compose_svcs" ]]; then
     migrate_stage stop "stopping $compose_svcs"
-    # shellcheck disable=SC2086
-    compose_cmd stop $compose_svcs || die "Could not stop $compose_svcs; nothing has been changed."
-    # Confirm each intended container is actually gone, one at a time: a
-    # command-substituted pattern list would word-split unpredictably.
-    local still="" svc
-    for svc in $compose_svcs; do
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$svc"; then
-        still+="${still:+ }$svc"
-      fi
-    done
-    [[ -z "$still" ]] || die "Still running after stop: $still. Nothing has been changed."
+    stop_compose_services_verified "$compose_svcs" \
+      || die "Could not confirm $compose_svcs stopped; nothing has been changed."
     started=1
   fi
 
