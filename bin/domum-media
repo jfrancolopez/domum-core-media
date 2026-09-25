@@ -2578,7 +2578,12 @@ refresh_images() {
       record_update_history "$logical_service" "skipped_unhealthy" "$before_image" "$after_image" "$snapshot_name" "failure" "automatic rollback triggered"
       if [[ "${AUTO_ROLLBACK_ENABLED:-1}" == "1" && -n "$snapshot_name" ]]; then
         restore_snapshot_for_service "$logical_service" "$snapshot_name"
-        record_update_history "$logical_service" "rolled_back" "$after_image" "$before_image" "$snapshot_name" "success" "restored after failed health validation"
+        # DATA only. restore_snapshot_for_service restores the snapshot and then
+        # runs `compose_cmd up -d` -- it never re-pins IMAGE_BEFORE, so the
+        # service comes back on the SAME image that just failed its health check.
+        # Recording this as an unqualified success said the opposite of what
+        # happened. Backlog task-24 is the fix; until then it is reported honestly.
+        record_update_history "$logical_service" "rolled_back_data_only" "$after_image" "$before_image" "$snapshot_name" "partial" "data restored from snapshot; the image was NOT rolled back and is still $after_image"
       fi
       if [[ "${AUTO_ROLLBACK_ENABLED:-1}" == "1" && -n "$snapshot_name" ]]; then
         die "Update aborted: $logical_service failed health validation and was rolled back."
@@ -2898,7 +2903,10 @@ immich_refresh_bundle() {
     record_update_history "immich" "skipped_unhealthy" "$old_server" "$server_image" "$snapshot_name" "failure" "bundle rollout failed validation"
     if [[ -n "$snapshot_name" ]]; then
       restore_snapshot_for_service immich "$snapshot_name"
-      record_update_history "immich" "rolled_back" "$server_image" "$old_server" "$snapshot_name" "success" "restored pre-bundle snapshot"
+      # Data only -- see the note in refresh_images. The images are re-pinned
+      # separately below by config_set, which is why this one is nearer the truth
+       # than the generic path, but the restore itself restored data alone.
+      record_update_history "immich" "rolled_back_data_only" "$server_image" "$old_server" "$snapshot_name" "partial" "pre-bundle snapshot restored; image pinning handled separately"
     else
       compose_cmd up -d immich_server immich_machine_learning immich_redis immich_postgres
     fi
@@ -3272,7 +3280,15 @@ Refusing to roll back while it runs."
 
   restore_snapshot_for_service "${SERVICE:-unknown}" "$snapshot_name"
   update_rollback_entry_status "$file" "consumed"
-  record_update_history "${SERVICE:-unknown}" "rolled_back" "${IMAGE_AFTER:-}" "${IMAGE_BEFORE:-}" "$snapshot_name" "success" "manual rollback apply ${rollback_id}"
+  # An operator-initiated rollback restores DATA. When the entry records a
+  # different image, say so rather than implying both halves went back.
+  if [[ -n "${IMAGE_BEFORE:-}" && -n "${IMAGE_AFTER:-}" && "${IMAGE_BEFORE:-}" != "${IMAGE_AFTER:-}" ]]; then
+    warn "Data was restored, but the image was NOT rolled back: still ${IMAGE_AFTER}, not ${IMAGE_BEFORE}."
+    warn "Re-pin it yourself if that matters; see backlog/task-24-rollback-previous-image.md."
+    record_update_history "${SERVICE:-unknown}" "rolled_back_data_only" "${IMAGE_AFTER:-}" "${IMAGE_BEFORE:-}" "$snapshot_name" "partial" "manual rollback apply ${rollback_id}; data only, image still ${IMAGE_AFTER}"
+  else
+    record_update_history "${SERVICE:-unknown}" "rolled_back" "${IMAGE_AFTER:-}" "${IMAGE_BEFORE:-}" "$snapshot_name" "success" "manual rollback apply ${rollback_id}"
+  fi
 }
 
 rollback_cmd() {
@@ -4922,10 +4938,18 @@ migrate_assert_same_btrfs() {
 # the caller's `|| { migrate_restart; exit 1; }` unreachable dead code and left
 # the service down until someone noticed and ran `docker compose up -d` by hand.
 # Refusing to migrate is correct; refusing and walking away is not.
-# "The containers are stopped" is not the same as "nothing is writing". A
-# leftover process, a manual `docker run`, an editor, a stray backup script, or
-# an rsync all keep file handles that no `docker ps` check can see -- and the
-# migration's entire safety argument rests on the tree being still.
+# "The containers are stopped" is not the same as "nothing is writing". A leftover
+# process, an editor, a stray backup script or an rsync on the HOST all keep file
+# handles that no `docker ps` check can see -- and the migration's entire safety
+# argument rests on the tree being still.
+#
+# Scope, stated precisely: this sees HOST processes. A containerised process has
+# its own mount namespace, so its fd links render as the container-internal path
+# (`/config/data/jellyfin.db`, not `/srv/data/jellyfin/config/data/jellyfin.db`)
+# and cannot match the pattern below. Containers are covered by
+# `stop_compose_services_verified`, which proves each one is gone from `docker ps`
+# -- a different mechanism for a different class of writer. An earlier version of
+# this comment claimed the scan caught "a manual `docker run`"; it would not.
 #
 # Read from /proc rather than lsof or fuser: /proc is always there on Linux and
 # needs no package, whereas fuser is NOT installed on this host. A check that
