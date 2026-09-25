@@ -1214,6 +1214,18 @@ domum_is_subvolume() {
   [[ "$(stat -f -c %T "$path" 2>/dev/null)" == "btrfs" ]] || return 1
   [[ "$(stat -c %i "$path" 2>/dev/null)" == "256" ]]
 }
+# Btrfs snapshots are NOT recursive: a snapshot of S contains an EMPTY DIRECTORY
+# wherever a nested subvolume used to be. So a path being a subvolume does not
+# mean a snapshot of it would contain everything under it.
+#
+# `-xdev` makes this cheap: nested subvolumes have their own st_dev, so find
+# reports the boundary and never descends into it. Measured at 0.38s against the
+# real 213 GB Immich tree.
+domum_subvolume_nested_children() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  find "$root" -xdev -mindepth 1 -type d -inum 256 2>/dev/null
+}
 # END SHARED SUBVOLUME HELPER
 
 # Retained as names the call sites already read well with. Both now resolve to
@@ -1432,11 +1444,9 @@ assert_service_snapshot_covers() {
 # `-xdev` makes this cheap: nested subvolumes have their own st_dev, so find
 # reports the boundary and never descends into it. No full-tree walk, even for
 # the 213 GB Immich library.
-subvolume_nested_children() {
-  local root="$1"
-  [[ -d "$root" ]] || return 0
-  find "$root" -xdev -mindepth 1 -type d -inum 256 2>/dev/null
-}
+# Retained as the name the call sites read well with; one implementation, in the
+# shared block above, so the CLI and the report cannot disagree about it.
+subvolume_nested_children() { domum_subvolume_nested_children "$1"; }
 
 create_service_snapshot() {
   local service="$1"
@@ -1705,7 +1715,21 @@ the live tree in the preserved copy. Nothing has been changed."
     # service with nothing.
     if [[ -n "$current_backup" && -e "$current_backup" ]]; then
       # Only ever removes a partial restore we just created, never live state.
-      [[ -e "$data_path" ]] && rm -rf -- "$data_path"
+      #
+      # The removal is CHECKED. `mv A B` with B an existing directory succeeds by
+      # moving A *inside* B, so a silent rm failure would leave the live state one
+      # level deeper inside a partial subvolume while `|| die` never fired and the
+      # message below claimed it had been put back. Verified: `mv live dest` with
+      # dest/ present yields dest/live/file.txt and exit 0.
+      if [[ -e "$data_path" ]]; then
+        rm -rf -- "$data_path" \
+          || die "Restore failed, and the partial restore at $data_path could not be removed.
+The preserved state is intact at $current_backup. Put it back by hand once
+$data_path is clear; do not delete $current_backup."
+      fi
+      [[ ! -e "$data_path" ]] \
+        || die "Restore failed, and $data_path still exists, so putting the preserved
+state back would nest it inside. The preserved state is intact at $current_backup."
       mv -- "$current_backup" "$data_path" \
         || die "Restore failed AND the preserved state could not be put back. It is at: $current_backup"
       echo "[domum-media] Restore failed; previous state put back from $current_backup" >&2
@@ -4954,11 +4978,48 @@ migrate_verify() {
   files="$s_count"
   if (( files <= MIGRATE_FULL_HASH_MAX_FILES )); then
     migrate_stage verify "hashing all $files file(s)"
-    if ! diff <(migrate_manifest "$src") <(migrate_manifest "$dst") >/dev/null; then
-      warn "content manifest mismatch"
+    local src_manifest dst_manifest src_lines dst_lines
+    src_manifest="$(mktemp)" || { warn "could not stage the source manifest"; return 1; }
+    dst_manifest="$(mktemp)" || { warn "could not stage the copy manifest"; rm -f "$src_manifest"; return 1; }
+    # `|| true` is deliberate here, unlike the pattern it usually is: sha256sum
+    # exits non-zero when it cannot read a file, and with `pipefail` plus this
+    # script's `set -e` that aborts the whole function before anything is
+    # compared. The completeness check immediately below is what turns that
+    # non-zero exit into a refusal, so swallowing it here hides nothing. Inside
+    # the old `<(...)` the failure was swallowed by the shell anyway, and there
+    # was no completeness check at all.
+    migrate_manifest "$src" > "$src_manifest" || true
+    migrate_manifest "$dst" > "$dst_manifest" || true
+    src_lines="$(wc -l < "$src_manifest")"
+    dst_lines="$(wc -l < "$dst_manifest")"
+
+    # A file sha256sum could not read is DROPPED from the manifest, silently --
+    # and because it drops out of both manifests identically, the diff below
+    # passes and verification reports "content manifest identical" having never
+    # compared it. The file count comes from `find`, so it cannot catch this
+    # either. Demonstrated: 2 files on disk, 1 line in the manifest.
+    #
+    # Root can normally read everything, so this is a guard against a
+    # verification that quietly proves less than it claims -- not a condition
+    # seen today.
+    # One check, not one per side. Separate src and dst checks were redundant for
+    # the only reachable case -- a file unreadable in BOTH trees, which is what
+    # makes the diff pass -- so either alone caught it and neither was
+    # independently testable. Symmetry that cannot fail is not a safeguard.
+    if [[ "$src_lines" != "$files" || "$dst_lines" != "$files" ]]; then
+      warn "manifests cover $src_lines and $dst_lines of $files file(s); some could not be hashed"
+      rm -f "$src_manifest" "$dst_manifest"
       return 1
     fi
-    migrate_stage verify "content manifest identical"
+
+    if ! diff "$src_manifest" "$dst_manifest" >/dev/null; then
+      warn "content manifest mismatch"
+      diff "$src_manifest" "$dst_manifest" | head -20 >&2
+      rm -f "$src_manifest" "$dst_manifest"
+      return 1
+    fi
+    rm -f "$src_manifest" "$dst_manifest"
+    migrate_stage verify "content manifest identical ($files of $files file(s))"
   else
     # Too many files to hash inline, so hash a deterministic sample: the first
     # and last paths in sorted order, every Nth in between, and the largest file.
