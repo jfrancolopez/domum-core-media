@@ -1233,18 +1233,21 @@ domum_subvolume_nested_children() {
 is_btrfs_subvol()   { domum_is_subvolume "$1"; }
 path_is_subvolume() { domum_is_subvolume "$1"; }
 
+# Resolved through service_data_path, NOT from hardcoded "$DOMUM_DATA_ROOT/<name>"
+# literals.
+#
+# service_data_path honours JELLYFIN_CONFIG_DIR, PLEX_CONFIG_DIR,
+# NAVIDROME_DATA_DIR, CALIBRE_WEB_CONFIG_DIR and KAVITA_CONFIG_DIR. The migration,
+# create_service_snapshot and the report all go through it. This function did not,
+# so with any of those set outside the default it operated on a path that does not
+# exist -- silently skipped -- while per-service snapshots and the report worked
+# fine against the real one. Same shape as the "three answers to is this a
+# subvolume" defect, one layer up: two sources of truth for where a service lives.
 snapshot_subvolumes() {
-  local candidates=()
-  candidates+=("$DOMUM_DATA_ROOT/immich")
-  candidates+=("$DOMUM_DATA_ROOT/jellyfin")
-  candidates+=("$DOMUM_DATA_ROOT/plex")
-  candidates+=("$DOMUM_DATA_ROOT/navidrome")
-  candidates+=("$DOMUM_DATA_ROOT/calibre-web")
-  candidates+=("$DOMUM_DATA_ROOT/kavita")
-  candidates+=("$DOMUM_DATA_ROOT/uptime-kuma")
-  candidates+=("$DOMUM_DATA_ROOT/traefik")
-  for c in "${candidates[@]}"; do
-    [[ -d "$c" ]] && echo "$c"
+  local svc path
+  for svc in immich jellyfin plex navidrome calibre-web kavita uptime-kuma traefik; do
+    path="$(service_data_path "$svc" 2>/dev/null)" || continue
+    [[ -n "$path" && -d "$path" ]] && printf '%s\n' "$path"
   done
 }
 
@@ -3299,7 +3302,11 @@ rollback_cmd() {
         unset ID SERVICE EVENT STATUS
         # shellcheck disable=SC1090
         source "$file"
-        [[ "${STATUS:-available}" == "available" ]] || continue
+        # Effective, not recorded: prune deletes snapshots without touching the
+        # index, so a recorded "available" can point at nothing. Offering such an
+        # entry in a menu invites the operator to pick one that cannot be applied.
+        [[ "$(rollback_entry_effective_status "${STATUS:-available}" \
+              "${SNAPSHOT_NAME:-$(basename "${SNAPSHOT:-}")}")" == "available" ]] || continue
         snapshots+=("${ID}")
         printf '%d) %s | %s | %s\n' "$idx" "${ID}" "${SERVICE:-unknown}" "${EVENT:-unknown}"
         idx=$(( idx + 1 ))
@@ -3383,7 +3390,21 @@ cleanup_images_execute() {
 }
 
 cleanup_snapshot_candidates() {
-  local keep="${CLEANUP_OLD_SNAPSHOTS_KEEP:-${SNAPSHOT_KEEP_PER_SUBVOL:-14}}"
+  # One retention policy, not two. This used to default to
+  # CLEANUP_OLD_SNAPSHOTS_KEEP, which the shipped example config sets to 7 while
+  # SNAPSHOT_KEEP_PER_SUBVOL is 14 -- so `cleanup snapshots --confirm` deleted
+  # seven more snapshots per service than the retention policy, including ones the
+  # weekly prune had deliberately kept. Two knobs for one policy is a policy
+  # nobody can state.
+  #
+  # CLEANUP_OLD_SNAPSHOTS_KEEP is still honoured, but only upwards: the effective
+  # value is the LARGER of the two, so setting either knob can keep more snapshots
+  # and never fewer. A cleanup command that quietly deletes past the retention
+  # policy is not a cleanup.
+  local keep_policy="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
+  local keep_cleanup="${CLEANUP_OLD_SNAPSHOTS_KEEP:-$keep_policy}"
+  local keep="$keep_policy"
+  (( keep_cleanup > keep )) && keep="$keep_cleanup"
   local names base total drop i
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
   names="$(find "$DOMUM_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
@@ -3460,7 +3481,17 @@ cleanup_cmd() {
   case "$sub" in
     summary) cleanup_summary ;;
     images) cleanup_images_execute "$dry_run" "$confirm" ;;
-    snapshots) cleanup_snapshots_execute "$dry_run" "$confirm" ;;
+    snapshots)
+      # A second snapshot DELETER, and until now the only one without the lock.
+      # A rollback checks its snapshot exists and then creates from it; a
+      # `cleanup snapshots --confirm` landing between those two steps turns a
+      # routine restore into a failure. Attended, so it refuses rather than waits.
+      if (( confirm == 1 )); then
+        domum_acquire_lock "cleanup snapshots" 0 \
+          || die "Another domum-media operation holds the lock: $(domum_lock_holder)
+Refusing to delete snapshots while it runs."
+      fi
+      cleanup_snapshots_execute "$dry_run" "$confirm" ;;
     *) die "Usage: domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]" ;;
   esac
 }
@@ -4544,7 +4575,13 @@ immich_cmd() {
         unset ID SERVICE STATUS
         # shellcheck disable=SC1090
         source "$file"
-        [[ "${SERVICE:-}" == "immich" && "${STATUS:-available}" == "available" ]] || continue
+        # Same as the interactive selector. This one also does `| tail -n 1`, so a
+        # single pruned-but-recorded entry made `immich rollback` pick it every
+        # time and die "not available: missing" -- permanently unusable, even with
+        # older genuinely restorable snapshots present.
+        [[ "${SERVICE:-}" == "immich" ]] || continue
+        [[ "$(rollback_entry_effective_status "${STATUS:-available}" \
+              "${SNAPSHOT_NAME:-$(basename "${SNAPSHOT:-}")}")" == "available" ]] || continue
         printf '%s\n' "${ID}"
       done | tail -n 1)"
       [[ -n "$rollback_id" ]] || die "No available Immich rollback points found."

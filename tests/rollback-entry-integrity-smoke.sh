@@ -116,4 +116,27 @@ grep -qi 'not available: missing' <<< "$out" \
 [[ "$(cat "$TMP_DIR/data/plex/live.db")" == "$CANARY" ]] \
   || fail "live state was touched by a refused rollback"
 
+# ---------------------------------------------------------------------------
+# 5. EVERY reader of the rollback index must use the effective status.
+#
+# `rollback_entry_effective_status` exists because prune deletes snapshots
+# without touching the index. Two of the four readers ignored it:
+#
+#   - the interactive selector offered pruned entries as menu choices;
+#   - `immich rollback` does `| tail -n 1`, so one pruned-but-recorded entry made
+#     it pick that entry every time and die "not available: missing" -- permanently
+#     unusable, even with older genuinely restorable snapshots present.
+#
+# Fail-closed, so no data risk -- but a rollback command that cannot be used is
+# not a rollback command.
+# ---------------------------------------------------------------------------
+if grep -nE '\[\[ "\$\{STATUS:-available\}" == "available" \]\]' "$REPO_ROOT/bin/domum-media"; then
+  fail "a rollback index reader still tests the RECORDED status instead of the effective one"
+fi
+
+# All four readers must go through the helper.
+readers="$(grep -c 'rollback_entry_effective_status' "$REPO_ROOT/bin/domum-media")"
+(( readers >= 4 )) \
+  || fail "expected at least 4 uses of rollback_entry_effective_status (definition + 3 readers), found $readers"
+
 echo "PASS: rollback entry integrity smoke test"

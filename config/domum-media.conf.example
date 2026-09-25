@@ -357,4 +357,8 @@ CLEANUP_IMAGES_AFTER_UPDATE=1
 # The automatic pruner (snapshot-prune timer) uses SNAPSHOT_KEEP_PER_SUBVOL
 # from the Backup policy section. Set this lower if you want the explicit
 # cleanup command to be more aggressive without changing the normal retention.
-CLEANUP_OLD_SNAPSHOTS_KEEP=7
+# Only ever raises retention: the effective value is the larger of this and
+# SNAPSHOT_KEEP_PER_SUBVOL, so `cleanup snapshots` can never delete past the
+# retention policy. It used to default to 7 against a policy of 14, which meant
+# cleanup silently removed seven more snapshots per service than the policy kept.
+CLEANUP_OLD_SNAPSHOTS_KEEP=14

@@ -378,4 +378,32 @@ snapshot_create nested && echo RC=0 || echo RC=1")"
 grep -q 'RC=1' <<< "$out" || fail "snapshot_create succeeded despite a nested subvolume: $out"
 grep -q '1 failed' <<< "$out" || fail "a nested subvolume was counted as a skip, not a failure: $out"
 
+# ---------------------------------------------------------------------------
+# snapshot_subvolumes must resolve through service_data_path, not hardcode paths.
+#
+# service_data_path honours JELLYFIN_CONFIG_DIR, PLEX_CONFIG_DIR,
+# NAVIDROME_DATA_DIR, CALIBRE_WEB_CONFIG_DIR and KAVITA_CONFIG_DIR. The
+# migration, create_service_snapshot and the report all go through it; this
+# function used "$DOMUM_DATA_ROOT/<name>" literals, so with any of those set
+# elsewhere it operated on a path that does not exist -- silently skipped --
+# while the report said protected and per-service snapshots worked.
+# ---------------------------------------------------------------------------
+if grep -nE 'candidates\+=\("\$DOMUM_DATA_ROOT/' "$REPO_ROOT/bin/domum-media"; then
+  fail "snapshot_subvolumes still hardcodes service paths instead of using service_data_path"
+fi
+
+mkdir -p "$TMP_DIR/elsewhere/jellyfin-custom/config" "$TMP_DIR/data/plex"
+out="$(bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'
+CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+DOMUM_DATA_ROOT='$TMP_DIR/data'
+JELLYFIN_CONFIG_DIR='$TMP_DIR/elsewhere/jellyfin-custom/config'
+snapshot_subvolumes" 2>/dev/null)"
+grep -q 'elsewhere/jellyfin-custom$' <<< "$out" \
+  || fail "snapshot_subvolumes ignored JELLYFIN_CONFIG_DIR; it would snapshot a path that does not exist: $out"
+grep -q "$TMP_DIR/data/plex" <<< "$out" \
+  || fail "snapshot_subvolumes lost a default-located service: $out"
+
 echo "PASS: snapshot safety gate smoke test"
