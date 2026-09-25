@@ -47,10 +47,20 @@ directories, dry runs, or an isolated scratch restore location.
 
 ## 3. Btrfs truth
 
-**Per-service Btrfs snapshot/rollback protection is currently DEGRADED / NOT
-FUNCTIONAL.** The service paths the snapshot implementation expects are
-ordinary directories rather than the required subvolumes, so service snapshots
+**`jellyfin` is migrated and protected as of 2026-09-25.** `/srv/data/jellyfin` is
+a real Btrfs subvolume (inode 256, `st_dev` 51 vs the parent's 45) with a verified
+read-only proof snapshot. `docs/JELLYFIN-PILOT-RESULT.md` holds the evidence.
+`/srv/data/jellyfin.premigration` and that snapshot are both retained deliberately
+and must not be deleted without the operator saying so.
+
+**Every other service path is still an ordinary directory**, so per-service
+snapshot/rollback protection remains DEGRADED for them and service snapshots
 silently skip.
+
+The report no longer calls a subvolume `protected` on its own: `protected` requires
+a snapshot to exist too, `snapshottable` means it can be snapshotted but nothing
+has been, and `degraded` means a nested subvolume would be omitted from any
+snapshot of it.
 
 Never:
 
@@ -282,6 +292,26 @@ organization.
 - Do not copy its known defects.
 - **`domum-core` is not currently available on this host.** Record that
   limitation when it matters; never invent or assume its behavior.
+
+---
+
+## 13b. Migration lifecycle — which comparison proves integrity
+
+A service's state legitimately changes during a clean shutdown and again on
+restart. Never assert that a pre-stop fingerprint equals a post-restart one: the
+first production pilot aborted on a perfect migration for exactly that reason.
+
+The integrity claim is **`.premigration` == proof snapshot** — the original that
+was moved aside against a snapshot of the copy that replaced it. Both are static,
+so a running application cannot disturb the comparison, and it catches corruption
+introduced after `migrate_verify` has already passed.
+
+The live tree is **classified, not compared**: a hard failure if a snapshotted
+file is missing, otherwise reported and split into expected runtime state (logs,
+locks, scheduled tasks, SQLite `-wal`/`-shm`) and anything else. A database file
+is never on that allowlist.
+
+Full detail and the measured evidence: `docs/MIGRATION-LIFECYCLE.md`.
 
 ---
 

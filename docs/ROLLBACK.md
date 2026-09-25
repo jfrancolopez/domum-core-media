@@ -88,3 +88,60 @@ sudo domum-media immich rollback
 ```
 
 This applies the newest available Immich rollback point.
+
+## Is a destructive production rollback drill warranted? (assessed 2026-09-25)
+
+**No, not now.** The reasoning, so it is not re-litigated:
+
+### What a real drill would add
+
+Exactly one fact: that `btrfs subvolume snapshot /srv/snapshots/<snap>
+/srv/data/<service>` works across the two separately **mounted** subvolumes
+(`st_dev` 45 and 46). Every existing rollback test — including the real-Btrfs
+integration suite — puts both trees inside a single mount, so that direction is
+genuinely untested.
+
+### What it would cost
+
+- Jellyfin stops and restarts (brief downtime).
+- A **third** copy of the tree appears in `/srv/data` as `.rollback-<stamp>`,
+  alongside `.premigration` and the live subvolume — all three in every nightly
+  backup.
+- The first real exercise of the restore path would be on the service we have just
+  migrated, with the thing being tested (the cross-mount create) also being the
+  thing that could fail.
+- It reverts Jellyfin's post-migration runtime state. Harmless, but it is a
+  production mutation for no data benefit.
+
+### Why it is not needed for that one fact
+
+The cross-mount direction can be proven **non-destructively**, with one root
+command that never touches a service path:
+
+```bash
+sudo btrfs subvolume snapshot \
+  /srv/snapshots/jellyfin-20260925-153317-post-migration \
+  /srv/data/staging/xmount-probe
+# then verify, and remove it:
+sudo btrfs subvolume delete /srv/data/staging/xmount-probe
+```
+
+That exercises the identical kernel operation in the identical direction across
+the identical mount boundary, with no downtime, no third copy, and nothing at risk.
+
+### What we already have instead of a drill
+
+- `.premigration` — a complete independent copy, verified identical to the proof
+  snapshot on every field.
+- the proof snapshot — read-only, verified.
+- real-Btrfs integration coverage of `restore_snapshot_for_service`: successful
+  rollback with byte-for-byte restoration, failed restore with the live state put
+  back, missing snapshot refused, foreign-service snapshot refused, name collision
+  refused, and the `rm -rf`/`mv`-nesting recovery path.
+- a migrated service that is demonstrably healthy.
+
+### When to revisit
+
+Drill for real when either (a) a rollback is actually needed, or (b) a service of
+**lower** value than Jellyfin has been migrated and can absorb the downtime — that
+is the cheap moment to exercise the path end to end, not now.
