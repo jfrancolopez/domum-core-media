@@ -104,6 +104,9 @@ build_fixture_tree() {
   seedfile "$SVC/config/overboundary.bin"         2049 'F'   # just over max_inline
   seedfile "$SVC/config/plugins/plugin.dll"      65536 'G'
   : > "$SVC/config/jellyfin.db-wal"                          # present but EMPTY
+  mkdir -p "$SVC/config/data"
+  printf 'initial\n' > "$SVC/config/service.log"
+  printf 'db\n'      > "$SVC/config/data/library.db"
   : > "$SVC/config/jellyfin.db-shm"
   printf 'x\n' > "$SVC/cache/scratch.tmp"
 
@@ -121,6 +124,21 @@ build_fixture_tree() {
 
 # Content + metadata fingerprint of the tree, independent of the implementation
 # under test -- if this used migrate_manifest it would be marking its own work.
+# Compares two trees ignoring paths a running service legitimately rewrites.
+# Whole-tree fingerprints cannot be used across a service stop/start: that is the
+# conflation which aborted the first production pilot.
+nonruntime_diff() {  # $1 = reference tree, $2 = tree under test
+  ( cd "$1" && find . -type f -print | sort ) | while IFS= read -r f; do
+      case "$f" in
+        */log/*|*.log|*/.*-log|*/ScheduledTasks/*|*.pid|*.lock|*.sock|*-wal|*-shm|*-journal) continue ;;
+      esac
+      a="$(sha256sum "$1/$f" 2>/dev/null | cut -d" " -f1)"
+      b="$(sha256sum "$2/$f" 2>/dev/null | cut -d" " -f1)"
+      [[ "$a" == "$b" ]] || printf '%s\n' "$f"
+      true
+    done
+}
+
 fingerprint() {
   local root="$1"
   ( cd "$root" && find . -depth -print0 | sort -z | while IFS= read -r -d '' e; do
@@ -167,13 +185,28 @@ RUNPID="$FIXTURE/service.pid"
 
 # A real process, in its own process group, holding a real descriptor inside the
 # service tree -- exactly what migrate_assert_quiesced must detect.
+# A real service writes during its clean SHUTDOWN and again on STARTUP. Jellyfin
+# appends its shutdown sequence to the day log and runs a SQLite optimize (743
+# bytes on the first production pilot), then on restart writes more log lines,
+# rewrites scheduled-task timestamps, and recreates its -wal/-shm sidecars.
+#
+# The stub models that, because a pilot harness that required the pre-stop tree to
+# equal the post-restart tree would abort on a perfect migration -- which is
+# exactly what happened on the first production run.
+svc_lifecycle_log() { printf '%s\n' "\$1" >> "$SVC/config/service.log"; }
+
 svc_start() {
+  svc_lifecycle_log "startup \$(date +%s%N)"
+  : > "$SVC/config/service.lock"
+  printf 'wal-data\n' > "$SVC/config/data/library.db-wal"
   [[ -e "\$RUNPID" ]] && return 0
   setsid bash -c 'echo \$\$ > "\$1"; exec sleep 600' _ "\$RUNPID" \\
     < "$SVC/config/jellyfin.db" >/dev/null 2>&1 &
   for _ in \$(seq 1 40); do [[ -s "\$RUNPID" ]] && break; sleep 0.05; done
 }
 svc_stop() {
+  svc_lifecycle_log "clean shutdown \$(date +%s%N)"
+  rm -f "$SVC/config/service.lock" "$SVC/config/data/library.db-wal"
   [[ -s "\$RUNPID" ]] || { rm -f "\$RUNPID"; return 0; }
   kill "\$(cat "\$RUNPID")" 2>/dev/null
   for _ in \$(seq 1 40); do kill -0 "\$(cat "\$RUNPID")" 2>/dev/null || break; sleep 0.05; done
@@ -261,17 +294,39 @@ DEV_PARENT="$(stat -c %d "$DATA")"; DEV_SVC="$(stat -c %d "$SVC")"
   || fail "nested subvolume shares its parent's st_dev ($DEV_SVC); the coverage check's premise is FALSE"
 ok "nested subvolume has a distinct st_dev" "parent=$DEV_PARENT child=$DEV_SVC"
 
-# --- content and metadata survived exactly ---------------------------------
+# --- the lifecycle states, which must not be conflated ----------------------
+#
+#   A  pre-stop baseline        (BASELINE, taken while the service was running)
+#   B  source after clean stop  (what the migration actually copied)
+#   C  .premigration            (B, preserved unchanged)
+#   D  the copied subvolume     (verified inside migrate_verify)
+#   E  the proof snapshot       (D, captured while still quiesced)
+#   F  the live tree            (the service is running again)
+#
+# The integrity claim is C == E, asserted below. Both are static.
+#
+# A == F is NOT an integrity test, and asserting it is a real bug: the first
+# production pilot aborted on a perfect migration because Jellyfin appended 743
+# bytes of shutdown log and ran a SQLite optimize before the copy, then wrote more
+# on restart. The simulated service here does the same on purpose.
 AFTER="$(fingerprint "$SVC")"
-[[ "$AFTER" == "$BASELINE" ]] \
-  || fail "the migrated tree differs from the original (fp $AFTER vs $BASELINE)"
-ok "tree is byte- and metadata-identical" "fp=${AFTER:0:12}"
+if [[ "$AFTER" == "$BASELINE" ]]; then
+  ok "live tree still matches the pre-stop baseline" "fp=${AFTER:0:12}"
+else
+  ok "live tree differs from the pre-stop baseline (expected)" "A=${BASELINE:0:8} F=${AFTER:0:8}"
+fi
 
 [[ -L "$SVC/config/library-link" ]] || fail "the relative symlink is not a symlink any more"
 [[ "$(readlink "$SVC/config/library-link")" == "data/library" ]] || fail "relative symlink retargeted"
 [[ "$(readlink "$SVC/config/media-link")" == "/srv/media" ]] || fail "absolute symlink retargeted"
 [[ -d "$SVC/config/empty" ]] || fail "the empty directory did not survive"
 [[ "$(stat -c %a "$SVC/config/jellyfin.db")" == "600" ]] || fail "permissions were not preserved"
+# The service really did write during its clean shutdown and its restart, or the
+# lifecycle this test exists to model was not exercised at all.
+grep -q 'clean shutdown' "$SVC/config/service.log" \
+  || fail "the simulated service did not write during clean shutdown; the lifecycle is not modelled"
+grep -q 'startup' "$SVC/config/service.log" \
+  || fail "the simulated service did not write on startup; the lifecycle is not modelled"
 [[ "$(stat -c %Y "$SVC/config/jellyfin.db")" == "$(date -d '2024-03-01 12:34:56' +%s)" ]] \
   || fail "mtime was not preserved"
 ok "symlinks, empty dir, modes and mtimes preserved"
@@ -288,9 +343,9 @@ ok "apparent size after migration" "${USED_KB} KiB"
 # --- .premigration retained, and it is the original ------------------------
 PRE="$DATA/jellyfin.premigration"
 [[ -d "$PRE" ]] || fail ".premigration was not retained"
-[[ "$(fingerprint "$PRE")" == "$BASELINE" ]] || fail ".premigration is not the original tree"
+PRE_FP="$(fingerprint "$PRE")"
 [[ "$(stat -c %i "$PRE")" != "256" ]] || fail ".premigration should be the original ordinary directory"
-ok ".premigration retained and identical to the original"
+ok ".premigration retained" "fp=${PRE_FP:0:12}"
 
 # --- proof snapshot exists, is read-only, and was taken while quiesced ------
 PROOF="$(sed -n 's/^  proof snapshot  : //p' <<< "$MIG_OUT" | tail -1)"
@@ -299,9 +354,58 @@ PROOF="$(sed -n 's/^  proof snapshot  : //p' <<< "$MIG_OUT" | tail -1)"
 [[ "$(stat -c %i "$SNAPS/$PROOF")" == "256" ]] || fail "the proof snapshot is not a subvolume"
 [[ "$(btrfs property get -ts "$SNAPS/$PROOF" 2>/dev/null)" == "ro=true" ]] \
   || fail "the proof snapshot is not read-only"
-[[ "$(fingerprint "$SNAPS/$PROOF")" == "$BASELINE" ]] \
-  || fail "the proof snapshot does not match the migrated tree"
-ok "proof snapshot is a read-only subvolume matching the tree" "$PROOF"
+PROOF_FP="$(fingerprint "$SNAPS/$PROOF")"
+ok "proof snapshot is a read-only subvolume" "$PROOF"
+
+# ---- THE INTEGRITY ASSERTION: C == E ---------------------------------------
+# The original that was moved aside, against a snapshot of the copy that replaced
+# it. Both static, so the running service cannot disturb this comparison -- which
+# makes it strictly stronger evidence than anything involving the live tree.
+[[ "$PRE_FP" == "$PROOF_FP" ]] \
+  || fail "INTEGRITY: .premigration and the proof snapshot differ ($PRE_FP vs $PROOF_FP)"
+ok "INTEGRITY PROVEN: .premigration == proof snapshot" "${PRE_FP:0:12}"
+
+# ---- nothing may have been LOST since the snapshot -------------------------
+missing="$(cd "$SNAPS/$PROOF" && find . -type f -print | sort | while IFS= read -r f; do
+             [[ -e "$SVC/$f" ]] || printf '%s\n' "$f"; done)"
+[[ -z "$missing" ]] || fail "files in the proof snapshot are missing from the live tree: $missing"
+ok "nothing lost since the snapshot"
+
+# ---- the live divergence must be confined to runtime state -----------------
+changed="$(cd "$SNAPS/$PROOF" && find . -type f -print | sort | while IFS= read -r f; do
+             a="$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)"
+             b="$(sha256sum "$SVC/$f" 2>/dev/null | cut -d" " -f1)"
+             [[ -n "$a" && "$a" != "$b" ]] && printf '%s\n' "$f"
+             true; done)"
+added="$(cd "$SVC" && find . -type f -print | sort | while IFS= read -r f; do
+             [[ -e "$SNAPS/$PROOF/$f" ]] || printf '%s\n' "$f"; done)"
+[[ -n "$changed$added" ]] \
+  || fail "the service wrote nothing after restart; the lifecycle divergence is not being exercised"
+
+unexpected=""
+for f in $changed $added; do
+  case "$f" in
+    */log/*|*.log|*/.*-log|*/ScheduledTasks/*|*.pid|*.lock|*.sock|*-wal|*-shm|*-journal) ;;
+    *) unexpected="$unexpected $f" ;;
+  esac
+done
+[[ -z "$unexpected" ]] \
+  || fail "the live tree diverged outside expected runtime state:$unexpected"
+ok "live divergence is runtime state only" "$(printf '%s' "$changed$added" | grep -c .) path(s)"
+
+# ---- and REAL corruption in the copy must still fail ------------------------
+# The classifier must not have become a blanket excuse: a content difference in a
+# non-runtime file between the two STATIC trees is exactly what it must catch.
+corrupt_probe="$SNAPS/corruption-probe-$$"
+btrfs subvolume snapshot "$SNAPS/$PROOF" "$corrupt_probe" >/dev/null 2>&1 \
+  || fail "could not stage a writable copy of the proof snapshot"
+printf 'CORRUPTED\n' >> "$corrupt_probe/config/jellyfin.db"
+[[ "$(fingerprint "$corrupt_probe")" != "$PROOF_FP" ]] \
+  || fail "a corrupted copy of the proof snapshot fingerprinted the same; the comparison is blind"
+ok "a corrupted static copy is still detected" "db content change caught"
+btrfs property set -ts "$corrupt_probe" ro false >/dev/null 2>&1
+find "$corrupt_probe" -mindepth 1 -depth -exec rm -rf {} + 2>/dev/null
+rmdir "$corrupt_probe" 2>/dev/null
 
 # Ordering: proof BEFORE restart, from the lifecycle log the service really wrote.
 PROOF_AT="$(grep -n 'migrate\[proof\]' <<< "$MIG_OUT" | head -1 | cut -d: -f1)"
@@ -336,7 +440,7 @@ rm -f "$SVC/config/tiny.conf"
 printf 'brand new file\n' > "$SVC/config/added-after-snapshot.txt"
 chmod 0777 "$SVC/config/plugins"
 MUTATED="$(fingerprint "$SVC")"
-[[ "$MUTATED" != "$BASELINE" ]] || fail "the mutation did not change the tree"
+[[ "$MUTATED" != "$PROOF_FP" ]] || fail "the mutation did not change the tree"
 ok "deterministic mutation applied" "fp=${MUTATED:0:12}"
 run "svc_start; sleep 0.2" >/dev/null
 
@@ -345,10 +449,23 @@ run "svc_start; sleep 0.2" >/dev/null
 RB_OUT="$(run "restore_snapshot_for_service jellyfin '$SNAP_A'")"; RB_RC=$?
 (( RB_RC == 0 )) || { printf '%s\n' "$RB_OUT"; fail "the real rollback failed (rc=$RB_RC)"; }
 
-RESTORED="$(fingerprint "$SVC")"
-[[ "$RESTORED" == "$BASELINE" ]] \
-  || fail "rollback did not restore the original tree (fp $RESTORED vs $BASELINE)"
-ok "tree restored to the pre-mutation state" "fp=${RESTORED:0:12}"
+# The rollback restores from the SNAPSHOT, and the service restarts afterwards and
+# writes lifecycle state again -- so the claim is "every file in the snapshot came
+# back byte-for-byte", not "the tree equals the pre-stop baseline". Comparing
+# against the baseline here is the same conflation that aborted the first
+# production pilot, one state further along.
+rb_wrong="$(cd "$SNAPS/$SNAP_A" && find . -type f -print | sort | while IFS= read -r f; do
+              case "$f" in
+                */log/*|*.log|*/.*-log|*/ScheduledTasks/*|*.pid|*.lock|*.sock|*-wal|*-shm|*-journal) continue ;;
+              esac
+              a="$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)"
+              b="$(sha256sum "$SVC/$f" 2>/dev/null | cut -d" " -f1)"
+              [[ "$a" == "$b" ]] || printf '%s\n' "$f"
+              true; done)"
+[[ -z "$rb_wrong" ]] \
+  || fail "rollback did not restore these files from the snapshot:
+$rb_wrong"
+ok "every non-runtime file restored from the snapshot" "byte-for-byte"
 [[ "$(sha256sum "$SVC/config/jellyfin.db" | cut -d' ' -f1)" == "$BASELINE_DB" ]] \
   || fail "the database file was not restored byte-for-byte"
 [[ -f "$SVC/config/tiny.conf" ]] || fail "the deleted file did not come back"
@@ -367,14 +484,21 @@ ok "restored path is still a Btrfs subvolume" "inode=256"
 # it. That copy is the only way back if the restore was the wrong choice.
 RB_DIR="$(find "$DATA" -maxdepth 1 -name 'jellyfin.rollback-*' | head -1)"
 [[ -n "$RB_DIR" ]] || fail "the rollback did not preserve the previous live state"
-[[ "$(fingerprint "$RB_DIR")" == "$MUTATED" ]] \
-  || fail "the preserved copy is not the state that was replaced"
+# The preserved copy is the MUTATED state as it was when the rollback stopped the
+# service -- which includes that shutdown's lifecycle writes, so compare the files
+# that were deliberately mutated rather than the whole-tree fingerprint.
+[[ "$(cat "$RB_DIR/config/jellyfin.db")" == "MUTATED-CONTENT-THAT-MUST-BE-REVERTED" ]] \
+  || fail "the preserved copy does not hold the mutated database"
+[[ -f "$RB_DIR/config/added-after-snapshot.txt" ]] \
+  || fail "the preserved copy is missing the file that was added before the rollback"
+[[ ! -e "$RB_DIR/config/tiny.conf" ]] \
+  || fail "the preserved copy should not contain the file that was deleted before the rollback"
 ok "previous live state preserved and intact" "$(basename "$RB_DIR")"
 
 # The snapshot itself must be untouched and still read-only.
 [[ "$(btrfs property get -ts "$SNAPS/$SNAP_A" 2>/dev/null)" == "ro=true" ]] \
   || fail "the source snapshot is no longer read-only"
-[[ "$(fingerprint "$SNAPS/$SNAP_A")" == "$BASELINE" ]] || fail "the source snapshot was modified"
+[[ "$(fingerprint "$SNAPS/$SNAP_A")" == "$PROOF_FP" ]] || fail "the source snapshot was modified"
 ok "source snapshot untouched and still read-only"
 
 grep -q 'compose stop jellyfin' "$FIXTURE/lifecycle.log" || fail "rollback did not stop the service"
@@ -565,7 +689,9 @@ ok "restart/health failure: .premigration preserved intact"
 # --- rollback restore failure ------------------------------------------------
 # The live state must be put back when the restore itself fails, never left
 # missing. jellyfin is migrated and has a real snapshot to aim at.
-LIVE_FP="$(fingerprint "$SVC")"
+LIVE_REF="$FIXTURE/live-ref"
+rm -rf "$LIVE_REF"; mkdir -p "$LIVE_REF"
+cp -a "$SVC/." "$LIVE_REF/"      # a static reference copy of the live tree
 out="$(run "btrfs() {
   if [[ \"\${1:-}\" == subvolume && \"\${2:-}\" == snapshot ]]; then return 1; fi
   command btrfs \"\$@\"
@@ -573,8 +699,10 @@ out="$(run "btrfs() {
 restore_snapshot_for_service jellyfin '$SNAP_A'")"; rc=$?
 (( rc != 0 )) || fail "a failed restore reported success"
 [[ -d "$SVC" ]] || fail "the service path is missing after a failed restore"
-[[ "$(fingerprint "$SVC")" == "$LIVE_FP" ]] \
-  || fail "the live state was not put back after a failed restore"
+left="$(nonruntime_diff "$LIVE_REF" "$SVC")"
+[[ -z "$left" ]] \
+  || fail "the live state was not put back after a failed restore; these differ:
+$left"
 grep -qi 'previous state put back' <<< "$out" || fail "the recovery was not reported: $out"
 ok "failed restore: live state put back intact"
 
@@ -586,19 +714,19 @@ btrfs subvolume snapshot -r "$SVC" "$COLLIDE" >/dev/null 2>&1 \
   || fail "could not stage a collision snapshot"
 out="$(run "btrfs subvolume snapshot -r '$SVC' '$COLLIDE'" 2>&1)"; rc=$?
 (( rc != 0 )) || fail "btrfs silently accepted a colliding snapshot name"
-[[ "$(fingerprint "$COLLIDE")" == "$LIVE_FP" ]] || fail "the existing snapshot was overwritten"
+[[ -z "$(nonruntime_diff "$LIVE_REF" "$COLLIDE")" ]] || fail "the existing snapshot was overwritten"
 ok "snapshot name collision refused by Btrfs" "existing snapshot untouched"
 
 # --- rollback against a snapshot that no longer exists ------------------------
 out="$(run "restore_snapshot_for_service jellyfin 'jellyfin-19990101-000000-gone'")"; rc=$?
 (( rc != 0 )) || fail "a rollback ran against a missing snapshot"
-[[ "$(fingerprint "$SVC")" == "$LIVE_FP" ]] || fail "a refused rollback disturbed live state"
+[[ -z "$(nonruntime_diff "$LIVE_REF" "$SVC")" ]] || fail "a refused rollback disturbed live state"
 ok "rollback against a missing snapshot refused"
 
 # --- rollback against another service's snapshot ------------------------------
 out="$(run "restore_snapshot_for_service jellyfin '$(basename "$COLLIDE" | sed 's/^jellyfin/navidrome/')'")"; rc=$?
 (( rc != 0 )) || fail "a rollback accepted another service's snapshot name"
-[[ "$(fingerprint "$SVC")" == "$LIVE_FP" ]] || fail "a refused rollback disturbed live state"
+[[ -z "$(nonruntime_diff "$LIVE_REF" "$SVC")" ]] || fail "a refused rollback disturbed live state"
 ok "rollback against a foreign snapshot name refused"
 
 # --- a nested subvolume must refuse the snapshot -----------------------------
