@@ -397,6 +397,39 @@ domum_subvolume_nested_children() {
 }
 # END SHARED SUBVOLUME HELPER
 
+# Migration and rollback both deliberately KEEP the copy they displaced --
+# `.premigration` from a migration, `.rollback-<stamp>` from a restore -- because
+# it is the only way back if the new state turns out to be wrong. Nothing deletes
+# them, and until now nothing mentioned them either.
+#
+# They sit inside BACKUP_INCLUDE_PATHS (which defaults to the whole data root), so
+# they are backed up nightly, forever. Content dedups in restic, but file counts,
+# sampling and backup runtime all grow, and the operator who was told "remove it
+# yourself when satisfied" has nothing reminding them.
+#
+# `.new` is different: it is a live staging directory during a migration and a
+# leftover from an interrupted one afterwards. Reported separately because its
+# presence blocks the next migration attempt.
+report_migration_leftovers() {
+  local root="${DOMUM_DATA_ROOT%/}" pre=0 rb=0 new=0 bytes=0 d sz
+  if [[ -d "$root" ]]; then
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      case "$d" in
+        *.premigration)  pre=$(( pre + 1 )) ;;
+        *.rollback-*)    rb=$(( rb + 1 )) ;;
+        *.new)           new=$(( new + 1 )) ;;
+        *) continue ;;
+      esac
+      sz="$(du -sb --apparent-size "$d" 2>/dev/null | cut -f1)"
+      [[ "$sz" =~ ^[0-9]+$ ]] && bytes=$(( bytes + sz ))
+    done < <(find "$root" -maxdepth 1 -mindepth 1 \
+               \( -name '*.premigration' -o -name '*.rollback-*' -o -name '*.new' \) 2>/dev/null)
+  fi
+  jq -cn --argjson pre "$pre" --argjson rb "$rb" --argjson new "$new" --argjson bytes "$bytes" \
+    '{premigration:$pre, rollback_copies:$rb, staging:$new, total_bytes:$bytes}'
+}
+
 report_snapshot_protection() {
   local service="$1" path="$2" state reason latest="" latest_epoch="" tier
   tier="$(report_service_tier "$service")"
@@ -770,6 +803,7 @@ report_generate_json() {
     --argjson protection "$(jq -s . "$protection_file")" --arg image_policy "${IMAGE_AUTO_UPDATE_ENABLED:-0}" \
     --arg snapshot_policy "${SNAPSHOT_POLICY:-REQUIRED}" \
     --argjson exposure "$(jq -s . "$exposure_file")" \
+    --argjson leftovers "$(report_migration_leftovers)" \
     --arg immich_enabled "${ENABLE_IMMICH:-0}" \
     '{schema_version:2,generated_at:$generated,overall:"unknown",
       host:{uptime_seconds:$uptime,load:{one:$load1,five:$load5,fifteen:$load15},memory:{total_bytes:$mem_total,available_bytes:$mem_available,used_bytes:$mem_used,used_percent:$mem_percent},temperature_c:$temperature,pending_reboot:$reboot},
@@ -777,7 +811,8 @@ report_generate_json() {
       immich:{enabled:($immich_enabled=="1"),library:$library,database_dump:$dump},
       backups:{heartbeat:{state:$heartbeat_state,last_success_at:$heartbeat_at,age_seconds:$heartbeat_age},timer:$backup_timer,check_timer:$check_timer,latest_snapshots:$snapshots,targets:$targets,restore_verification:$restore_verification,asset_sample:$asset_sample},
       recovery_pack:$recovery,updates:{image_refresh:{policy_enabled:($image_policy=="1"),timer:$image_timer},candidates:$candidates},snapshot_protection:{policy:($snapshot_policy|ascii_upcase),enforced:(($snapshot_policy|ascii_upcase)=="REQUIRED"),services:$protection},
-      container_state:[$exposure[]|select((.state|length) > 0)],findings:[]}')"
+      container_state:[$exposure[]|select((.state|length) > 0)],
+      migration_leftovers:$leftovers,findings:[]}')"
   findings="$(jq -c '[
     (.failed_systemd_units | select(.count != null and .count > 0) | {level:"critical",message:((.count|tostring)+" failed systemd service unit(s)"),action:"Run: systemctl --failed"}),
     (.failed_systemd_units | select(.count == null) | {level:"warning",message:"Failed systemd units could not be determined",action:"Verify systemctl is available to the reporting user"}),
@@ -816,6 +851,18 @@ report_generate_json() {
       {level:"critical",
        message:(.service+" contains nested subvolume(s); snapshots of it would silently omit them, so no snapshot of it can be trusted"),
        action:"Remove or separately migrate the nested subvolume(s); see docs/SNAPSHOT-MODEL.md"}),
+    # Retained on purpose, deleted by nothing, and backed up nightly forever.
+    # Info, not a warning: keeping them is correct until the operator is satisfied.
+    (.migration_leftovers | select((.premigration + .rollback_copies) > 0) |
+      {level:"info",
+       message:(((.premigration + .rollback_copies)|tostring)+" retained pre-migration/rollback copy(ies) under the data root, "
+                +((.total_bytes/1048576)|floor|tostring)+" MiB, included in every backup"),
+       action:"Remove them once the migrated or restored state is confirmed good; nothing deletes them automatically"}),
+    # A leftover .new is different: it blocks the next migration attempt.
+    (.migration_leftovers | select(.staging > 0) |
+      {level:"warning",
+       message:((.staging|tostring)+" leftover .new staging directory(ies) under the data root from an interrupted migration"),
+       action:"Investigate and remove them; a migration refuses to start while one exists"}),
     (.snapshot_protection.services[] | select(.state == "unknown") | {level:"warning",message:(.service+" snapshot protection is unknown"),action:"Verify the state path and Btrfs tooling"}),
     (.filesystems[] | select(.used_percent != null and .used_percent >= 90) | {level:"warning",message:(.path+" is "+(.used_percent|tostring)+"% full"),action:"Free space or expand the filesystem"}),
     (select(.backups.heartbeat.state != "available") | {level:"critical",message:"No successful backup heartbeat is available",action:"Run and verify domum-media-backup"}),

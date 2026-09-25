@@ -557,4 +557,47 @@ if grep -nE "[A-Za-z]'[A-Za-z]" "$REPO_ROOT/bin/domum-media-report" | grep -E 'm
   fail "an apostrophe appears in the findings jq program or its comments; it will break the parse"
 fi
 
+# ---------------------------------------------------------------------------
+# Retained pre-migration and rollback copies must be reported.
+#
+# Both the migration and every restore deliberately KEEP the copy they displaced,
+# because it is the only way back if the new state is wrong. Nothing deletes them,
+# and nothing mentioned them -- while they sit inside BACKUP_INCLUDE_PATHS and are
+# backed up nightly, forever. After the Jellyfin pilot the operator has three
+# copies of that tree under the data root and no reminder that two are theirs to
+# remove.
+# ---------------------------------------------------------------------------
+mkdir -p "$DOMUM_DATA_ROOT/jellyfin.premigration" \
+         "$DOMUM_DATA_ROOT/plex.rollback-20260101-000000"
+head -c 3145728 /dev/zero > "$DOMUM_DATA_ROOT/jellyfin.premigration/blob"
+bash "$TMP_DIR/harness.sh" > "$TMP_DIR/report-left.json" 2>/dev/null \
+  || fail "report generation failed with migration leftovers present"
+
+jq -e '.migration_leftovers.premigration == 1 and .migration_leftovers.rollback_copies == 1' \
+  "$TMP_DIR/report-left.json" >/dev/null \
+  || fail "retained copies were not counted: $(jq -c .migration_leftovers "$TMP_DIR/report-left.json")"
+jq -e '.migration_leftovers.total_bytes > 3000000' "$TMP_DIR/report-left.json" >/dev/null \
+  || fail "the size of the retained copies was not measured"
+jq -e '[.findings[]|select(.message|test("retained pre-migration"))|.level]|first == "info"' \
+  "$TMP_DIR/report-left.json" >/dev/null \
+  || fail "retained copies must be reported as info; keeping them is correct until the operator is satisfied"
+jq -e 'any(.findings[]; .message|test("included in every backup"))' "$TMP_DIR/report-left.json" >/dev/null \
+  || fail "the finding must say the copies are being backed up, which is why they matter"
+
+# A leftover .new is a WARNING, not info: it blocks the next migration attempt.
+mkdir -p "$DOMUM_DATA_ROOT/kavita.new"
+bash "$TMP_DIR/harness.sh" > "$TMP_DIR/report-new.json" 2>/dev/null \
+  || fail "report generation failed with a leftover .new present"
+jq -e '[.findings[]|select(.message|test("leftover .new staging"))|.level]|first == "warning"' \
+  "$TMP_DIR/report-new.json" >/dev/null \
+  || fail "a leftover .new must warn; a migration refuses to start while one exists"
+rm -rf "$DOMUM_DATA_ROOT/kavita.new" "$DOMUM_DATA_ROOT/jellyfin.premigration" \
+       "$DOMUM_DATA_ROOT/plex.rollback-20260101-000000"
+
+# ...and with none present, neither finding may appear.
+bash "$TMP_DIR/harness.sh" > "$TMP_DIR/report-clean.json" 2>/dev/null
+jq -e '[.findings[]|select(.message|test("retained pre-migration|leftover .new"))]|length == 0' \
+  "$TMP_DIR/report-clean.json" >/dev/null \
+  || fail "leftover findings appeared with no leftovers present"
+
 echo "PASS: operational report smoke test"

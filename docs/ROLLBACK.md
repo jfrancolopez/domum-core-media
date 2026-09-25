@@ -36,14 +36,40 @@ Applying a rollback:
 
 ## Current production limitation
 
-The current service paths are ordinary directories rather than individual
-Btrfs subvolumes, so service-level snapshots are not available. The generic
-rollback path also records `IMAGE_BEFORE` but does not yet restore that image
-before Compose starts the service. Therefore rollback metadata is not proof of
-a usable rollback point.
+The current service paths are ordinary directories rather than individual Btrfs
+subvolumes, so service-level snapshots are not available and rollback metadata is
+not proof of a usable rollback point.
 
-Do not run `rollback apply` against production until the snapshot exists and
-the previous-image restoration path has been corrected.
+Once a service **is** migrated, the report distinguishes the cases rather than
+calling them all `protected`: `snapshottable` means the path can be snapshotted
+but nothing has been, and `degraded` means snapshots of it would silently omit a
+nested subvolume. Only `protected` means a rollback is actually possible. See
+`docs/SNAPSHOT-MODEL.md`.
+
+`rollback apply` restores **data only.**
+
+`restore_snapshot_for_service` restores the snapshot and then runs
+`compose_cmd up -d`. It never re-pins `IMAGE_BEFORE`, so the service comes back
+on whatever image it was already running. For the automatic rollback after a
+failed health check that means it restarts on the **same image that just failed**.
+
+That is now reported as `rolled_back_data_only` with result `partial`, and a
+manual `rollback apply` warns when the entry records a different image. It used to
+record an unqualified `success`, which said the opposite of what happened.
+Restoring the image is `backlog/task-24-rollback-previous-image.md`.
+
+**What this means in practice:**
+
+| situation | safe to run? |
+|---|---|
+| rolling back *data* to a snapshot, image unchanged | yes — this is what the Jellyfin pilot drill does, and its entry records no image at all |
+| rolling back after a stateful **image** update | data comes back; the image does **not**. Re-pin it yourself |
+
+Earlier revisions of this document said *"do not run `rollback apply` against
+production until the snapshot exists and the previous-image restoration path has
+been corrected"*, while `docs/JELLYFIN-PILOT.md` step 3 instructs exactly that.
+Both were right about their own case and contradicted each other. The pilot drill
+is data-only by construction, so it is in scope; an image rollback is not.
 
 The restore itself no longer deletes live state. Whatever is at the service
 path is **moved aside** to `<path>.rollback-<timestamp>` first, whatever its

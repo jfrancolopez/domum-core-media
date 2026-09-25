@@ -100,6 +100,12 @@ sudo domum-media rollback apply <id-from-step-a>
 ls -l /srv/data/jellyfin/PILOT-MARKER      # expected: No such file
 sudo domum-media report
 ```
+> This drill is **data-only**, which is exactly what it needs to be. The
+> proof-snapshot entry records no image at all, so there is no image half to
+> restore. `docs/ROLLBACK.md` explains why `rollback apply` after a *stateful
+> image update* is a different and incomplete operation — that is
+> `backlog/task-24`, and it is not what this step exercises.
+
 
 The rollback moves the current state aside to
 `/srv/data/jellyfin.rollback-<timestamp>` rather than deleting it, so step (e)
