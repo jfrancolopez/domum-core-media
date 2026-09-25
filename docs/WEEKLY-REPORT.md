@@ -147,6 +147,13 @@ at 08:00 with a 45-minute randomised delay.
 deliberately once the output has been reviewed on the host:
 
 ```bash
+# The unit is NOT installed by default -- it is in the repository but not in
+# /etc/systemd/system, so this would fail with "Unit not found" as written.
+# Install it first:
+sudo install -m 0644 /opt/domum-core-media/systemd/domum-media-weekly-report.service \
+                     /opt/domum-core-media/systemd/domum-media-weekly-report.timer \
+                     /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable --now domum-media-weekly-report.timer
 ```
 

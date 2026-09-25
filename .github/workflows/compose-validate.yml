@@ -88,6 +88,11 @@ jobs:
       - name: Btrfs migration integration test (skips without Btrfs)
         run: tests/integration/btrfs-migration-integration.sh
 
+      # systemd-analyze verify cannot detect a unit invoking a subcommand the CLI
+      # does not implement (CLAUDE.md section 9). This is that check.
+      - name: systemd unit subcommands exist
+        run: tests/unit-subcommands-exist-smoke.sh
+
       - name: systemd unit validation
         run: |
           sudo install -m 0755 bin/domum-media bin/domum-media-backup /usr/local/bin/
