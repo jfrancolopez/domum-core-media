@@ -199,7 +199,11 @@ Notes:
   a shellcheck pass that did not run.
 - `systemd-analyze verify` only checks unit syntax and that `ExecStart` binaries
   exist. It cannot detect a unit invoking a subcommand the CLI does not
-  implement. Verify subcommand existence separately.
+  implement. `tests/unit-subcommands-exist-smoke.sh` is that separate
+  verification, and it also reports host units absent from `systemd/` as drift.
+  The live host carries a disabled `domum-media-hot-prune.service` invoking
+  `domum-media hot prune`, a subcommand that no longer exists — which is what
+  prompted the check.
 - The smoke tests are hermetic (`mktemp -d` + cleanup trap) and safe to run.
 
 Run the tests appropriate to the changed area. Add regression coverage with a
