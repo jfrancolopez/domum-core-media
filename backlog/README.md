@@ -188,3 +188,8 @@ host**. Record that limitation rather than assuming its behavior.
 - Tasks marked **Operator: yes** must ship an `## Operator runbook` section
   and must never be auto-applied by timers — the repo change lands first,
   the host step runs only when Franco schedules it.
+
+- `task-43-pre-migration-hardening-record.md` — **record, not work.** What landed
+  in the migration/snapshot/rollback chain before the Jellyfin pilot, and why each
+  defect was dormant until the first subvolume exists. Read it before touching
+  that chain; it will save re-deriving the reasoning.

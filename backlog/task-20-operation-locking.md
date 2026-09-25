@@ -1,5 +1,45 @@
 # Task 20 — Operation locking (flock)
 
+Status: **PARTIALLY DONE.** The lock exists and is enforced for the operations
+that can destroy or move data. Three call sites in the original scope remain.
+
+Landed (see `docs/OPERATION-LOCK.md`):
+
+| operation | behaviour |
+|---|---|
+| `storage migrate-subvolume` | refuse immediately (attended) |
+| `rollback apply` | refuse immediately (attended) |
+| daily backup | wait 1800s (unattended, never retried by a human) |
+| `snapshot prune` | wait 900s — it *deletes* snapshots |
+| `snapshot create` | wait 900s |
+| `host-upgrade` | wait 1800s — it upgrades `docker-ce`, restarting the daemon |
+
+The lock is an open file descriptor held by `flock`, so the kernel releases it on
+any exit including `SIGKILL`; there is no stale-lock reaper by design. The helper
+is duplicated byte-identically between `bin/domum-media` and
+`bin/domum-media-backup` and pinned by `tests/operation-lock-smoke.sh`, because
+two copies computing different lock paths would exclude nothing and fail
+silently.
+
+`compose_cmd` closes the lock descriptor for the command it runs: every child
+inherits it, and a service started under the lock would otherwise hold it
+forever. That one was found by the real-Btrfs integration test, not by reasoning.
+
+## Remaining scope
+
+Three operations from the original objective still take no lock:
+
+- **`apply`** — recreates containers. Racing a migration means the daemon brings
+  a service up while its data directory is being copied or renamed.
+- **image update / image refresh** — recreates containers *and* takes a
+  pre-update snapshot. The timer is disabled, so this is reachable only by hand
+  today, which is exactly when an operator might run it beside something else.
+- **Immich bundle apply** — takes a pre-bundle snapshot and recreates the stack.
+
+None of these can corrupt data *today*, because no service path is a subvolume
+and every snapshot gate therefore refuses. All three become live the moment the
+first migration lands. Treat as the next locking increment, not as done.
+
 ## Objective
 Add a single host-level operation lock so `apply`, image refresh/updates,
 backup, rollback, and the Immich bundle manager can never run concurrently —
