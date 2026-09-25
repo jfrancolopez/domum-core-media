@@ -1315,9 +1315,32 @@ service_snapshot_base_name() {
   basename -- "$path"
 }
 
+# Ordered OLDEST FIRST, by the timestamp this code puts in the snapshot name --
+# not by the directory mtime.
+#
+# `btrfs subvolume snapshot` copies the SOURCE subvolume root's mtime into the
+# snapshot, so mtime is useless as a creation order. Measured on this host:
+#
+#   1790343086   s-20260101-000000-old
+#   1790343087   s-20260601-000000-mid
+#   1790343086   s-20261231-235959-newest     <- taken last, after a rollback
+#
+# Every snapshot of one service ties while the source root is untouched, and
+# after a rollback -- when the live subvolume is recreated from an OLD snapshot
+# and inherits its mtime -- a NEW snapshot sorts before existing ones. Ordered by
+# mtime that list reads old, newest, mid: `snapshot_prune` deletes
+# `snaps[0..drop-1]`, so it would have deleted the newest recovery point while
+# keeping an older one, and `latest_snapshot_for_service` (tail -1) would have
+# named the wrong snapshot as the latest -- which the report then quotes.
+#
+# The name carries `-YYYYMMDD-HHMMSS-` and this code generates it, so it is both
+# authoritative and stable. A name without that field is EXCLUDED rather than
+# ordered arbitrarily: it would otherwise be either pruned first (deleting
+# something we did not create) or reported as the latest snapshot. It is
+# announced on stderr so it is not simply invisible; `snapshot list` still shows it.
 list_snapshots_for_base() {
   local base="$1"
-  local tmp_file path name mtime
+  local tmp_file path name stamp
 
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
 
@@ -1326,13 +1349,17 @@ list_snapshots_for_base() {
   for path in "$DOMUM_SNAPSHOT_ROOT"/"$base"-*; do
     [[ -d "$path" ]] || continue
     name="$(basename -- "$path")"
-    mtime="$(snapshot_path_mtime "$path")" || continue
-    printf '%s\t%s\n' "$mtime" "$name" >> "$tmp_file"
+    stamp="$(printf '%s' "$name" | sed -nE 's/^.*-([0-9]{8})-([0-9]{6})(-.*)?$/\1\2/p')"
+    if [[ -z "$stamp" ]]; then
+      printf '%s\n' "[domum-media] Ignoring snapshot with an unrecognised name: $name" >&2
+      continue
+    fi
+    printf '%s\t%s\n' "$stamp" "$name" >> "$tmp_file"
   done
   shopt -u nullglob
 
   if [[ -s "$tmp_file" ]]; then
-    sort -n "$tmp_file" | cut -f2-
+    sort "$tmp_file" | cut -f2-
   fi
   rm -f "$tmp_file"
 }
