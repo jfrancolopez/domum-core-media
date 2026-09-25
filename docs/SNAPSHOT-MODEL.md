@@ -252,3 +252,40 @@ five mutations of the logic are killed.
 The nested-children detector is now in the byte-identical shared block, so the
 CLI and the report cannot disagree about it — the same reason
 `domum_is_subvolume` lives there.
+
+## Snapshot order comes from the name, not the mtime
+
+`btrfs subvolume snapshot` copies the **source subvolume root's mtime** into the
+snapshot. It does not stamp a creation time. Measured on this host:
+
+```
+1790343086   s-20260101-000000-old
+1790343087   s-20260601-000000-mid
+1790343086   s-20261231-235959-newest     <- taken LAST, after a rollback
+```
+
+Two consequences, both measured rather than reasoned:
+
+- While the source root is untouched, **every snapshot of one service ties**, so
+  mtime carries no ordering information at all.
+- After a rollback the live subvolume is recreated from an old snapshot and
+  inherits its mtime, so the **next** snapshot — the newest recovery point there
+  is — carries an ancient mtime and sorts near the front.
+
+Ordered by mtime that list reads `old, newest, mid`. `snapshot_prune` deletes
+`snaps[0..drop-1]`, so it would have **deleted the newest recovery point while
+keeping an older one**, and `latest_snapshot_for_service` (`tail -1`) would have
+named the wrong snapshot as the latest — which the report then quotes as the
+service's snapshot age.
+
+`list_snapshots_for_base` now orders on the `-YYYYMMDD-HHMMSS-` field in the
+name, which this code generates and fully controls. A snapshot whose name lacks
+that field is **excluded and announced on stderr**, rather than ordered
+arbitrarily: it would otherwise be pruned first — deleting something this code
+did not create — or reported as the latest snapshot.
+
+The prune test previously seeded fixtures with
+`touch -d "2026-01-01 00:00:00 +$i minutes"`, fabricating exactly the monotonic
+mtimes real Btrfs does not provide. It validated, and actively pinned, an
+ordering key that cannot work. The fixture now uses real name stamps with
+deliberately **identical** mtimes, plus the rollback case directly.
