@@ -3441,6 +3441,59 @@ recovery_pack_manifest() {
   done
 }
 
+# Uptime Kuma keeps its entire configuration -- monitors, notification targets,
+# status pages, the admin account -- in one SQLite database inside a Docker
+# volume. Nothing snapshots it, no backup target includes it, and it is the last
+# durable state on this host covered by nothing.
+#
+# It is NOT captured by copying the files. kuma.db runs in WAL mode with an
+# uncheckpointed -wal alongside it (8 KB live, right now), so a file copy is a
+# torn database -- exactly the reason the Immich artefact is a validated dump
+# rather than raw PostgreSQL storage (CLAUDE.md section 7).
+#
+# `sqlite3 .backup` uses the SQLite backup API: it takes a read lock, walks the
+# committed state including the WAL, and produces a consistent copy WITHOUT
+# stopping the service. Verified against the live database on this host:
+# integrity_check returned ok.
+#
+# The dump is written inside the container (its own filesystem), read back with
+# `docker cp`, and validated before it is accepted. An unvalidated dump is not
+# evidence, and a recovery pack that contains a corrupt database is worse than
+# one that admits it has none.
+uptime_kuma_dump() {
+  local dest="$1"
+  local container="${UPTIME_KUMA_CONTAINER:-uptime-kuma}"
+  local db="${UPTIME_KUMA_DB:-/app/data/kuma.db}"
+  local in_container="/tmp/kuma-recovery-$$.db"
+
+  cmd_exists docker || return 1
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$container" || return 1
+
+  docker exec "$container" sh -c \
+    "rm -f '$in_container' && sqlite3 '$db' \".backup '$in_container'\"" >/dev/null 2>&1 || {
+      docker exec "$container" rm -f "$in_container" >/dev/null 2>&1
+      return 1
+    }
+
+  # Validate INSIDE the container, before trusting it enough to copy out.
+  local check
+  check="$(docker exec "$container" sqlite3 "$in_container" 'PRAGMA integrity_check;' 2>/dev/null || true)"
+  if [[ "$check" != "ok" ]]; then
+    warn "Uptime Kuma dump failed its integrity check: ${check:-no result}"
+    docker exec "$container" rm -f "$in_container" >/dev/null 2>&1
+    return 1
+  fi
+
+  docker cp "$container:$in_container" "$dest" >/dev/null 2>&1 || {
+    docker exec "$container" rm -f "$in_container" >/dev/null 2>&1
+    return 1
+  }
+  docker exec "$container" rm -f "$in_container" >/dev/null 2>&1
+  [[ -s "$dest" ]] || return 1
+  chmod 0600 "$dest"
+  return 0
+}
+
 recovery_pack_restore_instructions() {
   local stage_dir="$1"
   cat > "$stage_dir/RESTORE.txt" <<EOF
@@ -3452,7 +3505,20 @@ Recovery pack restore notes
 4. Restore state/backups/*-repo.env to $DOMUM_STATE_ROOT/backups with owner root:root.
 5. Restore state/immich/db_password.sha256 to
    $DOMUM_STATE_ROOT/immich/db_password.sha256 before restoring Immich data.
-6. If state/traefik/acme.json is present, restore it into the Traefik ACME
+6. If state/uptime-kuma/kuma.db is present, restore it into the Uptime Kuma
+   data volume with the service STOPPED, then start it:
+
+     docker compose stop uptime-kuma
+     install -m 0644 state/uptime-kuma/kuma.db \\
+       "\$(docker volume inspect ${UPTIME_KUMA_DATA_VOLUME:-domum-media_uptime-kuma-data} --format '{{.Mountpoint}}')/kuma.db"
+     rm -f "\$(docker volume inspect ${UPTIME_KUMA_DATA_VOLUME:-domum-media_uptime-kuma-data} --format '{{.Mountpoint}}')/kuma.db-wal" \\
+           "\$(docker volume inspect ${UPTIME_KUMA_DATA_VOLUME:-domum-media_uptime-kuma-data} --format '{{.Mountpoint}}')/kuma.db-shm"
+     docker compose up -d uptime-kuma
+
+   The -wal and -shm files MUST be removed: they belong to the database being
+   replaced, and leaving them beside a different kuma.db corrupts it.
+
+7. If state/traefik/acme.json is present, restore it into the Traefik ACME
    volume before starting Traefik, as mode 0600 owned by root:root:
      docker volume create ${TRAEFIK_ACME_VOLUME:-domum-media_traefik-letsencrypt}
      install -m 0600 state/traefik/acme.json \
@@ -3639,6 +3705,19 @@ recovery_pack_create() {
       echo "[domum-media] recovery-pack: included Traefik ACME store"
     else
       warn "Traefik is enabled but its ACME store could not be located; the recovery pack will NOT contain it."
+    fi
+  fi
+  # Uptime Kuma, when it is running. Absence is not fatal -- it may be disabled
+  # or not yet started -- but a failure to capture a RUNNING one is reported,
+  # because silently shipping a recovery pack without it is how the gap the pack
+  # exists to close stays open.
+  if [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]]; then
+    mkdir -p "$stage_dir/state/uptime-kuma"
+    if uptime_kuma_dump "$stage_dir/state/uptime-kuma/kuma.db"; then
+      echo "[domum-media] recovery-pack: included Uptime Kuma database (validated)"
+    else
+      rmdir "$stage_dir/state/uptime-kuma" 2>/dev/null || true
+      warn "Uptime Kuma is enabled but its database could not be captured; the recovery pack will NOT contain it."
     fi
   fi
   git -C "$DOMUM_DIR" rev-parse HEAD > "$stage_dir/meta/git-revision.txt" 2>/dev/null || true
