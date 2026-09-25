@@ -1352,11 +1352,30 @@ list_snapshots_for_base() {
   for path in "$DOMUM_SNAPSHOT_ROOT"/"$base"-*; do
     [[ -d "$path" ]] || continue
     name="$(basename -- "$path")"
-    stamp="$(printf '%s' "$name" | sed -nE 's/^.*-([0-9]{8})-([0-9]{6})(-.*)?$/\1\2/p')"
-    if [[ -z "$stamp" ]]; then
+    # ANCHORED to the base name. Unanchored, `^.*-` is greedy and matches the last
+    # stamp anywhere in the name, so the glob "jellyfin-*" pulled in
+    # "jellyfin-extra-20260301-000000-c" and counted another service's snapshots
+    # toward jellyfin's retention -- and with a tight keep would have deleted
+    # jellyfin's real snapshots while preserving the other service's. Measured:
+    #
+    #   list_snapshots_for_base jellyfin  ->  jellyfin-20260101-000000-a
+    #                                         jellyfin-20260201-000000-b
+    #                                         jellyfin-extra-20260301-000000-c   <-- wrong
+    #                                         jellyfin-extra-20260401-000000-d   <-- wrong
+    #
+    # Not reachable with today's service names, because none is a "-"-prefix of
+    # another. Adding one (plex-hd, immich-ml) would arm it silently.
+    # Two different questions, and conflating them produced noise: "is this a
+    # snapshot at all?" and "is it THIS base's snapshot?".
+    if [[ ! "$name" =~ -[0-9]{8}-[0-9]{6}(-|$) ]]; then
+      # No timestamp anywhere: not something this code created. Announced, because
+      # it is then neither pruned nor reported as the latest snapshot.
       printf '%s\n' "[domum-media] Ignoring snapshot with an unrecognised name: $name" >&2
       continue
     fi
+    stamp="$(printf '%s' "$name" | sed -nE "s/^${base}-([0-9]{8})-([0-9]{6})(-.*)?\$/\1\2/p")"
+    # A valid snapshot belonging to a DIFFERENT base. Silently not ours.
+    [[ -n "$stamp" ]] || continue
     printf '%s\t%s\n' "$stamp" "$name" >> "$tmp_file"
   done
   shopt -u nullglob
@@ -1617,8 +1636,43 @@ Service state paths must be Btrfs subvolumes; see docs/SNAPSHOT-MODEL.md.
 To proceed deliberately without rollback protection, set SNAPSHOT_POLICY=WARN in $CFG_FILE."
 }
 
+# The retention count, validated, with a floor of 1.
+#
+# `drop=$(( total - keep ))` is honest arithmetic and that is the problem: with
+# keep=0 a prune deletes EVERY snapshot of a service, and with a negative value it
+# deletes them and then fails. Measured against the real snapshot_prune on a
+# fixture shaped like production (one Jellyfin snapshot):
+#
+#   keep=14   start=1  left=1   <- the default and the shipped example: safe
+#   keep=0    start=1  left=0   <- the only recovery point, gone
+#   keep=-5   start=1  left=0   <- gone, and rc=1
+#   keep=fourteen      rc=1     <- aborts under set -u, deleting nothing
+#
+# A RETENTION job must never leave a protected service with zero recovery points.
+# Deliberate wholesale removal is what `cleanup snapshots --confirm` is for, which
+# is attended and asks. So the floor is 1, and a non-numeric value falls back to
+# the default rather than failing a weekly timer forever.
+#
+# This also removes the need to trust the config to know the Sunday job is safe.
+snapshot_retention_keep() {
+  local raw="${1:-}" keep
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    keep="$raw"
+  else
+    [[ -n "$raw" ]] && warn "SNAPSHOT_KEEP_PER_SUBVOL is not a non-negative integer ('$raw'); using 14."
+    keep=14
+  fi
+  if (( keep < 1 )); then
+    warn "Retention of $keep would leave services with no recovery point; using 1."
+    warn "To remove snapshots deliberately, use: domum-media cleanup snapshots --confirm"
+    keep=1
+  fi
+  printf '%s' "$keep"
+}
+
 snapshot_prune() {
-  local keep="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
+  local keep
+  keep="$(snapshot_retention_keep "${SNAPSHOT_KEEP_PER_SUBVOL:-}")"
   local pruned=0 failed=0
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
   local names
@@ -1676,9 +1730,19 @@ stop_compose_services_verified() {
   }
   # Confirm each intended container is actually gone, one at a time: a
   # command-substituted pattern list would word-split unpredictably.
-  local still="" svc
+  #
+  # `docker ps | grep -q` is deliberately NOT used. Under this script's `pipefail`,
+  # `grep -q` exits at the first match, the left-hand command takes SIGPIPE, and
+  # the PIPELINE reports 141 -- so a match reads as "no match". Measured:
+  # `sed file | grep -q <hit>` returns 141. It does not bite at 130 bytes of
+  # `docker ps` output (0 inversions in 1000 trials) because that fits the pipe
+  # buffer and docker finishes first -- but "safe because the output is small" is
+  # not a property to rest the stop verification on, and an inverted result here
+  # would declare a RUNNING container stopped and let the migration proceed.
+  local still="" svc running
+  running="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
   for svc in $svcs; do
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$svc"; then
+    if grep -qFx -- "$svc" <<< "$running"; then
       still+="${still:+ }$svc"
     fi
   done
@@ -3417,9 +3481,10 @@ cleanup_snapshot_candidates() {
   # value is the LARGER of the two, so setting either knob can keep more snapshots
   # and never fewer. A cleanup command that quietly deletes past the retention
   # policy is not a cleanup.
-  local keep_policy="${SNAPSHOT_KEEP_PER_SUBVOL:-14}"
-  local keep_cleanup="${CLEANUP_OLD_SNAPSHOTS_KEEP:-$keep_policy}"
-  local keep="$keep_policy"
+  local keep_policy keep_cleanup keep
+  keep_policy="$(snapshot_retention_keep "${SNAPSHOT_KEEP_PER_SUBVOL:-}")"
+  keep_cleanup="$(snapshot_retention_keep "${CLEANUP_OLD_SNAPSHOTS_KEEP:-$keep_policy}")"
+  keep="$keep_policy"
   (( keep_cleanup > keep )) && keep="$keep_cleanup"
   local names base total drop i
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0

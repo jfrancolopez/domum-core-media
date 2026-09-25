@@ -204,4 +204,108 @@ cln="$(grep -E '^CLEANUP_OLD_SNAPSHOTS_KEEP=' "$REPO_ROOT/config/domum-media.con
 [[ -n "$pol" && -n "$cln" && "$cln" -ge "$pol" ]] \
   || fail "the example config sets CLEANUP_OLD_SNAPSHOTS_KEEP=$cln below SNAPSHOT_KEEP_PER_SUBVOL=$pol"
 
+# ---------------------------------------------------------------------------
+# 5. Retention can never leave a service with ZERO recovery points.
+#
+# `drop=$(( total - keep ))` is honest arithmetic, and that is the hazard. With
+# the first real service migrated, /srv/snapshots holds exactly ONE Jellyfin
+# snapshot -- so a keep of 0, or a negative or non-numeric value, would have had
+# the Sunday timer delete the only recovery point that service has. Measured
+# against the real snapshot_prune before the fix:
+#
+#   keep=14   start=1  left=1     the default and the shipped example: safe
+#   keep=0    start=1  left=0     the only recovery point, gone
+#   keep=-5   start=1  left=0     gone, and rc=1
+#
+# A RETENTION job must never zero a service. Deliberate wholesale removal is
+# `cleanup snapshots --confirm`, which is attended and asks.
+# ---------------------------------------------------------------------------
+keep_probe() {  # $1 = configured value, $2 = snapshots to seed -> prints survivors
+  rm -rf "$TMP_DIR/snapshots"; seed_snapshots jellyfin "$2"
+  bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL='$1'
+btrfs() { [[ \"\${1:-}\" == subvolume && \"\${2:-}\" == delete ]] && { rm -rf -- \"\${!#}\"; return 0; }; return 0; }
+snapshot_prune" >/dev/null 2>&1
+  ls -1 "$TMP_DIR/snapshots" 2>/dev/null | wc -l
+}
+
+for bad in 0 -5 fourteen " "; do
+  got="$(keep_probe "$bad" 1)"
+  (( got >= 1 )) \
+    || fail "SNAPSHOT_KEEP_PER_SUBVOL='$bad' left $got snapshots; retention must never zero a service"
+done
+# A malformed value must not make the weekly timer fail forever: it must warn,
+# fall back to the default, and still prune correctly. The floor alone cannot do
+# this -- bash arithmetic on "14abc" is an error, which under `set -e` aborts the
+# run and leaves retention unapplied every single week.
+rm -rf "$TMP_DIR/snapshots"; seed_snapshots jellyfin 20
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL='14abc'
+btrfs() { [[ \"\${1:-}\" == subvolume && \"\${2:-}\" == delete ]] && { rm -rf -- \"\${!#}\"; return 0; }; return 0; }
+snapshot_prune" 2>&1)"
+rc=$?
+(( rc == 0 )) || fail "a malformed SNAPSHOT_KEEP_PER_SUBVOL made the prune fail outright: $out"
+grep -qi 'not a non-negative integer' <<< "$out" \
+  || fail "a malformed retention value was not reported: $out"
+[[ "$(ls -1 "$TMP_DIR/snapshots" | wc -l)" == "14" ]] \
+  || fail "a malformed value did not fall back to the default retention of 14"
+
+# The cleanup path must go through the same validation, not its own arithmetic.
+rm -rf "$TMP_DIR/snapshots"; seed_snapshots jellyfin 20
+n="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=0
+CLEANUP_OLD_SNAPSHOTS_KEEP=0
+cleanup_snapshot_candidates" 2>/dev/null | grep -c . || true)"
+(( n <= 19 )) \
+  || fail "cleanup proposed deleting all $n snapshots; it must leave at least one recovery point"
+# Both knobs are validated, and the effective value is the larger of the two, so
+# a bad value in either alone is absorbed. That redundancy is deliberate -- but it
+# means neither is independently killable, so the assertion here is that with BOTH
+# at zero the floor still holds.
+(( n >= 1 )) || fail "cleanup proposed nothing to delete from 20 snapshots; the fixture is wrong"
+
+# ...and a sane value is honoured exactly, so the floor did not become a ceiling.
+[[ "$(keep_probe 14 20)" == "14" ]] || fail "keep=14 of 20 should leave 14, got $(keep_probe 14 20)"
+[[ "$(keep_probe 3 20)"  == "3"  ]] || fail "keep=3 of 20 should leave 3, got $(keep_probe 3 20)"
+[[ "$(keep_probe 14 1)"  == "1"  ]] || fail "keep=14 of 1 should leave 1 untouched"
+
+# ---------------------------------------------------------------------------
+# 6. One service's snapshots must never count toward another's retention.
+#
+# The stamp extraction was unanchored, so the glob "jellyfin-*" also matched
+# "jellyfin-extra-20260301-000000-c". With a tight keep, prune would have deleted
+# jellyfin's REAL snapshots while preserving the other service's. Not reachable
+# with today's names -- none is a "-"-prefix of another -- but adding plex-hd or
+# immich-ml would arm it silently.
+# ---------------------------------------------------------------------------
+rm -rf "$TMP_DIR/snapshots"; mkdir -p "$TMP_DIR/snapshots"
+for n in jellyfin-20260101-000000-a jellyfin-20260201-000000-b \
+         jellyfin-extra-20260301-000000-c jellyfin-extra-20260401-000000-d \
+         calibre-web-20260501-000000-e; do
+  mkdir -p "$TMP_DIR/snapshots/$n"
+done
+listed() { bash -c "$(harness)
+list_snapshots_for_base '$1'" 2>/dev/null | tr '\n' ' '; }
+
+got="$(listed jellyfin)"
+[[ "$got" == *jellyfin-20260101* && "$got" == *jellyfin-20260201* ]] \
+  || fail "base 'jellyfin' lost its own snapshots: $got"
+[[ "$got" != *jellyfin-extra* ]] \
+  || fail "base 'jellyfin' claimed another service's snapshots: $got"
+[[ "$got" != *calibre-web* ]] || fail "base 'jellyfin' claimed calibre-web snapshots: $got"
+
+got="$(listed jellyfin-extra)"
+[[ "$got" == *jellyfin-extra-20260301* ]] || fail "base 'jellyfin-extra' lost its own snapshots: $got"
+[[ "$got" != *"jellyfin-20260101"* ]] || fail "base 'jellyfin-extra' claimed jellyfin snapshots: $got"
+
+# A name with no timestamp at all is announced; a name belonging to another base
+# is silently skipped. Conflating those two produced noise on every listing.
+mkdir -p "$TMP_DIR/snapshots/jellyfin-handmade"
+err="$(bash -c "$(harness)
+list_snapshots_for_base jellyfin" 2>&1 >/dev/null)"
+grep -q 'jellyfin-handmade' <<< "$err" \
+  || fail "a name with no timestamp was not announced: $err"
+grep -q 'jellyfin-extra' <<< "$err" \
+  && fail "another base's snapshot was reported as unrecognised; that is noise: $err"
+
 echo "PASS: snapshot prune safety smoke test"
