@@ -119,4 +119,47 @@ if [[ -d /srv/data && -d /srv/media ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# 5. The nested-subvolume detector must be regression-proof in CI.
+#
+# It had ZERO hermetic coverage: tests/snapshot-safety-gate-smoke.sh stubs
+# domum_subvolume_nested_children outright (correctly testing the CALLERS), and
+# the only test of the real thing is the Btrfs integration test -- which CI runs
+# knowing it SKIPS with exit 0 on a runner without Btrfs. So `-xdev`, `-inum 256`
+# or `-type d` could all be dropped and nothing in CI would fail.
+#
+# An inode number cannot be chosen, so the query SHAPE is pinned instead: that is
+# precisely what those mutations change.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP_DIR/probe"
+args="$(bash -c "set -uo pipefail
+$a
+find() { printf '%s\n' \"\$*\"; }
+domum_subvolume_nested_children '$TMP_DIR/probe'")"
+
+[[ -n "$args" ]] || fail "the nested-subvolume detector did not run find at all"
+grep -q -- '-xdev' <<< "$args" \
+  || fail "the detector lost -xdev; it would descend into every nested subvolume and scan the whole 213 GB tree: [$args]"
+grep -q -- '-inum 256' <<< "$args" \
+  || fail "the detector lost -inum 256, the only thing that identifies a subvolume root: [$args]"
+grep -q -- '-type d' <<< "$args" \
+  || fail "the detector lost -type d; a regular file with inode 256 would be reported: [$args]"
+grep -q -- '-mindepth 1' <<< "$args" \
+  || fail "the detector lost -mindepth 1; the root itself is inode 256 and would always self-report: [$args]"
+grep -q "$TMP_DIR/probe" <<< "$args" \
+  || fail "the detector did not search the path it was given: [$args]"
+
+# A tree with nothing nested must report nothing.
+[[ -z "$(bash -c "set -uo pipefail
+$a
+domum_subvolume_nested_children '$TMP_DIR/probe'")" ]] \
+  || fail "an ordinary directory tree reported a nested subvolume"
+
+# A missing path must be quiet, not an error -- it is called on paths that may
+# not exist yet.
+bash -c "set -uo pipefail
+$a
+domum_subvolume_nested_children '$TMP_DIR/definitely-absent'" >/dev/null 2>&1 \
+  || fail "the detector failed on a missing path instead of reporting nothing"
+
 echo "PASS: subvolume detection smoke test"

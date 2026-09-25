@@ -47,7 +47,7 @@ grep -q '0 created' <<< "$out" \
 # ...and it must still succeed when a snapshot really is taken. The stub creates
 # the snapshot target (the last argument), because the implementation now
 # verifies the snapshot exists rather than trusting btrfs's exit status.
-out="$( { bash -c "$(harness); is_btrfs_subvol() { return 0; }; btrfs() { mkdir -p \"\${!#}\"; }; record_rollback_entry() { :; }; if snapshot_create realtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
+out="$( { bash -c "$(harness); is_btrfs_subvol() { return 0; }; btrfs() { mkdir -p \"\${!#}\"; }; record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }; if snapshot_create realtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
 grep -q 'RC=0' <<< "$out" || fail "snapshot_create failed when a snapshot was created: $out"
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ awk '
 out="$( { bash -c "$(harness)
 is_btrfs_subvol() { return 0; }
 btrfs() { return 1; }          # the path IS a subvolume, but the snapshot fails
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 if snapshot_create failtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
 grep -q 'RC=1' <<< "$out" \
   || fail "snapshot_create reported success when the btrfs command failed: $out"
@@ -146,7 +146,7 @@ out="$( { bash -c "$(harness)
 is_btrfs_subvol() { return 0; }
 btrfs() { return 1; }
 record_service_snapshot_metadata() { :; }
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 if name=\"\$(create_service_snapshot plex pre-update a b)\"; then echo \"RC=0 name=\$name\"; else echo RC=\$?; fi" ; } 2>&1 )"
 grep -q 'RC=1' <<< "$out" \
   || fail "create_service_snapshot returned success for a snapshot that was never created: $out"
@@ -155,7 +155,7 @@ grep -q 'RC=1' <<< "$out" \
 out="$( { bash -c "$(harness)
 is_btrfs_subvol() { return 0; }
 btrfs() { return 0; }          # claims success, creates nothing
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 if snapshot_create lyingtag; then echo RC=0; else echo RC=\$?; fi" ; } 2>&1 )"
 grep -q 'RC=1' <<< "$out" \
   || fail "snapshot_create trusted btrfs's exit status without verifying the snapshot exists: $out"
@@ -248,7 +248,7 @@ only_jellyfin_is_subvol() {
 $(harness)
 is_btrfs_subvol() { [[ "\$1" == *"/jellyfin"* ]]; }
 btrfs() { mkdir -p "\${!#}"; }
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 record_service_snapshot_metadata() { :; }
 EOF
 }
@@ -319,7 +319,7 @@ snapname="$( bash -c "$(harness)
 is_btrfs_subvol() { return 0; }
 btrfs() { mkdir -p \"\${!#}\"; }
 record_service_snapshot_metadata() { :; }
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 create_service_snapshot immich pre-test a b" 2>/dev/null )"
 
 [[ "$snapname" == *$'"'"'\n'"'"'* ]] \
@@ -336,7 +336,7 @@ snaperr="$( bash -c "$(harness)
 is_btrfs_subvol() { return 0; }
 btrfs() { mkdir -p \"\${!#}\"; }
 record_service_snapshot_metadata() { :; }
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 create_service_snapshot immich pre-test2 a b" 2>&1 >/dev/null )"
 grep -q 'Snapshot:' <<< "$snaperr" \
   || fail "the progress line was not written to stderr: [$snaperr]"
@@ -357,7 +357,7 @@ nested_probe() {  # $1 = extra shell
 is_btrfs_subvol() { return 0; }
 btrfs() { mkdir -p \"\${!#}\"; }
 record_service_snapshot_metadata() { :; }
-record_rollback_entry() { :; }
+record_rollback_entry() { printf '%s' 'rb-0000000000-stub'; }
 subvolume_nested_children() { printf '%s\n' '$TMP_DIR/data/immich/postgres'; }
 $1" 2>&1
 }
