@@ -30,6 +30,7 @@ Immich migration would be copying.
 | `snapshot prune` | **wait**, default 900s (`SNAPSHOT_LOCK_WAIT_SECONDS`) | weekly timer; it *deletes* snapshots, and a rollback checks its snapshot exists and then creates from it — a prune landing between those turns a routine restore into a failure |
 | `snapshot create` | **wait**, default 900s | same timer family; snapshotting a tree a migration is renaming is the race the lock exists for |
 | `host-upgrade` | **wait**, default 1800s (`HOST_UPGRADE_LOCK_WAIT_SECONDS`) | upgrading `docker-ce`/`containerd` **restarts the Docker daemon**, which restarts containers a migration has deliberately stopped — and this unit can go on to reboot the host |
+| `cleanup snapshots --confirm` | refuse immediately | attended, and it *deletes snapshots* — the second deleter after `snapshot prune`, and the last one without the lock |
 
 `rollback apply --dry-run` takes no lock: it changes nothing.
 

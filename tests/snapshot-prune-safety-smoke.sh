@@ -166,4 +166,42 @@ kill "$holder" 2>/dev/null; wait 2>/dev/null
 (( rc != 0 )) || fail "prune ran while the operation lock was held: $out"
 grep -qi 'Timed out waiting' <<< "$out" || fail "the lock refusal did not explain itself: $out"
 
+# ---------------------------------------------------------------------------
+# 4. `cleanup snapshots` is a SECOND snapshot deleter. It must take the lock and
+#    share one retention policy.
+#
+#    It was the only snapshot deleter without the lock, and it defaulted to
+#    CLEANUP_OLD_SNAPSHOTS_KEEP, which the shipped example config set to 7 while
+#    SNAPSHOT_KEEP_PER_SUBVOL is 14 -- so it deleted seven more snapshots per
+#    service than the retention policy, including ones the weekly prune had
+#    deliberately kept.
+# ---------------------------------------------------------------------------
+grep -q 'domum_acquire_lock "cleanup snapshots"' "$REPO_ROOT/bin/domum-media" \
+  || fail "cleanup snapshots does not take the operation lock"
+
+# Retention can only be raised, never lowered -- asserted through the real
+# candidate selection, not by re-deriving the arithmetic in the test.
+rm -rf "$TMP_DIR/snapshots"; seed_snapshots jellyfin 20
+candidates_for() {  # $1 = SNAPSHOT_KEEP_PER_SUBVOL, $2 = CLEANUP_OLD_SNAPSHOTS_KEEP
+  bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=$1
+CLEANUP_OLD_SNAPSHOTS_KEEP=$2
+cleanup_snapshot_candidates" 2>/dev/null | grep -c . || true
+}
+got="$(candidates_for 14 7)"
+[[ "$got" == "6" ]] \
+  || fail "with policy 14 and cleanup 7, cleanup must still keep 14 of 20 (6 candidates), got $got"
+got="$(candidates_for 14 30)"
+[[ "$got" == "0" ]] \
+  || fail "with cleanup 30, nothing may be a candidate out of 20, got $got"
+got="$(candidates_for 5 5)"
+[[ "$got" == "15" ]] \
+  || fail "with both set to 5, 15 of 20 must be candidates, got $got"
+
+# And the shipped example must not configure the two knobs to disagree.
+pol="$(grep -E '^SNAPSHOT_KEEP_PER_SUBVOL=' "$REPO_ROOT/config/domum-media.conf.example" | cut -d= -f2)"
+cln="$(grep -E '^CLEANUP_OLD_SNAPSHOTS_KEEP=' "$REPO_ROOT/config/domum-media.conf.example" | cut -d= -f2)"
+[[ -n "$pol" && -n "$cln" && "$cln" -ge "$pol" ]] \
+  || fail "the example config sets CLEANUP_OLD_SNAPSHOTS_KEEP=$cln below SNAPSHOT_KEEP_PER_SUBVOL=$pol"
+
 echo "PASS: snapshot prune safety smoke test"
