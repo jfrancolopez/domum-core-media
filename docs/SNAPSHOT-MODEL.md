@@ -289,3 +289,54 @@ The prune test previously seeded fixtures with
 mtimes real Btrfs does not provide. It validated, and actively pinned, an
 ordering key that cannot work. The fixture now uses real name stamps with
 deliberately **identical** mtimes, plus the rollback case directly.
+
+## Retention can never zero a service
+
+`drop=$(( total - keep ))` is honest arithmetic, and that is the hazard. Before
+the first migration `/srv/snapshots` was empty and the weekly prune had nothing
+to delete. It now holds **exactly one** Jellyfin snapshot, so a retention value
+of `0`, a negative number, or a non-numeric string would have had the Sunday
+timer delete the only recovery point that service has.
+
+Measured against the real `snapshot_prune` on a fixture shaped like production:
+
+| `SNAPSHOT_KEEP_PER_SUBVOL` | before the fix | after |
+|---|---|---|
+| unset / `14` | 1 survives | 1 survives |
+| `0` | **0 survive** | 1 survives (floor) |
+| `-5` | **0 survive**, rc=1 | 1 survives (falls back to 14) |
+| `fourteen` | rc=1, nothing pruned, every week | warns, falls back to 14, prunes correctly |
+
+`snapshot_retention_keep` validates the value and enforces a floor of 1. A
+*retention* job must never leave a protected service with no recovery point;
+deliberate wholesale removal is `cleanup snapshots --confirm`, which is attended
+and asks. Both the prune and the cleanup path go through it.
+
+This also means the Sunday job's safety no longer depends on the production
+config being sane — which matters, because that file is root-only and cannot be
+read during an unprivileged audit.
+
+## One service's snapshots never count toward another's retention
+
+The stamp extraction was unanchored. `^.*-` is greedy, so the glob `jellyfin-*`
+also matched `jellyfin-extra-20260301-000000-c`:
+
+```
+list_snapshots_for_base jellyfin
+  jellyfin-20260101-000000-a
+  jellyfin-20260201-000000-b
+  jellyfin-extra-20260301-000000-c   <-- another service
+  jellyfin-extra-20260401-000000-d   <-- another service
+```
+
+With a tight retention, prune deletes the oldest by stamp — which would have
+removed **jellyfin's real snapshots** while preserving the other service's.
+
+Not reachable with today's names, because none is a `-`-prefix of another. Adding
+`plex-hd` or `immich-ml` would arm it silently. The extraction is now anchored to
+the base name.
+
+A name carrying **no** timestamp is announced on stderr, because it is then
+neither pruned nor reported as the latest snapshot. A name belonging to a
+*different* base is skipped silently — conflating those two produced a warning on
+every listing, which is how warnings stop being read.
