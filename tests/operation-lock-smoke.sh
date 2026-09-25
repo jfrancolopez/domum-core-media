@@ -239,4 +239,29 @@ kill "$huholder" 2>/dev/null; wait 2>/dev/null
 grep -q 'APT RAN' <<< "$out" && fail "apt was invoked despite the lock being held: $out"
 grep -qi 'Timed out waiting' <<< "$out" || fail "the lock refusal did not explain itself: $out"
 
+# ---------------------------------------------------------------------------
+# 7. The stop verification must not use a SIGPIPE-prone pipeline.
+#
+# Under `pipefail`, `cmd | grep -q` reports 141 when grep matches: grep exits at
+# the first hit and the left-hand command takes SIGPIPE. Measured:
+# `sed bin/domum-media | grep -q <hit>` returns 141.
+#
+# In stop_compose_services_verified an inverted result declares a RUNNING
+# container stopped and lets the migration proceed over live state. It does not
+# bite at 130 bytes of `docker ps` output -- 0 inversions in 1000 trials, because
+# that fits the pipe buffer -- but the entire migration safety argument should not
+# rest on the output staying small.
+# ---------------------------------------------------------------------------
+# Comments stripped: this function's own comment explains the hazard by naming the
+# pattern, and matching that would fail on correct code.
+fn_stop="$(awk '/^stop_compose_services_verified\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media" | sed 's/#.*//')"
+[[ -n "$fn_stop" ]] || fail "could not extract stop_compose_services_verified"
+if grep -qE 'docker ps[^|]*\|[[:space:]]*grep' <<< "$fn_stop"; then
+  fail "the stop verification pipes docker ps into grep; under pipefail a match reads as no-match and a running container would be declared stopped"
+fi
+grep -q 'running="\$(docker ps' <<< "$fn_stop" \
+  || fail "the stop verification does not capture docker ps output before matching"
+grep -q 'grep -qFx -- "\$svc" <<< "\$running"' <<< "$fn_stop" \
+  || fail "the stop verification does not match against the captured output"
+
 echo "PASS: operation lock smoke test"

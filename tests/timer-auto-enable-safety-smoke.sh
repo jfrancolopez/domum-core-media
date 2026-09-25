@@ -138,7 +138,10 @@ fi
 # ---------------------------------------------------------------------------
 for f in "$REPO_ROOT/install.sh" "$REPO_ROOT/bin/domum-media"; do
   for timer in "${DEPLOYMENT_TIMERS[@]}"; do
-    if grep -n "systemctl enable" -A 8 "$f" | grep -q "$timer"; then
+    # Not `grep file | grep -q`: under pipefail a match makes the left grep take
+    # SIGPIPE and the pipeline report 141, so the match reads as no-match.
+    enable_ctx="$(grep -n "systemctl enable" -A 8 "$f" || true)"
+    if grep -q "$timer" <<< "$enable_ctx"; then
       fail "$f still passes $timer to systemctl enable"
     fi
   done

@@ -185,6 +185,14 @@ inspect → reproduce → develop → test → focused commit → push branch �
   Poll the run instead (`gh run view <id> --json status`), which reaches
   `completed`, and treat an empty or missing result as terminal rather than as
   "keep waiting".
+- **Never write `cmd | grep -q` under `pipefail`.** `grep -q` exits at the first
+  match, the left-hand command takes `SIGPIPE`, and the *pipeline* reports 141 —
+  so **a match reads as no-match**. Measured: `sed bin/domum-media | grep -q <hit>`
+  returns 141. It is intermittent, because it only bites when the left side is
+  still writing when grep exits, which makes it worse. Capture first
+  (`out="$(cmd)"`), then `grep -q … <<< "$out"`. This silently inverted a test
+  guard and was one pipe-buffer away from inverting the stop verification that
+  the whole migration safety argument rests on.
 - **Take the backup before the mutation, unconditionally.** When mutation-testing,
   `cp` the file on its own line — not chained after the command being tested. A
   short-circuited `&&` chain leaves the mutation applied and no way back.

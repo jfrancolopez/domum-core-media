@@ -185,4 +185,34 @@ grep -qE "trap .*runlog.*exit [0-9]+.* (HUP|INT|TERM)" <<< "$fn_backup" \
 grep -q 'trap - EXIT' <<< "$fn_backup" \
   || fail "the trap must be cleared once the capture file is gone"
 
+# ---------------------------------------------------------------------------
+# The backup must NOT pass --one-file-system.
+#
+# restic documents that flag as "don't cross filesystem boundaries AND
+# SUBVOLUMES". Proven on this host with a disposable repo and a fixture holding a
+# nested subvolume:
+#
+#   without -x :  .../svc/nested/b.txt   .../svc/plain/a.txt
+#   with    -x :                         .../svc/plain/a.txt
+#
+# Every migrated service is a nested subvolume under /srv/data. Adding that flag
+# -- which reads like a sensible "do not wander onto other disks" precaution --
+# would silently drop every one of them from the backup, and the backup would
+# still report success.
+# ---------------------------------------------------------------------------
+# Checked over the whole file with comments stripped, NOT by requiring the match
+# to sit on a line containing "restic": the flag sits on a continuation line of
+# its own, which is exactly how the first version of this check missed it.
+#
+# And NOT as `sed ... | grep -q`. Under `pipefail` that pipeline reports FAILURE
+# when grep matches: grep -q exits at the first hit, sed takes SIGPIPE, and the
+# pipeline status becomes non-zero -- so the `if` never fired and the check passed
+# while the flag was present. Strip to a variable first.
+backup_src_nocomments="$(sed 's/#.*//' "$REPO_ROOT/bin/domum-media-backup")"
+if grep -qE -- '--one-file-system|(^|[[:space:]])-x([[:space:]]|$)' <<< "$backup_src_nocomments"; then
+  fail "domum-media-backup passes --one-file-system (or -x) to restic; every migrated service, being a nested subvolume, would silently vanish from the backup"
+fi
+grep -q 'restic_for_target .* backup' "$REPO_ROOT/bin/domum-media-backup" \
+  || fail "could not find the restic backup invocation; this check is not looking at anything"
+
 echo "PASS: backup target evidence smoke test"

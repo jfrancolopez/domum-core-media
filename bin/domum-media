@@ -1730,9 +1730,19 @@ stop_compose_services_verified() {
   }
   # Confirm each intended container is actually gone, one at a time: a
   # command-substituted pattern list would word-split unpredictably.
-  local still="" svc
+  #
+  # `docker ps | grep -q` is deliberately NOT used. Under this script's `pipefail`,
+  # `grep -q` exits at the first match, the left-hand command takes SIGPIPE, and
+  # the PIPELINE reports 141 -- so a match reads as "no match". Measured:
+  # `sed file | grep -q <hit>` returns 141. It does not bite at 130 bytes of
+  # `docker ps` output (0 inversions in 1000 trials) because that fits the pipe
+  # buffer and docker finishes first -- but "safe because the output is small" is
+  # not a property to rest the stop verification on, and an inverted result here
+  # would declare a RUNNING container stopped and let the migration proceed.
+  local still="" svc running
+  running="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
   for svc in $svcs; do
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$svc"; then
+    if grep -qFx -- "$svc" <<< "$running"; then
       still+="${still:+ }$svc"
     fi
   done
