@@ -242,6 +242,11 @@ state_emit_entry() {
 state_recovery_coverage() {
   case "$1" in
     traefik:/letsencrypt) printf 'recovery-pack' ;;
+    # The whole Uptime Kuma configuration is one SQLite database. It is captured
+    # as a VALIDATED dump via the SQLite backup API, not by copying the files:
+    # kuma.db runs in WAL mode with an uncheckpointed -wal beside it, so a file
+    # copy would be torn. Same discipline as the Immich artefact.
+    uptime-kuma:/app/data) printf 'recovery-pack' ;;
     *) printf '' ;;
   esac
 }
