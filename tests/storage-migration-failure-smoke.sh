@@ -498,4 +498,44 @@ grep -q '^restart$' "$d/order.log" || fail "the service was never restarted"
 [ "$(head -1 "$d/order.log")" = "proof" ] \
   || fail "the proof snapshot was taken AFTER the restart, so it is crash-consistent rather than clean: $(cat "$d/order.log")"
 
+# ---------------------------------------------------------------------------
+# migrate_verify must not report "content manifest identical" over files it
+# never hashed.
+#
+# `migrate_manifest` pipes through `xargs -0 sha256sum 2>/dev/null`, so a file
+# sha256sum cannot read is DROPPED from the manifest silently -- and because it
+# drops out of both manifests identically, the diff passes. The file count comes
+# from `find`, so it cannot catch this either. Demonstrated: 2 files on disk,
+# 1 line in the manifest.
+#
+# Root can normally read everything, so this guards a verification that quietly
+# proves less than it claims rather than a condition seen today.
+# ---------------------------------------------------------------------------
+rm -rf "$TMP_DIR/vunread"; mkdir -p "$TMP_DIR/vunread/src" "$TMP_DIR/vunread/dst"
+printf 'readable\n' > "$TMP_DIR/vunread/src/ok.dat"
+printf 'secretxx\n' > "$TMP_DIR/vunread/src/secret.dat"
+cp -a "$TMP_DIR/vunread/src/." "$TMP_DIR/vunread/dst/"
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "    manifest completeness                      skipped (root reads everything)"
+else
+  chmod 000 "$TMP_DIR/vunread/src/secret.dat" "$TMP_DIR/vunread/dst/secret.dat"
+  out="$(run_verify vunread 10000)"
+  rc=$?
+  chmod 644 "$TMP_DIR/vunread/src/secret.dat" "$TMP_DIR/vunread/dst/secret.dat"
+  (( rc != 0 )) \
+    || fail "migrate_verify reported success over a file it never hashed: $out"
+  grep -qi 'could not be hashed' <<< "$out" \
+    || fail "the incomplete manifest was not reported: $out"
+  grep -qE 'manifests cover 1 and 1 of 2' <<< "$out" \
+    || fail "the refusal did not say how much of the tree was actually covered: $out"
+
+  # And a fully readable pair must still pass, and must say how many it covered.
+  out="$(run_verify vunread 10000)"
+  rc=$?
+  (( rc == 0 )) || fail "migrate_verify failed on a fully readable pair: $out"
+  grep -qE 'content manifest identical \(2 of 2 file' <<< "$out" \
+    || fail "migrate_verify did not report the manifest coverage: $out"
+fi
+
 echo "PASS: storage migration failure smoke test"

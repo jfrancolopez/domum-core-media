@@ -56,7 +56,24 @@ WAL survives the stop.
 sudo domum-media report
 ```
 
-`jellyfin` must move from `unprotected` to `protected` in the snapshot section.
+`jellyfin` must move from `unprotected` to **`protected`** in the snapshot
+section — and `protected` now means what it says. It requires the path to be a
+subvolume **and** at least one snapshot to exist **and** no nested subvolumes.
+
+Previously it was set from the path type alone, so a migration whose proof
+snapshot failed — which the migration treats as non-fatal, exiting non-zero but
+leaving the data migrated — still flipped this to `protected` and this step
+passed. The two states that used to hide there now report themselves:
+
+| state | meaning |
+|---|---|
+| `protected` | subvolume, at least one snapshot, nothing nested — rollback is possible |
+| `snapshottable` | subvolume, but **no snapshot** — nothing to roll back to (warning) |
+| `degraded` | subvolume containing a nested subvolume, whose contents no snapshot of it would include (critical) |
+| `unprotected` | still an ordinary directory |
+
+If you see `snapshottable`, the migration moved the data but established no
+rollback point: find out why the proof snapshot failed before going further..
 Then open Jellyfin and confirm the libraries load.
 
 ## Step 3 — prove rollback, not just snapshots

@@ -138,4 +138,47 @@ grep -qi 'could not be confirmed stopped' <<< "$out" \
 [[ "$(cat "$TMP_DIR/data/plex/important.db")" == "LIVE DATA THAT MUST NOT BE LOST" ]] \
   || fail "live data was disturbed after a failed stop"
 
+# A failed restore puts the live state back with `mv`. If the partial restore at
+# the destination could not be removed first, `mv A B` succeeds by nesting A
+# INSIDE B -- so `|| die` never fires and the code reports "previous state put
+# back" while the live state sits one level deeper inside a partial subvolume.
+# Verified independently: `mv live dest` with dest/ present yields
+# dest/live/file.txt and exit 0.
+# Two distinct scenarios, so each guard is uniquely responsible. Tested together
+# they were redundant -- bypassing either one let the other catch it, and neither
+# was independently killable.
+#
+# (a) the removal FAILS -> must refuse, naming the removal.
+setup
+out="$( { bash -c "$(harness)
+btrfs() { mkdir -p \"\${!#}\"; return 1; }   # restore fails, leaving a partial dir
+rm() { case \"\$*\" in *-rf*) return 1 ;; esac; command rm \"\$@\"; }
+restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+rc=$?
+(( rc != 0 )) || fail "a restore that could not clear its partial output reported success: $out"
+grep -qi 'could not be removed' <<< "$out" \
+  || fail "a failed removal was not named as the cause: $out"
+grep -qi 'previous state put back' <<< "$out" \
+  && fail "the code claimed the previous state was put back when it was not: $out"
+
+# (b) the removal claims SUCCESS but the path is still there -> must still refuse
+#     rather than nesting the preserved copy inside it.
+setup
+out="$( { bash -c "$(harness)
+btrfs() { mkdir -p \"\${!#}\"; return 1; }
+rm() { case \"\$*\" in *-rf*) return 0 ;; esac; command rm \"\$@\"; }
+restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+rc=$?
+(( rc != 0 )) || fail "a restore proceeded with the destination still present: $out"
+grep -qi 'would nest it inside' <<< "$out" \
+  || fail "the nesting hazard was not named as the cause: $out"
+grep -qi 'previous state put back' <<< "$out" \
+  && fail "the code claimed the previous state was put back when it was not: $out"
+# The preserved copy must still be exactly where the message says it is.
+rb="$(find "$TMP_DIR/data" -maxdepth 1 -name 'plex.rollback-*' | head -1)"
+[[ -n "$rb" ]] || fail "the preserved copy is missing after a failed restore"
+[[ "$(cat "$rb/important.db")" == "LIVE DATA THAT MUST NOT BE LOST" ]] \
+  || fail "the preserved copy was damaged"
+[[ ! -e "$rb/plex" ]] || fail "the live state was nested inside the preserved copy"
+
 echo "PASS: restore preserves state smoke test"

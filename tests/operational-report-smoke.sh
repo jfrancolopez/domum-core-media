@@ -489,4 +489,72 @@ jq -e '[.findings[]|select(.level=="info" and (.message|test("/letsencrypt")))]|
   || fail "coverage was presented as protection while the recovery pack was unavailable"
 rm -f "$FAKE_BIN/docker"
 
+# ---------------------------------------------------------------------------
+# "protected" must mean the service can actually be rolled back.
+#
+# It used to be set from the path TYPE alone, so a migration whose proof snapshot
+# failed -- which the migration treats as non-fatal, exiting non-zero but leaving
+# the data migrated -- still flipped the report to "protected". JELLYFIN-PILOT.md
+# made exactly that the pilot success criterion. The same false positive appeared
+# once the weekly prune removed a service's last snapshot.
+#
+# There was no test for the protected branch at all: the harness stubs
+# latest_snapshot_for_service to fail and every assertion was "state != protected".
+# ---------------------------------------------------------------------------
+prot_state() {  # $1 = is-subvolume rc, $2 = 1 if no snapshot, $3 = nested paths
+  bash -c "
+set -uo pipefail
+cmd_exists() { command -v \"\$1\" >/dev/null 2>&1; }
+DOMUM_DATA_ROOT='$DOMUM_DATA_ROOT'
+DOMUM_SNAPSHOT_ROOT='$TMP_DIR/snapshots'
+source '$REPO_ROOT/bin/domum-media-report'
+domum_is_subvolume() { return $1; }
+domum_subvolume_nested_children() { printf '%s' '$3'; }
+latest_snapshot_for_service() { [ $2 -eq 1 ] && return 1; printf 'jellyfin-20260101-000000-t'; }
+snapshot_path_mtime() { printf '1700000000'; }
+report_snapshot_protection jellyfin '$DOMUM_DATA_ROOT/immich'" 2>/dev/null | jq -r '.state'
+}
+
+got="$(prot_state 0 0 '')"
+[ "$got" = "protected" ] || fail "a subvolume WITH a snapshot must be protected, got $got"
+got="$(prot_state 0 1 '')"
+[ "$got" = "snapshottable" ] || fail "a subvolume with NO snapshot must not read as protected, got $got"
+got="$(prot_state 0 0 '/srv/data/x/nested')"
+[ "$got" = "degraded" ] || fail "a subvolume containing a nested subvolume must not read as protected, got $got"
+got="$(prot_state 1 1 '')"
+[ "$got" = "unprotected" ] || fail "an ordinary directory must be unprotected, got $got"
+
+# The two new states must raise findings at the right severity, or they are
+# invisible -- which is no better than calling them protected. Driven through the
+# real report so the severities come from the implementation.
+prot_report() {  # $1 = is-subvolume rc, $2 = 1 if no snapshot, $3 = nested paths
+  awk -v a="$1" -v b="$2" -v c="$3" '
+    /^report_generate_json$/ {
+      print "domum_is_subvolume() { return " a "; }"
+      print "domum_subvolume_nested_children() { printf \"%s\" \"" c "\"; }"
+      print "latest_snapshot_for_service() { [ " b " -eq 1 ] && return 1; printf jellyfin-20260101-000000-t; }"
+      print "snapshot_path_mtime() { printf 1700000000; }"
+    } { print }' "$TMP_DIR/harness.sh" > "$TMP_DIR/harness-prot.sh"
+  bash "$TMP_DIR/harness-prot.sh" 2>/dev/null
+}
+
+lvl_for() { jq -r '[.findings[]|select(.message|test("can be snapshotted but has no snapshot|contains nested subvolume"))|.level]|first // "none"'; }
+
+got="$(prot_report 0 1 '' | lvl_for)"
+[ "$got" = "warning" ] \
+  || fail "a subvolume with no snapshot must raise a warning, got $got"
+got="$(prot_report 0 0 '/srv/data/x/nested' | lvl_for)"
+[ "$got" = "critical" ] \
+  || fail "a subvolume containing a nested subvolume must raise a critical, got $got"
+got="$(prot_report 0 0 '' | lvl_for)"
+[ "$got" = "none" ] \
+  || fail "a genuinely protected service must raise neither finding, got $got"
+
+# The findings filter is a SINGLE-QUOTED jq program, so one apostrophe anywhere in
+# it terminates the shell string and breaks the parse. That has happened three
+# times in this file's history, and `bash -n` only catches it after the fact.
+if grep -nE "[A-Za-z]'[A-Za-z]" "$REPO_ROOT/bin/domum-media-report" | grep -E 'message:|action:|^\s*#.*jq'; then
+  fail "an apostrophe appears in the findings jq program or its comments; it will break the parse"
+fi
+
 echo "PASS: operational report smoke test"

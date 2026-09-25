@@ -220,3 +220,35 @@ boundary and never descends into it. Measured at **0.38 s** against the real
 
 There are no nested subvolumes under `/srv/data` today. This is a guard against
 the topology becoming reachable, not a description of it.
+
+## "protected" means the service can be rolled back
+
+The report's snapshot-protection state used to be set from the path **type**
+alone: if the service directory was a Btrfs subvolume, it said `protected`.
+
+Being a subvolume is a *necessary* condition, not a sufficient one. Two ways it
+was wrong, both reachable the moment the first migration lands:
+
+- A migration whose **proof snapshot failed** leaves the data migrated and exits
+  non-zero, but the path is a subvolume — so the report said `protected` with no
+  snapshot anywhere. `JELLYFIN-PILOT.md` made exactly that the pilot success
+  criterion, so the confirmation step would have passed.
+- Once the weekly prune removes a service's **last** snapshot, the same thing.
+
+Four states now, and each answers "can this be rolled back right now?":
+
+| state | meaning | finding |
+|---|---|---|
+| `protected` | subvolume, ≥1 snapshot, nothing nested | none |
+| `snapshottable` | subvolume, but **no snapshot** — nothing to roll back to | warning |
+| `degraded` | subvolume containing a nested subvolume, whose contents no snapshot of it includes | critical |
+| `unprotected` | still an ordinary directory | warning / info by tier |
+
+There was **no test for the `protected` branch at all** before this: the report
+test harness stubs `latest_snapshot_for_service` to fail, and every assertion was
+`state != "protected"`. All four states and both new findings are now pinned, and
+five mutations of the logic are killed.
+
+The nested-children detector is now in the byte-identical shared block, so the
+CLI and the report cannot disagree about it — the same reason
+`domum_is_subvolume` lives there.

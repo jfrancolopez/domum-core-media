@@ -383,6 +383,18 @@ domum_is_subvolume() {
   [[ "$(stat -f -c %T "$path" 2>/dev/null)" == "btrfs" ]] || return 1
   [[ "$(stat -c %i "$path" 2>/dev/null)" == "256" ]]
 }
+# Btrfs snapshots are NOT recursive: a snapshot of S contains an EMPTY DIRECTORY
+# wherever a nested subvolume used to be. So a path being a subvolume does not
+# mean a snapshot of it would contain everything under it.
+#
+# `-xdev` makes this cheap: nested subvolumes have their own st_dev, so find
+# reports the boundary and never descends into it. Measured at 0.38s against the
+# real 213 GB Immich tree.
+domum_subvolume_nested_children() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  find "$root" -xdev -mindepth 1 -type d -inum 256 2>/dev/null
+}
 # END SHARED SUBVOLUME HELPER
 
 report_snapshot_protection() {
@@ -393,9 +405,34 @@ report_snapshot_protection() {
   elif ! cmd_exists btrfs; then
     state=unknown; reason="btrfs tool unavailable"
   elif domum_is_subvolume "$path"; then
-    state=protected; reason="state path is a Btrfs subvolume"
+    # "protected" must answer the only question that matters: can this service be
+    # rolled back right now? Being a subvolume is a NECESSARY condition, not a
+    # sufficient one.
+    #
+    # It used to be set from the path type alone, so a migration whose proof
+    # snapshot failed -- which the migration itself treats as non-fatal, exiting
+    # non-zero but leaving the data migrated -- still flipped the report to
+    # "protected", and JELLYFIN-PILOT.md made exactly that the pilot's success
+    # criterion. The same false positive appeared once the weekly prune removed
+    # the last snapshot for a service. That is the CLAUDE.md section 14 defect
+    # stated outright: a report implying protection that does not exist.
+    local nested
+    nested="$(domum_subvolume_nested_children "$path")"
     latest="$(latest_snapshot_for_service "$service" 2>/dev/null || true)"
     [[ -n "$latest" ]] && latest_epoch="$(snapshot_path_mtime "$DOMUM_SNAPSHOT_ROOT/$latest" 2>/dev/null || true)"
+    if [[ -n "$nested" ]]; then
+      # Snapshots of this path would hold empty directories where the nested
+      # subvolumes are, so create_service_snapshot refuses outright. Any snapshot
+      # that does exist predates the nesting and cannot be trusted to be whole.
+      state=degraded
+      reason="state path contains nested subvolume(s), which Btrfs snapshots do not include: $(printf '%s' "$nested" | tr '\n' ' ')"
+    elif [[ -z "$latest" ]]; then
+      state=snapshottable
+      reason="state path is a Btrfs subvolume but no snapshot exists, so there is nothing to roll back to"
+    else
+      state=protected
+      reason="state path is a Btrfs subvolume with at least one snapshot"
+    fi
   else
     state=unprotected; reason="state path is an ordinary directory, not a Btrfs subvolume"
   fi
@@ -767,6 +804,18 @@ report_generate_json() {
          message:(.service+" has no service-level snapshot protection (rebuildable state)"),
          action:("Migrate "+.path+" to a Btrfs subvolume when convenient; meanwhile risky operations are refused")}
       end),
+    # A subvolume with no snapshot is the state a migration leaves behind when its
+    # proof snapshot failed -- and the state a prune leaves behind once it removes
+    # the last one. Neither is visible as "unprotected", so neither would have been
+    # reported at all.
+    (.snapshot_protection.services[] | select(.state == "snapshottable") |
+      {level:"warning",
+       message:(.service+" can be snapshotted but has no snapshot, so there is nothing to roll back to"),
+       action:"Run: domum-media snapshot create, or re-check why the proof snapshot failed during migration"}),
+    (.snapshot_protection.services[] | select(.state == "degraded") |
+      {level:"critical",
+       message:(.service+" contains nested subvolume(s); snapshots of it would silently omit them, so no snapshot of it can be trusted"),
+       action:"Remove or separately migrate the nested subvolume(s); see docs/SNAPSHOT-MODEL.md"}),
     (.snapshot_protection.services[] | select(.state == "unknown") | {level:"warning",message:(.service+" snapshot protection is unknown"),action:"Verify the state path and Btrfs tooling"}),
     (.filesystems[] | select(.used_percent != null and .used_percent >= 90) | {level:"warning",message:(.path+" is "+(.used_percent|tostring)+"% full"),action:"Free space or expand the filesystem"}),
     (select(.backups.heartbeat.state != "available") | {level:"critical",message:"No successful backup heartbeat is available",action:"Run and verify domum-media-backup"}),
