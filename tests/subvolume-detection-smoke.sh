@@ -113,10 +113,19 @@ if [[ -d /srv/data && -d /srv/media ]]; then
   # case the ext4 false positive would have broken.
   run "domum_is_subvolume /srv/data" || fail "/srv/data was not detected as a subvolume"
   run "domum_is_subvolume /srv/media" && fail "/srv/media (ext4) was detected as a subvolume"
-  if [[ -d /srv/data/jellyfin ]]; then
-    run "domum_is_subvolume /srv/data/jellyfin" \
-      && fail "/srv/data/jellyfin is an ordinary directory but was detected as a subvolume"
-  fi
+  # Do NOT assert that a particular service is or is not a subvolume: migrating
+  # one is a legitimate operation, and this assertion failed the moment the
+  # Jellyfin pilot succeeded. Assert the INVARIANT instead -- that the detector
+  # agrees with the independent evidence (inode 256 on a btrfs filesystem) for
+  # whatever state each service happens to be in.
+  for d in /srv/data/*/; do
+    [[ -d "$d" ]] || continue
+    expect=no
+    [[ "$(stat -c %i "$d")" == "256" && "$(stat -f -c %T "$d")" == "btrfs" ]] && expect=yes
+    if run "domum_is_subvolume '$d'"; then got=yes; else got=no; fi
+    [[ "$got" == "$expect" ]] \
+      || fail "domum_is_subvolume said $got for $d but inode/fstype evidence says $expect"
+  done
 fi
 
 # ---------------------------------------------------------------------------

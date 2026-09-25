@@ -538,4 +538,53 @@ else
     || fail "migrate_verify did not report the manifest coverage: $out"
 fi
 
+# ---------------------------------------------------------------------------
+# migrate_verify must compare the SOURCE against the DESTINATION -- not one of
+# them against itself.
+#
+# Two mutations survived the whole suite before these assertions existed:
+#   * measuring the destination for BOTH the source and destination counts
+#   * hashing the destination for BOTH manifests
+#
+# Neither was caught, because no fixture exercised the full-hash branch with
+# trees that differ in content ALONE, and none exercised the count/byte
+# comparison as a discriminator at all. A verification that compares a tree to
+# itself passes on any copy, however wrong.
+# ---------------------------------------------------------------------------
+
+# (a) content differs, counts and byte totals identical, SMALL tree -> full-hash
+#     branch. Only the content manifest can catch this.
+rm -rf "$TMP_DIR/vcontent"; mkdir -p "$TMP_DIR/vcontent/src" "$TMP_DIR/vcontent/dst"
+for i in 1 2 3; do
+  printf 'AAAAAAAA\n' > "$TMP_DIR/vcontent/src/f$i"
+  printf 'BBBBBBBB\n' > "$TMP_DIR/vcontent/dst/f$i"
+done
+out="$(run_verify vcontent 10000)"
+rc=$?
+(( rc != 0 )) \
+  || fail "migrate_verify PASSED on a full-hash tree whose content is entirely different: $out"
+grep -qi 'content manifest mismatch' <<< "$out" \
+  || fail "the content difference was not reported as a manifest mismatch: $out"
+
+# (b) the count/byte comparison must itself discriminate. An extra file in the
+#     destination changes both, and must be caught before any hashing.
+rm -rf "$TMP_DIR/vcount"; mkdir -p "$TMP_DIR/vcount/src" "$TMP_DIR/vcount/dst"
+printf 'same\n' > "$TMP_DIR/vcount/src/a"
+printf 'same\n' > "$TMP_DIR/vcount/dst/a"
+printf 'extra\n' > "$TMP_DIR/vcount/dst/b"
+out="$(run_verify vcount 10000)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify PASSED with an extra file in the destination: $out"
+grep -qiE 'file count mismatch|byte count mismatch' <<< "$out" \
+  || fail "the count/byte difference was not reported: $out"
+
+# ...and the reverse, an extra file in the SOURCE.
+rm -rf "$TMP_DIR/vcount2"; mkdir -p "$TMP_DIR/vcount2/src" "$TMP_DIR/vcount2/dst"
+printf 'same\n' > "$TMP_DIR/vcount2/src/a"
+printf 'extra\n' > "$TMP_DIR/vcount2/src/b"
+printf 'same\n' > "$TMP_DIR/vcount2/dst/a"
+out="$(run_verify vcount2 10000)"
+rc=$?
+(( rc != 0 )) || fail "migrate_verify PASSED with a file missing from the destination: $out"
+
 echo "PASS: storage migration failure smoke test"
