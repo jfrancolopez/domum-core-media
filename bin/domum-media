@@ -2573,6 +2573,24 @@ host_upgrade() {
     return 0
   fi
 
+  # Upgrading docker-ce/containerd RESTARTS the Docker daemon, which restarts
+  # containers. A migration running at the same time has those containers
+  # deliberately stopped while it copies and then renames their data directory --
+  # so the daemon would bring a service back up onto a half-copied .new, or
+  # during the cutover rename itself. btrfs-progs is in the same list, and this
+  # unit can go on to reboot the host.
+  #
+  # Mondays 05:45 (+45m) does not overlap the 02:30 backup, but it very much can
+  # overlap an attended migration, which is exactly when the operator is not
+  # expecting the daemon to restart underneath them.
+  #
+  # Unattended, so it WAITS rather than skipping a week of security updates.
+  if ! domum_acquire_lock "host-upgrade" "${HOST_UPGRADE_LOCK_WAIT_SECONDS:-1800}"; then
+    die "Timed out waiting for another domum-media operation: $(domum_lock_holder)
+No packages were upgraded. Upgrading docker-ce here would restart the Docker
+daemon underneath that operation."
+  fi
+
   echo "[domum-media] Updating host packages from configured apt repos..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
