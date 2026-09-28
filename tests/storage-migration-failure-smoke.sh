@@ -26,8 +26,18 @@ CANARY='the-original-bytes-that-must-survive'
 run_migration() {
   local dir="$TMP_DIR/$1" stubs="${2:-}"
   rm -rf "$dir"; mkdir -p "$dir/data/jellyfin/config" "$dir/snapshots"
-  printf '%s\n' "$CANARY" > "$dir/data/jellyfin/config/jellyfin.db"
+  printf '%s\n' "$CANARY" > "$dir/data/jellyfin/config/canary.txt"
   printf 'more\n' > "$dir/data/jellyfin/config/settings.xml"
+  # A REAL SQLite database, so migrate_verify_recovery_point's integrity check
+  # has something genuine to open. A text file named `.db` is skipped by the
+  # magic-byte test, which would make the check silently vacuous here.
+  python3 - "$dir/data/jellyfin/config/jellyfin.db" <<'MKDB'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table library(id integer primary key, title text)")
+con.execute("insert into library values (1, 'the original row')")
+con.commit(); con.close()
+MKDB
 
   cat > "$dir/harness.sh" <<EOF
 set -uo pipefail
@@ -46,12 +56,26 @@ service_compose_services() { printf 'jellyfin'; }
 compose_cmd() { :; }
 docker() { :; }
 wait_for_service_health() { return 0; }
-create_service_snapshot() { printf 'jellyfin-stub-snap'; }
+# A stub that actually SNAPSHOTS. It used to return a name and create nothing,
+# so the happy path never had a recovery point to verify.
+# migrate_verify_recovery_point now compares .premigration against the snapshot,
+# and a stub producing no tree would fail every run for the wrong reason.
+create_service_snapshot() {
+  local name="jellyfin-stub-snap"
+  command cp -a "$dir/data/jellyfin" "$dir/snapshots/\$name" 2>/dev/null || return 1
+  printf '%s\\n' "$dir/snapshots/\$name" >> "\$SUBVOL_REG"
+  printf '%s' "\$name"
+}
 # Track subvolume-ness out of band: a marker file inside the directory would
 # inflate the file/byte counts that migrate_verify compares.
 SUBVOL_REG="$dir/.subvols"
 path_is_subvolume() { grep -qxF "\$1" "\$SUBVOL_REG" 2>/dev/null; }
-btrfs() { case "\$1" in subvolume) mkdir -p "\${!#}" && printf '%s\\n' "\${!#}" >> "\$SUBVOL_REG";; esac; }
+btrfs() {
+  case "\$1" in
+    subvolume) mkdir -p "\${!#}" && printf '%s\\n' "\${!#}" >> "\$SUBVOL_REG" ;;
+    property)  printf 'ro=true\\n' ;;
+  esac
+}
 mv() {
   local src="\${@: -2:1}" dst="\${@: -1}"
   command mv "\$@" || return 1
@@ -186,8 +210,8 @@ d="$(run_migration success '')"
 [ "$(cat "$d/rc")" = "0" ] || fail "the success path failed: $(cat "$d/out.txt")"
 grep -qxF "$d/data/jellyfin" "$d/.subvols" || fail "success: the service path is not a subvolume"
 [ -d "$d/data/jellyfin.premigration" ] || fail "success: the previous state was not preserved"
-grep -q "$CANARY" "$d/data/jellyfin/config/jellyfin.db" || fail "success: content did not survive the migration"
-grep -q "$CANARY" "$d/data/jellyfin.premigration/config/jellyfin.db" || fail "success: the preserved copy is wrong"
+grep -q "$CANARY" "$d/data/jellyfin/config/canary.txt" || fail "success: content did not survive the migration"
+grep -q "$CANARY" "$d/data/jellyfin.premigration/config/canary.txt" || fail "success: the preserved copy is wrong"
 grep -qi 'retained deliberately' "$d/out.txt" || fail "success: the operator was not told the previous state is kept"
 echo "    migrated, verified, premigration retained  OK"
 
@@ -489,7 +513,9 @@ grep -qi 'rollback journal' <<< "$out" || fail "the hot journal was not recorded
 # migrate_restart sends compose output to /dev/null, so the stubs record their
 # order in a file rather than on stderr.
 d="$(run_migration proof-order 'ORDER="'"$TMP_DIR"'/proof-order/order.log"
-create_service_snapshot() { printf "proof\n" >> "$ORDER"; printf "jellyfin-stub-snap"; }
+create_service_snapshot() { printf "proof\n" >> "$ORDER"
+  command cp -a "'"$TMP_DIR"'/proof-order/data/jellyfin" "'"$TMP_DIR"'/proof-order/snapshots/jellyfin-stub-snap"
+  printf "jellyfin-stub-snap"; }
 compose_cmd() { [[ "${1:-}" == "up" ]] && printf "restart\n" >> "$ORDER"; return 0; }')"
 [ "$(cat "$d/rc")" = "0" ] || fail "the ordering scenario did not complete: $(cat "$d/out.txt")"
 [ -f "$d/order.log" ] || fail "neither the proof snapshot nor the restart happened"
@@ -497,6 +523,18 @@ grep -q '^proof$' "$d/order.log" || fail "the proof snapshot was never taken"
 grep -q '^restart$' "$d/order.log" || fail "the service was never restarted"
 [ "$(head -1 "$d/order.log")" = "proof" ] \
   || fail "the proof snapshot was taken AFTER the restart, so it is crash-consistent rather than clean: $(cat "$d/order.log")"
+
+# ...and the recovery-point verification must come AFTER the restart. Both trees
+# it compares are static (the original was moved aside; the snapshot is
+# read-only), so holding the service down while a large tree is hashed would buy
+# nothing and cost real downtime.
+proof_line="$(grep -n 'migrate\[proof\]' "$d/out.txt" | head -1 | cut -d: -f1)"
+recov_line="$(grep -n 'migrate\[recovery\]' "$d/out.txt" | head -1 | cut -d: -f1)"
+health_line="$(grep -n 'migrate\[health\]' "$d/out.txt" | head -1 | cut -d: -f1)"
+[ -n "$recov_line" ] || fail "the recovery point was never verified: $(cat "$d/out.txt")"
+[ "$proof_line" -lt "$recov_line" ] || fail "the recovery point was verified before the snapshot existed"
+[ "$health_line" -lt "$recov_line" ] \
+  || fail "the recovery point was verified while the service was still down; that is avoidable downtime"
 
 # ---------------------------------------------------------------------------
 # migrate_verify must not report "content manifest identical" over files it
