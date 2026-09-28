@@ -5438,11 +5438,53 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   return 0
 }
 
+# A deterministic inventory of the storage topology this project manages.
+#
+# Exists because the Jellyfin deployment aborted on a stale ABSOLUTE invariant.
+# The hand-written deploy script asserted
+#
+#   find /srv/data -maxdepth 1 -inum 256   ->  must be EMPTY
+#   ls /srv/snapshots | wc -l              ->  must be 0
+#
+# which was true only before any service had been migrated. After the pilot,
+# /srv/data/jellyfin is intentionally a subvolume and /srv/snapshots intentionally
+# holds its proof snapshot, so a deployment that changed nothing was reported as
+# having changed storage. Both assertions would have fired; the first one did.
+#
+# The question a deployment actually needs answered is not "is the topology
+# empty?" but "is the topology the SAME as before I started?". This prints it in a
+# form two runs can be compared with, so the caller asserts equality rather than
+# emptiness.
+#
+# Sorted, one item per line, no timestamps or sizes -- nothing that changes on its
+# own between two captures minutes apart.
+storage_topology() {
+  local data_root="${DOMUM_DATA_ROOT%/}" snap_root="${DOMUM_SNAPSHOT_ROOT%/}" p
+  # Service subvolumes: depth 1 under the data root. Nested subvolumes deeper than
+  # that are a different concern and are reported by the protection states.
+  if [[ -d "$data_root" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && printf 'subvolume %s\n' "$p"
+    done < <(find "$data_root" -maxdepth 1 -mindepth 1 -type d -inum 256 2>/dev/null | sort)
+  fi
+  if [[ -d "$snap_root" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && printf 'snapshot %s\n' "$p"
+    done < <(find "$snap_root" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+  fi
+}
+
 storage_cmd() {
   local sub="${1:-}"
   case "$sub" in
     migrate-subvolume) shift; storage_migrate_subvolume "$@" ;;
-    *) die "Usage: domum-media storage migrate-subvolume <service>" ;;
+    topology)
+      # Read-only. Deliberately does NOT require root: a deployment captures this
+      # before and after, and both captures must run the same code -- if this
+      # needed privilege the pre-capture could silently differ from the post one.
+      load_cfg
+      storage_topology ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology}" ;;
   esac
 }
 
@@ -5497,6 +5539,11 @@ Usage:
   domum-media checkup [--json]
   domum-media report [--json|--write]
   domum-media storage migrate-subvolume <service>
+  domum-media storage topology              Deterministic inventory of managed
+                                            subvolumes and snapshots. Capture it
+                                            before and after an operation and
+                                            compare, rather than asserting an
+                                            absolute state
   domum-media compose <docker compose arguments...>
                                             Run docker compose with this
                                             installation's fragment layering
