@@ -66,7 +66,20 @@ Never:
 
 - claim a skipped snapshot provides rollback protection;
 - treat snapshot success as proven merely because `/srv/data` itself is Btrfs;
-- use the current snapshot layer to justify a risky deployment.
+- treat one migrated service as protection for the others;
+- use the current snapshot layer to justify a risky deployment;
+- write an **absolute** assertion about the storage topology — no subvolumes
+  exist, the snapshot root is empty, a global snapshot count, a service-name-only
+  gate. Every such assertion was true before the first migration and is
+  permanently false after it; one of them aborted a correct production
+  deployment. Compare *before* against *after* instead.
+
+`domum-media storage topology` prints the inventory and
+`domum-media storage topology --verify <capture>` compares a capture against the
+live one (`0` unchanged, `1` changed and named, `2` not comparable). That is the
+**one** implementation of the check: operator scripts must invoke it rather than
+carry their own copy, which is how the aborted invariant escaped CI. See
+`docs/DEPLOYMENT-INVARIANTS.md`.
 
 Operations that depend on a snapshot for rollback (stateful image update,
 Immich bundle apply, `immich reset-db`) **refuse to run** when no snapshot could
@@ -364,11 +377,13 @@ it is actually fixed; keep the detail in `docs/`.
   `tests/timer-auto-enable-safety-smoke.sh` enforces this.
 - **`domum-media-btrfs-snapshot.service` runs `snapshot prune`, not
   `snapshot create`** — confirmed, and deliberately left that way for now.
-  Its timer is enabled and fires weekly (Sun 04:30 +20m). It has never deleted
-  anything, because no service path is a subvolume and the snapshot root is
-  empty. **The first migration turns it into a live deleting job.** It now takes
-  the operation lock, reports what it deleted, and fails when a delete fails.
-  Do not repurpose it to create snapshots as a side effect of other work.
+  Its timer is enabled and fires weekly (Sun 04:30 +20m). **It is now a live
+  deleting job**: since the Jellyfin migration the snapshot root is no longer
+  empty. It ran for the first time with something to prune on 2026-09-27 04:33:43,
+  deleted nothing, and exited 0 — see `docs/SNAPSHOT-PRUNE-FORENSICS.md`. It takes
+  the operation lock, enforces a retention floor of 1, reports what it deleted, and
+  fails when a delete fails. Do not repurpose it to create snapshots as a side
+  effect of other work, and treat any change to it as a change to a deletion path.
 - Documentation may still describe protection that production does not have
   (snapshot coverage, backup targets that are not enabled). Verify claims
   against live evidence before repeating them.

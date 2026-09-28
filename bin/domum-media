@@ -5456,22 +5456,109 @@ underneath it would make that backup fail. Wait for it to finish and retry."
 # form two runs can be compared with, so the caller asserts equality rather than
 # emptiness.
 #
+# Subvolume-ness is decided by domum_is_subvolume, NOT by an inline `find -inum
+# 256`. Inode 256 is necessary but not sufficient -- it is perfectly ordinary on
+# ext4, and /srv/media on this host is ext4 -- so an inline test here would have
+# been a fourth answer to a question this project deliberately has one answer to.
+#
 # Sorted, one item per line, no timestamps or sizes -- nothing that changes on its
 # own between two captures minutes apart.
+DOMUM_TOPOLOGY_FORMAT=1
+
+# domum_is_subvolume answers with the btrfs tool when it can (root) and with
+# inode+filesystem-type when it cannot. Both are correct, and they are not
+# guaranteed to agree in every corner -- so a capture RECORDS which one produced
+# it. Comparing a capture taken unprivileged against one taken as root would
+# otherwise be able to report a change that never happened, which is precisely
+# the failure this whole mechanism exists to prevent.
+storage_topology_detector() {
+  if command -v btrfs >/dev/null 2>&1 && [[ "$(id -u)" == "0" ]]; then
+    printf 'btrfs-tool'
+  else
+    printf 'inode+fstype'
+  fi
+}
+
 storage_topology() {
-  local data_root="${DOMUM_DATA_ROOT%/}" snap_root="${DOMUM_SNAPSHOT_ROOT%/}" p
+  local data_root="${DOMUM_DATA_ROOT%/}" snap_root="${DOMUM_SNAPSHOT_ROOT%/}" p name
+  printf '# topology-format %s detector=%s data-root=%s snapshot-root=%s\n' \
+    "$DOMUM_TOPOLOGY_FORMAT" "$(storage_topology_detector)" "$data_root" "$snap_root"
   # Service subvolumes: depth 1 under the data root. Nested subvolumes deeper than
   # that are a different concern and are reported by the protection states.
   if [[ -d "$data_root" ]]; then
     while IFS= read -r p; do
-      [[ -n "$p" ]] && printf 'subvolume %s\n' "$p"
-    done < <(find "$data_root" -maxdepth 1 -mindepth 1 -type d -inum 256 2>/dev/null | sort)
+      [[ -n "$p" ]] || continue
+      domum_is_subvolume "$p" && printf 'subvolume %s\n' "$p"
+    done < <(find "$data_root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | LC_ALL=C sort)
   fi
   if [[ -d "$snap_root" ]]; then
-    while IFS= read -r p; do
-      [[ -n "$p" ]] && printf 'snapshot %s\n' "$p"
-    done < <(find "$snap_root" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && printf 'snapshot %s\n' "$name"
+    done < <(find "$snap_root" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
   fi
+}
+
+# Compare a saved capture against the live topology, and say WHAT differs.
+#
+# This is the assertion a storage-neutral operation -- a deployment installs files
+# and moves a git ref -- needs after it finishes. It lives here, tested, rather
+# than in each hand-written operator script, because the script that aborted the
+# b762fe8 deployment was the only copy of an invariant nobody had reviewed.
+#
+# Three outcomes, deliberately distinct:
+#   0  unchanged
+#   1  CHANGED, with each appearance and disappearance named
+#   2  NOT COMPARABLE -- the two captures do not describe the same question
+#
+# 2 exists because "I cannot tell" must never be reported as "unchanged". A caller
+# that only tests for success treats it as a failure, which is the safe default.
+storage_topology_verify() {
+  local before="${1:-}" now hb hn line changed=0 subs snaps
+  [[ -n "$before" ]] || die "storage_topology_verify needs a capture file"
+
+  if [[ ! -f "$before" ]]; then
+    warn "No topology capture to compare against: $before"
+    return 2
+  fi
+
+  now="$(mktemp)"
+  storage_topology > "$now"
+
+  hb="$(grep -m1 '^# topology-format ' "$before" || true)"
+  hn="$(grep -m1 '^# topology-format ' "$now" || true)"
+  if [[ -z "$hb" ]]; then
+    warn "$before has no topology header; it was not produced by 'storage topology'."
+    rm -f "$now"
+    return 2
+  fi
+  if [[ "$hb" != "$hn" ]]; then
+    # Different format version, different subvolume detector, or different roots.
+    # Diffing these would manufacture a topology change out of a changed question.
+    warn "Topology captures are not comparable; refusing to report a change that may not have happened."
+    warn "  captured: $hb"
+    warn "  now     : $hn"
+    rm -f "$now"
+    return 2
+  fi
+
+  while IFS= read -r line; do
+    case "$line" in
+      '<'*) printf 'DISAPPEARED %s\n' "${line#< }"; changed=1 ;;
+      '>'*) printf 'APPEARED    %s\n' "${line#> }"; changed=1 ;;
+    esac
+  done < <(diff <(grep -v '^#' "$before" | LC_ALL=C sort) \
+                <(grep -v '^#' "$now"    | LC_ALL=C sort) | grep -E '^[<>]' || true)
+
+  subs="$(grep -c '^subvolume ' "$now" || true)"
+  snaps="$(grep -c '^snapshot ' "$now" || true)"
+  rm -f "$now"
+
+  if (( changed )); then
+    warn "Storage topology CHANGED (now ${subs} subvolume(s), ${snaps} snapshot(s))."
+    return 1
+  fi
+  echo "[domum-media] Storage topology unchanged: ${subs} subvolume(s), ${snaps} snapshot(s)."
+  return 0
 }
 
 storage_cmd() {
@@ -5479,12 +5566,20 @@ storage_cmd() {
   case "$sub" in
     migrate-subvolume) shift; storage_migrate_subvolume "$@" ;;
     topology)
+      shift
       # Read-only. Deliberately does NOT require root: a deployment captures this
       # before and after, and both captures must run the same code -- if this
       # needed privilege the pre-capture could silently differ from the post one.
+      # The capture records which detector produced it, so a mismatch is reported
+      # rather than silently diffed.
       load_cfg
-      storage_topology ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology}" ;;
+      case "${1:-}" in
+        "")        storage_topology ;;
+        --verify)  [[ -n "${2:-}" ]] || die "Usage: domum-media storage topology --verify <capture-file>"
+                   storage_topology_verify "$2" ;;
+        *)         die "Usage: domum-media storage topology [--verify <capture-file>]" ;;
+      esac ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]}" ;;
   esac
 }
 
@@ -5541,9 +5636,14 @@ Usage:
   domum-media storage migrate-subvolume <service>
   domum-media storage topology              Deterministic inventory of managed
                                             subvolumes and snapshots. Capture it
-                                            before and after an operation and
-                                            compare, rather than asserting an
-                                            absolute state
+                                            before an operation, then verify,
+                                            rather than asserting an absolute
+                                            state
+  domum-media storage topology --verify <file>
+                                            Compare a saved capture against the
+                                            live topology. 0 unchanged, 1 changed
+                                            (naming each difference), 2 not
+                                            comparable
   domum-media compose <docker compose arguments...>
                                             Run docker compose with this
                                             installation's fragment layering
