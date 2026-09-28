@@ -426,6 +426,72 @@ out="$(run "domum_is_subvolume '$SVC' && echo YES || echo NO")"
 grep -q YES <<< "$out" || fail "domum_is_subvolume does not see the migrated path as a subvolume: $out"
 ok "protected-state detection agrees" "domum_is_subvolume -> yes"
 
+# --- the storage topology, against REAL subvolumes ---------------------------
+# tests/storage-topology-smoke.sh has to stub domum_is_subvolume, because inode
+# 256 cannot be arranged without root and a btrfs filesystem. Here both are real,
+# so this is the only place the inventory is proven against an actual subvolume
+# rather than against a fixture that says it is one.
+#
+# This is the invariant that aborted the b762fe8 deployment. It gets exercised in
+# exactly the shape a deployment uses it: capture, do something storage-neutral,
+# verify.
+CAP="$FIXTURE/topology.capture"
+run "storage_topology" > "$CAP"
+grep -q "^subvolume $SVC\$" "$CAP" \
+  || fail "storage_topology does not list the real migrated subvolume: $(cat "$CAP")"
+grep -q "^snapshot $(basename -- "$PROOF")\$" "$CAP" \
+  || fail "storage_topology does not list the real proof snapshot: $(cat "$CAP")"
+grep -q '^# topology-format 1 detector=btrfs-tool ' "$CAP" \
+  || fail "as root with btrfs present the capture must record the tool detector: $(cat "$CAP")"
+# Ordinary sibling directories must NOT be listed. This is the half of the
+# inventory a stubbed detector cannot prove.
+mkdir -p "$DATA/ordinary-dir"
+out="$(run "storage_topology")"
+grep -q 'ordinary-dir' <<< "$out" \
+  && fail "an ordinary directory was reported as a subvolume: $out"
+ok "topology lists the real subvolume and snapshot, and no ordinary directory" \
+   "$(grep -c '^subvolume ' "$CAP") subvol, $(grep -c '^snapshot ' "$CAP") snap"
+
+# Storage-neutral work in between: touching file contents must not read as a
+# topology change, or a correct deployment aborts.
+printf 'deployment-like write\n' >> "$SVC/config/service.log"
+out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
+(( rc == 0 )) || fail "THE BUG: an unchanged real topology reported a change (rc=$rc): $out"
+ok "verify accepts an unchanged real topology" "rc=0"
+
+# A real subvolume appearing must be caught. Created and destroyed with the real
+# primitives, not simulated.
+btrfs subvolume create "$DATA/interloper" >/dev/null 2>&1 \
+  || fail "could not create a second real subvolume"
+out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
+(( rc == 1 )) || fail "a real new subvolume was not reported as a change (rc=$rc): $out"
+grep -q "APPEARED    subvolume $DATA/interloper" <<< "$out" \
+  || fail "the new real subvolume was not named: $out"
+btrfs subvolume delete "$DATA/interloper" >/dev/null 2>&1 \
+  || fail "could not remove the interloping subvolume"
+ok "verify reports a real subvolume appearing" "and names it"
+
+# A real snapshot disappearing -- the recovery point itself -- must be caught.
+# Moved aside, not deleted: this is the proof snapshot.
+mv "$PROOF" "$SNAPS/.held-aside"
+out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
+mv "$SNAPS/.held-aside" "$PROOF"
+(( rc == 1 )) || fail "a vanished real snapshot was not reported (rc=$rc): $out"
+grep -q "DISAPPEARED snapshot $(basename -- "$PROOF")" <<< "$out" \
+  || fail "the vanished snapshot was not named: $out"
+out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
+(( rc == 0 )) || fail "restoring the snapshot did not restore the topology (rc=$rc): $out"
+ok "verify reports a real snapshot disappearing, and clears when it returns"
+
+# A capture taken with the other detector must be refused, not diffed: it answers
+# a different question, and "I cannot tell" must never read as "unchanged".
+sed 's/detector=btrfs-tool/detector=inode+fstype/' "$CAP" > "$FIXTURE/topology.other"
+out="$(run "storage_topology_verify '$FIXTURE/topology.other'" 2>&1)"; rc=$?
+(( rc == 2 )) || fail "a capture from the other detector must be 'not comparable' (rc=$rc): $out"
+ok "a capture from a different detector is refused, not diffed" "rc=2"
+
+rmdir "$DATA/ordinary-dir"
+
 # ===========================================================================
 sect "3. the real rollback, against real snapshots"
 # ===========================================================================

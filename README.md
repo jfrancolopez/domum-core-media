@@ -100,3 +100,5 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/RESTORE-VERIFICATION.md](docs/RESTORE-VERIFICATION.md)
 - [docs/BTRFS-MIGRATION-PLAN.md](docs/BTRFS-MIGRATION-PLAN.md)
 - [docs/JELLYFIN-PILOT.md](docs/JELLYFIN-PILOT.md)
+- [docs/DEPLOYMENT-INVARIANTS.md](docs/DEPLOYMENT-INVARIANTS.md)
+- [docs/SNAPSHOT-PRUNE-FORENSICS.md](docs/SNAPSHOT-PRUNE-FORENSICS.md)

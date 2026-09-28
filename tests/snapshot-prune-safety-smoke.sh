@@ -308,4 +308,49 @@ grep -q 'jellyfin-handmade' <<< "$err" \
 grep -q 'jellyfin-extra' <<< "$err" \
   && fail "another base's snapshot was reported as unrecognised; that is noise: $err"
 
+# ---------------------------------------------------------------------------
+# The real production inventory, as of the first weekly run that had something to
+# prune (2026-09-27). Pinned by its ACTUAL name, because the retention arithmetic
+# and the name parser both have to accept it and a change to either would be
+# invisible against synthetic `-tag` fixtures.
+#
+# The suffix is what makes it worth pinning: `-post-migration` contains a hyphen,
+# so it exercises the `(-.*)?$` tail rather than a single trailing word. A name
+# this code cannot parse is EXCLUDED from the listing -- which sounds safe, and is
+# not: the report would then name no latest snapshot for a service that has one.
+#
+# docs/SNAPSHOT-PRUNE-FORENSICS.md records what the run actually did.
+# ---------------------------------------------------------------------------
+rm -rf "$TMP_DIR/snapshots"
+mkdir -p "$TMP_DIR/snapshots/jellyfin-20260925-153317-post-migration"
+# The mtime real Btrfs produces: the SOURCE subvolume root's, not a creation time.
+touch -d "2026-06-05 15:13:09" "$TMP_DIR/snapshots/jellyfin-20260925-153317-post-migration"
+
+got="$(bash -c "$(harness)
+list_snapshots_for_base jellyfin" 2>/dev/null)"
+[[ "$got" == "jellyfin-20260925-153317-post-migration" ]] \
+  || fail "the real production snapshot name does not parse: [$got]"
+
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+btrfs() { echo \"DELETE \${!#}\"; return 0; }
+snapshot_prune")" || fail "prune failed against the real inventory: $out"
+grep -q 'DELETE' <<< "$out" && fail "the weekly prune would delete the only recovery point: $out"
+grep -q '0 deleted, 0 failed (keeping 14 per subvolume)' <<< "$out" \
+  || fail "prune did not report a clean no-op: $out"
+[[ -d "$TMP_DIR/snapshots/jellyfin-20260925-153317-post-migration" ]] \
+  || fail "the only snapshot is gone"
+
+# One snapshot must survive every retention value, including the ones that used to
+# delete it. This is the invariant, stated against the real inventory: a RETENTION
+# job never leaves a protected service with zero recovery points.
+for keep in 0 -1 "" fourteen 1 14 999; do
+  out="$(bash -c "$(harness)
+${keep:+SNAPSHOT_KEEP_PER_SUBVOL='$keep'}
+btrfs() { echo \"DELETE \${!#}\"; return 0; }
+snapshot_prune" 2>&1)"
+  grep -q 'DELETE' <<< "$out" \
+    && fail "SNAPSHOT_KEEP_PER_SUBVOL='$keep' would delete the only recovery point: $out"
+done
+
 echo "PASS: snapshot prune safety smoke test"
