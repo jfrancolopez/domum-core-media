@@ -120,11 +120,30 @@ grep -q 'No snapshot was created' "$REPO_ROOT/bin/domum-media" \
   || fail "the operator-facing 'snapshot create' can still exit 0 having created nothing"
 
 # apply stays non-fatal by design, but must warn rather than claim success.
+#
+# Scoped to the `if ! snapshot_create "pre-apply"` block and its closing `fi`,
+# NOT to a fixed line window after the echo: a window makes the assertion
+# sensitive to comment length, so adding an explanatory comment inside the block
+# broke this check while the behaviour it tests was correct.
 awk '
-  /Pre-apply btrfs snapshot/ { found=1; window=8 }
-  found && window-- > 0 && /no rollback point/ { ok=1 }
+  /if ! snapshot_create "pre-apply"/ { inblock=1 }
+  inblock && /no rollback point/     { ok=1 }
+  inblock && /^  fi$/                { inblock=0 }
   END { exit ok ? 0 : 1 }
 ' "$REPO_ROOT/bin/domum-media" || fail "apply does not warn that it has no rollback point"
+
+# ...and it must NOT assert a cause it cannot know. While no service path was a
+# subvolume, "service state paths are not Btrfs subvolumes" was the only possible
+# reason. With migrated services present, snapshot_create also returns non-zero
+# when a subvolume's snapshot genuinely FAILED, and naming the old cause would
+# hide the new one.
+awk '
+  /if ! snapshot_create "pre-apply"/ { inblock=1 }
+  inblock && /warn "Service state paths are not Btrfs subvolumes/ { bad=1 }
+  inblock && /^  fi$/ { inblock=0 }
+  END { exit bad ? 1 : 0 }
+' "$REPO_ROOT/bin/domum-media" \
+  || fail "the pre-apply warning asserts a cause that is no longer the only one"
 
 # ---------------------------------------------------------------------------
 # 5. A btrfs command that FAILS on a real subvolume must not pass the gate.

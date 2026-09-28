@@ -83,6 +83,29 @@ The **database file itself is deliberately not on that list.** Sidecars appearin
 proves the service opened its database; the `.db` content changing is a different
 claim and the operator should always see it.
 
+## The implementation now asserts C == E itself
+
+`C == E` was stated here and enforced only in a hand-written operator script, so a
+migration run straight from the CLI never made its own central claim — and the one
+copy of the check lived in a file CI never sees. `migrate_verify_recovery_point`
+closes that: the snapshot must be read-only, both trees must exist, content and
+metadata must match in full, and every SQLite database **in the snapshot** must
+open and pass `integrity_check` and `foreign_key_check`.
+
+The database check is not redundant with the hashes. A torn write that predates
+the migration copies perfectly and verifies perfectly; two byte-identical trees
+holding the same broken database satisfy `C == E` and are still an unusable
+recovery point. Hashes prove the copy is faithful, not that what was copied is
+loadable.
+
+It is always done on a **disposable copy**. Opening a WAL-mode database creates
+`-shm` and `-wal` beside it and leaves them there even with `mode=ro` (measured),
+so checking in place would make `C` differ from `E` — the act of verifying the
+claim would break it — and would simply fail against the read-only snapshot.
+
+It runs **after** the restart. Both C and E are static, so holding the service
+down to hash them buys nothing.
+
 ## Regression coverage
 
 `tests/integration/btrfs-migration-integration.sh` models a service that writes

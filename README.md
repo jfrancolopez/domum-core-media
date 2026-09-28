@@ -102,3 +102,4 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/JELLYFIN-PILOT.md](docs/JELLYFIN-PILOT.md)
 - [docs/DEPLOYMENT-INVARIANTS.md](docs/DEPLOYMENT-INVARIANTS.md)
 - [docs/SNAPSHOT-PRUNE-FORENSICS.md](docs/SNAPSHOT-PRUNE-FORENSICS.md)
+- [docs/KAVITA-PILOT.md](docs/KAVITA-PILOT.md)

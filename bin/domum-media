@@ -885,21 +885,61 @@ verify_backup_freshness() {
   fi
 }
 
-service_is_healthy() {
-  local svc="$1"
-  local compose_svcs cid health_url
+# Docker health as THREE answers, not two.
+#
+# `starting` is the one that matters. For StartPeriod after a restart Docker
+# reports `starting`, and the previous code only rejected `unhealthy` -- so
+# `starting` read as healthy and `wait_for_service_health` returned on its FIRST
+# poll, before the healthcheck had run even once. Measured on this host:
+#
+#   kavita   Healthcheck.Test = ["CMD-SHELL","curl -fsS http://localhost:5000/api/health || exit 1"]
+#            StartPeriod=30s Interval=30s Timeout=15s Retries=3
+#
+# So for the first ~30 seconds after the migration restarts kavita, "healthy"
+# meant nothing more than "docker start returned". Kavita was chosen as migration
+# #2 precisely because that healthcheck is a real HTTP request to the application,
+# and the migration was throwing the only application-level signal it has away.
+#
+# `none` is kept distinct from `healthy` for the opposite reason: jellyfin, plex,
+# navidrome, calibre-web and traefik have no healthcheck at all, so there is
+# nothing to wait for and "the container is running" is the whole claim. Callers
+# must not report that as application health.
+#
+# Precedence across a multi-container service (immich has four): unhealthy >
+# starting > healthy > none. One container still starting means the service is
+# still starting.
+service_health_state() {  # -> healthy | starting | unhealthy | stopped | none
+  local svc="$1" compose_svcs compose_svc cid status health worst=none
 
   compose_svcs="$(service_compose_services "$svc" || true)"
+  [[ -n "$compose_svcs" ]] || { printf 'stopped'; return 0; }
+
   for compose_svc in $compose_svcs; do
     cid="$(tracked_service_container_id "$compose_svc")"
-    [[ -n "$cid" ]] || return 1
-    if [[ "$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || true)" != "running" ]]; then
-      return 1
-    fi
-    if [[ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null || true)" == "unhealthy" ]]; then
-      return 1
-    fi
+    [[ -n "$cid" ]] || { printf 'stopped'; return 0; }
+    status="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || true)"
+    [[ "$status" == "running" ]] || { printf 'stopped'; return 0; }
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
+    case "$health" in
+      unhealthy) printf 'unhealthy'; return 0 ;;
+      starting)  worst=starting ;;
+      healthy)   [[ "$worst" == "none" ]] && worst=healthy ;;
+      *)         ;;
+    esac
   done
+
+  printf '%s' "$worst"
+}
+
+service_is_healthy() {
+  local svc="$1"
+  local state health_url
+
+  state="$(service_health_state "$svc")"
+  case "$state" in
+    healthy|none) ;;
+    *) return 1 ;;
+  esac
 
   health_url="$(service_health_url "$svc" || true)"
   if [[ -n "$health_url" ]] && cmd_exists curl; then
@@ -3109,8 +3149,14 @@ apply() {
   # rollback, so this stays non-fatal -- but it must be loud rather than
   # silently reporting a snapshot that never happened.
   if ! snapshot_create "pre-apply"; then
-    warn "No pre-apply snapshot was created; this apply has no rollback point."
-    warn "Service state paths are not Btrfs subvolumes — see docs/SNAPSHOT-MODEL.md."
+    # Do NOT assert a cause here. This used to say "service state paths are not
+    # Btrfs subvolumes", which was the only possible reason while none of them
+    # was -- and is now wrong in the case that matters: with migrated services
+    # present, snapshot_create also returns non-zero when a subvolume's snapshot
+    # genuinely FAILED. Naming the old cause would hide the new one. The counts
+    # it just printed say which happened.
+    warn "No usable pre-apply snapshot; this apply has no rollback point."
+    warn "See the snapshot counts above for whether paths were skipped or a snapshot failed, and docs/SNAPSHOT-MODEL.md."
   fi
 
   echo "[domum-media] Applying desired state..."
@@ -4092,11 +4138,18 @@ checkup_cmd() {
   local service enable_var
   while IFS='|' read -r service enable_var _ _ _ _ _; do
     [[ "${!enable_var:-0}" == "1" ]] || continue
-    if wait_for_service_health "$service" 1 1; then
-      checkup_add healthy "${service} healthy."
-    else
-      checkup_add warning "${service} is not healthy."
-    fi
+    case "$(service_health_state "$service")" in
+      healthy)   checkup_add healthy "${service} healthy." ;;
+      # Not a warning. A healthcheck reports `starting` for its whole StartPeriod
+      # after any restart, and calling that unhealthy would make the report cry
+      # wolf every time a service is restarted.
+      starting)  checkup_add healthy "${service} starting (healthcheck has not passed yet)." ;;
+      unhealthy) checkup_add warning "${service} is UNHEALTHY." ;;
+      stopped)   checkup_add warning "${service} is not running." ;;
+      # No healthcheck: running is the whole claim, and saying more than that is
+      # the CLAUDE.md section 14 defect -- a report implying health it cannot see.
+      *)         checkup_add healthy "${service} running (no healthcheck; application health unverified)." ;;
+    esac
   done < <(service_lifecycle_specs)
 
   local last_success age_hours
@@ -4972,6 +5025,7 @@ doctor_cmd() {
 # stage that can fail has an explicit recovery.
 
 MIGRATE_FULL_HASH_MAX_FILES="${MIGRATE_FULL_HASH_MAX_FILES:-20000}"
+MIGRATE_SQLITE_MAX_BYTES="${MIGRATE_SQLITE_MAX_BYTES:-2147483648}"
 
 migrate_stage() { echo "[domum-media] migrate[$1] $2"; }
 
@@ -5120,17 +5174,17 @@ migrate_metadata_manifest() {
 }
 
 migrate_verify() {
-  local src="$1" dst="$2" files
+  local src="$1" dst="$2" stage="${3:-verify}" files
   local s_count s_bytes d_count d_bytes
   read -r s_count s_bytes <<< "$(migrate_measure "$src")"
   read -r d_count d_bytes <<< "$(migrate_measure "$dst")"
-  migrate_stage verify "files: $s_count -> $d_count, bytes: $s_bytes -> $d_bytes"
+  migrate_stage "$stage" "files: $s_count -> $d_count, bytes: $s_bytes -> $d_bytes"
   [[ "$s_count" == "$d_count" ]] || { warn "file count mismatch"; return 1; }
   [[ "$s_bytes" == "$d_bytes" ]] || { warn "byte count mismatch"; return 1; }
 
   files="$s_count"
   if (( files <= MIGRATE_FULL_HASH_MAX_FILES )); then
-    migrate_stage verify "hashing all $files file(s)"
+    migrate_stage "$stage" "hashing all $files file(s)"
     local src_manifest dst_manifest src_lines dst_lines
     src_manifest="$(mktemp)" || { warn "could not stage the source manifest"; return 1; }
     dst_manifest="$(mktemp)" || { warn "could not stage the copy manifest"; rm -f "$src_manifest"; return 1; }
@@ -5172,7 +5226,7 @@ migrate_verify() {
       return 1
     fi
     rm -f "$src_manifest" "$dst_manifest"
-    migrate_stage verify "content manifest identical ($files of $files file(s))"
+    migrate_stage "$stage" "content manifest identical ($files of $files file(s))"
   else
     # Too many files to hash inline, so hash a deterministic sample: the first
     # and last paths in sorted order, every Nth in between, and the largest file.
@@ -5182,7 +5236,7 @@ migrate_verify() {
     # and verification PASSED having compared nothing. That was reachable
     # whenever MIGRATE_FULL_HASH_MAX_FILES < files < 400. A sample of zero is
     # now a failure, so the degenerate case cannot masquerade as a pass.
-    migrate_stage verify "$files files exceeds $MIGRATE_FULL_HASH_MAX_FILES; hashing a deterministic sample"
+    migrate_stage "$stage" "$files files exceeds $MIGRATE_FULL_HASH_MAX_FILES; hashing a deterministic sample"
     local step sample_file sampled=0 bad=0 rel
     step=$(( files / 200 )); (( step > 0 )) || step=1
     sample_file="$(mktemp)" || { warn "could not stage the verification sample"; return 1; }
@@ -5222,7 +5276,7 @@ migrate_verify() {
     # defence in depth against a future change to the selection rules rather
     # than a tested path -- mutation testing confirms nothing exercises it.
     (( sampled > 0 )) || { warn "the verification sample was empty; nothing was compared"; return 1; }
-    migrate_stage verify "sampled content identical ($sampled of $files file(s))"
+    migrate_stage "$stage" "sampled content identical ($sampled of $files file(s))"
   fi
 
   # Always compared in full, whichever content branch ran: this is cheap
@@ -5234,7 +5288,163 @@ migrate_verify() {
       | head -20 >&2
     return 1
   fi
-  migrate_stage verify "type, mode, owner, group and symlink targets identical"
+  migrate_stage "$stage" "type, mode, owner, group and symlink targets identical"
+  return 0
+}
+
+# SQLite integrity for a tree that has to be RECOVERABLE, not merely identical.
+#
+# Byte-for-byte equality proves the copy is faithful. It does not prove the thing
+# copied is a loadable database: a torn write that predates the migration copies
+# perfectly and verifies perfectly. The recovery point is the one tree whose
+# usability actually matters, so it gets opened.
+#
+# Always against a DISPOSABLE COPY, never in place. The proof snapshot is
+# read-only and `.premigration` is the last independent copy of the pre-migration
+# state; opening a WAL-mode database can create sidecars and can trigger
+# recovery, and neither may happen to either tree.
+#
+# Prints `ok`, a reason, or `unchecked`. `unchecked` is not a pass, and the caller
+# must not report it as one -- a check that did not run is reported as not having
+# run. This is the only function here allowed to say "I don't know".
+domum_sqlite_check() {  # $1 = path to a disposable COPY
+  local db="$1" ic fk
+  if cmd_exists sqlite3; then
+    ic="$(sqlite3 -readonly "$db" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+    fk="$(sqlite3 -readonly "$db" 'PRAGMA foreign_key_check;' 2>&1 | grep -c . || true)"
+    if [[ "$ic" != "ok" ]]; then printf 'integrity_check: %s' "$ic"
+    elif [[ "${fk:-0}" != "0" ]]; then printf 'foreign_key_check: %s violation(s)' "$fk"
+    else printf 'ok'; fi
+  elif cmd_exists python3; then
+    python3 - "$db" <<'PY' 2>/dev/null || printf 'unreadable as a database'
+import sqlite3, sys
+try:
+    con = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+except Exception as e:
+    print("cannot open: %s" % e, end=""); sys.exit(0)
+try:
+    ic = con.execute("PRAGMA integrity_check").fetchone()[0]
+    fk = con.execute("PRAGMA foreign_key_check").fetchall()
+    if ic != "ok":
+        print("integrity_check: %s" % ic, end="")
+    elif fk:
+        print("foreign_key_check: %d violation(s)" % len(fk), end="")
+    else:
+        print("ok", end="")
+except Exception as e:
+    print("failed: %s" % e, end="")
+finally:
+    con.close()
+PY
+  else
+    printf 'unchecked'
+  fi
+}
+
+# Every SQLite database in $1, checked from a copy. Returns non-zero only for a
+# database that is genuinely broken -- never for one that could not be checked,
+# which is reported instead.
+migrate_sqlite_integrity() {  # $1 = tree, $2 = stage label
+  local tree="$1" stage="${2:-verify}"
+  local tmp rel size result bad=0 checked=0 skipped=0
+
+  tmp="$(mktemp -d)" || { warn "could not stage a scratch directory for the database check"; return 1; }
+  while IFS= read -r -d "" rel; do
+    [[ -n "$rel" ]] || continue
+    size="$(stat -c %s "$tree/$rel" 2>/dev/null || echo 0)"
+    # Copying a very large database to check it costs real time and space, and a
+    # multi-gigabyte SQLite file is not a shape this project has. Stated, not
+    # silently skipped.
+    if (( size > MIGRATE_SQLITE_MAX_BYTES )); then
+      migrate_stage "$stage" "sqlite $rel: $(( size / 1048576 )) MiB exceeds the check limit; NOT checked"
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+    # Only files that ARE SQLite databases. A `.db` extension is a naming
+    # convention, not a format: failing a migration because some application's
+    # `.db` is Berkeley DB, or a plain file someone named `.db`, would be a false
+    # positive on a path where a false positive is expensive. The 16-byte magic
+    # is definitive, costs one read, and avoids copying the file at all.
+    # 15 bytes, not 16: the magic is "SQLite format 3\0" and command
+    # substitution drops the NUL with a warning on stderr.
+    if [[ "$(head -c 15 "$tree/$rel" 2>/dev/null)" != "SQLite format 3" ]]; then
+      migrate_stage "$stage" "sqlite $rel: not a SQLite database; not checked"
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+    # A COPY, always. Opening a WAL-mode database CREATES `-shm` and `-wal` beside
+    # it and leaves them there -- even with `mode=ro`. Measured:
+    #
+    #   before:  w.db
+    #   ro open: w.db  w.db-shm  w.db-wal      <- and they persist after close
+    #
+    # In `.premigration` that would make the preserved original differ from the
+    # proof snapshot, so the act of verifying the integrity claim would break it.
+    # Against the read-only snapshot it would simply fail. Neither is acceptable.
+    if ! cp -- "$tree/$rel" "$tmp/probe.db" 2>/dev/null; then
+      warn "sqlite $rel: could not be copied for checking"
+      bad=1
+      continue
+    fi
+    result="$(domum_sqlite_check "$tmp/probe.db")"
+    rm -f -- "$tmp/probe.db"
+    case "$result" in
+      ok)        migrate_stage "$stage" "sqlite $rel: ok"; checked=$(( checked + 1 )) ;;
+      unchecked) migrate_stage "$stage" "sqlite $rel: NOT checked (no sqlite3 and no python3)"; skipped=$(( skipped + 1 )) ;;
+      *)         warn "sqlite $rel: $result"; bad=1 ;;
+    esac
+  done < <(find "$tree" -xdev -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -printf '%P\0' 2>/dev/null)
+  rm -rf -- "$tmp"
+
+  (( bad == 0 )) || return 1
+  migrate_stage "$stage" "sqlite: $checked checked, $skipped not checked"
+  return 0
+}
+
+# THE integrity claim of a migration, asserted by the migration itself.
+#
+# CLAUDE.md section 13b states it: `.premigration` == proof snapshot -- the
+# original that was moved aside, against a snapshot of the copy that replaced it.
+# Both are static, so a running application cannot disturb the comparison, and it
+# catches corruption introduced after migrate_verify has already passed.
+#
+# Until now that comparison existed ONLY in a hand-written operator script. A
+# migration run straight from the CLI never made its own central claim, and the
+# one copy of it lived in a file CI never sees -- which is exactly how the stale
+# topology invariant came to abort a correct deployment. Same class, higher stakes.
+#
+# Deliberately run AFTER the restart: both trees are static, so nothing is gained
+# by holding the service down while a large tree is hashed.
+#
+# A failure here is not recoverable by this command and must not try to be: both
+# copies are intact, and which one is right is a question for the operator.
+migrate_verify_recovery_point() {  # $1 = .premigration, $2 = proof snapshot path
+  local premigration="$1" proof_path="$2"
+
+  [[ -d "$premigration" ]] || { warn "the preserved original is missing from $premigration"; return 1; }
+  [[ -d "$proof_path" ]] || { warn "the proof snapshot is missing from $proof_path"; return 1; }
+
+  # Read-only is what makes the snapshot a proof rather than another mutable copy.
+  if cmd_exists btrfs; then
+    local ro
+    ro="$(btrfs property get -ts "$proof_path" 2>/dev/null || true)"
+    if [[ "$ro" != "ro=true" ]]; then
+      warn "the proof snapshot is not read-only ($proof_path: ${ro:-unknown})"
+      return 1
+    fi
+  fi
+
+  if ! migrate_verify "$premigration" "$proof_path" recovery; then
+    warn "THE PRESERVED ORIGINAL AND THE PROOF SNAPSHOT DIFFER."
+    warn "  preserved original : $premigration"
+    warn "  proof snapshot     : $proof_path"
+    warn "Both trees are intact. Do NOT delete either one."
+    return 1
+  fi
+
+  migrate_sqlite_integrity "$proof_path" recovery || return 1
+
+  migrate_stage recovery "integrity proven: $premigration == $proof_path"
   return 0
 }
 
@@ -5312,19 +5522,29 @@ underneath it would make that backup fail. Wait for it to finish and retry."
 
   # ---- stage 1: stop --------------------------------------------------------
   local started=0
-  if [[ -n "$compose_svcs" ]]; then
-    migrate_stage stop "stopping $compose_svcs"
-    stop_compose_services_verified "$compose_svcs" \
-      || die "Could not confirm $compose_svcs stopped; nothing has been changed."
-    started=1
-  fi
 
+  # Defined BEFORE the stop is attempted, because the stop itself can fail and
+  # the recovery for that is a restart.
   migrate_restart() {
     if (( started == 1 )) && [[ -n "$compose_svcs" ]]; then
       # shellcheck disable=SC2086
       compose_cmd up -d $compose_svcs >/dev/null 2>&1 || warn "Could not restart $compose_svcs"
     fi
   }
+
+  if [[ -n "$compose_svcs" ]]; then
+    migrate_stage stop "stopping $compose_svcs"
+    # Set BEFORE the stop, not after it succeeds. A stop that fails part-way has
+    # still taken containers down, and the old ordering made migrate_restart a
+    # no-op in exactly that case: the message said "nothing has been changed"
+    # while leaving the service off. No data was ever at risk -- but the service
+    # stayed down until somebody noticed.
+    started=1
+    stop_compose_services_verified "$compose_svcs" || {
+      migrate_restart
+      die "Could not confirm $compose_svcs stopped; no data was changed, and a restart was attempted."
+    }
+  fi
 
   if ! migrate_assert_quiesced "$path"; then
     migrate_restart
@@ -5399,22 +5619,42 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   migrate_restart
   if [[ -n "$compose_svcs" ]]; then
     if wait_for_service_health "$service" 120 5; then
-      # Be precise about what that actually proved. For a service with no
-      # healthcheck and no configured health URL, service_is_healthy means the
-      # container is running -- not that the application works.
-      local health_url
+      # Be precise about what that actually proved, because the three cases prove
+      # very different things and conflating them is how "the container started"
+      # becomes "the application works".
+      local health_url health_state
       health_url="$(service_health_url "$service" 2>/dev/null || true)"
-      if [[ -n "$health_url" ]]; then
+      health_state="$(service_health_state "$service")"
+      if [[ "$health_state" == "healthy" ]]; then
+        migrate_stage health "$service is HEALTHY: its container healthcheck passed after the migration"
+      elif [[ -n "$health_url" ]]; then
         migrate_stage health "$service container running and $health_url responded"
       else
         migrate_stage health "$service container is running (no healthcheck or health URL configured)"
         migrate_stage health "content was verified byte-for-byte; confirm the application itself before removing $premigration"
       fi
     else
-      warn "$service did not become healthy after migration."
+      # `starting` now counts as not-yet-healthy, so this is reached when a real
+      # healthcheck has not passed within the timeout -- not merely when a
+      # container failed to appear.
+      warn "$service did not become healthy after migration (state: $(service_health_state "$service"))."
       warn "The previous state is intact at $premigration."
       warn "To roll back: stop the service, mv '$path' aside, mv '$premigration' '$path', start it."
       die "Migration completed but the service is unhealthy. Nothing was deleted."
+    fi
+  fi
+
+  # ---- stage 9: prove the RECOVERY POINT, not just the copy -----------------
+  # migrate_verify proved the copy matched the source before cutover. This proves
+  # the thing a rollback would actually use: the preserved original against the
+  # snapshot of what replaced it. Two static trees, so the running service cannot
+  # disturb it, and it catches corruption introduced after verification passed.
+  local recovery_ok=1
+  if [[ -n "$proof" ]]; then
+    if ! migrate_verify_recovery_point "$premigration" "$DOMUM_SNAPSHOT_ROOT/$proof"; then
+      recovery_ok=0
+      warn "The data is migrated and $service is running, but the recovery point did not verify."
+      warn "Nothing has been deleted. Investigate before relying on rollback for $service."
     fi
   fi
 
@@ -5424,6 +5664,11 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   echo "  previous state  : $premigration   (retained deliberately; remove it yourself when satisfied)"
   if [[ -n "$proof" ]]; then
     echo "  proof snapshot  : $proof"
+    if (( recovery_ok == 0 )); then
+      echo "  recovery point  : DID NOT VERIFY -- see the warnings above"
+      return 1
+    fi
+    echo "  recovery point  : verified ($premigration == the proof snapshot)"
   else
     # The migration itself succeeded and the data is safe, but rollback
     # protection was not established. Exit non-zero so a script or a systemd
