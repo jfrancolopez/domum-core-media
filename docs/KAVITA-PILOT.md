@@ -154,6 +154,13 @@ as **not checked**, never as checked.
 It runs **after** the restart: both trees are static, so holding the service down
 to hash them would buy nothing.
 
+**What it rests on.** The probe copies the `.db` file alone, without its `-wal`.
+That is sound only because step 11 already refused a non-empty WAL after the stop:
+with committed data still sitting in a WAL, a probe of the bare database would
+read a stale but internally consistent file and report `ok`. The quiesce check is
+what makes the integrity check mean what it says, so weakening either one
+weakens both.
+
 ## Failure recovery — every phase
 
 The invariant: **no failure may destroy the last valid copy of the state.** Every
