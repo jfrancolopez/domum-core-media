@@ -147,6 +147,14 @@ operation refuses, or its result is reported as something other than success. A
 service that is down is visible and fixable in one command; a service silently
 running a different application than its recovery point pairs with is neither.
 
+**Operator scripts must not assert on the CLI's prose.** A wrapper grepped for the
+literal summary line `recovery point  : verified`; the wording changed when the
+summary was split into four claims, and it aborted a migration that had completed
+perfectly — the same shape as the stale topology invariant. Assert on exit status,
+on files, or on a subcommand written for the purpose (`storage verify-recovery`,
+`storage topology --verify`). If a script needs a fact, give the CLI a way to state
+it.
+
 `tests/reconcile-boundary-audit.py` enforces the classification rather than
 trusting it: an image-preserving function containing an executable reconcile fails,
 a deployment function that stops reconciling fails, and a reconcile in an
