@@ -105,4 +105,5 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/KAVITA-PILOT.md](docs/KAVITA-PILOT.md)
 - [docs/IMAGE-DEPLOYMENT-BY-MIGRATION.md](docs/IMAGE-DEPLOYMENT-BY-MIGRATION.md)
 - [docs/MIGRATION-ORDER-3.md](docs/MIGRATION-ORDER-3.md)
+- [docs/MIGRATION-ORDER-4.md](docs/MIGRATION-ORDER-4.md)
 - [docs/RECOVERY-POINT-IDENTITY.md](docs/RECOVERY-POINT-IDENTITY.md)
