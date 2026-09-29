@@ -205,6 +205,153 @@ assert_data_survives "$d" "proof snapshot fails"
 # ---------------------------------------------------------------------------
 # Success path.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# A migration must not DEPLOY a staged image.
+#
+# `compose up -d` recreates a container whose image has changed, so restarting a
+# service deploys whatever has been pulled since it last started. This is not
+# hypothetical: the Kavita migration recreated its container on a newer image and
+# Kavita forward-migrated its database on startup, leaving the proof snapshot --
+# taken minutes earlier -- holding an OLDER schema than the running binary.
+# ---------------------------------------------------------------------------
+echo "  staged image:"
+
+# docker inspect answers: container -> running image, container -> tag,
+# tag -> a DIFFERENT image id. That is a staged upgrade.
+staged_stub='docker() {
+  case "$*" in
+    *"{{.Image}}"*)        printf "sha256:running
+" ;;
+    *"{{.Config.Image}}"*) printf "example/img:latest
+" ;;
+    *"{{.Id}}"*)           printf "sha256:staged
+" ;;
+    *) : ;;
+  esac
+}
+tracked_service_container_id() { printf "cid-%s" "$1"; }'
+
+d="$(run_migration staged-image "$staged_stub")"
+[ "$(cat "$d/rc")" != "0" ] || fail "staged image: the migration proceeded and would have deployed it: $(cat "$d/out.txt")"
+grep -q 'newer image is already staged' "$d/out.txt"   || fail "staged image: refused for the wrong reason: $(cat "$d/out.txt")"
+# Refused BEFORE anything was touched.
+[ ! -e "$d/data/jellyfin.premigration" ] || fail "staged image: refused, but the tree had already been moved"
+[ ! -e "$d/data/jellyfin.new" ] || fail "staged image: refused, but a staging copy was left behind"
+grep -q 'migrate\[stop\]' "$d/out.txt" && fail "staged image: the service was stopped before the refusal"
+assert_data_survives "$d" "staged image refused"
+
+# The deliberate override deploys it, and says so rather than going quiet.
+d="$(run_migration staged-override "$staged_stub
+MIGRATE_ALLOW_IMAGE_CHANGE=1")"
+grep -q 'may also deploy an image' "$d/out.txt" \
+  || fail "staged override: the upgrade was not announced: $(cat "$d/out.txt")"
+grep -q "previous application's data" "$d/out.txt" \
+  || fail "staged override: the weakened recovery story was not stated: $(cat "$d/out.txt")"
+grep -q 'migrate\[stop\]' "$d/out.txt" \
+  || fail "staged override: the migration did not proceed: $(cat "$d/out.txt")"
+
+# No staged image -> no refusal, and the image is reported as unchanged.
+same_stub='docker() {
+  case "$*" in
+    *"{{.Image}}"*)        printf "sha256:running
+" ;;
+    *"{{.Config.Image}}"*) printf "example/img:latest
+" ;;
+    *"{{.Id}}"*)           printf "sha256:running
+" ;;
+    *) : ;;
+  esac
+}
+tracked_service_container_id() { printf "cid-%s" "$1"; }'
+d="$(run_migration image-unchanged "$same_stub")"
+[ "$(cat "$d/rc")" = "0" ] || fail "image unchanged: the migration failed: $(cat "$d/out.txt")"
+grep -q 'image unchanged across the restart' "$d/out.txt"   || fail "image unchanged: not confirmed: $(cat "$d/out.txt")"
+
+# An image that changes ANYWAY -- the tag was absent locally, so the preflight
+# could not predict it and `up -d` pulled -- must be reported, not swallowed.
+drift_stub='DOCKER_CALLS="'"$TMP_DIR"'/img-calls"
+: > "$DOCKER_CALLS"
+docker() {
+  case "$*" in
+    *"{{.Image}}"*)
+      printf "%s
+" x >> "$DOCKER_CALLS"
+      if [ "$(wc -l < "$DOCKER_CALLS")" -le 2 ]; then printf "sha256:before
+"; else printf "sha256:after
+"; fi ;;
+    *"{{.Config.Image}}"*) printf "example/img:latest
+" ;;
+    # Preflight sees nothing staged: the tag resolves to the image that is
+    # running. The change happens across the restart anyway -- a tag re-pointed
+    # mid-migration, or a compose pull_policy that pulls -- which is exactly the
+    # case the preflight check cannot predict.
+    *"{{.Id}}"*)           printf "sha256:before
+" ;;
+    *) : ;;
+  esac
+}
+tracked_service_container_id() { printf "cid-%s" "$1"; }'
+d="$(run_migration image-drift "$drift_stub")"
+grep -q 'IS RUNNING A DIFFERENT IMAGE' "$d/out.txt"   || fail "image drift: an upgrade that happened anyway was not reported: $(cat "$d/out.txt")"
+grep -q 'data recovery point, not a full rollback' "$d/out.txt"   || fail "image drift: the weakened recovery story was not stated: $(cat "$d/out.txt")"
+# A check that CANNOT tell must not read as "nothing is staged".
+#
+# The first version returned nothing for every undecidable case, so it reported
+# clean when it had simply failed to look -- and unprivileged it always failed to
+# look, because `compose ps -q` produces no container id. Four services with a
+# newer image staged came back clean. A guard that fails OPEN is worse than no
+# guard, because it is trusted.
+unknown_stub='docker() {
+  case "$*" in
+    *"{{.Image}}"*)        printf "sha256:running
+" ;;
+    *"{{.Config.Image}}"*) printf "example/img:latest
+" ;;
+    *"{{.Id}}"*)           printf "
+" ;;   # tag not present locally
+    *) : ;;
+  esac
+}
+tracked_service_container_id() { printf "cid-%s" "$1"; }'
+d="$(run_migration image-unknown "$unknown_stub")"
+[ "$(cat "$d/rc")" != "0" ] || fail "image unknown: proceeded on a check that could not run: $(cat "$d/out.txt")"
+grep -q 'cannot determine whether restarting' "$d/out.txt"   || fail "image unknown: refused for the wrong reason: $(cat "$d/out.txt")"
+grep -q 'is not present locally' "$d/out.txt" || fail "image unknown: the reason was not named: $(cat "$d/out.txt")"
+assert_data_survives "$d" "image undeterminable refused"
+
+# ...and the container being un-inspectable is the same answer.
+broken_stub='docker() { return 1; }
+tracked_service_container_id() { printf "cid-%s" "$1"; }'
+d="$(run_migration image-broken "$broken_stub")"
+[ "$(cat "$d/rc")" != "0" ] || fail "image broken: proceeded although docker inspect failed: $(cat "$d/out.txt")"
+grep -q 'cannot determine whether restarting' "$d/out.txt"   || fail "image broken: refused for the wrong reason: $(cat "$d/out.txt")"
+
+# A service with no running container is NOT undeterminable: there is no current
+# image to preserve. It proceeds, and says what will happen.
+stopped_stub='docker() {
+  case "$*" in
+    *"{{.Image}}"*)        printf "sha256:running
+" ;;
+    *"{{.Config.Image}}"*) printf "example/img:latest
+" ;;
+    *"{{.Id}}"*)           printf "sha256:running
+" ;;
+    *) : ;;
+  esac
+}
+tracked_service_container_id() { printf ""; }'
+d="$(run_migration image-stopped "$stopped_stub")"
+[ "$(cat "$d/rc")" = "0" ] || fail "image stopped: a stopped service could not be migrated: $(cat "$d/out.txt")"
+grep -q 'not running, so it will start on whatever the tag resolves to' "$d/out.txt"   || fail "image stopped: not reported: $(cat "$d/out.txt")"
+
+# The override must cover the undeterminable case too, or it is unusable exactly
+# when the operator needs it.
+d="$(run_migration image-unknown-override "$unknown_stub
+MIGRATE_ALLOW_IMAGE_CHANGE=1")"
+grep -q 'migrate\[stop\]' "$d/out.txt"   || fail "image unknown override: the migration did not proceed: $(cat "$d/out.txt")"
+
+echo "    staged image refused; undeterminable refused; stopped allowed; drift reported  OK"
+
 echo "  success path:"
 d="$(run_migration success '')"
 [ "$(cat "$d/rc")" = "0" ] || fail "the success path failed: $(cat "$d/out.txt")"

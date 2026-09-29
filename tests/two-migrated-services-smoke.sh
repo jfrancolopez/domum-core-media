@@ -249,7 +249,102 @@ assert_service_snapshot_covers kavita probe '$DATA/kavita/config/kavita.db' && e
 grep -q 'RC=0' <<< "$out" || fail "8: kavita's own snapshot did not cover its own data: $out"
 
 # ---------------------------------------------------------------------------
-# 9. restic must still traverse into BOTH subvolumes.
+# 9. A restore must not accept another service's snapshot -- including one whose
+#    name merely STARTS with this service's basename.
+#
+# This is the last check before `btrfs subvolume snapshot` writes over a service's
+# data path, so a false accept overwrites live state rather than miscounting
+# retention. With two migrated services it is no longer hypothetical.
+#
+# EVERY case starts from a clean fixture. The first version of this did not, and
+# every negative case after the first passed for the wrong reason: a successful
+# restore leaves `<path>.rollback-<YYYYMMDD-HHMMSS>` behind, the next restore in
+# the same second collides with it, and the refusal that follows is
+# "rollback directory already exists" -- not the ownership check under test. The
+# unanchored-prefix mutant survived because of exactly that.
+# ---------------------------------------------------------------------------
+restore_case() {  # $1 = service, $2 = snapshot name, $3.. = snapshot dirs to create
+  local svc="$1" snap="$2"; shift 2
+  rm -rf "$DATA" "$SNAPS"; mkdir -p "$DATA/jellyfin" "$DATA/kavita" "$DATA/kavita-extra" "$SNAPS"
+  local d
+  for d in "$@"; do mkdir -p "$SNAPS/$d"; done
+  run "$BOTH" "
+service_data_path() { printf '%s' '$DATA'/\"\$1\"; }
+service_compose_services() { printf 'x'; }
+stop_compose_services_verified() { return 0; }
+compose_cmd() { :; }
+btrfs() { mkdir -p \"\${!#}\"; }
+# A SUBSHELL: a refusal goes through die -> exit, which would otherwise terminate
+# the harness before either echo runs and make every refusal look alike.
+( restore_snapshot_for_service '$svc' '$snap' >/dev/null ) && echo RC=0 || echo RC=1"
+}
+
+K=kavita-20260929-001131-post-migration
+J=jellyfin-20260925-153317-post-migration
+X=kavita-extra-20260101-000000-tag
+
+# Positive control first. Without it, a fixture mistake makes every negative case
+# below pass for free.
+out="$(restore_case kavita "$K" "$K")"
+grep -q 'RC=0' <<< "$out" || fail "9: kavita's own snapshot was refused: $out"
+
+# Another service's snapshot: refused, and named.
+out="$(restore_case kavita "$J" "$J" "$K")"
+grep -q 'RC=1' <<< "$out" || fail "9: a jellyfin snapshot was accepted for kavita: $out"
+grep -q 'does not belong to kavita' <<< "$out" \
+  || fail "9: refused for the wrong reason (not the ownership check): $out"
+
+# THE PREFIX CASE. `kavita-extra-...` starts with "kavita-", so an unanchored
+# prefix test accepts it and writes kavita-extra's state over kavita's path.
+out="$(restore_case kavita "$X" "$X" "$K")"
+grep -q 'RC=1' <<< "$out" \
+  || fail "9: a DIFFERENT service's snapshot beginning 'kavita-' was accepted: $out"
+grep -q 'does not belong to kavita' <<< "$out" \
+  || fail "9: the prefix case was refused for the wrong reason: $out"
+
+# ...and kavita-extra must still restore its own, or the fix is just a ban.
+out="$(restore_case kavita-extra "$X" "$X")"
+grep -q 'RC=0' <<< "$out" || fail "9: kavita-extra could not restore its own snapshot: $out"
+
+# This service's prefix but no timestamp: not one of ours.
+out="$(restore_case kavita kavita-handmade kavita-handmade)"
+grep -q 'RC=1' <<< "$out" || fail "9: a hand-made directory was accepted as a snapshot: $out"
+grep -q 'does not belong to kavita' <<< "$out" || fail "9: wrong reason: $out"
+
+# Traversal. The first three do not even start with "kavita-", so the ownership
+# check alone would catch them -- the last one DOES, and passes the ownership
+# check, so only the path-component guard stands between it and a restore from
+# outside the snapshot root.
+for bad in "../$J" "." ".." "kavita-20260101-000000-../../../etc"; do
+  out="$(restore_case kavita "$bad" "$K")"
+  grep -q 'RC=1' <<< "$out" || fail "9: '$bad' was accepted as a snapshot name: $out"
+  grep -q 'is not a valid snapshot name' <<< "$out" \
+    || fail "9: '$bad' was refused, but not as an invalid name: $out"
+done
+
+# A second restore in the SAME SECOND must refuse rather than overwrite the
+# preserved copy: `<path>.rollback-<YYYYMMDD-HHMMSS>` has one-second resolution.
+# Refusing is correct -- the preserved copy is the only way back -- so this is
+# pinned so nobody "fixes" it by overwriting.
+rm -rf "$DATA" "$SNAPS"; mkdir -p "$DATA/kavita" "$SNAPS/$K"
+twice="$(run "$BOTH" "
+service_data_path() { printf '%s' '$DATA'/\"\$1\"; }
+service_compose_services() { printf 'x'; }
+stop_compose_services_verified() { return 0; }
+compose_cmd() { :; }
+btrfs() { mkdir -p \"\${!#}\"; }
+( restore_snapshot_for_service kavita $K >/dev/null ) && echo FIRST=0 || echo FIRST=1
+( restore_snapshot_for_service kavita $K >/dev/null ) && echo SECOND=0 || echo SECOND=1")"
+grep -q 'FIRST=0' <<< "$twice" || fail "9: the first restore failed: $twice"
+grep -q 'SECOND=1' <<< "$twice" \
+  || fail "9: a second restore in the same second overwrote the preserved copy: $twice"
+grep -q 'already exists' <<< "$twice" || fail "9: not explained: $twice"
+
+# Restore the shared fixture the later cases expect.
+rm -rf "$DATA" "$SNAPS"; mkdir -p "$DATA/jellyfin" "$DATA/kavita" "$DATA/plex" "$SNAPS"
+
+# ---------------------------------------------------------------------------
+# 10. restic must still traverse into BOTH subvolumes.
 #
 # `--one-file-system` means "do not cross filesystem boundaries AND SUBVOLUMES".
 # Each migrated service is a nested subvolume under /srv/data, so that flag would
@@ -259,7 +354,7 @@ grep -q 'RC=0' <<< "$out" || fail "8: kavita's own snapshot did not cover its ow
 # ---------------------------------------------------------------------------
 backup_nocomments="$(sed 's/#.*//' "$REPO_ROOT/bin/domum-media-backup")"
 if grep -qE -- '--one-file-system|(^|[[:space:]])-x([[:space:]]|$)' <<< "$backup_nocomments"; then
-  fail "9: domum-media-backup passes --one-file-system; every migrated service would vanish from the backup"
+  fail "10: domum-media-backup passes --one-file-system; every migrated service would vanish from the backup"
 fi
 
 echo "PASS: two migrated services smoke test"
