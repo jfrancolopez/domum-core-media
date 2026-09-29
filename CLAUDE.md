@@ -104,19 +104,40 @@ until the update/apply/rollback pipeline has been audited and proven safe.
 - Image discovery, pulling, and staging must never automatically imply
   deployment.
 
-**`docker compose up -d` deploys a staged image.** It recreates any container
-whose image has changed, so *every* command that restarts a service is an image
-deployment vector — not just the update path. This is not theoretical: the Kavita
-storage migration recreated its container on a newer locally-staged image and
-Kavita forward-migrated its database on startup, leaving the proof snapshot taken
-minutes earlier holding an older schema than the running binary
+**`docker compose up -d` deploys a staged image.** It *reconciles*: it recreates
+any container whose image has changed, so every command that restarts a service
+is an image deployment vector — not just the update path. The Kavita storage
+migration recreated its container on a newer locally-staged image and Kavita
+forward-migrated its database on startup, leaving the proof snapshot taken minutes
+earlier holding an older schema than the running binary
 (`docs/IMAGE-DEPLOYMENT-BY-MIGRATION.md`).
 
-Before adding or changing any code path that restarts a service, decide
-explicitly whether it may deploy: compare the running image against what the tag
-resolves to (`service_staged_image_changes`), and refuse, or say so. A path that
-both moves data and upgrades the application gives the operator one rollback story
-for two independent changes.
+Classify every path that restarts a service, and never leave it implicit:
+
+- **may deploy** — `update`, `apply`, `immich bundle apply`. Recreating is the
+  point; they are gated on backup age, health and a snapshot.
+- **must preserve** — `storage migrate-subvolume`, `rollback apply`. These use
+  **`compose start`**, which starts the container that was stopped and therefore
+  resolves no image reference at all. Do not "simplify" them to `up -d`: the
+  preflight staged-image comparison narrows that hole but cannot close it, since a
+  `docker pull` between check and restart re-points the tag and the operation lock
+  does not cover other tools.
+- **must refuse when identity is ambiguous** — anything that would start a service
+  for which no image identity was captured.
+
+**A recovery point is `service + snapshot + the application that wrote it`**, not
+`service + snapshot`. An application that migrates its own schema on startup makes
+that the difference between a rollback point and a museum piece. Migrations record
+the third part in `<recovery-point>.recovery`, and a snapshot whose application
+image is unknown must never be advertised as a complete rollback point. Never put
+secrets in that evidence — identify configuration by digest, never by rendering
+it. See `docs/RECOVERY-POINT-IDENTITY.md`.
+
+**A migration preserves runtime state.** Running before → running after; stopped
+before → stopped after; no container before → none after. "Stopped" is not a
+loophole for resolving a tag with no captured identity, and a stopped container
+still has an image — inspect it with `compose ps -qa`, because `ps -q` lists only
+running containers and conflates stopped with absent.
 
 ---
 
