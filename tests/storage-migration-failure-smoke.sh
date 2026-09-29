@@ -54,7 +54,23 @@ export_env_for_compose() { :; }
 service_data_path() { printf '%s' "$dir/data/\$1"; }
 service_compose_services() { printf 'jellyfin'; }
 compose_cmd() { :; }
-docker() { :; }
+# Answers the image and state queries the migration now makes. The default is a
+# RUNNING service on an image that equals what its tag resolves to, i.e. nothing
+# staged -- which is the state these scenarios are about. Without it the image
+# check reads UNKNOWN and refuses at preflight, and every failure-injection
+# scenario below becomes a no-op that still passes.
+docker() {
+  case "\$*" in
+    *"{{.State.Status}}"*) printf 'running\n' ;;
+    *"{{.Image}}"*)        printf 'sha256:same\n' ;;
+    *"{{.Config.Image}}"*) printf 'example/img:latest\n' ;;
+    *"{{.Id}}"*)           printf 'sha256:same\n' ;;
+    *) : ;;
+  esac
+}
+# compose ps -q lists running containers only, so the migration asks -qa too.
+tracked_service_container_id()     { printf 'cid-%s' "\$1"; }
+tracked_service_container_id_any() { printf 'cid-%s' "\$1"; }
 wait_for_service_health() { return 0; }
 # A stub that actually SNAPSHOTS. It used to return a name and create nothing,
 # so the happy path never had a recovery point to verify.
@@ -160,8 +176,12 @@ grep -qi 'write-ahead log' "$d/out.txt" || fail "the WAL condition must be repor
 assert_data_survives "$d" "non-empty SQLite WAL remains"
 grep -q 'compose stop' "$d/compose.log" 2>/dev/null \
   || fail "the WAL scenario never reached the stop, so the restart assertion below proves nothing"
-grep -q 'compose up -d' "$d/compose.log" 2>/dev/null \
+grep -qE 'compose (start|up -d)' "$d/compose.log" 2>/dev/null \
   || fail "the migration aborted on a non-empty WAL and left the service stopped"
+# And it must come back with `start`, which cannot change the image, rather than
+# `up -d`, which reconciles and resolves the tag afresh.
+grep -q 'compose up -d' "$d/compose.log" 2>/dev/null \
+  && fail "the abort path restarted with 'up -d', which can deploy a staged image"
 
 d="$(run_migration fail-create 'btrfs() { return 1; }')"
 [ "$(cat "$d/rc")" != "0" ] || fail "a failed subvolume creation must abort"
@@ -326,8 +346,8 @@ d="$(run_migration image-broken "$broken_stub")"
 [ "$(cat "$d/rc")" != "0" ] || fail "image broken: proceeded although docker inspect failed: $(cat "$d/out.txt")"
 grep -q 'cannot determine whether restarting' "$d/out.txt"   || fail "image broken: refused for the wrong reason: $(cat "$d/out.txt")"
 
-# A service with no running container is NOT undeterminable: there is no current
-# image to preserve. It proceeds, and says what will happen.
+# A STOPPED service keeps its image identity -- a stopped container is inspected
+# like any other -- and it is LEFT STOPPED. A migration preserves runtime intent.
 stopped_stub='docker() {
   case "$*" in
     *"{{.Image}}"*)        printf "sha256:running
@@ -339,10 +359,17 @@ stopped_stub='docker() {
     *) : ;;
   esac
 }
-tracked_service_container_id() { printf ""; }'
+tracked_service_container_id() { printf ""; }
+tracked_service_container_id_any() { printf "cid-jellyfin"; }
+service_runtime_state() { printf 'stopped'; }'
 d="$(run_migration image-stopped "$stopped_stub")"
 [ "$(cat "$d/rc")" = "0" ] || fail "image stopped: a stopped service could not be migrated: $(cat "$d/out.txt")"
-grep -q 'not running, so it will start on whatever the tag resolves to' "$d/out.txt"   || fail "image stopped: not reported: $(cat "$d/out.txt")"
+grep -q 'runtime state before: stopped' "$d/out.txt" \
+  || fail "image stopped: the runtime state was not captured: $(cat "$d/out.txt")"
+grep -q 'will be left stopped' "$d/out.txt" \
+  || fail "image stopped: the decision to leave it stopped was not stated: $(cat "$d/out.txt")"
+grep -qE 'compose (start|up -d)' "$d/compose.log" 2>/dev/null \
+  && fail "image stopped: a STOPPED service was started by the migration: $(cat "$d/compose.log")"
 
 # The override must cover the undeterminable case too, or it is unusable exactly
 # when the operator needs it.
@@ -663,7 +690,7 @@ d="$(run_migration proof-order 'ORDER="'"$TMP_DIR"'/proof-order/order.log"
 create_service_snapshot() { printf "proof\n" >> "$ORDER"
   command cp -a "'"$TMP_DIR"'/proof-order/data/jellyfin" "'"$TMP_DIR"'/proof-order/snapshots/jellyfin-stub-snap"
   printf "jellyfin-stub-snap"; }
-compose_cmd() { [[ "${1:-}" == "up" ]] && printf "restart\n" >> "$ORDER"; return 0; }')"
+compose_cmd() { [[ "${1:-}" == "start" || "${1:-}" == "up" ]] && printf "restart\n" >> "$ORDER"; return 0; }')"
 [ "$(cat "$d/rc")" = "0" ] || fail "the ordering scenario did not complete: $(cat "$d/out.txt")"
 [ -f "$d/order.log" ] || fail "neither the proof snapshot nor the restart happened"
 grep -q '^proof$' "$d/order.log" || fail "the proof snapshot was never taken"

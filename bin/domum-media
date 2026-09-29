@@ -975,7 +975,7 @@ service_is_healthy() {
 #
 #   STAGED  <svc> <running> <tag-now>   the tag resolves to a different image
 #   UNKNOWN <svc> <reason>              could not be determined
-#   STOPPED <svc>                       no running container to compare against
+#   ABSENT  <svc>                       no container at all, running or stopped to compare against
 #
 # The first version returned nothing for every undecidable case, so it reported
 # "no staged image" when it had simply failed to look -- and it failed to look
@@ -983,10 +983,10 @@ service_is_healthy() {
 # services with a newer image staged came back clean. A guard that fails OPEN is
 # worse than no guard, because it is trusted.
 #
-# STOPPED is not UNKNOWN. A service that is not running has no current image to
-# preserve, so starting it on whatever the tag resolves to is not a change of
-# anything -- but it is still reported, because the result is a version the
-# operator did not choose.
+# ABSENT is not the same as stopped. A STOPPED container still has an image, and
+# it is inspected like any other. Only a service with no container at all has no
+# identity to preserve -- and the migration's answer to that is to leave it with
+# no container, not to create one.
 service_staged_image_changes() {  # $1 = service
   local svc="$1" compose_svcs compose_svc cid run_img tag tag_img
   compose_svcs="$(service_compose_services "$svc" || true)"
@@ -995,9 +995,11 @@ service_staged_image_changes() {  # $1 = service
     return 0
   fi
   for compose_svc in $compose_svcs; do
-    cid="$(tracked_service_container_id "$compose_svc" 2>/dev/null || true)"
+    # -qa, so a STOPPED container is inspected rather than reported as absent:
+    # its image identity is exactly as knowable as a running one's.
+    cid="$(tracked_service_container_id_any "$compose_svc" 2>/dev/null || true)"
     if [[ -z "$cid" ]]; then
-      printf 'STOPPED %s\n' "$compose_svc"
+      printf 'ABSENT %s\n' "$compose_svc"
       continue
     fi
     run_img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
@@ -1029,7 +1031,7 @@ service_running_images() {  # $1 = service
   compose_svcs="$(service_compose_services "$svc" || true)"
   [[ -n "$compose_svcs" ]] || return 0
   for compose_svc in $compose_svcs; do
-    cid="$(tracked_service_container_id "$compose_svc")"
+    cid="$(tracked_service_container_id_any "$compose_svc")"
     [[ -n "$cid" ]] || continue
     img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
     printf '%s %s\n' "$compose_svc" "${img:-none}"
@@ -1517,6 +1519,108 @@ snapshot_metadata_dir() {
   printf '%s/snapshots' "$DOMUM_STATE_ROOT"
 }
 
+# The recovery evidence a filesystem snapshot cannot carry.
+#
+# `.premigration == proof snapshot` proves the DATA came across intact. It says
+# nothing about which application wrote that data -- and an application that
+# forward-migrates its schema on startup makes that the difference between a
+# recovery point and a museum piece. The Kavita migration proved it: the snapshot
+# holds a Kavita 0.9.0.2 database, and the service now runs 0.9.1.0.
+#
+# So a recovery point is not `service + snapshot`. It is
+#
+#     service + snapshot + the exact application image that wrote it
+#
+# and this records the third part, before anything is stopped.
+#
+# Deliberately NOT the rendered compose configuration: `docker compose config`
+# interpolates secrets, and recovery evidence is kept for months in a file an
+# operator will read. The compose CONFIG HASH that docker itself computes per
+# container, plus the list of config files and their digests, identifies the
+# configuration that produced the container without reproducing any of its values.
+#
+# Format is line-oriented `KEY='value'` so it can be sourced, with a header
+# explaining itself to whoever finds it much later.
+write_recovery_point_metadata() {  # $1 = service, $2 = recovery point name, $3 = runtime state
+  local service="$1" point="$2" runtime_state="$3"
+  local meta_dir meta_file compose_svcs compose_svc cid n=0
+  meta_dir="$(snapshot_metadata_dir)"
+  install -d -m 0700 "$meta_dir" || return 1
+  meta_file="$meta_dir/${point}.recovery"
+
+  {
+    printf '# domum-media recovery point evidence.\n'
+    printf '#\n'
+    printf '# What application was operating this state when the snapshot was taken.\n'
+    printf '# A filesystem snapshot alone is NOT a complete rollback point: an application\n'
+    printf '# that migrates its own schema on startup will forward-migrate restored data,\n'
+    printf '# so restoring it under a newer image does not return the service to this state.\n'
+    printf '#\n'
+    printf '# No secrets are recorded. The compose configuration is identified by digest,\n'
+    printf '# not reproduced, because rendering it would interpolate secret values.\n'
+    printf '#\n'
+    printf '# RUNTIME_STATE_BEFORE is what the operator had: a migration preserves it.\n'
+    printf '# IMAGE_IDENTITY=unknown means no container existed, so nothing can be paired.\n'
+    printf '\n'
+    printf "FORMAT='1'\n"
+    printf "SERVICE='%s'\n" "$service"
+    printf "RECOVERY_POINT='%s'\n" "$point"
+    printf "CAPTURED_AT='%s'\n" "$(date -Iseconds)"
+    printf "DATA_PATH='%s'\n" "$(service_data_path "$service" 2>/dev/null || true)"
+    printf "RUNTIME_STATE_BEFORE='%s'\n" "$runtime_state"
+    printf "COMPOSE_PROJECT='%s'\n" "${COMPOSE_PROJECT_NAME:-domum-media}"
+  } > "$meta_file" || return 1
+
+  # The layered compose files, by digest. Which fragments were in play is part of
+  # the configuration, and their contents are not secret -- but the digest is
+  # enough to tell later whether they are the same files.
+  local f
+  # The same layered list compose_cmd passes, with the "-f" markers dropped.
+  for f in $(compose_files_for_enabled_services 2>/dev/null | grep -v '^-f$' || true); do
+    [[ -r "$f" ]] || continue
+    n=$(( n + 1 ))
+    printf "COMPOSE_FILE_%s='%s'\n" "$n" "$f" >> "$meta_file"
+    printf "COMPOSE_FILE_%s_SHA256='%s'\n" "$n" "$(sha256sum "$f" | cut -d' ' -f1)" >> "$meta_file"
+  done
+
+  compose_svcs="$(service_compose_services "$service" || true)"
+  n=0
+  for compose_svc in $compose_svcs; do
+    n=$(( n + 1 ))
+    cid="$(tracked_service_container_id_any "$compose_svc" 2>/dev/null || true)"
+    printf "CONTAINER_%s_SERVICE='%s'\n" "$n" "$compose_svc" >> "$meta_file"
+    if [[ -z "$cid" ]]; then
+      printf "CONTAINER_%s_IMAGE_IDENTITY='unknown'\n" "$n" >> "$meta_file"
+      printf "CONTAINER_%s_NOTE='no container existed when this point was captured'\n" "$n" >> "$meta_file"
+      continue
+    fi
+    local img ref digests created ver rev chash
+    img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
+    ref="$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)"
+    chash="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid" 2>/dev/null || true)"
+    digests="$(docker image inspect --format '{{join .RepoDigests ","}}' "$img" 2>/dev/null || true)"
+    created="$(docker image inspect --format '{{.Created}}' "$img" 2>/dev/null || true)"
+    ver="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img" 2>/dev/null || true)"
+    rev="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$img" 2>/dev/null || true)"
+    {
+      printf "CONTAINER_%s_IMAGE_IDENTITY='%s'\n" "$n" "$([[ -n "$img" ]] && printf 'known' || printf 'unknown')"
+      printf "CONTAINER_%s_ID='%s'\n" "$n" "$cid"
+      printf "CONTAINER_%s_IMAGE_ID='%s'\n" "$n" "$img"
+      # The tag the container was created from. MUTABLE: it may point elsewhere
+      # already, which is the whole reason the image ID above is recorded.
+      printf "CONTAINER_%s_IMAGE_REF='%s'\n" "$n" "$ref"
+      printf "CONTAINER_%s_IMAGE_REPO_DIGESTS='%s'\n" "$n" "$digests"
+      printf "CONTAINER_%s_IMAGE_CREATED='%s'\n" "$n" "$created"
+      printf "CONTAINER_%s_IMAGE_LABEL_VERSION='%s'\n" "$n" "$ver"
+      printf "CONTAINER_%s_IMAGE_LABEL_REVISION='%s'\n" "$n" "$rev"
+      printf "CONTAINER_%s_COMPOSE_CONFIG_HASH='%s'\n" "$n" "$chash"
+    } >> "$meta_file"
+  done
+
+  chmod 600 "$meta_file" 2>/dev/null || true
+  printf '%s' "$meta_file"
+}
+
 record_service_snapshot_metadata() {
   local service="$1"
   local before_version="$2"
@@ -1982,8 +2086,20 @@ state back would nest it inside. The preserved state is intact at $current_backu
   fi
 
   if [[ -n "$compose_svcs" ]]; then
+    # `start`, not `up -d`, for the same reason the migration uses it: `up -d`
+    # reconciles and would recreate the containers on whatever the image tag now
+    # resolves to. Restoring an older application's data and upgrading the
+    # application in the same breath is the pairing failure, not a fix for it --
+    # and a rollback is the operation where it matters most.
+    #
     # shellcheck disable=SC2086
-    compose_cmd up -d $compose_svcs
+    if ! compose_cmd start $compose_svcs; then
+      warn "Could not start the existing container(s) for $compose_svcs; recreating instead."
+      warn "Recreation resolves the image tag, so $service may come back on a DIFFERENT image"
+      warn "than the one that wrote the state just restored."
+      # shellcheck disable=SC2086
+      compose_cmd up -d $compose_svcs
+    fi
   fi
   return 0
 }
@@ -2605,6 +2721,46 @@ configure_cmd() {
 tracked_service_container_id() {
   local svc="$1"
   compose_cmd ps -q "$svc" 2>/dev/null | head -n 1
+}
+
+# `compose ps -q` lists RUNNING containers only, so it cannot tell "this service
+# has no container" from "its container is stopped". Measured on a disposable
+# compose project:
+#
+#   after `compose stop`:   ps -q  -> (empty)
+#                           ps -qa -> 5312d8c00833
+#
+# Those two cases need opposite handling. A stopped container still carries the
+# image identity that was in use; an absent one carries none, and starting one
+# resolves a mutable tag.
+tracked_service_container_id_any() {
+  local svc="$1"
+  compose_cmd ps -qa "$svc" 2>/dev/null | head -n 1
+}
+
+# running | stopped | absent, for the whole service.
+#
+# A migration must PRESERVE runtime intent: running before means running after,
+# and stopped before means stopped after. Turning a service the operator stopped
+# into a running one is a change they did not ask for -- and it is the only way a
+# migration can be forced to resolve an image tag it has no captured identity for.
+#
+# Mixed states in a multi-container service (Immich has four) report `running`,
+# because at least one container is up and the whole set has to come back.
+service_runtime_state() {  # $1 = service
+  local svc="$1" compose_svcs compose_svc any_running=0 any_container=0 cid status
+  compose_svcs="$(service_compose_services "$svc" || true)"
+  [[ -n "$compose_svcs" ]] || { printf 'absent'; return 0; }
+  for compose_svc in $compose_svcs; do
+    cid="$(tracked_service_container_id_any "$compose_svc" 2>/dev/null || true)"
+    [[ -n "$cid" ]] || continue
+    any_container=1
+    status="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || true)"
+    [[ "$status" == "running" ]] && any_running=1
+  done
+  if (( any_running )); then printf 'running'
+  elif (( any_container )); then printf 'stopped'
+  else printf 'absent'; fi
 }
 
 tracked_service_image_id() {
@@ -5664,8 +5820,10 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
     fi
   fi
 
-  local images_before
+  local images_before runtime_before
   images_before="$(service_running_images "$service")"
+  runtime_before="$(service_runtime_state "$service")"
+  migrate_stage preflight "runtime state before: $runtime_before"
 
   migrate_stage preflight "service=$service path=$path"
   migrate_stage preflight "compose services: ${compose_svcs:-none}"
@@ -5676,14 +5834,46 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
 
   # Defined BEFORE the stop is attempted, because the stop itself can fail and
   # the recovery for that is a restart.
+  #
+  # `compose start`, NOT `compose up -d`. This is the invariant, not a preference:
+  #
+  #   `up -d` RECONCILES. It recreates any container whose image or config has
+  #   changed, so it resolves the image tag afresh -- which is how the Kavita
+  #   migration deployed a staged image and forward-migrated its schema. Worse,
+  #   the preflight staged-image check cannot close that hole, only narrow it: a
+  #   `docker pull` between the check and the restart re-points the tag, and the
+  #   operation lock does not cover other tools' pulls.
+  #
+  #   `start` starts THE SAME CONTAINER OBJECT. There is no image resolution at
+  #   all, so the image cannot change and the race has nowhere to happen.
+  #
+  # A migration changes no compose configuration, so nothing requires recreation.
+  # What it changes is the tree a bind mount points at -- and a bind mount is
+  # re-resolved on start. Measured on a disposable compose project:
+  #
+  #   up -d                     -> container 5312d8c00833, sees OLD
+  #   compose stop; swap dir; compose start
+  #                             -> container 5312d8c00833, sees NEW, same image
+  #
+  # Same container, same image, new tree. That is exactly what a migration needs.
   migrate_restart() {
-    if (( started == 1 )) && [[ -n "$compose_svcs" ]]; then
-      # shellcheck disable=SC2086
-      compose_cmd up -d $compose_svcs >/dev/null 2>&1 || warn "Could not restart $compose_svcs"
+    (( started == 1 )) || return 0
+    [[ -n "$compose_svcs" ]] || return 0
+    # shellcheck disable=SC2086
+    if compose_cmd start $compose_svcs >/dev/null 2>&1; then
+      return 0
     fi
+    # `start` failed, which means a container is gone -- removed externally, or
+    # never created. Recreating is the only way to bring the service back, and it
+    # may deploy a different image. Do it, then say so; leaving the service down
+    # is worse, and the post-restart image comparison reports what happened.
+    warn "Could not start the existing container(s) for $compose_svcs; recreating instead."
+    warn "Recreation resolves the image tag, so the image may differ from the one captured."
+    # shellcheck disable=SC2086
+    compose_cmd up -d $compose_svcs >/dev/null 2>&1 || warn "Could not restart $compose_svcs"
   }
 
-  if [[ -n "$compose_svcs" ]]; then
+  if [[ -n "$compose_svcs" && "$runtime_before" == "running" ]]; then
     migrate_stage stop "stopping $compose_svcs"
     # Set BEFORE the stop, not after it succeeds. A stop that fails part-way has
     # still taken containers down, and the old ordering made migrate_restart a
@@ -5695,6 +5885,15 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
       migrate_restart
       die "Could not confirm $compose_svcs stopped; no data was changed, and a restart was attempted."
     }
+  fi
+
+  if [[ "$runtime_before" != "running" ]]; then
+    # Nothing was running, so there is nothing to stop and nothing to start
+    # afterwards. A migration PRESERVES runtime intent: a service the operator
+    # stopped must not come back running, and a service with no container must
+    # not acquire one -- creating it would resolve a mutable image tag for which
+    # no identity was ever captured.
+    migrate_stage stop "$service was $runtime_before before this migration and will be left $runtime_before"
   fi
 
   if ! migrate_assert_quiesced "$path"; then
@@ -5761,6 +5960,17 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
   local proof=""
   if proof="$(create_service_snapshot "$service" "post-migration" "" "")" && [[ -n "$proof" ]]; then
     migrate_stage proof "snapshot created: $DOMUM_SNAPSHOT_ROOT/$proof"
+    # What application wrote the state this snapshot holds. Captured while the
+    # service is still stopped, from the container that was running before -- so
+    # it describes the snapshot, not whatever comes up afterwards.
+    local recovery_meta
+    if recovery_meta="$(write_recovery_point_metadata "$service" "$proof" "$runtime_before")" \
+       && [[ -n "$recovery_meta" ]]; then
+      migrate_stage proof "recovery evidence: $recovery_meta"
+    else
+      warn "Could not record the recovery-point evidence for $proof."
+      warn "The snapshot is intact, but which application image wrote it is not recorded."
+    fi
   else
     proof=""
     warn "Migration succeeded but a snapshot could NOT be created; investigate before relying on rollback."
@@ -5768,7 +5978,7 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
 
   # ---- stage 8: restart and health -----------------------------------------
   migrate_restart
-  if [[ -n "$compose_svcs" ]]; then
+  if [[ -n "$compose_svcs" && "$runtime_before" == "running" ]]; then
     if wait_for_service_health "$service" 120 5; then
       # Be precise about what that actually proved, because the three cases prove
       # very different things and conflating them is how "the container started"
@@ -5802,6 +6012,14 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
   if [[ -n "$compose_svcs" ]]; then
     local images_after
     images_after="$(service_running_images "$service")"
+    local runtime_after
+    runtime_after="$(service_runtime_state "$service")"
+    if [[ "$runtime_after" != "$runtime_before" ]]; then
+      warn "$service was $runtime_before before this migration and is $runtime_after now."
+      warn "A migration must preserve runtime state; this did not."
+    else
+      migrate_stage health "runtime state preserved: $runtime_after"
+    fi
     if [[ "$images_after" != "$images_before" ]]; then
       warn "$service IS RUNNING A DIFFERENT IMAGE than before the migration:"
       warn "  before: $(printf '%s' "$images_before" | tr '\n' ' ')"
