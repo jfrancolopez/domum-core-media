@@ -575,8 +575,15 @@ d="$(run_migration no-proof 'create_service_snapshot() { return 1; }')"
 [ "$(cat "$d/rc")" != "0" ] || fail "a migration with no proof snapshot reported success"
 grep -qi 'rollback protection was not established' "$d/out.txt" \
   || fail "the missing proof snapshot was not explained: $(cat "$d/out.txt")"
-grep -qi 'migration complete' "$d/out.txt" \
-  || fail "the migration did not actually complete, so this proves nothing"
+# The data DID migrate -- that claim is reported separately from completion, so
+# the result reads INCOMPLETE rather than "Migration complete" with a bad exit
+# status. This assertion used to require the misleading headline.
+grep -q 'data migrated   : yes' "$d/out.txt" \
+  || fail "the data claim is missing, so this scenario proves nothing: $(cat "$d/out.txt")"
+grep -q 'Migration INCOMPLETE' "$d/out.txt" \
+  || fail "a migration with no proof snapshot was not reported as incomplete: $(cat "$d/out.txt")"
+grep -q 'Migration COMPLETE' "$d/out.txt" \
+  && fail "a migration with no proof snapshot claimed completion"
 [ -d "$d/data/jellyfin.premigration" ] \
   || fail "the premigration copy is missing after a completed migration"
 

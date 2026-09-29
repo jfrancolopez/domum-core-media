@@ -261,3 +261,231 @@ paths no longer need it to be correct, because they no longer resolve an image.
 Image refresh remains **disabled and inactive**. Nothing here enables it, and the
 stage/deploy separation is unchanged: staging still never implies deployment, and
 now neither does restarting.
+
+---
+
+# Fail-open, twice, in the same mechanism
+
+Both were found by reading the **merged** implementation rather than the summary
+of it. Both had already been "fixed" once — in the preflight check, not in the
+restart, which is where the failure actually lives.
+
+## 1. The rollback reconciled after a failed start
+
+```bash
+if ! compose_cmd start $compose_svcs; then
+  warn "Could not start the existing container(s) ...; recreating instead."
+  warn "Recreation resolves the image tag, so $service may come back on a DIFFERENT image"
+  warn "than the one that wrote the state just restored."
+  compose_cmd up -d $compose_svcs            # <- and then it did exactly that
+fi
+```
+
+A rollback has *already restored an older database* by this point. So the
+sequence was:
+
+```
+old data  ->  mutable tag resolved  ->  newer application  ->  automatic schema migration
+```
+
+which is the Kavita failure mode, reached during the operation whose purpose is to
+undo it. The restored data would have been forward-migrated before anyone looked.
+
+**A documented fail-open is the worst shape available**: the warning proves the
+author knew, and shipped it anyway.
+
+## 2. Recovery metadata was advisory
+
+```bash
+if write_recovery_point_metadata ...; then
+  ...
+else
+  warn "Could not record the recovery-point evidence"
+  warn "The snapshot is intact, but which application image wrote it is not recorded."
+fi
+```
+
+…and the command went on to print **"Migration complete"** and exit `0`. If the
+application identity is part of a recovery point — which this document argues at
+length — then a migration that cannot record it has not made one.
+
+## What they have in common
+
+Both substituted a *description* of the harm for a refusal. Warning text is not a
+control. The rule now:
+
+> A safety mechanism that can be summarised as "warn and continue" is not a
+> safety mechanism. Either the operation refuses, or the result is reported as
+> something other than success.
+
+## Fail closed, both
+
+**Neither path recreates.** `start` failing means a container is gone, and
+recreating resolves the image tag — so the operator is told, with the exact
+command, and nothing happens automatically:
+
+```
+Could not start the existing container(s) for navidrome.
+NOT recreating them: that resolves the image tag, and a newer application
+would migrate the state just restored -- destroying the pairing this
+rollback exists to recover.
+The restored state is in place at /srv/data/navidrome.
+The state it replaced is preserved at /srv/data/navidrome.rollback-20260929-...
+navidrome is DOWN. Nothing has been deleted.
+The image that wrote the restored state is recorded in:
+    /var/lib/domum-media/snapshots/<point>.recovery
+```
+
+A service that is down is visible and fixable in one command. A service silently
+running a different application than its recovery point pairs with is neither.
+
+**The metadata is captured before the stop and bound atomically.**
+
+| phase | when | why |
+|---|---|---|
+| **stage** | before anything is stopped | the containers that wrote the state are still the ones running |
+| **bind** | once the proof snapshot has its final name | append it, `sync`, then `mv` into place |
+
+A staging failure **refuses at preflight**, where nothing has been touched. A bind
+failure cannot be refused — the data is already migrated — so it is reported as an
+**incomplete** result, and nothing is deleted.
+
+The landed file is then verified against what it claims to describe: required
+keys present, `SERVICE` and `RECOVERY_POINT` matching, at least one container
+recorded, and no container claiming `known` identity with an empty image ID. A
+truncated write is a failure rather than evidence.
+
+## Four claims, reported separately
+
+"Migration complete" used to be printed before any of them was known, with the
+exit status decided by one:
+
+```
+[domum-media] Migration result for navidrome
+  data migrated   : yes -- /srv/data/navidrome is a Btrfs subvolume
+  previous state  : /srv/data/navidrome.premigration   (retained deliberately)
+  proof snapshot  : navidrome-20260929-...-post-migration
+  recovery point  : complete -- verified, and paired with the image that wrote it
+  recovery evidence: /var/lib/domum-media/snapshots/<point>.recovery
+  service         : running (as it was before)
+
+[domum-media] Migration COMPLETE for navidrome.
+```
+
+Anything less prints `Migration INCOMPLETE`, exits non-zero, and says which claim
+failed. `recovery point : DATA ONLY` is the specific outcome when the filesystem
+evidence verifies but the application pairing was not recorded.
+
+# Identity is not recoverability
+
+Recording `IMAGE_ID=sha256:…` proves **identity**. It does not prove the image can
+still be obtained: a local object can be pruned, and a mutable tag says nothing
+about what it will resolve to next year. Recorded per container, never aggregated
+into one reassuring word:
+
+| value | meaning |
+|---|---|
+| `identity` | the exact image this state was written by is known |
+| `local` | that object is present on this host **right now** |
+| `registry-digest` | an immutable `repo@sha256` reference is recorded |
+| `version-only` | only the application version is known |
+| `unknown` | nothing |
+
+**A RepoDigest equal to the image ID is not an independent registry reference.**
+Measured on this host, docker reports exactly that:
+
+```
+kavita     RepoDigests = [jvmilazz0/kavita@sha256:454f2a77…]   == .Image
+navidrome  RepoDigests = [deluan/navidrome@sha256:9012939114…] == .Image
+```
+
+Counting those as manifest digests would claim retrievability that has not been
+established, so they are excluded. Navidrome's current classification is therefore
+**`identity,local`** — recoverable today because the object is here, with *no*
+immutable reference to fetch it again later.
+
+**No images are being exported or saved.** That is a policy question, and the
+policy is the point: recovery metadata must never claim *application recovery
+verified* on the strength of a recorded string. It states what is true —
+`identity,local` — and leaves the gap visible.
+
+# Application readiness without touching production
+
+navidrome has no Docker healthcheck and no host-published port (4533 is exposed
+only on the proxy network), so "the container is running" was the whole claim.
+
+It does log, on stdout, after opening and migrating its database and binding its
+listener:
+
+```
+goose: successfully migrated database to version: 20260703013908
+Started watcher for library libraryID=1 path=/music
+----> Navidrome server is ready! address="0.0.0.0:4533" startupTime=128.3ms
+```
+
+That is strictly stronger than a process check: it proves the application opened
+the **migrated** database and reached its listener. It needs no networking, no
+credentials and no production change — `docker logs --since <restart>` is
+read-only.
+
+Options considered and not taken: a request from inside the proxy network (needs a
+client in some container, and the traefik image has neither curl nor wget); the
+existing Traefik route at `music.ladomum.com` (needs TLS and DNS from the host,
+and routes traffic through the proxy to prove a local fact); publishing a port
+(changes production networking for a test).
+
+The limitation is stated rather than papered over: **a log pattern is fragile.** An
+upstream wording change breaks it. The failure is safe — the migration refuses
+having deleted nothing, and says exactly what it looked for — and the pattern is
+pinned by a test, so a wording change breaks CI rather than a migration. For a
+service whose only application-level evidence is a log line, that is the right
+trade; for kavita, whose healthcheck makes a real HTTP request, no pattern is
+added because the healthcheck is stronger.
+
+A service with neither says so:
+
+```
+no healthcheck, no health URL and no readiness pattern for calibre-web:
+  'running' is the whole claim. Content was verified byte-for-byte;
+  exercise the application yourself before removing .premigration
+```
+
+# The reconcile boundary is enforced, not remembered
+
+`tests/reconcile-boundary-audit.py` classifies every call in `bin/domum-media`
+that can create or replace a container, and fails when the classification is
+violated **or absent**:
+
+| class | members | rule |
+|---|---|---|
+| **image-preserving** | `storage_migrate_subvolume`, `restore_snapshot_for_service` | no executable reconcile; must use `compose_cmd start`; must state that it is refusing |
+| **intentional deployment** | `refresh_images`, `immich_refresh_bundle`, `apply` | must still reconcile — a refactor that quietly stops deploying is also a defect |
+| **utility** | `htpasswd_hash` | `docker run --rm` of a one-shot tool, in no compose project |
+
+A reconcile in any **unclassified** function fails the audit, which forces the
+decision to be made rather than inherited. Strings and heredoc bodies are
+excluded: these functions legitimately *print* `compose up -d` in recovery
+instructions, and telling an operator how to recreate a container deliberately is
+the opposite of doing it silently. Not excluding heredocs made the audit flag
+`recovery_pack_restore_instructions` — a runbook — which is how a checker earns a
+suppression instead of a fix.
+
+Seven mutants killed, including the two named directly: rollback `refuse → up -d`,
+and migration `refuse → up -d`.
+
+# The historical exceptions stay honest
+
+Nothing is manufactured retroactively.
+
+| | Jellyfin | Kavita |
+|---|---|---|
+| filesystem recovery | **verified** | **verified** |
+| application version then | 10.11.11 (proven, schema unchanged) | **0.9.0.2** (proven) |
+| exact image ID then | **unknown** | **unknown** |
+| application now | 10.11.11ubu2604-ls47 | 0.9.1.0 |
+| pairing | compatible — no schema moved | **data only** — schema moved |
+
+Neither `.premigration` tree nor either proof snapshot has been touched. Kavita is
+not downgraded and its forward-migrated database is left alone. Only migrations
+from here on carry `.recovery` evidence; the two existing points are recorded as
+the exceptions they are.

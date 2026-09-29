@@ -179,6 +179,12 @@ grep -qiE "password|secret|token|api[_-]?key|PRIVATE KEY" <<< "$meta_values" \
 [ "$(stat -c %a "$meta")" = "600" ] || fail "4: recovery evidence is mode $(stat -c %a "$meta"), expected 600"
 
 # ---------------------------------------------------------------------------
+# 5. If `start` fails the service must NOT be brought back by recreating it.
+#
+# This assertion used to be the opposite: it required `up -d`, because the
+# implementation warned that recreation resolves the image tag and then did it.
+# A documented fail-open, pinned by a test that agreed with it.
+# ---------------------------------------------------------------------------
 # 5. If `start` fails the service must still come back -- and the fact that
 #    recreation resolves the tag must be said out loud, not discovered later.
 # ---------------------------------------------------------------------------
@@ -189,9 +195,15 @@ compose_cmd() {
   return 0
 }")"
 grep -q '^start kavita$' "$d/compose.log" || fail "5: 'start' was not attempted first: $(cat "$d/compose.log")"
-grep -q '^up -d kavita$' "$d/compose.log" || fail "5: the service was not brought back at all: $(cat "$d/compose.log")"
-grep -q 'Recreation resolves the image tag' "$d/out.txt" \
-  || fail "5: recreation happened silently: $(cat "$d/out.txt")"
+grep -qE '^(up|create|run)' "$d/compose.log" \
+  && fail "5: THE FAIL-OPEN -- the migration reconciled after a failed start: $(cat "$d/compose.log")"
+grep -q 'NOT recreating' "$d/out.txt" \
+  || fail "5: the refusal was not explained: $(cat "$d/out.txt")"
+[ "$(cat "$d/rc")" != "0" ] \
+  || fail "5: a service left DOWN was reported as a successful migration: $(cat "$d/out.txt")"
+grep -q 'service         : DOWN' "$d/out.txt" \
+  || fail "5: the down service was not reported in the result: $(cat "$d/out.txt")"
+[ -d "$d/data/kavita.premigration" ] || fail "5: .premigration was deleted"
 
 # ---------------------------------------------------------------------------
 # 6. service_runtime_state, directly -- including a multi-container service.
@@ -276,7 +288,14 @@ grep -q '^STAGED kavita ' <<< "$staged_on_stopped" \
 restore_block="$(awk '/^restore_snapshot_for_service\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
 grep -q 'compose_cmd start' <<< "$restore_block" \
   || fail "8: the rollback still brings the service back with 'up -d', which can deploy a staged image"
-awk '/compose_cmd up -d/ {found=1} END {exit found ? 0 : 1}' <<< "$restore_block" \
-  || fail "8: the rollback has no recreate fallback, so a removed container would leave it down"
+# ...and it must have NO recreate fallback. This assertion used to require one.
+# The rollback warned that recreating resolves the image tag -- after it had
+# already restored an older database -- and then recreated: old data, newer
+# application, automatic schema migration, during the operation meant to undo
+# exactly that.
+awk '/^ *compose_cmd up -d/ {found=1} END {exit found ? 1 : 0}' <<< "$restore_block" \
+  || fail "8: the rollback reconciles after a failed start, which can hand restored data to a newer application"
+grep -q 'NOT recreating' <<< "$restore_block" \
+  || fail "8: the rollback does not state that it is refusing to recreate"
 
 echo "PASS: image identity preservation smoke test"

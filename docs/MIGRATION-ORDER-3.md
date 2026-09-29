@@ -78,18 +78,53 @@ Navidrome is also the first migration where the recorded runtime state matters i
 a mundane way: it is **running**, so it will be running afterwards, and the
 migration says so before and after.
 
-## The one real weakness
+## The application-level check it CAN make
 
-**No healthcheck and no published port**, so application verification after the
-restart is limited to "the container is running". That is strictly weaker than
-Kavita, whose `/api/health` request was the point of choosing it — and it cannot
-be improved without adding a health URL that is reachable from the host, which
-means routing through Traefik with a hostname and TLS. Worth doing eventually;
-not worth half-doing as part of a migration.
+No Docker healthcheck and no host-published port — 4533 is exposed only on the
+proxy network. So "the container is running" was the whole claim.
 
-The compensating evidence is byte-level: 1,006 files hashed in full, 816
-directories' metadata compared, `.premigration == proof snapshot`, and
-`navidrome.db` opened and `integrity_check`ed from a copy of the snapshot.
+It does log, on stdout, after opening and migrating its database and binding its
+listener:
+
+```
+goose: successfully migrated database to version: 20260703013908
+Started watcher for library libraryID=1 name="Music Library" path=/music
+----> Navidrome server is ready! address="0.0.0.0:4533" startupTime=128.3ms
+```
+
+The migration now polls `docker logs --since <restart>` for
+`Navidrome server is ready!` and **refuses if it never appears**. That is
+strictly stronger than a process check: it proves the application opened the
+*migrated* database and reached its listener. Read-only, no networking, no
+credentials, no production change.
+
+Alternatives considered and not taken: a request from inside the proxy network
+(needs an HTTP client in some container, and the traefik image has neither curl
+nor wget); the existing Traefik route at `music.ladomum.com` (needs TLS and DNS
+from the host, and routes through the proxy to prove a local fact); publishing a
+port (changes production networking for a test).
+
+**The limitation, stated:** a log pattern is fragile. An upstream wording change
+breaks it — safely, since the migration refuses having deleted nothing and says
+exactly what it looked for, and the pattern is pinned by a test so a wording
+change breaks CI rather than a migration.
+
+## Image recoverability, not just identity
+
+```
+image id     sha256:9012939114fbb1bb641b81cf96dec5ded15f0aafefe8d47a511d7cb919658e40
+RepoDigests  deluan/navidrome@sha256:9012939114fbb1bb641b81cf96dec5ded15f0aafefe8d47a511d7cb919658e40
+```
+
+The RepoDigest **equals the image ID**, so it is not an independent registry
+reference. Navidrome's recovery evidence will therefore record
+`IMAGE_AVAILABILITY='identity,local'`: the exact image is known and present on
+this host today, with **no immutable reference to fetch it again later**. The
+version label `0.63.2` and the banner line `Version: 0.63.2 (be10f89c)` in its own
+log are the compatibility evidence that survives the object being pruned.
+
+That gap is recorded rather than closed — exporting images is a policy decision,
+not a migration detail.
 
 ## Before migrating navidrome
 
