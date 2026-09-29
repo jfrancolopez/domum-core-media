@@ -285,6 +285,12 @@ Notes:
 
 - `shellcheck` is **not installed on this host**; CI installs it. Do not report
   a shellcheck pass that did not run.
+- **The workflow enumerates every test by name — there is no glob.** A new suite
+  is not enforced until a step is added, and seven were not: they passed locally
+  and were reported as "CI green" while CI had never run them. `tests/ci-coverage-audit.sh`
+  now fails when a test file is missing from the workflow, or when the workflow
+  names one that no longer exists. Never describe a suite as CI-verified without
+  checking it is listed.
 - `systemd-analyze verify` only checks unit syntax and that `ExecStart` binaries
   exist. It cannot detect a unit invoking a subcommand the CLI does not
   implement. `tests/unit-subcommands-exist-smoke.sh` is that separate
