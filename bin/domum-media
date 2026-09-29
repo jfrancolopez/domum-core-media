@@ -908,6 +908,57 @@ verify_backup_freshness() {
 # Precedence across a multi-container service (immich has four): unhealthy >
 # starting > healthy > none. One container still starting means the service is
 # still starting.
+# An application-level readiness signal for services with no healthcheck and no
+# host-published port, needing no networking, no credentials and no production
+# change: the line the application itself writes when it is actually serving.
+#
+# "the container is running" is not application health, and for navidrome it was
+# all that could be claimed -- no Docker healthcheck, port 4533 published only to
+# the proxy network. But it logs, on stdout, after opening and migrating its
+# database and binding its listener:
+#
+#   goose: successfully migrated database to version: 20260703013908
+#   Started watcher for library libraryID=1 path=/music
+#   ----> Navidrome server is ready! address="0.0.0.0:4533" startupTime=128.3ms
+#
+# That is strictly stronger than a process check: it proves the application opened
+# the MIGRATED database and reached its listener.
+#
+# A log pattern is admittedly fragile -- an upstream wording change breaks it. The
+# failure is safe (the migration refuses, having deleted nothing) and says exactly
+# what it looked for, which is the right trade for the only application evidence
+# some services offer. Patterns are pinned by tests.
+#
+# Empty means "no pattern known": callers must then say that plainly rather than
+# implying application health.
+service_ready_log_pattern() {  # $1 = service
+  case "$1" in
+    navidrome)   printf 'Navidrome server is ready!' ;;
+    # kavita has a real HTTP healthcheck (curl /api/health), which is a stronger
+    # signal than a log line, so nothing is added here.
+    *)           printf '' ;;
+  esac
+}
+
+# Did the application log readiness since $2? 0 yes, 1 no, 2 nothing to look for.
+service_logged_ready_since() {  # $1 = service, $2 = docker --since value
+  local svc="$1" since="$2" pat compose_svcs compose_svc cid logs
+  pat="$(service_ready_log_pattern "$svc")"
+  [[ -n "$pat" ]] || return 2
+  compose_svcs="$(service_compose_services "$svc" || true)"
+  [[ -n "$compose_svcs" ]] || return 1
+  for compose_svc in $compose_svcs; do
+    cid="$(tracked_service_container_id_any "$compose_svc" 2>/dev/null || true)"
+    [[ -n "$cid" ]] || continue
+    # Captured first, NOT piped into `grep -q`. Under pipefail grep exits at the
+    # first match, docker takes SIGPIPE, and the pipeline reports 141 -- so a match
+    # reads as no-match. See CLAUDE.md section 8.
+    logs="$(docker logs --since "$since" "$cid" 2>&1 || true)"
+    grep -qF -- "$pat" <<< "$logs" && return 0
+  done
+  return 1
+}
+
 service_health_state() {  # -> healthy | starting | unhealthy | stopped | none
   local svc="$1" compose_svcs compose_svc cid status health worst=none
 
@@ -1531,7 +1582,17 @@ snapshot_metadata_dir() {
 #
 #     service + snapshot + the exact application image that wrote it
 #
-# and this records the third part, before anything is stopped.
+# and this is a REQUIRED part, not a note. Two phases, because the two facts
+# become available at different times:
+#
+#   STAGE  before anything is stopped, while the containers that wrote the state
+#          are still the ones running. The recovery point has no name yet.
+#   BIND   once the proof snapshot exists and has its final name: append it and
+#          rename atomically into place.
+#
+# Staging first is what makes the evidence describe the snapshot rather than
+# whatever came up afterwards, and the atomic rename is what stops a half-written
+# file from ever being mistaken for evidence.
 #
 # Deliberately NOT the rendered compose configuration: `docker compose config`
 # interpolates secrets, and recovery evidence is kept for months in a file an
@@ -1541,12 +1602,91 @@ snapshot_metadata_dir() {
 #
 # Format is line-oriented `KEY='value'` so it can be sourced, with a header
 # explaining itself to whoever finds it much later.
-write_recovery_point_metadata() {  # $1 = service, $2 = recovery point name, $3 = runtime state
-  local service="$1" point="$2" runtime_state="$3"
-  local meta_dir meta_file compose_svcs compose_svc cid n=0
+RECOVERY_METADATA_FORMAT=1
+
+# An image ID proves IDENTITY. It does not prove the image can still be obtained:
+# a local object can be pruned, and a mutable tag says nothing about what it will
+# resolve to next year. Those are different claims and conflating them is how
+# "application recovery verified" comes to rest on a string.
+#
+#   identity        the exact image this state was written by is known
+#   local           that object is present on this host right now
+#   registry-digest an immutable repo@sha256 reference is recorded
+#   version-only    only the application version is known, not the image
+#   unknown         nothing
+#
+# Recorded per container, never aggregated into a single reassuring word.
+recovery_image_availability() {  # $1 = image id, $2 = repo digests (comma-separated)
+  local img="$1" digests="$2" out=""
+  [[ -n "$img" ]] && out="identity"
+  [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1 && out="${out},local"
+  # A RepoDigest equal to the image ID is NOT an independent registry reference.
+  # Measured on this host: docker reports
+  #   RepoDigests = [jvmilazz0/kavita@sha256:454f2a77...]  ==  .Image
+  # so treating it as a manifest digest would claim retrievability that has not
+  # been established.
+  if [[ -n "$digests" ]]; then
+    local d bare
+    for d in ${digests//,/ }; do
+      bare="${d##*@}"
+      [[ "$bare" == "$img" ]] && continue
+      out="${out},registry-digest"
+      break
+    done
+  fi
+  printf '%s' "${out:-unknown}"
+}
+
+# Every key a complete recovery point must carry. Checked after the write, on the
+# file as it lands, so a truncated or half-written file is a failure rather than
+# evidence.
+recovery_metadata_required_keys() {
+  printf '%s\n' FORMAT SERVICE RECOVERY_POINT CAPTURED_AT DATA_PATH RUNTIME_STATE_BEFORE
+}
+
+# Validates a recovery file against what it claims to describe. Prints the first
+# problem and returns non-zero.
+verify_recovery_point_metadata() {  # $1 = file, $2 = expected service, $3 = expected point
+  local file="$1" want_service="$2" want_point="$3" key
+  [[ -s "$file" ]] || { printf 'missing or empty: %s' "$file"; return 1; }
+  while IFS= read -r key; do
+    grep -q "^${key}=" "$file" || { printf 'missing key %s' "$key"; return 1; }
+  done < <(recovery_metadata_required_keys)
+
+  local got_service got_point
+  got_service="$(sed -nE "s/^SERVICE='(.*)'\$/\1/p" "$file" | head -1)"
+  got_point="$(sed -nE "s/^RECOVERY_POINT='(.*)'\$/\1/p" "$file" | head -1)"
+  [[ "$got_service" == "$want_service" ]] \
+    || { printf 'names service %s, expected %s' "${got_service:-<none>}" "$want_service"; return 1; }
+  [[ "$got_point" == "$want_point" ]] \
+    || { printf 'names recovery point %s, expected %s' "${got_point:-<none>}" "$want_point"; return 1; }
+
+  grep -q "^CONTAINER_1_SERVICE=" "$file" \
+    || { printf 'records no containers at all'; return 1; }
+
+  # A container claiming known identity must actually carry an image id. This is
+  # the case a truncated write produces.
+  local n ident img
+  n=1
+  while grep -q "^CONTAINER_${n}_SERVICE=" "$file"; do
+    ident="$(sed -nE "s/^CONTAINER_${n}_IMAGE_IDENTITY='(.*)'\$/\1/p" "$file" | head -1)"
+    img="$(sed -nE "s/^CONTAINER_${n}_IMAGE_ID='(.*)'\$/\1/p" "$file" | head -1)"
+    [[ -n "$ident" ]] || { printf 'container %s has no IMAGE_IDENTITY' "$n"; return 1; }
+    if [[ "$ident" == "known" && -z "$img" ]]; then
+      printf 'container %s claims known identity with no image id' "$n"; return 1
+    fi
+    n=$(( n + 1 ))
+  done
+  return 0
+}
+
+# Phase 1: capture, before anything stops. Prints the staged file's path.
+stage_recovery_point_metadata() {  # $1 = service, $2 = runtime state
+  local service="$1" runtime_state="$2"
+  local meta_dir staged compose_svcs compose_svc cid n=0
   meta_dir="$(snapshot_metadata_dir)"
   install -d -m 0700 "$meta_dir" || return 1
-  meta_file="$meta_dir/${point}.recovery"
+  staged="$(mktemp "$meta_dir/.staged-recovery.XXXXXX")" || return 1
 
   {
     printf '# domum-media recovery point evidence.\n'
@@ -1556,31 +1696,31 @@ write_recovery_point_metadata() {  # $1 = service, $2 = recovery point name, $3 
     printf '# that migrates its own schema on startup will forward-migrate restored data,\n'
     printf '# so restoring it under a newer image does not return the service to this state.\n'
     printf '#\n'
+    printf '# IMAGE_AVAILABILITY says what is actually recoverable, and is not the same\n'
+    printf '# claim as identity: identity,local means the object is here TODAY; without\n'
+    printf '# registry-digest there is no immutable reference to fetch it again later.\n'
+    printf '#\n'
     printf '# No secrets are recorded. The compose configuration is identified by digest,\n'
     printf '# not reproduced, because rendering it would interpolate secret values.\n'
     printf '#\n'
     printf '# RUNTIME_STATE_BEFORE is what the operator had: a migration preserves it.\n'
-    printf '# IMAGE_IDENTITY=unknown means no container existed, so nothing can be paired.\n'
     printf '\n'
-    printf "FORMAT='1'\n"
+    printf "FORMAT='%s'\n" "$RECOVERY_METADATA_FORMAT"
     printf "SERVICE='%s'\n" "$service"
-    printf "RECOVERY_POINT='%s'\n" "$point"
     printf "CAPTURED_AT='%s'\n" "$(date -Iseconds)"
     printf "DATA_PATH='%s'\n" "$(service_data_path "$service" 2>/dev/null || true)"
     printf "RUNTIME_STATE_BEFORE='%s'\n" "$runtime_state"
     printf "COMPOSE_PROJECT='%s'\n" "${COMPOSE_PROJECT_NAME:-domum-media}"
-  } > "$meta_file" || return 1
+  } > "$staged" || { rm -f "$staged"; return 1; }
 
-  # The layered compose files, by digest. Which fragments were in play is part of
-  # the configuration, and their contents are not secret -- but the digest is
-  # enough to tell later whether they are the same files.
-  local f
   # The same layered list compose_cmd passes, with the "-f" markers dropped.
+  local f
   for f in $(compose_files_for_enabled_services 2>/dev/null | grep -v '^-f$' || true); do
     [[ -r "$f" ]] || continue
     n=$(( n + 1 ))
-    printf "COMPOSE_FILE_%s='%s'\n" "$n" "$f" >> "$meta_file"
-    printf "COMPOSE_FILE_%s_SHA256='%s'\n" "$n" "$(sha256sum "$f" | cut -d' ' -f1)" >> "$meta_file"
+    printf "COMPOSE_FILE_%s='%s'\n" "$n" "$f" >> "$staged" || { rm -f "$staged"; return 1; }
+    printf "COMPOSE_FILE_%s_SHA256='%s'\n" "$n" "$(sha256sum "$f" | cut -d' ' -f1)" >> "$staged" \
+      || { rm -f "$staged"; return 1; }
   done
 
   compose_svcs="$(service_compose_services "$service" || true)"
@@ -1588,13 +1728,16 @@ write_recovery_point_metadata() {  # $1 = service, $2 = recovery point name, $3 
   for compose_svc in $compose_svcs; do
     n=$(( n + 1 ))
     cid="$(tracked_service_container_id_any "$compose_svc" 2>/dev/null || true)"
-    printf "CONTAINER_%s_SERVICE='%s'\n" "$n" "$compose_svc" >> "$meta_file"
     if [[ -z "$cid" ]]; then
-      printf "CONTAINER_%s_IMAGE_IDENTITY='unknown'\n" "$n" >> "$meta_file"
-      printf "CONTAINER_%s_NOTE='no container existed when this point was captured'\n" "$n" >> "$meta_file"
+      {
+        printf "CONTAINER_%s_SERVICE='%s'\n" "$n" "$compose_svc"
+        printf "CONTAINER_%s_IMAGE_IDENTITY='unknown'\n" "$n"
+        printf "CONTAINER_%s_IMAGE_AVAILABILITY='unknown'\n" "$n"
+        printf "CONTAINER_%s_NOTE='no container existed when this point was captured'\n" "$n"
+      } >> "$staged" || { rm -f "$staged"; return 1; }
       continue
     fi
-    local img ref digests created ver rev chash
+    local img ref digests created ver rev chash avail
     img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
     ref="$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)"
     chash="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid" 2>/dev/null || true)"
@@ -1602,8 +1745,11 @@ write_recovery_point_metadata() {  # $1 = service, $2 = recovery point name, $3 
     created="$(docker image inspect --format '{{.Created}}' "$img" 2>/dev/null || true)"
     ver="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img" 2>/dev/null || true)"
     rev="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$img" 2>/dev/null || true)"
+    avail="$(recovery_image_availability "$img" "$digests")"
     {
+      printf "CONTAINER_%s_SERVICE='%s'\n" "$n" "$compose_svc"
       printf "CONTAINER_%s_IMAGE_IDENTITY='%s'\n" "$n" "$([[ -n "$img" ]] && printf 'known' || printf 'unknown')"
+      printf "CONTAINER_%s_IMAGE_AVAILABILITY='%s'\n" "$n" "$avail"
       printf "CONTAINER_%s_ID='%s'\n" "$n" "$cid"
       printf "CONTAINER_%s_IMAGE_ID='%s'\n" "$n" "$img"
       # The tag the container was created from. MUTABLE: it may point elsewhere
@@ -1614,11 +1760,35 @@ write_recovery_point_metadata() {  # $1 = service, $2 = recovery point name, $3 
       printf "CONTAINER_%s_IMAGE_LABEL_VERSION='%s'\n" "$n" "$ver"
       printf "CONTAINER_%s_IMAGE_LABEL_REVISION='%s'\n" "$n" "$rev"
       printf "CONTAINER_%s_COMPOSE_CONFIG_HASH='%s'\n" "$n" "$chash"
-    } >> "$meta_file"
+    } >> "$staged" || { rm -f "$staged"; return 1; }
   done
 
-  chmod 600 "$meta_file" 2>/dev/null || true
-  printf '%s' "$meta_file"
+  chmod 600 "$staged" 2>/dev/null || true
+  printf '%s' "$staged"
+}
+
+# Phase 2: bind the staged evidence to the recovery point that now exists, and
+# prove it landed. Atomic: the name only appears once the content is complete.
+bind_recovery_point_metadata() {  # $1 = staged file, $2 = service, $3 = point
+  local staged="$1" service="$2" point="$3"
+  local meta_dir final problem
+  [[ -s "$staged" ]] || { warn "recovery evidence: staged file is missing or empty"; return 1; }
+  meta_dir="$(snapshot_metadata_dir)"
+  final="$meta_dir/${point}.recovery"
+
+  printf "RECOVERY_POINT='%s'\n" "$point" >> "$staged" \
+    || { warn "recovery evidence: could not bind it to $point"; return 1; }
+  # Durable before it is visible: a rename that survives while the content does
+  # not is the one outcome worse than no file.
+  sync -f "$staged" 2>/dev/null || sync 2>/dev/null || true
+  mv -- "$staged" "$final" \
+    || { warn "recovery evidence: could not move it into place at $final"; return 1; }
+
+  if ! problem="$(verify_recovery_point_metadata "$final" "$service" "$point")"; then
+    warn "recovery evidence at $final is not usable: $problem"
+    return 1
+  fi
+  printf '%s' "$final"
 }
 
 record_service_snapshot_metadata() {
@@ -2094,11 +2264,26 @@ state back would nest it inside. The preserved state is intact at $current_backu
     #
     # shellcheck disable=SC2086
     if ! compose_cmd start $compose_svcs; then
-      warn "Could not start the existing container(s) for $compose_svcs; recreating instead."
-      warn "Recreation resolves the image tag, so $service may come back on a DIFFERENT image"
-      warn "than the one that wrote the state just restored."
-      # shellcheck disable=SC2086
-      compose_cmd up -d $compose_svcs
+      # FAIL CLOSED, and here it matters most. The old state has already been
+      # restored. Recreating would resolve the image tag, so the sequence would be
+      #
+      #   old data -> newer application -> automatic schema migration
+      #
+      # which is the Kavita failure mode, arrived at during the very operation
+      # meant to undo it. The restored data would be forward-migrated before
+      # anyone noticed.
+      warn "Could not start the existing container(s) for $compose_svcs."
+      warn "NOT recreating them: that resolves the image tag, and a newer application"
+      warn "would migrate the state just restored -- destroying the pairing this"
+      warn "rollback exists to recover."
+      warn "The restored state is in place at $data_path."
+      [[ -n "$current_backup" ]] && warn "The state it replaced is preserved at $current_backup."
+      warn "$service is DOWN. Nothing has been deleted."
+      warn "The image that wrote the restored state is recorded in:"
+      warn "    ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots/${snapshot_name}.recovery"
+      die "Rollback restored the data but could not restart $service from its existing container.
+Start it on the recorded image, or recreate it deliberately:
+    <SERVICE>_IMAGE=<CONTAINER_1_IMAGE_ID> sudo domum-media compose up -d $compose_svcs"
     fi
   fi
   return 0
@@ -5787,13 +5972,16 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   # effect of moving its data: the two decisions have different blast radii and
   # different rollback stories, and bundling them means the proof snapshot holds
   # the OLD application's data while the NEW application runs.
-  local image_verdicts staged_images unknown_images stopped_images
+  local image_verdicts staged_images unknown_images absent_images
   image_verdicts="$(service_staged_image_changes "$service")"
   staged_images="$(grep '^STAGED '  <<< "$image_verdicts" || true)"
   unknown_images="$(grep '^UNKNOWN ' <<< "$image_verdicts" || true)"
-  stopped_images="$(grep '^STOPPED ' <<< "$image_verdicts" || true)"
-  [[ -n "$stopped_images" ]] \
-    && migrate_stage preflight "not running, so it will start on whatever the tag resolves to: $(tr '\n' ' ' <<< "$stopped_images")"
+  # ABSENT, not STOPPED: the verdict was renamed when stopped containers started
+  # being inspected like any other, and this grep went on looking for a string the
+  # producer no longer emits -- so it silently matched nothing.
+  absent_images="$(grep '^ABSENT ' <<< "$image_verdicts" || true)"
+  [[ -n "$absent_images" ]] \
+    && migrate_stage preflight "no container at all: $(tr '\n' ' ' <<< "$absent_images")"
 
   if [[ -n "$staged_images" || -n "$unknown_images" ]]; then
     if [[ "${MIGRATE_ALLOW_IMAGE_CHANGE:-0}" == "1" ]]; then
@@ -5820,10 +6008,27 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
     fi
   fi
 
-  local images_before runtime_before
+  local images_before runtime_before staged_recovery
   images_before="$(service_running_images "$service")"
   runtime_before="$(service_runtime_state "$service")"
   migrate_stage preflight "runtime state before: $runtime_before"
+
+  # Captured NOW, from the containers that are still the ones that wrote this
+  # state, and bound to the proof snapshot's name later. Staging it before the
+  # stop is what makes the evidence describe the snapshot rather than whatever
+  # comes up afterwards -- and a migration that cannot record it refuses here,
+  # where nothing has been touched, rather than after the cutover.
+  if ! staged_recovery="$(stage_recovery_point_metadata "$service" "$runtime_before")" \
+     || [[ -z "$staged_recovery" ]]; then
+    die "Refusing: could not record which application image is operating $service.
+A recovery point is the filesystem state AND the application that wrote it; without
+the second part the snapshot cannot be paired with anything. Nothing has been changed.
+Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
+  fi
+  migrate_stage preflight "recovery evidence staged: $staged_recovery"
+  # Never left behind on any exit path, including a die from a later stage.
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$staged_recovery'" EXIT
 
   migrate_stage preflight "service=$service path=$path"
   migrate_stage preflight "compose services: ${compose_svcs:-none}"
@@ -5863,14 +6068,28 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
     if compose_cmd start $compose_svcs >/dev/null 2>&1; then
       return 0
     fi
-    # `start` failed, which means a container is gone -- removed externally, or
-    # never created. Recreating is the only way to bring the service back, and it
-    # may deploy a different image. Do it, then say so; leaving the service down
-    # is worse, and the post-restart image comparison reports what happened.
-    warn "Could not start the existing container(s) for $compose_svcs; recreating instead."
-    warn "Recreation resolves the image tag, so the image may differ from the one captured."
-    # shellcheck disable=SC2086
-    compose_cmd up -d $compose_svcs >/dev/null 2>&1 || warn "Could not restart $compose_svcs"
+    # FAIL CLOSED. `start` failing means a container is gone -- removed
+    # externally, or never created -- and the only way to bring the service back
+    # is to recreate it, which resolves the image tag and can deploy whatever has
+    # since been pulled. That is the exact failure this invariant exists to
+    # prevent, so it is NOT done automatically.
+    #
+    # The previous version warned that recreation would resolve the tag and then
+    # did it anyway, which is the worst shape available: a documented fail-open.
+    # A service that is down is visible and fixable in one command. A service
+    # silently running a different application than the one its recovery point
+    # pairs with is neither.
+    warn "Could not start the existing container(s) for $compose_svcs."
+    warn "NOT recreating them: recreation resolves the image tag and could start a"
+    warn "different application than the one this migration's recovery point pairs with."
+    warn "$service is DOWN. Nothing has been deleted."
+    warn "To bring it back on the image recorded in the recovery evidence:"
+    warn "    sudo domum-media rollback list          # find the recovery point"
+    warn "    cat ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots/<point>.recovery"
+    warn "    <SERVICE>_IMAGE=<CONTAINER_1_IMAGE_ID> sudo domum-media compose up -d $compose_svcs"
+    warn "or, to accept whatever the tag now resolves to, deliberately:"
+    warn "    sudo domum-media compose up -d $compose_svcs"
+    return 1
   }
 
   if [[ -n "$compose_svcs" && "$runtime_before" == "running" ]]; then
@@ -5964,12 +6183,20 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
     # service is still stopped, from the container that was running before -- so
     # it describes the snapshot, not whatever comes up afterwards.
     local recovery_meta
-    if recovery_meta="$(write_recovery_point_metadata "$service" "$proof" "$runtime_before")" \
+    if recovery_meta="$(bind_recovery_point_metadata "$staged_recovery" "$service" "$proof")" \
        && [[ -n "$recovery_meta" ]]; then
       migrate_stage proof "recovery evidence: $recovery_meta"
+      trap - EXIT
     else
-      warn "Could not record the recovery-point evidence for $proof."
-      warn "The snapshot is intact, but which application image wrote it is not recorded."
+      # The data is migrated and safe, and NOTHING is deleted -- but this is not a
+      # complete recovery point, and saying "Migration complete" would be a lie of
+      # exactly the kind this project keeps finding. Reported at the end as an
+      # incomplete result, not swallowed as a warning.
+      recovery_meta=""
+      warn "The recovery-point evidence for $proof could NOT be recorded."
+      warn "The data is migrated and both copies are intact, but the snapshot is not"
+      warn "paired with the application image that wrote it, so it is a DATA recovery"
+      warn "point only. Do not treat it as a rollback point."
     fi
   else
     proof=""
@@ -5977,8 +6204,12 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
   fi
 
   # ---- stage 8: restart and health -----------------------------------------
-  migrate_restart
-  if [[ -n "$compose_svcs" && "$runtime_before" == "running" ]]; then
+  local restart_ok=1 restart_since
+  # Recorded BEFORE the restart, so `docker logs --since` cannot be satisfied by a
+  # readiness line from the previous run.
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%S)"
+  migrate_restart || restart_ok=0
+  if (( restart_ok == 1 )) && [[ -n "$compose_svcs" && "$runtime_before" == "running" ]]; then
     if wait_for_service_health "$service" 120 5; then
       # Be precise about what that actually proved, because the three cases prove
       # very different things and conflating them is how "the container started"
@@ -5992,7 +6223,31 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
         migrate_stage health "$service container running and $health_url responded"
       else
         migrate_stage health "$service container is running (no healthcheck or health URL configured)"
-        migrate_stage health "content was verified byte-for-byte; confirm the application itself before removing $premigration"
+      fi
+
+      # An application-level claim for services that cannot make one any other
+      # way. Polled within the same window, because a readiness line arrives after
+      # the container does.
+      local ready_pat ready_waited=0 ready_rc=2
+      ready_pat="$(service_ready_log_pattern "$service")"
+      if [[ -n "$ready_pat" ]]; then
+        while (( ready_waited < 120 )); do
+          service_logged_ready_since "$service" "$restart_since" && { ready_rc=0; break; }
+          sleep 5
+          ready_waited=$(( ready_waited + 5 ))
+        done
+        if (( ready_rc == 0 )); then
+          migrate_stage health "$service LOGGED READY since the restart: \"$ready_pat\""
+        else
+          warn "$service never logged readiness (\"$ready_pat\") in ${ready_waited}s after the restart."
+          warn "Its container is running, but the application did not report that it is serving."
+          warn "The previous state is intact at $premigration; nothing was deleted."
+          die "Migration completed but $service did not report readiness."
+        fi
+      elif [[ "$health_state" != "healthy" && -z "$health_url" ]]; then
+        migrate_stage health "no healthcheck, no health URL and no readiness pattern for $service:"
+        migrate_stage health "  'running' is the whole claim. Content was verified byte-for-byte;"
+        migrate_stage health "  exercise the application yourself before removing $premigration"
       fi
     else
       # `starting` now counts as not-yet-healthy, so this is reached when a real
@@ -6046,27 +6301,52 @@ To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
   fi
 
   echo
-  echo "[domum-media] Migration complete for $service."
-  echo "  now a subvolume : $path"
+  # FOUR claims, reported separately. "Migration complete" used to be printed
+  # before any of them was known, and the exit status was decided by one. The
+  # filesystem migration can succeed while the recovery point is incomplete, and
+  # calling that success is the class of defect this project keeps finding.
+  local complete=1
+  echo "[domum-media] Migration result for $service"
+  echo "  data migrated   : yes -- $path is a Btrfs subvolume"
   echo "  previous state  : $premigration   (retained deliberately; remove it yourself when satisfied)"
+
   if [[ -n "$proof" ]]; then
     echo "  proof snapshot  : $proof"
-    if (( recovery_ok == 0 )); then
-      echo "  recovery point  : DID NOT VERIFY -- see the warnings above"
-      return 1
-    fi
-    echo "  recovery point  : verified ($premigration == the proof snapshot)"
   else
-    # The migration itself succeeded and the data is safe, but rollback
-    # protection was not established. Exit non-zero so a script or a systemd
-    # unit driving this does not read it as a clean result -- and say why,
-    # rather than leaving the caller to infer it from an exit code that used to
-    # be set by accident (the old `[[ -n "$proof" ]] && echo` was the function's
-    # last statement, so an empty proof returned 1 silently, right after
-    # printing "Migration complete").
     echo "  proof snapshot  : NONE -- rollback protection was not established"
-    return 1
+    complete=0
   fi
+
+  if [[ -z "$proof" ]]; then
+    echo "  recovery point  : not established (no snapshot)"
+  elif (( recovery_ok == 0 )); then
+    echo "  recovery point  : DID NOT VERIFY -- see the warnings above"
+    complete=0
+  elif [[ -z "$recovery_meta" ]]; then
+    echo "  recovery point  : DATA ONLY -- verified, but not paired with an application image"
+    complete=0
+  else
+    echo "  recovery point  : complete -- verified, and paired with the image that wrote it"
+    echo "  recovery evidence: $recovery_meta"
+  fi
+
+  if (( restart_ok == 0 )); then
+    echo "  service         : DOWN -- could not be started from its existing container"
+    complete=0
+  elif [[ "$runtime_before" == "running" ]]; then
+    echo "  service         : running (as it was before)"
+  else
+    echo "  service         : $runtime_before (as it was before; deliberately not started)"
+  fi
+
+  echo
+  if (( complete == 1 )); then
+    echo "[domum-media] Migration COMPLETE for $service."
+    return 0
+  fi
+  echo "[domum-media] Migration INCOMPLETE for $service -- read the lines above."
+  echo "  Nothing was deleted. Both copies of the previous state are intact."
+  return 1
   return 0
 }
 

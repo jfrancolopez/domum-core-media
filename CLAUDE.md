@@ -139,6 +139,28 @@ loophole for resolving a tag with no captured identity, and a stopped container
 still has an image — inspect it with `compose ps -qa`, because `ps -q` lists only
 running containers and conflates stopped with absent.
 
+**"Warn and continue" is not a safety mechanism.** Twice now a control has shipped
+that described the harm in a warning and then caused it: the rollback warned that
+recreating resolves the image tag and then recreated, and a failed recovery-metadata
+write warned and still reported "Migration complete" with exit 0. Either the
+operation refuses, or its result is reported as something other than success. A
+service that is down is visible and fixable in one command; a service silently
+running a different application than its recovery point pairs with is neither.
+
+`tests/reconcile-boundary-audit.py` enforces the classification rather than
+trusting it: an image-preserving function containing an executable reconcile fails,
+a deployment function that stops reconciling fails, and a reconcile in an
+**unclassified** function fails — so the boundary cannot be inherited by accident.
+
+**Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
+state; it does not prove that image can still be obtained. A local object can be
+pruned and a mutable tag says nothing about next year, so availability is recorded
+per container as `identity`/`local`/`registry-digest`/`version-only`/`unknown` and
+never collapsed into one reassuring word. A RepoDigest **equal to the image ID** is
+not an independent registry reference — measured: docker reports exactly that here
+— so it does not count. Never let "application recovery verified" rest on a
+recorded string.
+
 ---
 
 ## 5. Production deployment
@@ -263,6 +285,12 @@ Notes:
 
 - `shellcheck` is **not installed on this host**; CI installs it. Do not report
   a shellcheck pass that did not run.
+- **The workflow enumerates every test by name — there is no glob.** A new suite
+  is not enforced until a step is added, and seven were not: they passed locally
+  and were reported as "CI green" while CI had never run them. `tests/ci-coverage-audit.sh`
+  now fails when a test file is missing from the workflow, or when the workflow
+  names one that no longer exists. Never describe a suite as CI-verified without
+  checking it is listed.
 - `systemd-analyze verify` only checks unit syntax and that `ExecStart` binaries
   exist. It cannot detect a unit invoking a subcommand the CLI does not
   implement. `tests/unit-subcommands-exist-smoke.sh` is that separate
