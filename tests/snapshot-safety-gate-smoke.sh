@@ -137,13 +137,31 @@ awk '
 # reason. With migrated services present, snapshot_create also returns non-zero
 # when a subvolume's snapshot genuinely FAILED, and naming the old cause would
 # hide the new one.
-awk '
-  /if ! snapshot_create "pre-apply"/ { inblock=1 }
-  inblock && /warn "Service state paths are not Btrfs subvolumes/ { bad=1 }
-  inblock && /^  fi$/ { inblock=0 }
-  END { exit bad ? 1 : 0 }
-' "$REPO_ROOT/bin/domum-media" \
-  || fail "the pre-apply warning asserts a cause that is no longer the only one"
+#
+# Enforced over the WHOLE file, not just this block: the same sentence sat at the
+# operator-facing `snapshot create` site too, and a block-scoped check caught only
+# one of the two. `snapshot_protection_unavailable` says "must be Btrfs
+# subvolumes" -- a requirement, which is still true -- so only the diagnostic
+# phrasing is banned.
+src_nocomments="$(sed 's/#.*//' "$REPO_ROOT/bin/domum-media")"
+if grep -q 'are not Btrfs subvolumes' <<< "$src_nocomments"; then
+  grep -n 'are not Btrfs subvolumes' "$REPO_ROOT/bin/domum-media" >&2
+  fail "a snapshot failure asserts 'paths are not Btrfs subvolumes' as its cause.
+That was the only possible reason while none of them was. With migrated services
+present, snapshot_create also returns non-zero when a real subvolume's snapshot
+FAILED, and naming the old cause hides the new one."
+fi
+
+# ...and each site must still say something, rather than failing mutely.
+for site in 'snapshot_create "pre-apply"' 'snapshot_create "${1:-manual}"'; do
+  awk -v site="$site" '
+    index($0, site) { inblock=1 }
+    inblock && /SNAPSHOT-MODEL\.md/ { ok=1 }
+    inblock && /^      fi$|^  fi$/ { inblock=0 }
+    END { exit ok ? 0 : 1 }
+  ' "$REPO_ROOT/bin/domum-media" \
+    || fail "the failure path at '$site' points the operator nowhere"
+done
 
 # ---------------------------------------------------------------------------
 # 5. A btrfs command that FAILS on a real subvolume must not pass the gate.

@@ -949,6 +949,93 @@ service_is_healthy() {
   return 0
 }
 
+# What a service is RUNNING, versus what its image tag resolves to right now.
+#
+# `docker compose up -d` recreates a container whose image has changed. That is
+# what it is for -- and it means every command that restarts a service deploys
+# whatever image has been pulled since the service last started. CLAUDE.md section 4
+# says image discovery, pulling and staging must never automatically imply
+# deployment, and section 11 makes application/image deployment and broad container
+# recreation operator boundaries. A storage migration restarting a service is
+# therefore an image-deployment vector, and it fired:
+#
+#   the Kavita migration recreated its container on jvmilazz0/kavita:latest built
+#   2026-08-28, and Kavita forward-migrated its database on startup -- schema
+#   migrations dated 2026-08-12..18 that the proof snapshot, taken minutes
+#   earlier, does not contain. Nothing was lost and the service is healthy, but
+#   the application was upgraded by a storage operation, and the recovery point
+#   is now an OLDER schema than the running binary.
+#
+# Measured on this host the same day: uptime-kuma, traefik, plex and calibre-web
+# all have a newer image staged under their existing tag. Two of them are
+# migration candidates.
+#
+# Prints one line per compose service, prefixed with a verdict, and NEVER nothing
+# for a case it could not decide.
+#
+#   STAGED  <svc> <running> <tag-now>   the tag resolves to a different image
+#   UNKNOWN <svc> <reason>              could not be determined
+#   STOPPED <svc>                       no running container to compare against
+#
+# The first version returned nothing for every undecidable case, so it reported
+# "no staged image" when it had simply failed to look -- and it failed to look
+# unprivileged, where `compose ps -q` produces no container id. Measured: four
+# services with a newer image staged came back clean. A guard that fails OPEN is
+# worse than no guard, because it is trusted.
+#
+# STOPPED is not UNKNOWN. A service that is not running has no current image to
+# preserve, so starting it on whatever the tag resolves to is not a change of
+# anything -- but it is still reported, because the result is a version the
+# operator did not choose.
+service_staged_image_changes() {  # $1 = service
+  local svc="$1" compose_svcs compose_svc cid run_img tag tag_img
+  compose_svcs="$(service_compose_services "$svc" || true)"
+  if [[ -z "$compose_svcs" ]]; then
+    printf 'UNKNOWN %s no compose services mapped\n' "$svc"
+    return 0
+  fi
+  for compose_svc in $compose_svcs; do
+    cid="$(tracked_service_container_id "$compose_svc" 2>/dev/null || true)"
+    if [[ -z "$cid" ]]; then
+      printf 'STOPPED %s\n' "$compose_svc"
+      continue
+    fi
+    run_img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
+    tag="$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)"
+    if [[ -z "$run_img" || -z "$tag" ]]; then
+      printf 'UNKNOWN %s could not inspect container %s\n' "$compose_svc" "$cid"
+      continue
+    fi
+    tag_img="$(docker inspect --format '{{.Id}}' "$tag" 2>/dev/null || true)"
+    if [[ -z "$tag_img" ]]; then
+      # The tag is not present locally, so `up -d` would pull it and there is
+      # nothing here to compare. Reported, not swallowed: the post-restart
+      # comparison is what catches the outcome.
+      printf 'UNKNOWN %s tag %s is not present locally; up -d would pull\n' "$compose_svc" "$tag"
+      continue
+    fi
+    if [[ "$run_img" != "$tag_img" ]]; then
+      printf 'STAGED %s %s %s\n' "$compose_svc" "$run_img" "$tag_img"
+    fi
+  done
+}
+
+# The image each of a service's containers is running, as "<svc> <image-id>" lines.
+# Compared across a stop/start to catch a deployment that happened anyway --
+# including the one service_staged_image_changes cannot predict, where the tag is
+# not present locally and `up -d` pulls it.
+service_running_images() {  # $1 = service
+  local svc="$1" compose_svcs compose_svc cid img
+  compose_svcs="$(service_compose_services "$svc" || true)"
+  [[ -n "$compose_svcs" ]] || return 0
+  for compose_svc in $compose_svcs; do
+    cid="$(tracked_service_container_id "$compose_svc")"
+    [[ -n "$cid" ]] || continue
+    img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
+    printf '%s %s\n' "$compose_svc" "${img:-none}"
+  done
+}
+
 wait_for_service_health() {
   local svc="$1"
   local timeout="${2:-120}"
@@ -1815,9 +1902,26 @@ restore_snapshot_for_service() {
   case "$snapshot_name" in
     ""|*/*|.|..) die "Refusing: '$snapshot_name' is not a valid snapshot name" ;;
   esac
-  local expect; expect="$(basename "$data_path")"
-  [[ "$snapshot_name" == "$expect"-* ]] \
-    || die "Refusing: snapshot '$snapshot_name' does not belong to $service (expected '$expect-<timestamp>-<tag>').
+  #
+  # ANCHORED to the stamp, not just the prefix. `"$expect"-*` accepts any name
+  # that merely STARTS with this service's basename, so with two services where
+  # one basename is a "-"-prefix of the other -- plex and plex-hd, immich and
+  # immich-ml -- restoring `plex` would accept `plex-hd-20260101-000000-tag` and
+  # write plex-hd's state over plex's path. Exactly the defect defe282 fixed in
+  # list_snapshots_for_base, in the one place where a false accept overwrites live
+  # state instead of miscounting retention.
+  #
+  # Not reachable with today's eight service basenames, because none is a
+  # "-"-prefix of another. Adding one would arm it silently, and this is the last
+  # check before a `btrfs subvolume snapshot` over a service's data path.
+  #
+  # Prefix STRIPPED rather than regex-matched, so a basename containing regex
+  # metacharacters cannot change what is accepted.
+  local expect rest
+  expect="$(basename "$data_path")"
+  rest="${snapshot_name#"$expect"-}"
+  [[ "$rest" != "$snapshot_name" && "$rest" =~ ^[0-9]{8}-[0-9]{6}(-|$) ]] \
+    || die "Refusing: snapshot '$snapshot_name' does not belong to $service (expected '$expect-<YYYYMMDD>-<HHMMSS>[-tag]').
 The rollback index and the snapshot store disagree; investigate before restoring."
 
   [[ -d "$DOMUM_SNAPSHOT_ROOT/$snapshot_name" ]] || die "Snapshot not found: $snapshot_name"
@@ -3288,7 +3392,12 @@ snapshot_cmd() {
       # Propagate the real outcome: an operator who asked for a snapshot and got
       # none must not see a success exit status.
       if ! snapshot_create "${1:-manual}"; then
-        die "No snapshot was created. Service state paths are not Btrfs subvolumes; see docs/SNAPSHOT-MODEL.md."
+        # Does NOT assert a cause. "Service state paths are not Btrfs subvolumes"
+        # was the only possible reason while none of them was, and it is now wrong
+        # in the case that matters: with migrated services present, snapshot_create
+        # also returns non-zero when a real subvolume's snapshot FAILED. Naming the
+        # old cause would hide the new one. The counts it just printed say which.
+        die "No snapshot was created. See the counts above for whether paths were skipped or a snapshot failed, and docs/SNAPSHOT-MODEL.md."
       fi
       ;;
     list)   snapshot_list ;;
@@ -5516,6 +5625,48 @@ underneath it would make that backup fail. Wait for it to finish and retry."
   (( avail_kb > 1048576 )) || die "Refusing: less than 1 GiB free on $DOMUM_DATA_ROOT"
 
   compose_svcs="$(service_compose_services "$service" || true)"
+
+  # A migration stops and starts the service, and `up -d` deploys whatever image
+  # the tag now resolves to. Refuse rather than upgrade the application as a side
+  # effect of moving its data: the two decisions have different blast radii and
+  # different rollback stories, and bundling them means the proof snapshot holds
+  # the OLD application's data while the NEW application runs.
+  local image_verdicts staged_images unknown_images stopped_images
+  image_verdicts="$(service_staged_image_changes "$service")"
+  staged_images="$(grep '^STAGED '  <<< "$image_verdicts" || true)"
+  unknown_images="$(grep '^UNKNOWN ' <<< "$image_verdicts" || true)"
+  stopped_images="$(grep '^STOPPED ' <<< "$image_verdicts" || true)"
+  [[ -n "$stopped_images" ]] \
+    && migrate_stage preflight "not running, so it will start on whatever the tag resolves to: $(tr '\n' ' ' <<< "$stopped_images")"
+
+  if [[ -n "$staged_images" || -n "$unknown_images" ]]; then
+    if [[ "${MIGRATE_ALLOW_IMAGE_CHANGE:-0}" == "1" ]]; then
+      warn "MIGRATE_ALLOW_IMAGE_CHANGE=1, so this migration may also deploy an image for $service:"
+      printf '  %s\n' "$staged_images$unknown_images" >&2
+      warn "If it does, the proof snapshot will hold the previous application's data."
+    elif [[ -n "$staged_images" ]]; then
+      die "Refusing: a newer image is already staged for $service, so restarting it would DEPLOY that image.
+$staged_images
+A storage migration must not upgrade the application as a side effect: the proof
+snapshot would hold the old application's data while the new one runs, and an
+application upgrade is a separate operator decision (CLAUDE.md sections 4 and 11).
+Deploy it deliberately first, or migrate a service with no staged image.
+To accept the upgrade as part of this migration, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
+    else
+      # "I could not tell" must never read as "nothing is staged". A migration is
+      # attended and nothing has been touched yet, so refusing costs nothing --
+      # and the alternative is proceeding on a check that did not run.
+      die "Refusing: cannot determine whether restarting $service would deploy a different image.
+$unknown_images
+Restarting a service deploys whatever its tag resolves to, so this must be known
+before the service is stopped, not discovered afterwards.
+To proceed anyway, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
+    fi
+  fi
+
+  local images_before
+  images_before="$(service_running_images "$service")"
+
   migrate_stage preflight "service=$service path=$path"
   migrate_stage preflight "compose services: ${compose_svcs:-none}"
   migrate_stage preflight "free space: $(( avail_kb / 1024 )) MiB"
@@ -5641,6 +5792,24 @@ underneath it would make that backup fail. Wait for it to finish and retry."
       warn "The previous state is intact at $premigration."
       warn "To roll back: stop the service, mv '$path' aside, mv '$premigration' '$path', start it."
       die "Migration completed but the service is unhealthy. Nothing was deleted."
+    fi
+  fi
+
+  # The image must be the same one that was running before. Belt and braces: the
+  # preflight refusal cannot see a tag that is absent locally, where `up -d`
+  # pulls. An upgrade that happened anyway must be reported, not discovered later
+  # from a schema that no longer matches the recovery point.
+  if [[ -n "$compose_svcs" ]]; then
+    local images_after
+    images_after="$(service_running_images "$service")"
+    if [[ "$images_after" != "$images_before" ]]; then
+      warn "$service IS RUNNING A DIFFERENT IMAGE than before the migration:"
+      warn "  before: $(printf '%s' "$images_before" | tr '\n' ' ')"
+      warn "  after : $(printf '%s' "$images_after" | tr '\n' ' ')"
+      warn "The application was upgraded by this migration. The proof snapshot holds the"
+      warn "PREVIOUS application's data, so it is a data recovery point, not a full rollback."
+    else
+      migrate_stage health "image unchanged across the restart"
     fi
   fi
 

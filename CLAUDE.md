@@ -104,6 +104,20 @@ until the update/apply/rollback pipeline has been audited and proven safe.
 - Image discovery, pulling, and staging must never automatically imply
   deployment.
 
+**`docker compose up -d` deploys a staged image.** It recreates any container
+whose image has changed, so *every* command that restarts a service is an image
+deployment vector — not just the update path. This is not theoretical: the Kavita
+storage migration recreated its container on a newer locally-staged image and
+Kavita forward-migrated its database on startup, leaving the proof snapshot taken
+minutes earlier holding an older schema than the running binary
+(`docs/IMAGE-DEPLOYMENT-BY-MIGRATION.md`).
+
+Before adding or changing any code path that restarts a service, decide
+explicitly whether it may deploy: compare the running image against what the tag
+resolves to (`service_staged_image_changes`), and refuse, or say so. A path that
+both moves data and upgrades the application gives the operator one rollback story
+for two independent changes.
+
 ---
 
 ## 5. Production deployment

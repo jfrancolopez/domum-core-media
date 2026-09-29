@@ -36,9 +36,14 @@ EOF
 
 setup() {
   rm -rf "$TMP_DIR/data" "$TMP_DIR/snapshots"
-  mkdir -p "$TMP_DIR/data/plex" "$TMP_DIR/snapshots/plex-snap"
+  # A REALISTIC snapshot name. It used to be "plex-snap", which
+  # create_service_snapshot can never produce -- names always carry
+  # "-YYYYMMDD-HHMMSS-<tag>" -- so the fixture exercised a restore the real code
+  # now refuses, and the refusal is the point: a name without a stamp is not one
+  # of ours, and restoring from it would overwrite live state from an unknown tree.
+  mkdir -p "$TMP_DIR/data/plex" "$TMP_DIR/snapshots/plex-20260101-000000-snap"
   printf 'LIVE DATA THAT MUST NOT BE LOST\n' > "$TMP_DIR/data/plex/important.db"
-  printf 'RESTORED\n' > "$TMP_DIR/snapshots/plex-snap/important.db"
+  printf 'RESTORED\n' > "$TMP_DIR/snapshots/plex-20260101-000000-snap/important.db"
 }
 
 # ---------------------------------------------------------------------------
@@ -49,7 +54,7 @@ out="$(bash -c "$(harness)
 # btrfs subvolume snapshot [-r] SRC DST -- take the last two arguments so the
 # stub works whether or not -r is present.
 btrfs() { cp -a \"\${@: -2:1}\" \"\${!#}\"; }
-restore_snapshot_for_service plex plex-snap" 2>&1)" || fail "1: a working restore should succeed: $out"
+restore_snapshot_for_service plex plex-20260101-000000-snap" 2>&1)" || fail "1: a working restore should succeed: $out"
 
 [ -f "$TMP_DIR/data/plex/important.db" ] || fail "1: nothing was restored"
 grep -q RESTORED "$TMP_DIR/data/plex/important.db" || fail "1: the snapshot content was not restored"
@@ -67,7 +72,7 @@ grep -q 'remove it once satisfied' <<< "$out" \
 setup
 out="$(bash -c "$(harness)
 btrfs() { return 1; }
-restore_snapshot_for_service plex plex-snap" 2>&1)"
+restore_snapshot_for_service plex plex-20260101-000000-snap" 2>&1)"
 [ -n "$out" ] || fail "2: a failed restore produced no output"
 
 [ -d "$TMP_DIR/data/plex" ] || fail "2: the live state was not put back after a failed restore"
@@ -111,7 +116,7 @@ grep -q 'mv -- "$data_path" "$current_backup"' <<< "$fn" \
 setup
 out="$( { bash -c "$(harness)
 docker() { [[ \"\$1\" == ps ]] && printf 'plex\n'; }
-restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+restore_snapshot_for_service plex plex-20260101-000000-snap" ; } 2>&1 )"
 rc=$?
 (( rc != 0 )) || fail "a restore was allowed while the container was still running: $out"
 grep -qi 'could not be confirmed stopped' <<< "$out" \
@@ -125,7 +130,7 @@ grep -qi 'could not be confirmed stopped' <<< "$out" \
 setup
 out="$( { bash -c "$(harness)
 compose_cmd() { [[ \"\$1\" == stop ]] && return 1; return 0; }
-restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+restore_snapshot_for_service plex plex-20260101-000000-snap" ; } 2>&1 )"
 rc=$?
 (( rc != 0 )) || fail "a restore proceeded after the stop command failed: $out"
 # It must refuse for the RIGHT reason. Without this the test also passes when
@@ -153,7 +158,7 @@ setup
 out="$( { bash -c "$(harness)
 btrfs() { mkdir -p \"\${!#}\"; return 1; }   # restore fails, leaving a partial dir
 rm() { case \"\$*\" in *-rf*) return 1 ;; esac; command rm \"\$@\"; }
-restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+restore_snapshot_for_service plex plex-20260101-000000-snap" ; } 2>&1 )"
 rc=$?
 (( rc != 0 )) || fail "a restore that could not clear its partial output reported success: $out"
 grep -qi 'could not be removed' <<< "$out" \
@@ -167,7 +172,7 @@ setup
 out="$( { bash -c "$(harness)
 btrfs() { mkdir -p \"\${!#}\"; return 1; }
 rm() { case \"\$*\" in *-rf*) return 0 ;; esac; command rm \"\$@\"; }
-restore_snapshot_for_service plex plex-snap" ; } 2>&1 )"
+restore_snapshot_for_service plex plex-20260101-000000-snap" ; } 2>&1 )"
 rc=$?
 (( rc != 0 )) || fail "a restore proceeded with the destination still present: $out"
 grep -qi 'would nest it inside' <<< "$out" \
