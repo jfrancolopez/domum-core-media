@@ -107,4 +107,6 @@ Use the runbook in [docs/disaster-recovery.md](docs/disaster-recovery.md).
 - [docs/MIGRATION-ORDER-3.md](docs/MIGRATION-ORDER-3.md)
 - [docs/MIGRATION-ORDER-4.md](docs/MIGRATION-ORDER-4.md)
 - [docs/PREMIGRATION-COST.md](docs/PREMIGRATION-COST.md)
+- [docs/UPGRADE-PROTECTION.md](docs/UPGRADE-PROTECTION.md)
+- [docs/REBOOT-READINESS.md](docs/REBOOT-READINESS.md)
 - [docs/RECOVERY-POINT-IDENTITY.md](docs/RECOVERY-POINT-IDENTITY.md)

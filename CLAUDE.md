@@ -168,6 +168,30 @@ trusting it: an image-preserving function containing an executable reconcile fai
 a deployment function that stops reconciling fails, and a reconcile in an
 **unclassified** function fails — so the boundary cannot be inherited by accident.
 
+**`domum-media update` is NOT the gated upgrade path.** It is `repo_update`:
+`git reset --hard origin/main`, converge, then `exec domum-media apply` — and
+`apply`'s pre-apply snapshot is fleet-wide and non-fatal by design, while
+`compose up -d` recreates any container whose image changed. The per-service gate
+lives in `refresh_images` (`domum-media updates apply` / `refresh-images`), which
+snapshots the service it is updating, by name, and dies when that returns nothing.
+
+**An image upgrade may proceed only when the state THAT service may mutate has a
+recovery point appropriate to THAT service.** A Jellyfin snapshot must never
+satisfy a Plex upgrade — the `immich reset-db` defect class. So it is evaluated per
+service and never counted: `apply` refuses before its fleet-wide `up -d` when any
+enabled service has a staged image and unprotected state. A service with no state
+under `/srv/data` is reported, not blocked — a snapshot could never cover a Docker
+volume, and that is the recovery-pack question. A path that exists whose protection
+is `unknown` IS blocked. See `docs/UPGRADE-PROTECTION.md`.
+
+**Docker must not start before `/srv/data` is mounted.** Containers are
+`restart: unless-stopped`, so the daemon starts them at boot without compose; with
+the mount absent it would create the bind-mount sources on the OS disk and every
+service would come up as a fresh install, hidden later when the mount lands.
+`systemd/docker.service.d/10-domum-require-mounts.conf` makes the dependency
+explicit — it was previously only transitive target ordering, with
+`RequiresMountsFor=` empty. Never add `nofail` to those fstab lines.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
