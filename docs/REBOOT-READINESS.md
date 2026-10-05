@@ -258,6 +258,128 @@ the host — opt-in, per `systemd/auto-enable.timers`. That is why
 `systemctl is-enabled domum-media-weekly-report.timer` reports `not-found`, and it
 is not drift.
 
+## Outcome: the reboot of 2026-10-05, measured
+
+Performed at 16:43:49 EDT after deploying `4db50728`. Uptime before it was 2
+weeks 1 day.
+
+| | before | after |
+|---|---|---|
+| boot ID | `5c86af83-…` | `8ff52d09-…` |
+| kernel | `6.12.107+deb13-amd64` | **`6.12.111+deb13-amd64`** |
+| `reboot-required` | set | not set |
+| containers | 11 running / 11 objects | 11 running / 11 objects |
+| failed units | 0 | 0 |
+| production HEAD | `4db50728` | `4db50728` |
+
+**The split-brain did not happen.** The verifier's section 3 bind-mounts `/srv`
+non-recursively and looks *underneath* the mountpoints, where Docker would have
+created bind-mount sources had it started first:
+
+```
+ok      the underlying /srv/data and /srv/snapshots directories are empty
+```
+
+**Nothing resolved a tag.** All eleven container *objects* survived with their
+original IDs and `Created` timestamps — `jellyfin` still `2026-09-25T15:33:17Z`
+from its migration, `plex` still `2026-06-12T13:04:34Z` — with only `StartedAt`
+moving to `2026-10-05T20:43:55Z` and `RestartCount=0`. Docker restarted the
+existing objects; it did not recreate them.
+
+The decisive evidence is the four services that had a **newer image staged
+locally under the same tag**, measured again after the boot:
+
+| service | running | tag resolves to | result |
+|---|---|---|---|
+| `plex` | `58f13a1df833` | `7f9a1d574958` | still old |
+| `calibre-web` | `6cf7dab48a4a` | `d5ad2aaf36f8` | still old |
+| `traefik` | `9c3b91d5fb77` | `9c2a54d87f76` | still old |
+| `uptime-kuma` | `a8610b3b4c38` | `3e24e96c89ef` | still old |
+
+A reboot is therefore **not** an image-deployment vector, demonstrated rather
+than argued.
+
+Everything else reconciled: topology digest identical, three subvolumes still
+inode 256, per-service protection identical, all three `.premigration` trees
+byte-for-byte (37/501962, 79/4399811, 1004/51522430), all three proof snapshots
+still `ro=true` with unchanged file counts, Navidrome's `.recovery` intact, every
+timer back `enabled/active`, image refresh still `disabled/inactive`, operation
+lock free, and `navidrome`/`plex`/`jellyfin` all logging readiness since boot with
+all six healthchecks `healthy`.
+
+The mount dependency survived into the new boot: `RequiresMountsFor=/srv/data`,
+`Requires=srv-data.mount`, `After=srv-data.mount`, `srv-data.mount` active on
+`/dev/sda1[/@data]`.
+
+### The stale `.holder` warning is by design
+
+The verifier warns:
+
+```
+warn    a stale .holder file remains (diagnostic only, never consulted):
+        1318756 2026-10-05T10:10:12+00:00 host-upgrade
+```
+
+That is the `host-upgrade` run of 06:10 EDT, which installed the new kernel. The
+helper writes `.holder` on acquire and never removes it, deliberately — and
+`domum_lock_holder` is called **only** inside `die` on the failure branch of
+`domum_acquire_lock`, so it is read only when the lock genuinely is held, when
+the file is current. A stale `.holder` beside a free lock is never consulted. The
+warning is honest and correctly non-fatal.
+
+## Validating the capture before the reboot
+
+`domum-media-validate-capture.sh` closes a gap the other two scripts leave:
+`/var/lib/domum-media` is `0700` root-owned and the capture `0600`, so "the
+capture exited zero" is not evidence that its *contents* are right. A capture
+that recorded zero containers, or lost its `RECOVERY_EVIDENCE` lines, would make
+the post-boot comparison pass **vacuously** — and the pre-reboot state cannot be
+re-captured afterwards, so before the reboot is the only chance to check.
+
+It is the mirror image of the post-boot verifier: here the capture's `BOOT_ID`
+must **equal** the current boot; afterwards it must **differ**. That inversion
+proved itself immediately — run again after the reboot, it correctly refused:
+
+```
+FAIL    capture BOOT_ID is 5c86af83-… but the current boot is 8ff52d09-….
+        This capture was taken under a DIFFERENT boot.
+FAIL    running kernel is 6.12.111 but the capture says 6.12.107
+```
+
+Both are the right answer to the wrong question: a pre-reboot gate run after the
+reboot. The post-boot verifier, given the same files, passed.
+
+### A check that fires on its own data is worse than no check
+
+The validator's first version asserted "no secrets" with
+`[A-Za-z0-9+/]{60,}={0,2}$`, and failed on the real capture. The cause was its
+own most ordinary field: a **64-character hex digest**. `CLI_SHA256`,
+`TOPOLOGY_SHA256`, `CONTAINER_*_ID`, `CONTAINER_*_IMAGE` and `RECOVERY_EVIDENCE`
+all match that shape; the genuine credential patterns matched nothing. Worse, it
+reported "a secret-looking value" **without naming the line**, so the finding
+could not be acted on.
+
+Both halves were defects. The replacement flags by *key* and never by value:
+
+1. a key whose name implies a credential;
+2. a `BEGIN … PRIVATE KEY` block;
+3. base64 **with `=` padding** — a hex digest can never end that way, which keeps
+   the heuristic without the false positive;
+4. every key must belong to the **closed set the capture script emits** — a future
+   field that leaked something surfaces as an unknown key.
+
+The capture's write set is independently auditable: 20 key families, 4 record
+types, plus `TOPOLOGY:`/`PROTECTION:`. It reads no secret path, no `_PASSWORD`/
+`_TOKEN`/`_KEY` variable, no `.Config.Env`, and no compose config; the only
+container fields it touches are `Id`, `Image`, `Config.Image`, `Created`,
+`RestartPolicy.Name`, `State.Status` and `State.Health`.
+
+When fixed, it reported `25 value(s) are plain hex digests` and passed.
+
+The general rule: a safety check must be tested against the data it will actually
+see, and a failing check must name what it matched. An unactionable `FAIL` trains
+the operator to ignore it.
+
 ## Acceptance
 
 Two scripts, both read-only, both feature-gated against the **installed** CLI:
