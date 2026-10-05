@@ -2,6 +2,10 @@
 Description=domum-media: write weekly operational report
 Documentation=file:///opt/domum-core-media/docs/WEEKLY-REPORT.md
 ConditionPathExists=/usr/local/bin/domum-media
+# This unit reads or writes the protected storage, so it must not run with
+# either root unmounted: it would classify a phantom tree, or create the
+# snapshot root on the OS disk. RequiresMountsFor= adds Requires= and After=.
+RequiresMountsFor=/srv/data /srv/snapshots
 
 [Service]
 Type=oneshot
