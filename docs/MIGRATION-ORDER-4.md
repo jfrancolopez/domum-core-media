@@ -1,75 +1,131 @@
-# Service #4 — not yet, and here is why
+# Service #4 — what it would and would not buy
 
-Measured 2026-09-29, after Navidrome. Three services are migrated: Jellyfin,
-Kavita, Navidrome. Two candidates remain before Immich, which is deliberately last
-and outside this sequence.
+Measured 2026-10-05. Three services migrated: Jellyfin, Kavita, Navidrome. Two
+routine candidates remain; Immich is deliberately last and excluded.
 
-| | files | bytes | dirs | symlinks | non-empty `-wal` | healthcheck | readiness log | image |
-|---|---|---|---|---|---|---|---|---|
-| calibre-web | 6 | 245 KB | 2 | 0 | 0 | none | **none found** | **staged newer** |
-| plex | 121 | 272 MB | 171 | **7** | **2** | none | `[migrations] started` only | **staged newer** |
+## Measured now, not remembered
 
-## Both are blocked on the same thing, and it is not a storage question
+| | calibre-web | plex |
+|---|---|---|
+| path | ordinary directory, inode 4375 | ordinary directory, inode 4373 |
+| files / dirs | 6 / 2 | 121 / 171 |
+| bytes | 250,850 | 263,117,420 |
+| **symlinks** | 0 | **7** (6 relative incl. 2 chains, 1 absolute and broken on the host) |
+| SQLite | `app.db` 118 KB, `gdrive.db` 24 KB | `…library.db` 421 KB, `…blobs.db` 365 KB |
+| WAL / SHM | **none at all** | `library.db-wal` **76,536 B**, `blobs.db-wal` 0 B, both `-shm` 32,768 B |
+| open handles under the tree | 0 | 0 |
+| nested subvolumes / leftovers | 0 / 0 | 0 / 0 |
+| runtime | running, no healthcheck | running, no healthcheck |
+| container / image | `06c0695330023…` / `6cf7dab48a4a…` | `7a917ab1f387…` / `58f13a1df833…` |
+| mutable ref | `lscr.io/linuxserver/calibre-web:latest` | `lscr.io/linuxserver/plex:latest` |
+| **staged image** | **yes** → tag now `d5ad2aaf36f8…` | **yes** → tag now `7f9a1d574958…` |
+| RepoDigests | **none** | **none** |
+| recoverability | `identity,local` | `identity,local` |
+| readiness signal | **none found** | `Connection to localhost (::1) 32400 port [tcp/*] succeeded!` |
+| bind mounts | `config` + `/srv/media/books` (rw) | `config` + `/srv/media` (ro) + transcode cache |
 
-**Both have a newer image staged under their existing tag.** Under the current
-invariant that is no longer dangerous — `compose start` restarts the container
-that was stopped, so no image is resolved and nothing can be deployed. But the
-preflight still refuses a staged image, deliberately: a migration is not the
-moment to discover that an application upgrade is pending.
+Both would be **refused today**: each has a newer image staged under its tag, and
+the migration refuses rather than bundle an application upgrade into a storage
+move. That decision comes first, separately, on its own merits.
 
-So for either service, the honest order is:
+Neither has a RepoDigest, so both would record `identity,local` — the exact image
+known and present today, with no immutable reference for later. Plex's running
+image is `ls308`, built 2026-06-08, with several newer ones already pulled; its
+upgrade is overdue as an upgrade.
 
-1. decide about the image upgrade **as an upgrade**, on its own merits
-2. then migrate
+## What has already been proven
 
-Not the reverse, and not both at once.
+| | proved by |
+|---|---|
+| real Btrfs conversion, quiesced copy, cutover | all three |
+| read-only proof snapshot, `.premigration == snapshot` | all three |
+| SQLite integrity of the recovery point | all three |
+| **container healthcheck** verification | Kavita (`/api/health`) |
+| **non-empty running WAL → clean stop → sidecars removed** | **Navidrome** |
+| runtime-state preservation | Navidrome (`running` → `running`) |
+| **same container object, same image** | Navidrome (`Created` unchanged) |
+| complete recovery metadata + `verify-recovery` | Navidrome |
+| three-service topology, independent retention | all three |
+| survival of a host upgrade and fleet restart | all three, 2026-10-05 |
 
-## What each would actually prove
+## What calibre-web would add: essentially nothing
 
-**calibre-web proves almost nothing new.** 6 files, 245 KB, no symlinks, no dirty
-WAL, no healthcheck, and **no readiness line in its logs** — so its
-post-restart evidence would be weaker than any migration so far: container running,
-and nothing else. It is the smallest remaining risk and the smallest remaining
-information.
+6 files, 2 directories, 250 KB, no symlinks, no WAL, no sidecars, no healthcheck,
+**no readiness line in its logs**. Its post-restart evidence would be weaker than
+any migration so far — container running, and nothing else. Two databases, but
+Kavita already proved two. It is the smallest remaining risk and the smallest
+remaining information.
 
-**plex proves two genuinely new things**, and carries the most novelty at once:
+The honest answer: **migrating calibre-web would prove nothing.**
 
-- **7 symlinks, one of them absolute**, pointing at a container-internal path:
-  ```
-  Cache/va-dri-linux-x86_64/iHD_drv_video.so
-    -> /config/Library/Application Support/Plex Media Server/Drivers/imd-…/dri/iHD_drv_video.so
-  ```
-  `cp -a --reflink` preserves symlinks and the metadata manifest compares targets,
-  so this is the first migration where that comparison does real work. An absolute
-  target that resolves only *inside* the container is exactly the case where a
-  naive copy would silently dereference.
-- **272 MB and two non-empty WALs** (`com.plexapp.plugins.library.db-wal` and
-  `…blobs.db-wal`) — the WAL gate again, but this time with two databases that
-  must both checkpoint, on a tree two orders of magnitude larger than Kavita's.
+## What plex would add: symlinks, and a second dirty WAL
 
-Its post-restart evidence is still weak: no healthcheck, and its logs offer
-`[migrations] started` but nothing that reliably means *serving*. A readiness
-pattern could be added, but it should be chosen from observed behaviour across a
-restart, not guessed — and the only way to observe that is a restart, which is
-what the migration would be doing.
+Two genuinely new dimensions:
 
-## Recommendation: neither yet
+**Symlinks.** The only remaining service with any — including an absolute one
+pointing at a container-internal path that does not exist on the host:
 
-Navidrome added three newly proven dimensions on the same day:
+```
+Cache/va-dri-linux-x86_64/iHD_drv_video.so
+  -> /config/Library/Application Support/Plex Media Server/Drivers/imd-…/dri/iHD_drv_video.so
+```
 
-1. **non-empty running WAL → clean stop → checkpointed, sidecars removed**
-2. **preserved container and image identity** (same container object, `Created`
-   unchanged)
-3. **complete recovery-point metadata**, the first production use
+and two **chains** (`libiga64.so → libiga64.so.2 → libiga64.so.2.16.0+0`).
 
-That is a lot of new machinery exercised once. The useful next step is to let
-those three sit — in particular, to see one **nightly backup** and one **weekly
-prune** run against a three-subvolume topology — before adding a fourth.
+That dimension is now covered by tests rather than by hope —
+`tests/symlink-verification-smoke.sh`, built to the measured plex layout:
 
-When it is time, **plex** is the more valuable pilot of the two, once its image
-decision is made separately. calibre-web is the safer one and teaches less; it is
-a reasonable choice if the goal is to finish the set rather than to learn
-something.
+- symlinks are never hashed, and what they point at is never read: a 1 MiB file
+  outside the tree, reachable only through a link, must not appear in the manifest
+  or in the byte count
+- a directory outside the tree, linked absolutely, is not traversed
+- a symlink **chain** is not resolved to its eventual file
+- dangling targets (absolute and relative) survive and compare
+- a retarget to a name of the **same length** is caught — identical file count and
+  byte count, so only the metadata manifest can see it
+- a **count- and byte-preserving type swap** (symlink ↔ regular file) is caught,
+  the one case the content manifest alone cannot see
 
-Nothing here should be read as a decision. The next migration should be chosen
-from measurements taken at the time, as this one was.
+Four mutants killed, including `find -L` (dereferencing) and `du -sbL` (counting
+the target's bytes).
+
+**A second dirty WAL, on a larger tree.** `library.db-wal` is 76,536 B while
+`blobs.db-wal` is empty — so one database must checkpoint and the other is
+already clean, across 263 MB. Navidrome proved one dirty WAL on 51 MB.
+
+**Its readiness signal is weaker than Navidrome's**, and the difference matters.
+Navidrome logs readiness *after* opening and migrating its database; plex's line
+is the LinuxServer init script's own probe of port 32400, which proves the
+listener came up and nothing about the databases. Those are covered instead by the
+snapshot integrity check, which opens both. The pattern is observed from a real
+restart on this host, not guessed, and pinned by a test — along with the benign
+`Critical: libusb_init failed` that arrives 12s later and must not be read either
+way.
+
+## Recommendation: not yet, and not because of risk
+
+Plex is clearly the more valuable of the two, and "because it is next" is no
+longer a reason for either. But three things argue against doing it now:
+
+1. **It needs an image decision first.** Running `ls308` from June with newer
+   images staged is a pending upgrade, and the migration correctly refuses to
+   bundle them. Deciding the upgrade is the higher-value action.
+2. **The new machinery has run once.** Recovery metadata, `verify-recovery`,
+   runtime-state preservation and the fail-closed restart each have exactly one
+   production data point — plus one week of scheduled jobs and one host upgrade.
+   A second is worth more after the first has been boring for a while.
+3. **Its new dimension is already covered by tests.** Symlink handling was the
+   reason to want plex; that is now proven against the measured layout, with
+   mutants. A production run would confirm it rather than discover it.
+
+So the next higher-value milestone is **not another migration**. In order:
+
+- **Decide the plex and calibre-web image upgrades** as upgrades, through the
+  update path, which is gated on backup age, health and a snapshot — and is the
+  path that has never been exercised against a migrated subvolume.
+- **Reboot.** `/var/run/reboot-required` is set after the 2026-10-05 host upgrade.
+  A reboot is the one event none of the three migrated subvolumes has survived; a
+  fleet restart is not the same thing.
+- Then plex, with the image question already settled.
+
+Immich stays last and outside this sequence.
