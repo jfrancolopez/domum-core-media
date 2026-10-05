@@ -106,6 +106,47 @@ worth verifying rather than assuming.
 | Traefik | `unless-stopped`, same as the rest; its ACME store is a Docker volume |
 | database ordering | Immich's four containers have compose `depends_on`, and Docker restores them with their restart policies |
 
+## The drop-in is not reverted by a rollback
+
+The deployment that installs `systemd/docker.service.d/10-domum-require-mounts.conf`
+has a rollback script, and that script deliberately **leaves the drop-in in place**
+while it restores the three CLI files and rewinds the production checkout.
+
+That asymmetry is the decision, not an omission:
+
+- The drop-in is independent of the CLI. It constrains only the order in which
+  systemd starts Docker at boot, and it is correct under every revision of
+  `bin/domum-media` — including the one being rolled back to.
+- A rollback exists to undo a defect in the CLI. Removing a boot-ordering safety
+  constraint on the way out would silently restore the ability to start Docker
+  before `/srv/data` is mounted, which is the split-brain this whole change
+  prevents. A rollback must not widen the blast radius of the thing it is
+  recovering from.
+- So the rollback *reports* what it did not revert rather than reverting it. Its
+  last section prints the drop-in's path and the live `RequiresMountsFor`, and
+  warns if the file is absent.
+
+Removing it is therefore an explicit operator action:
+
+```
+rm /etc/systemd/system/docker.service.d/10-domum-require-mounts.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/docker.service.d
+systemctl daemon-reload
+```
+
+Note that `apply`, `init` and `configure` reinstall it, because
+`converge_local_installation` installs `systemd/*.service.d/*.conf`. That is
+intended: convergence should restore it, and it changes nothing until the next
+boot.
+
+### One behavioural consequence worth knowing
+
+`RequiresMountsFor=` adds `Requires=` as well as `After=`. Once it is loaded, an
+**unmount of `/srv/data` stops `docker.service`**, and with it all eleven
+containers. That is the correct direction — containers stopped beats containers
+writing to the OS disk — but it means a future `umount /srv/data` for maintenance
+is no longer a quiet operation. Stop the stack first, deliberately.
+
 ## Acceptance
 
 Two scripts, both read-only, both feature-gated against the **installed** CLI:
