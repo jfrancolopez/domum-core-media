@@ -611,3 +611,64 @@ Expected, from the evidence captured before the stop:
 `IMAGE_ID=sha256:9012939114fb…`, `IMAGE_REF=deluan/navidrome:latest` (mutable),
 `IMAGE_LABEL_VERSION=0.63.2`, and **`IMAGE_AVAILABILITY=identity,local`** — the
 RepoDigest equals the image ID, so there is no independent registry reference.
+
+---
+
+# A week of three migrated subvolumes
+
+Measured 2026-10-05, six days after the Navidrome migration. Nothing was touched
+in between.
+
+| scheduled job | last run | result |
+|---|---|---|
+| `domum-media-btrfs-snapshot` (prune) | **Sun 2026-10-04 04:48:53** | success, exit 0 |
+| `domum-media-check` | Sun 2026-10-04 03:38:53 | success, exit 0 |
+| `domum-media-backup` | Mon 2026-10-05 02:39:53 | success, exit 0 |
+| `domum-media-host-update` | Mon 2026-10-05 06:10:12 | success, exit 0 |
+
+**The first weekly prune with three subvolumes deleted nothing**, and that is
+established without reading its output: `/srv/snapshots` and `/srv/data` both
+still carry mtime `2026-09-29 13:56:57` — the instant of the Navidrome migration.
+A directory's mtime changes when an entry is created, removed or renamed inside
+it, so nothing has been added to or removed from either in six days. Three
+snapshots present, one per service.
+
+Backups have run nightly against the three-subvolume topology, with
+`/var/log/domum-media/last-success` reading `2026-10-05T02:40:24-04:00`. No failed
+units; 11 containers.
+
+So the topology has survived a full cycle of every scheduled job, which is the
+thing that was worth waiting for before migrating a fourth service.
+
+# Advice is not a deployment
+
+The acceptance test for the first complete recovery point was handed over as:
+
+```
+sudo domum-media storage verify-recovery navidrome navidrome-20260929-175657-post-migration
+```
+
+and produced:
+
+```
+ERROR: Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]}
+```
+
+The subcommand existed only on an unmerged branch. The repository was ahead of
+production, and the recommendation came from the repository — the same mistake
+shape as the stale string assertion, pointed the other way: instead of a script
+asserting against code that had moved, a human was asked to run code that had not
+arrived.
+
+`tests/documented-commands-audit.py` now reads every fenced block and inline code
+span in `docs/`, `README.md` and `CLAUDE.md`, and fails when a `domum-media`
+command named there is not dispatched by the CLI. 78 commands checked; four
+mutants killed, including a nonexistent nested subcommand added to a runbook and
+the CLI renaming one the docs still mention.
+
+It is explicitly the **weaker half** of the problem. It compares the docs to
+`bin/`, and `bin/` is not what runs. Nothing in CI can see `/usr/local/bin` —
+which is exactly why the migration wrapper feature-gates on the *installed*
+binary, and why a documented command only becomes safe advice once the revision
+carrying it has been deployed. The rule that covers the other half is in
+`CLAUDE.md` §9, and it is a rule because it cannot be a test.

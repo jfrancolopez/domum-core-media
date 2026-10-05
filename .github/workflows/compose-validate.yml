@@ -106,6 +106,10 @@ jobs:
       - name: Reconcile boundary audit
         run: python3 tests/reconcile-boundary-audit.py
 
+      # A runbook command that does not exist is discovered during a recovery.
+      - name: Documented commands audit
+        run: python3 tests/documented-commands-audit.py
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI

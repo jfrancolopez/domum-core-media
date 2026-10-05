@@ -147,6 +147,14 @@ operation refuses, or its result is reported as something other than success. A
 service that is down is visible and fixable in one command; a service silently
 running a different application than its recovery point pairs with is neither.
 
+**Never tell the operator to run a command that is not DEPLOYED.** The repository
+runs ahead of production, so a subcommand existing in `bin/` says nothing about
+`/usr/local/bin`. A `storage verify-recovery` command was recommended while it sat
+on an unmerged branch, and the operator got a usage error. Check the installed
+binary — `grep` it, or run `domum-media --help` — before putting a command in a
+message or a runbook. `tests/documented-commands-audit.py` checks the docs against
+the CLI, which is the weaker half of this: it cannot see what is deployed.
+
 **Operator scripts must not assert on the CLI's prose.** A wrapper grepped for the
 literal summary line `recovery point  : verified`; the wording changed when the
 summary was split into four claims, and it aborted a migration that had completed
