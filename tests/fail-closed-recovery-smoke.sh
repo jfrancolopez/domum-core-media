@@ -315,7 +315,7 @@ recovery_image_availability '$1' '$2'"
 # Strictly stronger than a process check, and it needs no networking, credentials
 # or production change.
 # ---------------------------------------------------------------------------
-ready() {  # $1 = service, $2 = what docker logs returns, $3 = expected rc
+ready() {  # $1 = service, $2 = what `docker logs -t` returns, $3 = restart boundary
   cat > "$TMP_DIR/ready.sh" <<PROBE
 set -uo pipefail
 DOMUM_DIR="$REPO_ROOT"
@@ -328,16 +328,49 @@ docker() { [[ "\$1" == logs ]] && printf '%s\n' '$2'; return 0; }
 # Guarded: sourcing bin/domum-media re-enables `set -e` in this shell, so a
 # non-zero return would kill the probe before it could report the code.
 rc=0
-service_logged_ready_since '$1' 2026-01-01T00:00:00 || rc=\$?
+service_logged_ready_since '$1' '${3:-2026-01-01T00:00:00}' || rc=\$?
 printf 'RC=%s' "\$rc"
 PROBE
   bash "$TMP_DIR/ready.sh" 2>/dev/null
 }
 
-[[ "$(ready navidrome 'time=... msg="----> Navidrome server is ready!" address="0.0.0.0:4533"')" == "RC=0" ]] \
-  || fail "5: the real navidrome readiness line was not recognised: $(ready navidrome 'msg="----> Navidrome server is ready!"')"
+# The real line as `docker logs -t` emits it, with its RFC3339Nano UTC prefix.
+FRESH='2026-09-29T17:56:58.386777720Z time="2026-09-29T17:56:58Z" level=info msg="----> Navidrome server is ready!" address="0.0.0.0:4533"'
+STALE='2026-09-21T10:20:05.594409942Z time="2026-09-21T10:20:05Z" level=info msg="----> Navidrome server is ready!" address="0.0.0.0:4533"'
+[[ "$(ready navidrome "$FRESH" 2026-09-29T17:56:58)" == "RC=0" ]] \
+  || fail "5: the real navidrome readiness line was not recognised"
 [[ "$(ready navidrome 'time=... msg="Closing Database"')" == "RC=1" ]] \
-  || fail "5: absence of readiness was not reported: $(ready navidrome 'msg=\"Closing Database\"')"
+  || fail "5: absence of readiness was not reported"
+
+# THE FALSE POSITIVE. A readiness line from a PREVIOUS start must not satisfy the
+# check. `docker logs --since` alone cannot exclude it: a bare timestamp is parsed
+# in the CALLER'S timezone, so east of UTC the window opens hours early and an old
+# line lands inside it. Measured on this host against a line at 17:56:58Z:
+#
+#   TZ=UTC               --since 2026-09-29T17:56:00   -> 1 match
+#   TZ=America/New_York  --since 2026-09-29T17:56:00   -> 0 matches
+#   any TZ               --since 2026-09-29T17:56:00Z  -> 1 match
+#
+# West of UTC that aborts a correct migration; east of UTC it accepts a stale
+# line. So the line's OWN timestamp is compared, which does not depend on it.
+[[ "$(ready navidrome "$STALE" 2026-09-29T17:56:58)" == "RC=1" ]] \
+  || fail "5: a readiness line from a PREVIOUS start satisfied the check"
+[[ "$(ready navidrome "$STALE
+$FRESH" 2026-09-29T17:56:58)" == "RC=0" ]] \
+  || fail "5: a fresh readiness line was missed when an older one was also present"
+# Same second, nanosecond stamp: '.' sorts before 'Z', so comparing against a
+# boundary ending in 'Z' would read this as earlier and reject it.
+[[ "$(ready navidrome '2026-09-29T17:56:58.386777720Z msg="----> Navidrome server is ready!"' 2026-09-29T17:56:58)" == "RC=0" ]] \
+  || fail "5: a readiness line in the same second as the restart was rejected"
+[[ "$(ready navidrome '2026-09-29T17:56:57.999999999Z msg="----> Navidrome server is ready!"' 2026-09-29T17:56:58)" == "RC=1" ]] \
+  || fail "5: a readiness line from BEFORE the restart was accepted"
+
+# The --since value handed to docker must carry an explicit zone.
+fnsrc="$(awk '/^service_logged_ready_since\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+grep -q -- '--since "${boundary}Z"' <<< "$fnsrc" \
+  || fail "5: --since is passed without a timezone, which docker reads in local time"
+grep -q -- 'docker logs -t' <<< "$fnsrc" \
+  || fail "5: readiness does not request timestamps, so it cannot check the line's own time"
 # A service with no known pattern must say so (rc=2), never claim readiness.
 [[ "$(ready jellyfin 'anything at all')" == "RC=2" ]] \
   || fail "5: a service with no readiness pattern did not report 'nothing to look for': $(ready jellyfin x)"
@@ -357,5 +390,87 @@ grep -qE 'docker logs[^|]*\| *grep' <<< "$fn" \
   && fail "5: readiness uses 'docker logs | grep', which pipefail inverts on a match"
 grep -q 'logs="\$(docker logs' <<< "$fn" \
   || fail "5: readiness does not capture the logs before matching"
+
+# ---------------------------------------------------------------------------
+# Part 6: `storage verify-recovery` -- reading a recovery point without grepping
+# the CLI's prose.
+#
+# The migration wrapper used to assert on the literal string
+# "recovery point  : verified". That wording changed when the summary was split
+# into four claims, and the wrapper aborted a migration that had completed
+# perfectly -- the same shape as the stale topology invariant that aborted a
+# correct deployment. Prose is not a contract; a subcommand is.
+# ---------------------------------------------------------------------------
+vr() {  # $1 = state root, $2 = service, $3 = point
+  bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'
+CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+DOMUM_STATE_ROOT='$1'
+need_root() { :; }
+load_cfg() { :; }
+docker() { return 1; }
+rc=0
+storage_verify_recovery '$2' '$3' || rc=\$?
+printf 'RC=%s' \"\$rc\"" 2>&1
+}
+
+SR="$TMP_DIR/state6"; mkdir -p "$SR/snapshots"
+cat > "$SR/snapshots/navidrome-20260929-175657-post-migration.recovery" <<'EV'
+FORMAT='1'
+SERVICE='navidrome'
+RECOVERY_POINT='navidrome-20260929-175657-post-migration'
+CAPTURED_AT='2026-09-29T13:56:57-04:00'
+DATA_PATH='/srv/data/navidrome'
+RUNTIME_STATE_BEFORE='running'
+CONTAINER_1_SERVICE='navidrome'
+CONTAINER_1_IMAGE_IDENTITY='known'
+CONTAINER_1_IMAGE_AVAILABILITY='identity,local'
+CONTAINER_1_ID='ef44ae505efc'
+CONTAINER_1_IMAGE_ID='sha256:9012939114fb'
+CONTAINER_1_IMAGE_REF='deluan/navidrome:latest'
+CONTAINER_1_IMAGE_LABEL_VERSION='0.63.2'
+EV
+out="$(vr "$SR" navidrome navidrome-20260929-175657-post-migration)"
+grep -q 'RC=0' <<< "$out" || fail "6: valid evidence was rejected: $out"
+grep -q 'identity,local' <<< "$out" || fail "6: availability was not shown: $out"
+grep -q 'no immutable reference for later' <<< "$out" \
+  || fail "6: 'identity,local' was not explained as recoverable-today-only: $out"
+grep -q 'MUTABLE' <<< "$out" || fail "6: the image ref was not labelled mutable: $out"
+grep -q 'present now   : NO' <<< "$out" \
+  || fail "6: an image absent from the host was not reported as absent now: $out"
+
+# Missing evidence is a failure, and says what that costs.
+out="$(vr "$SR" navidrome no-such-point)"
+grep -q 'RC=1' <<< "$out" || fail "6: a missing recovery point did not fail: $out"
+grep -q 'DATA recovery point only' <<< "$out" || fail "6: the consequence was not stated: $out"
+
+# Evidence for a different service must not satisfy a query for this one.
+out="$(vr "$SR" kavita navidrome-20260929-175657-post-migration)"
+grep -q 'RC=1' <<< "$out" || fail "6: evidence for another service was accepted: $out"
+
+# ---------------------------------------------------------------------------
+# Part 7: the result summary is an operator contract.
+#
+# Not because anything greps it now -- the wrapper was moved onto the exit status
+# and the evidence file precisely so it would not -- but because these six lines
+# are what a person reads at 2am, and a rewording should be a decision rather than
+# a side effect.
+# ---------------------------------------------------------------------------
+fn="$(awk '/^storage_migrate_subvolume\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+for line in \
+  'Migration result for' \
+  'data migrated   :' \
+  'proof snapshot  :' \
+  'recovery point  :' \
+  'service         :' \
+  'Migration COMPLETE for' \
+  'Migration INCOMPLETE for'; do
+  grep -qF -- "$line" <<< "$fn" || fail "7: the result summary no longer prints '$line'"
+done
+# And the two outcomes must be mutually exclusive in the code, not just in prose.
+grep -qF 'if (( complete == 1 )); then' <<< "$fn" \
+  || fail "7: completion is not decided by a single flag"
 
 echo "PASS: fail-closed recovery smoke test"

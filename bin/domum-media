@@ -940,21 +940,51 @@ service_ready_log_pattern() {  # $1 = service
   esac
 }
 
-# Did the application log readiness since $2? 0 yes, 1 no, 2 nothing to look for.
-service_logged_ready_since() {  # $1 = service, $2 = docker --since value
-  local svc="$1" since="$2" pat compose_svcs compose_svc cid logs
+# Did the application log readiness at or after $2? 0 yes, 1 no, 2 nothing to look for.
+#
+# $2 is UTC, `YYYY-MM-DDTHH:MM:SS`, as `date -u` produces it.
+#
+# `docker logs --since` is NOT trusted to decide this. A bare timestamp with no
+# zone is interpreted in the CALLER'S timezone, so the same call gives different
+# answers on the same host. Measured, against a readiness line at 17:56:58Z:
+#
+#   TZ=UTC               --since 2026-09-29T17:56:00   -> 1 match
+#   TZ=America/New_York  --since 2026-09-29T17:56:00   -> 0 matches
+#   any TZ               --since 2026-09-29T17:56:00Z  -> 1 match
+#
+# West of UTC that is a false NEGATIVE: a correct migration aborts because the
+# window starts in the future. East of UTC it is a false POSITIVE, which is worse
+# -- the window opens hours early and a readiness line from a PREVIOUS start
+# satisfies the check. The navidrome migration passed only because the environment
+# it ran under happened to resolve the bare stamp as UTC.
+#
+# So the `Z` is appended, and the line's OWN timestamp is compared as well, which
+# removes the dependence on how `--since` is parsed at all. Compared to
+# whole-second precision: docker stamps `17:56:58.386777720Z` and the boundary is
+# `17:56:58`, and lexicographically '.' sorts before 'Z', so a nanosecond stamp in
+# the same second would otherwise be read as earlier than the boundary.
+service_logged_ready_since() {  # $1 = service, $2 = UTC YYYY-MM-DDTHH:MM:SS
+  local svc="$1" since="$2" pat compose_svcs compose_svc cid logs line stamp
   pat="$(service_ready_log_pattern "$svc")"
   [[ -n "$pat" ]] || return 2
   compose_svcs="$(service_compose_services "$svc" || true)"
   [[ -n "$compose_svcs" ]] || return 1
+  local boundary="${since:0:19}"
   for compose_svc in $compose_svcs; do
     cid="$(tracked_service_container_id_any "$compose_svc" 2>/dev/null || true)"
     [[ -n "$cid" ]] || continue
-    # Captured first, NOT piped into `grep -q`. Under pipefail grep exits at the
-    # first match, docker takes SIGPIPE, and the pipeline reports 141 -- so a match
-    # reads as no-match. See CLAUDE.md section 8.
-    logs="$(docker logs --since "$since" "$cid" 2>&1 || true)"
-    grep -qF -- "$pat" <<< "$logs" && return 0
+    # `-t` prefixes each line with an RFC3339Nano UTC timestamp, which is what the
+    # comparison below reads. Captured first, NOT piped into `grep -q`: under
+    # pipefail grep exits at the first match, docker takes SIGPIPE, and the
+    # pipeline reports 141 -- so a match reads as no-match. CLAUDE.md section 8.
+    logs="$(docker logs -t --since "${boundary}Z" "$cid" 2>&1 || true)"
+    while IFS= read -r line; do
+      [[ "$line" == *"$pat"* ]] || continue
+      stamp="${line:0:19}"
+      # Not older than the boundary. A readiness line from a previous start is
+      # exactly what this must not accept.
+      [[ "$stamp" < "$boundary" ]] || return 0
+    done <<< "$logs"
   done
   return 1
 }
@@ -6207,6 +6237,8 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
   local restart_ok=1 restart_since
   # Recorded BEFORE the restart, so `docker logs --since` cannot be satisfied by a
   # readiness line from the previous run.
+  # UTC, and compared against the log line's own UTC stamp -- never handed to
+  # `docker logs --since` without a zone, which is read in the caller's timezone.
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%S)"
   migrate_restart || restart_ok=0
   if (( restart_ok == 1 )) && [[ -n "$compose_svcs" && "$runtime_before" == "running" ]]; then
@@ -6473,6 +6505,77 @@ storage_topology_verify() {
   return 0
 }
 
+# Read the recovery evidence for a point and say what it actually proves.
+#
+# Exists so nobody has to grep the CLI's prose to find out. The migration wrapper
+# used to assert on the literal string "recovery point  : verified"; the wording
+# changed when the summary was split into four claims, and a perfectly good
+# migration was aborted by a stale string assertion -- the same shape as the
+# topology invariant that aborted a correct deployment.
+#
+# Read-only. Prints a per-container classification and returns non-zero when the
+# evidence is missing or does not describe what it claims to.
+storage_verify_recovery() {  # $1 = service, $2 = recovery point
+  local service="${1:-}" point="${2:-}" meta problem n ident avail img ref ver
+  [[ -n "$service" && -n "$point" ]] \
+    || die "Usage: domum-media storage verify-recovery <service> <recovery-point>"
+  meta="$(snapshot_metadata_dir)/${point}.recovery"
+
+  if [[ ! -s "$meta" ]]; then
+    echo "recovery evidence : MISSING for $point"
+    echo "  expected at     : $meta"
+    echo "  A filesystem snapshot without it is a DATA recovery point only: which"
+    echo "  application wrote the state is not recorded, so restoring it under a"
+    echo "  different one is untested."
+    return 1
+  fi
+
+  if ! problem="$(verify_recovery_point_metadata "$meta" "$service" "$point")"; then
+    echo "recovery evidence : NOT USABLE -- $problem"
+    echo "  file            : $meta"
+    return 1
+  fi
+
+  echo "recovery evidence : $meta"
+  echo "  service         : $service"
+  echo "  recovery point  : $point"
+  echo "  runtime before  : $(sed -nE "s/^RUNTIME_STATE_BEFORE='(.*)'\$/\1/p" "$meta" | head -1)"
+  echo "  captured at     : $(sed -nE "s/^CAPTURED_AT='(.*)'\$/\1/p" "$meta" | head -1)"
+  n=1
+  while grep -q "^CONTAINER_${n}_SERVICE=" "$meta"; do
+    ident="$(sed -nE "s/^CONTAINER_${n}_IMAGE_IDENTITY='(.*)'\$/\1/p" "$meta" | head -1)"
+    avail="$(sed -nE "s/^CONTAINER_${n}_IMAGE_AVAILABILITY='(.*)'\$/\1/p" "$meta" | head -1)"
+    img="$(sed -nE "s/^CONTAINER_${n}_IMAGE_ID='(.*)'\$/\1/p" "$meta" | head -1)"
+    ref="$(sed -nE "s/^CONTAINER_${n}_IMAGE_REF='(.*)'\$/\1/p" "$meta" | head -1)"
+    ver="$(sed -nE "s/^CONTAINER_${n}_IMAGE_LABEL_VERSION='(.*)'\$/\1/p" "$meta" | head -1)"
+    echo "  container $n"
+    echo "    service       : $(sed -nE "s/^CONTAINER_${n}_SERVICE='(.*)'\$/\1/p" "$meta" | head -1)"
+    echo "    image id      : ${img:-<none>}"
+    echo "    created from  : ${ref:-<none>}   (MUTABLE: may point elsewhere now)"
+    echo "    version label : ${ver:-<none>}"
+    echo "    identity      : $ident"
+    echo "    availability  : ${avail:-unknown}"
+    # Says what each value means, because the whole point is that they are
+    # different claims and only one of them is about getting the image back.
+    case "$avail" in
+      *registry-digest*) echo "      -> an immutable registry reference is recorded" ;;
+      *local*)           echo "      -> the object is on THIS HOST today; no immutable reference for later" ;;
+      identity)          echo "      -> identified only; not present locally and no registry reference" ;;
+      *)                 echo "      -> nothing recorded; pairing is unknown" ;;
+    esac
+    # Is that image still here, now, rather than when the evidence was written?
+    if [[ -n "$img" ]]; then
+      if cmd_exists docker && docker image inspect "$img" >/dev/null 2>&1; then
+        echo "    present now   : yes"
+      else
+        echo "    present now   : NO -- the recorded image is no longer on this host"
+      fi
+    fi
+    n=$(( n + 1 ))
+  done
+  return 0
+}
+
 storage_cmd() {
   local sub="${1:-}"
   case "$sub" in
@@ -6491,7 +6594,13 @@ storage_cmd() {
                    storage_topology_verify "$2" ;;
         *)         die "Usage: domum-media storage topology [--verify <capture-file>]" ;;
       esac ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]}" ;;
+    verify-recovery)
+      shift
+      # Read-only, and deliberately does not require root beyond reading the state
+      # directory, so an operator can ask months later what a point is paired with.
+      load_cfg
+      storage_verify_recovery "${1:-}" "${2:-}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|verify-recovery <service> <point>}" ;;
   esac
 }
 
@@ -6551,6 +6660,10 @@ Usage:
                                             before an operation, then verify,
                                             rather than asserting an absolute
                                             state
+  domum-media storage verify-recovery <service> <point>
+                                            What application image a recovery
+                                            point is paired with, and whether that
+                                            image can still be obtained
   domum-media storage topology --verify <file>
                                             Compare a saved capture against the
                                             live topology. 0 unchanged, 1 changed

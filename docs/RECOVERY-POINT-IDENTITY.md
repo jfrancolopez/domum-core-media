@@ -489,3 +489,125 @@ Neither `.premigration` tree nor either proof snapshot has been touched. Kavita 
 not downgraded and its forward-migrated database is left alone. Only migrations
 from here on carry `.recovery` evidence; the two existing points are recorded as
 the exceptions they are.
+
+---
+
+# Navidrome: the first complete recovery point, and two defects it exposed
+
+The migration succeeded on every claim. The **wrapper script** then aborted, and
+the readiness check passed for a reason that will not hold everywhere.
+
+## What the migration proved
+
+**The WAL experiment, which is why navidrome was chosen.** It was the first
+service migrated with a *non-empty running* write-ahead log:
+
+```
+before stop     navidrome.db-wal  20,632 B    navidrome.db-shm  32,768 B    1006 files
+after clean stop  (both sidecars GONE)                                      1004 files
+quiesced db     1,851,392 B   sha256 2a137d30492486ca…
+```
+
+1006 − 1004 is exactly the two sidecars. SQLite checkpointed **and removed** them
+on clean shutdown, so the preserved database is complete on its own — there is no
+outstanding WAL a restore would need. The gate ran and observed zero
+(`quiesced: nothing holding files open, no non-empty WAL`) before any storage
+mutation. The live tree has since re-created both, which is what makes the
+before/after contrast meaningful rather than incidental.
+
+**The image invariant, in production.** Not "the same tag" — the same objects:
+
+```
+container id   ef44ae505efc398924b7c63701e95c794f366507d97d3a9683449d4398e567cf   (before AND after)
+image id       sha256:9012939114fbb1bb641b81cf96dec5ded15f0aafefe8d47a511d7cb919658e40   (before AND after)
+Created        2026-08-02T09:43:04Z     <- unchanged: the container was NOT recreated
+StartedAt      2026-09-29T17:56:58Z     <- the migration's restart
+RestartCount   0
+```
+
+Contrast Kavita, whose `Created` jumped to its migration timestamp. `compose start`
+restarted the container that was stopped, so no image reference was resolved at
+all.
+
+**Integrity**, re-derived independently: 1004 files / 816 dirs / 0 symlinks /
+51,522,430 bytes on both sides, all 1004 hashed with **zero unreadable**, 1820
+metadata entries identical, combined digest `11ca25602c6e9313…` on both. The
+snapshot's `navidrome.db`: `integrity_check=ok`, 0 FK violations, WAL mode, 45
+tables, 452 pages — checked from a copy, and neither preserved tree changed.
+
+**Three-service topology**: three subvolumes, three read-only snapshots, each
+service resolving only its own (`count=1` each, plex `count=0`), the three
+`.premigration` directories correctly ordinary (inodes 269, 4377, 272 — the
+originals, renamed). Next Sunday's prune traced against the real inventory:
+`0 deleted`, and `0 deleted` again with `keep=0` because the floor holds.
+
+## Defect 1 — the wrapper aborted on a string I had changed
+
+```
+ABORT: the CLI did not assert the integrity claim at all.
+Expected 'recovery point  : verified' in its output.
+```
+
+The migration had already completed. The wrapper grepped for a literal summary
+line, and that wording had changed when the summary was split into four separate
+claims — so a stale string assertion aborted a perfect migration. **The same shape
+as the topology invariant that aborted a correct deployment**, in the same class
+of hand-written operator script.
+
+Prose is not a contract. The wrapper now asserts on the **exit status** and the
+**recovery evidence file**, and reads the evidence through a new read-only
+subcommand instead of grepping output:
+
+```
+domum-media storage verify-recovery <service> <recovery-point>
+```
+
+which prints the per-container identity, availability, and whether the recorded
+image is *still on this host now* — a different question from whether it was when
+the evidence was written.
+
+## Defect 2 — the readiness window was timezone-dependent
+
+`docker logs --since` given a bare timestamp interprets it in the **caller's**
+timezone. Measured against the real readiness line at `17:56:58Z`:
+
+```
+TZ=UTC               --since 2026-09-29T17:56:00    -> 1 match
+TZ=America/New_York  --since 2026-09-29T17:56:00    -> 0 matches
+any TZ               --since 2026-09-29T17:56:00Z   -> 1 match
+```
+
+The implementation passed `date -u` output **without a `Z`**. West of UTC that is a
+false negative — the window starts in the future and a correct migration aborts
+after 120 s. **East of UTC it is a false positive**, which is worse: the window
+opens hours early and a readiness line from a *previous start* satisfies the
+check. The navidrome run passed only because the environment it ran under resolved
+the bare stamp as UTC.
+
+Fixed twice over: the `Z` is appended, **and** each matching line's own timestamp
+is compared against the restart, which removes the dependence on `--since`
+parsing entirely. Compared at whole-second precision, because docker stamps
+`17:56:58.386777720Z` while the boundary is `17:56:58`, and `.` sorts before `Z`
+— so a nanosecond stamp in the same second would otherwise read as earlier.
+
+Four mutants killed, including a stale readiness line from a previous start being
+accepted.
+
+## The evidence that could not be checked without root
+
+`/var/lib/domum-media` is `drwx------ root`, so the `.recovery` file's **content**
+cannot be inspected unprivileged. What is established without root: the CLI
+verified it at write time — required keys, `SERVICE` and `RECOVERY_POINT` matching,
+no container claiming `known` identity with an empty image ID — and both
+`recovery point : complete` and exit 0 depend on that verification passing.
+
+An independent read needs one privileged command:
+
+```
+sudo domum-media storage verify-recovery navidrome navidrome-20260929-175657-post-migration
+```
+
+Expected, from the evidence captured before the stop:
+`IMAGE_ID=sha256:9012939114fb…`, `IMAGE_REF=deluan/navidrome:latest` (mutable),
+`IMAGE_LABEL_VERSION=0.63.2`, and **`IMAGE_AVAILABILITY=identity,local`** — the
+RepoDigest equals the image ID, so there is no independent registry reference.
