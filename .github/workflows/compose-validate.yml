@@ -97,6 +97,10 @@ jobs:
       - name: Fail-closed recovery smoke test
         run: tests/fail-closed-recovery-smoke.sh
 
+      # Symlinks, end to end, before plex -- the only remaining candidate with any.
+      - name: Symlink verification smoke test
+        run: tests/symlink-verification-smoke.sh
+
       # The python audits. These were written and then never wired in, so seven
       # suites were reported as "CI green" while CI had never run them.
       # tests/ci-coverage-audit.sh now fails when a test file is not listed here.

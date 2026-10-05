@@ -365,6 +365,60 @@ $FRESH" 2026-09-29T17:56:58)" == "RC=0" ]] \
 [[ "$(ready navidrome '2026-09-29T17:56:57.999999999Z msg="----> Navidrome server is ready!"' 2026-09-29T17:56:58)" == "RC=1" ]] \
   || fail "5: a readiness line from BEFORE the restart was accepted"
 
+# THE MATRIX. The comparison is on the line's own UTC stamp, so the answer must
+# not change with the host's timezone, and must be right across midnight and for
+# both whole and fractional seconds.
+for tz in UTC America/New_York Asia/Tokyo; do
+  # fresh: accepted in every zone
+  [[ "$(TZ="$tz" ready navidrome "$FRESH" 2026-09-29T17:56:58)" == "RC=0" ]] \
+    || fail "5: TZ=$tz rejected a fresh readiness line"
+  # stale: refused in every zone -- east of UTC is where a --since-only check
+  # would have let it through
+  [[ "$(TZ="$tz" ready navidrome "$STALE" 2026-09-29T17:56:58)" == "RC=1" ]] \
+    || fail "5: TZ=$tz accepted a readiness line from a PREVIOUS start"
+done
+
+# Across midnight: a restart at 23:59:59Z and a readiness line at 00:00:01Z the
+# next day. Lexicographic comparison of the full stamps handles the date rollover;
+# comparing times alone would read 00:00:01 as earlier than 23:59:59.
+MIDNIGHT_AFTER='2026-09-30T00:00:01.100000000Z msg="----> Navidrome server is ready!"'
+MIDNIGHT_BEFORE='2026-09-29T23:59:58.900000000Z msg="----> Navidrome server is ready!"'
+[[ "$(ready navidrome "$MIDNIGHT_AFTER" 2026-09-29T23:59:59)" == "RC=0" ]] \
+  || fail "5: a readiness line just after midnight was rejected for a restart just before it"
+[[ "$(ready navidrome "$MIDNIGHT_BEFORE" 2026-09-29T23:59:59)" == "RC=1" ]] \
+  || fail "5: a readiness line BEFORE the restart was accepted across a midnight boundary"
+# ...and the same, one whole day earlier, which a time-only comparison would accept.
+[[ "$(ready navidrome '2026-09-28T23:59:59.999999999Z msg="----> Navidrome server is ready!"' 2026-09-29T23:59:59)" == "RC=1" ]] \
+  || fail "5: a readiness line from the previous DAY at the same clock time was accepted"
+
+# Whole seconds, no fractional part -- docker emits these for some runtimes.
+[[ "$(ready navidrome '2026-09-29T17:56:58Z msg="----> Navidrome server is ready!"' 2026-09-29T17:56:58)" == "RC=0" ]] \
+  || fail "5: a whole-second stamp equal to the restart was rejected"
+[[ "$(ready navidrome '2026-09-29T17:56:57Z msg="----> Navidrome server is ready!"' 2026-09-29T17:56:58)" == "RC=1" ]] \
+  || fail "5: a whole-second stamp one second early was accepted"
+
+# Plex's pattern, from the line this host actually emits. Pinned for the same
+# reason as navidrome's: an upstream wording change must break CI, not a migration.
+PLEX_FRESH='2026-10-05T10:10:26.559725948Z Connection to localhost (::1) 32400 port [tcp/*] succeeded!'
+[[ "$(ready plex "$PLEX_FRESH" 2026-10-05T10:10:24)" == "RC=0" ]] \
+  || fail "5: plex's real readiness line was not recognised"
+[[ "$(ready plex '2026-10-05T10:10:25.511545597Z Starting Plex Media Server. . .' 2026-10-05T10:10:24)" == "RC=1" ]] \
+  || fail "5: 'Starting Plex Media Server' was treated as readiness; it precedes the listener"
+# The benign error the image tells you to ignore must not be mistaken either way.
+[[ "$(ready plex '2026-10-05T10:10:38.328027003Z Critical: libusb_init failed' 2026-10-05T10:10:24)" == "RC=1" ]] \
+  || fail "5: a benign post-readiness error line was read as readiness"
+plexpat="$(bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'; CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+service_ready_log_pattern plex")"
+[[ "$plexpat" == "port [tcp/*] succeeded!" ]] || fail "5: the plex readiness pattern changed to [$plexpat]"
+# Services with no known pattern must still say so rather than claim readiness.
+for svc in jellyfin calibre-web immich traefik; do
+  [[ "$(ready "$svc" 'anything')" == "RC=2" ]] \
+    || fail "5: $svc has no readiness pattern but did not report 'nothing to look for'"
+done
+
 # The --since value handed to docker must carry an explicit zone.
 fnsrc="$(awk '/^service_logged_ready_since\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
 grep -q -- '--since "${boundary}Z"' <<< "$fnsrc" \
@@ -472,5 +526,72 @@ done
 # And the two outcomes must be mutually exclusive in the code, not just in prose.
 grep -qF 'if (( complete == 1 )); then' <<< "$fn" \
   || fail "7: completion is not decided by a single flag"
+
+# ---------------------------------------------------------------------------
+# Part 8: `storage protection` -- protection as a VALUE, not a sentence.
+#
+# The migration wrapper decided this by grepping `domum-media report` for
+# ": protected" / ": snapshottable" / ": degraded" and ABORTING on the English.
+# Same dependency that aborted a completed migration over a reworded summary
+# line, except here it gated a safety decision.
+#
+# Exit status is the contract: 0 only for `protected`.
+# ---------------------------------------------------------------------------
+prot() {  # $1 = service, $2 = subvolume? yes/no, $3 = snapshot name or "", $4 = nested? yes/no
+  cat > "$TMP_DIR/prot.sh" <<PROBE
+set -uo pipefail
+DOMUM_DIR="$REPO_ROOT"
+CFG_FILE="$TMP_DIR/absent.conf"
+source "$REPO_ROOT/bin/domum-media"
+DOMUM_DATA_ROOT="$TMP_DIR/protdata"
+DOMUM_SNAPSHOT_ROOT="$TMP_DIR/protsnaps"
+need_root() { :; }
+load_cfg() { :; }
+load_report_lib() { source "$REPO_ROOT/bin/domum-media-report"; }
+cmd_exists() { return 0; }
+service_data_path() { printf '%s' "\$DOMUM_DATA_ROOT/\$1"; }
+# After the report library is sourced it redefines these, so they are overridden
+# inside storage_protection's call path by wrapping load_report_lib.
+_orig_load_report_lib() { source "$REPO_ROOT/bin/domum-media-report"; }
+load_report_lib() {
+  _orig_load_report_lib
+  domum_is_subvolume() { [[ "$2" == yes ]]; }
+  domum_subvolume_nested_children() { [[ "$4" == yes ]] && printf '%s/nested\n' "\$1"; return 0; }
+  latest_snapshot_for_service() { [[ -n "$3" ]] && printf '%s' "$3"; return 0; }
+  snapshot_path_mtime() { printf '1790000000'; }
+}
+rc=0
+storage_protection '$1' || rc=\$?
+printf 'RC=%s' "\$rc"
+PROBE
+  mkdir -p "$TMP_DIR/protdata/$1" "$TMP_DIR/protsnaps"
+  bash "$TMP_DIR/prot.sh" 2>/dev/null
+}
+
+out="$(prot kavita yes kavita-20260101-000000-tag no)"
+grep -q '^protected' <<< "$out" || fail "8: a subvolume with a snapshot is not 'protected': $out"
+grep -q 'RC=0'       <<< "$out" || fail "8: 'protected' did not exit 0: $out"
+
+out="$(prot kavita yes "" no)"
+grep -q '^snapshottable' <<< "$out" || fail "8: a subvolume with NO snapshot is not 'snapshottable': $out"
+grep -q 'RC=1'           <<< "$out" || fail "8: 'snapshottable' exited 0 -- the whole point is that it must not: $out"
+
+out="$(prot kavita yes kavita-20260101-000000-tag yes)"
+grep -q '^degraded' <<< "$out" || fail "8: a nested subvolume is not 'degraded': $out"
+grep -q 'RC=1'      <<< "$out" || fail "8: 'degraded' exited 0: $out"
+
+out="$(prot kavita no "" no)"
+grep -q '^unprotected' <<< "$out" || fail "8: an ordinary directory is not 'unprotected': $out"
+grep -q 'RC=1'         <<< "$out" || fail "8: 'unprotected' exited 0: $out"
+
+# The state must be computed, not asserted. A hardcoded answer passes the three
+# positive cases above and fails these.
+[[ "$(prot kavita yes "" no | head -1)" != "$(prot kavita yes snap no | head -1)" ]] \
+  || fail "8: the same state is returned whether or not a snapshot exists"
+
+# And the dispatcher must expose it, exit status intact.
+storage_block="$(awk '/^storage_cmd\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+grep -q 'protection)' <<< "$storage_block" || fail "8: 'storage protection' is not dispatched"
+grep -q 'storage_protection' <<< "$storage_block" || fail "8: the arm does not call storage_protection"
 
 echo "PASS: fail-closed recovery smoke test"

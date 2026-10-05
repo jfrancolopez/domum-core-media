@@ -934,6 +934,22 @@ verify_backup_freshness() {
 service_ready_log_pattern() {  # $1 = service
   case "$1" in
     navidrome)   printf 'Navidrome server is ready!' ;;
+    # The LinuxServer.io init script's own probe of PMS's listener, observed on
+    # this host across a real restart:
+    #
+    #   Starting Plex Media Server. . . (you can ignore the libusb_init error)
+    #   Connection to localhost (::1) 32400 port [tcp/*] succeeded!
+    #   [ls.io-init] done.
+    #
+    # WEAKER than navidrome's, and the difference matters: navidrome logs readiness
+    # after opening and migrating its database, whereas this proves only that the
+    # TCP listener came up. Plex's databases are covered instead by the snapshot
+    # integrity check, which opens both of them.
+    #
+    # `Critical: libusb_init failed` arrives about 12s later and is benign -- the
+    # image says so itself -- which is why readiness is matched on a positive
+    # signal rather than inferred from an absence of scary words.
+    plex)        printf 'port [tcp/*] succeeded!' ;;
     # kavita has a real HTTP healthcheck (curl /api/health), which is a stronger
     # signal than a log line, so nothing is added here.
     *)           printf '' ;;
@@ -6515,6 +6531,44 @@ storage_topology_verify() {
 #
 # Read-only. Prints a per-container classification and returns non-zero when the
 # evidence is missing or does not describe what it claims to.
+# "Is this service actually protected?", as a value rather than a sentence.
+#
+# The migration wrapper used to decide this by grepping `domum-media report` for
+# `: protected` / `: snapshottable` / `: degraded` and ABORTING on the English.
+# That is the same dependency that aborted a completed migration when a summary
+# line was reworded -- and it was a safety decision, not a note.
+#
+# One implementation: report_snapshot_protection already computes it, and this
+# exposes its verdict. Prints the state word; exits 0 only for `protected`, so a
+# caller can simply test the command.
+#
+#   protected      a subvolume WITH a snapshot that covers it
+#   snapshottable  a subvolume with no snapshot -- nothing to roll back to
+#   degraded       a nested subvolume would be omitted from any snapshot of it
+#   unprotected    an ordinary directory
+#   unknown        the path is missing, or btrfs is unavailable
+storage_protection() {  # $1 = service (optional: all services when omitted)
+  local service="${1:-}" path state rc=0
+  load_report_lib
+  if [[ -z "$service" ]]; then
+    local svc
+    while IFS='|' read -r svc _ _ _ _ _ _; do
+      [[ -n "$svc" ]] || continue
+      path="$(service_data_path "$svc" 2>/dev/null || true)"
+      [[ -n "$path" ]] || continue
+      state="$(report_snapshot_protection "$svc" "$path" | jq -r '.state')"
+      printf '%-14s %s\n' "$svc" "$state"
+    done < <(service_lifecycle_specs)
+    return 0
+  fi
+  path="$(service_data_path "$service" 2>/dev/null || true)"
+  [[ -n "$path" ]] || die "No data path mapping for $service"
+  state="$(report_snapshot_protection "$service" "$path" | jq -r '.state')"
+  printf '%s\n' "$state"
+  [[ "$state" == "protected" ]] || rc=1
+  return "$rc"
+}
+
 storage_verify_recovery() {  # $1 = service, $2 = recovery point
   local service="${1:-}" point="${2:-}" meta problem n ident avail img ref ver
   [[ -n "$service" && -n "$point" ]] \
@@ -6594,13 +6648,19 @@ storage_cmd() {
                    storage_topology_verify "$2" ;;
         *)         die "Usage: domum-media storage topology [--verify <capture-file>]" ;;
       esac ;;
+    protection)
+      shift
+      # Read-only. Prints the state word and exits 0 only when `protected`, so an
+      # operator script tests the command rather than matching its prose.
+      load_cfg
+      storage_protection "${1:-}" ;;
     verify-recovery)
       shift
       # Read-only, and deliberately does not require root beyond reading the state
       # directory, so an operator can ask months later what a point is paired with.
       load_cfg
       storage_verify_recovery "${1:-}" "${2:-}" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|verify-recovery <service> <point>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point>}" ;;
   esac
 }
 
@@ -6660,6 +6720,11 @@ Usage:
                                             before an operation, then verify,
                                             rather than asserting an absolute
                                             state
+  domum-media storage protection [service]  Whether a service is actually
+                                            protected: protected,
+                                            snapshottable, degraded,
+                                            unprotected or unknown. Exits 0 only
+                                            for "protected"
   domum-media storage verify-recovery <service> <point>
                                             What application image a recovery
                                             point is paired with, and whether that
