@@ -34,6 +34,83 @@ copies, no obvious symptom.
 `subvol=…,noatime,compress=zstd:3,ssd` and **no `nofail` and no `noauto`**, so
 both are part of `local-fs.target`. `/srv/media` is not in fstab at all.
 
+## Scope: every bind source of all eleven containers, classified
+
+The drop-in must match what containers need — no more, no less. Measured over
+every bind mount of all eleven running containers (2026-10-05):
+
+| bind source | backing device | fstype | mount unit | containers |
+|---|---|---|---|---|
+| `/srv/data/{calibre-web,immich/library,immich/postgres,jellyfin,kavita,navidrome,plex}/…` | `/dev/sda1[/@data]` | btrfs | **`srv-data.mount`** | 7 |
+| `/srv/media`, `/srv/media/{books,music,.cache/jellyfin,.cache/plex-transcode}` | `/dev/sdb2` | ext4 | *(a directory on `/`)* | 3 |
+| `/etc/localtime`, `/opt/domum-core-media/compose/proxy/traefik`, `/etc/domum-core-media/secrets/traefik_dashboard_users` | `/dev/sdb2` | ext4 | *(on `/`)* | 2 |
+| `/var/run/docker.sock` | `tmpfs` | tmpfs | *(on `/run`)* | 1 |
+| `/srv/snapshots` | `/dev/sda1[/@snapshots]` | btrfs | `srv-snapshots.mount` | **0** |
+
+Named volumes (`immich-model-cache`, `traefik-letsencrypt`, `uptime-kuma-data`,
+and two anonymous ones) live under `/var/lib/docker/volumes` on `/dev/sdb2`, the
+root filesystem. A Btrfs snapshot can never cover them; that is the recovery-pack
+question, not a mount-dependency one.
+
+So `docker.service` requires exactly one path:
+
+```
+[Unit]
+RequiresMountsFor=/srv/data
+```
+
+### Why the other three are deliberately absent
+
+**`/srv/media` is not a mount.** `findmnt --target /srv/media` resolves to `/`.
+It is a plain directory on the root filesystem, so there is no mount unit to
+depend on. systemd resolves `RequiresMountsFor=` to the *enclosing* mountpoint —
+measured on this host, `logrotate.service` declares
+`RequiresMountsFor=/var/log` and systemd gives it `Requires=-.mount` — so naming
+`/srv/media` would add nothing beyond the root filesystem every unit already has.
+Do not invent a dependency for it.
+
+**`/srv/snapshots` is a real mount that no container uses.** Zero of the eleven
+containers bind any path under it. Requiring it on `docker.service` would mean a
+failure of a filesystem no container touches stops all eleven containers. The
+snapshot root is needed by the *domum-media units*, so the dependency lives
+there instead:
+
+| unit | `RequiresMountsFor=` | why |
+|---|---|---|
+| `domum-media-btrfs-snapshot.service` | `/srv/data /srv/snapshots` | `snapshot prune` **deletes** from the snapshot root |
+| `domum-media-backup.service` | `/srv/data /srv/snapshots` | reads state, and does `mkdir -p "$DOMUM_SNAPSHOT_ROOT"` before the Immich pre-backup snapshot — unmounted, that creates `/srv/snapshots` on the OS disk |
+| `domum-media-check.service` | `/srv/data /srv/snapshots` | same binary; a check over a phantom tree reports nonsense |
+| `domum-media-image-refresh.service` | `/srv/data /srv/snapshots` | takes the per-service pre-update snapshot (disabled today; correctness must not depend on that) |
+| `domum-media-host-update.service` | `/srv/data /srv/snapshots` | snapshots before touching the host |
+| `domum-media-weekly-report.service` | `/srv/data /srv/snapshots` | would otherwise write a report claiming services are unprotected |
+| `domum-media-dr-reminder.service` | *(none, deliberately)* | appends only to `/var/log/domum-media`. A storage failure must not silence the DR reminder |
+
+An explicit `RequiresMountsFor=` does **not** displace the one systemd derives
+from `CacheDirectory=`: measured, they accumulate, as do two separate
+assignments. `domum-media-backup.service` keeps its implicit
+`/var/cache/domum-media-restic` entry.
+
+## Systemd semantics, measured rather than assumed
+
+`RequiresMountsFor=` is documented to add both `Requires=` and `After=`. Verified
+on *this* host and this systemd version, using units that already use it:
+
+| unit | declares | resulting `Requires=` | resulting `After=` |
+|---|---|---|---|
+| `e2scrub_reap.service` | `RequiresMountsFor=/` | `-.mount` | `-.mount` |
+| `logrotate.service` | `RequiresMountsFor=/var/log` | `-.mount` | `-.mount` |
+
+`systemd-escape -p --suffix=mount /srv/data` → `srv-data.mount`, which is live
+and `active mounted`. So `RequiresMountsFor=/srv/data` yields
+`Requires=srv-data.mount` and `After=srv-data.mount`: Docker is ordered after the
+mount *and* refuses to start if it fails.
+
+One caveat worth recording, because it nearly produced a wrong conclusion: in the
+**user** manager the same directive expands to `After=` only, with no `Requires=`,
+because a user manager cannot require a system mount unit. A disposable
+`systemctl --user` probe therefore proves the parsing but **not** the requirement
+semantics. The system-manager units above are the real evidence.
+
 ## The dependency was real but incidental
 
 ```
@@ -146,6 +223,40 @@ boot.
 containers. That is the correct direction — containers stopped beats containers
 writing to the OS disk — but it means a future `umount /srv/data` for maintenance
 is no longer a quiet operation. Stop the stack first, deliberately.
+
+## Timer catch-up: a reboot must not fire a deleting job
+
+Every enabled timer sets `Persistent=true`, so systemd runs a *missed* job
+immediately at boot. One of them deletes: `domum-media-btrfs-snapshot.service` is
+`snapshot prune`.
+
+Measured 2026-10-05 13:54 EDT — every enabled timer had already run for its
+current period, so a reboot now triggers no catch-up:
+
+| timer | last trigger | next elapse | catch-up at boot? |
+|---|---|---|---|
+| `domum-media-backup.timer` | Mon 2026-10-05 02:39 | Tue 2026-10-06 02:35 | no |
+| `domum-media-check.timer` | Sun 2026-10-04 03:36 | Sun 2026-10-11 03:47 | no |
+| `domum-media-btrfs-snapshot.timer` | Sun 2026-10-04 04:48 | Sun 2026-10-11 04:49 | no |
+| `domum-media-host-update.timer` | Mon 2026-10-05 06:10 | Mon 2026-10-12 06:11 | no |
+| `domum-media-dr-reminder.timer` | Thu 2026-10-01 09:00 | Fri 2027-01-01 09:00 | no |
+| `domum-media-image-refresh.timer` | — | — | `disabled`/`inactive`; a disabled timer does not start at boot |
+
+This is a point-in-time fact and it decays. Rebooting before Sunday 03:30 keeps
+all of it true; a reboot after a long power-off, or on a Sunday morning, could
+fire the backup, the restic check and the prune at once. The pre-reboot capture
+records these stamps so the verifier can confirm afterwards what did and did not
+run.
+
+Two things make the catch-up safer than it was: the prune enforces a retention
+floor of 1 and cannot remove a service's last recovery point, and as of this
+change it declares `RequiresMountsFor=/srv/data /srv/snapshots`, so it cannot run
+at all against an unmounted snapshot root.
+
+`domum-media-weekly-report.{service,timer}` are intentionally **not installed** on
+the host — opt-in, per `systemd/auto-enable.timers`. That is why
+`systemctl is-enabled domum-media-weekly-report.timer` reports `not-found`, and it
+is not drift.
 
 ## Acceptance
 

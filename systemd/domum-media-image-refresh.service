@@ -5,6 +5,10 @@ Wants=network-online.target
 After=network-online.target docker.service
 Requires=docker.service
 ConditionPathExists=/usr/local/bin/domum-media
+# This unit reads or writes the protected storage, so it must not run with
+# either root unmounted: it would classify a phantom tree, or create the
+# snapshot root on the OS disk. RequiresMountsFor= adds Requires= and After=.
+RequiresMountsFor=/srv/data /srv/snapshots
 
 [Service]
 Type=oneshot

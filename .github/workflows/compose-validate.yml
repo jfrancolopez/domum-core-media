@@ -105,6 +105,11 @@ jobs:
       - name: Upgrade protection gate smoke test
         run: tests/upgrade-protection-gate-smoke.sh
 
+      # `update` is repo_update, which execs `apply`. Same gate, by the real
+      # production service names.
+      - name: Update path gate smoke test
+        run: tests/update-path-gate-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh

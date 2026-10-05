@@ -37,13 +37,34 @@ grep -qE '^\[Unit\]$' "$DROPIN" || fail "the drop-in has no [Unit] section, so s
 req="$(sed -nE 's/^RequiresMountsFor=(.*)$/\1/p' "$DROPIN" | head -1)"
 [[ -n "$req" ]] || fail "the drop-in does not set RequiresMountsFor"
 
-# Both btrfs mountpoints. /srv/media is deliberately NOT here: it is a directory
-# on the OS disk, not a mount, so there is no mount unit to require.
-for p in /srv/data /srv/snapshots; do
-  grep -qF -- "$p" <<< "$req" || fail "RequiresMountsFor does not cover $p: '$req'"
-done
+# SCOPE. Docker's dependency must match what CONTAINERS need, no more and no less.
+#
+# Measured on this host, over every bind source of all eleven containers:
+#
+#   /srv/data/...   /dev/sda1[/@data]  btrfs   srv-data.mount   <- 7 containers
+#   /srv/media...   /dev/sdb2          ext4    (a DIRECTORY on /, not a mount)
+#   /srv/snapshots  /dev/sda1[/@snaps] btrfs   srv-snapshots.mount  <- ZERO containers
+#   /etc/..., /opt/..., /var/run/docker.sock    on / and /run
+#
+# So: /srv/data is required, and the other three are deliberately absent.
+#
+# /srv/media would be a dependency on a unit that never appears. systemd resolves
+# RequiresMountsFor to the ENCLOSING mountpoint -- proven on this host, where
+# `RequiresMountsFor=/var/log` on logrotate.service yields `Requires=-.mount` --
+# so naming it would add nothing beyond the root filesystem everything already has.
+#
+# /srv/snapshots is a real mount, but no container binds anything under it.
+# Requiring it HERE would mean a failure of a filesystem no container uses takes
+# down all eleven containers. The snapshot root is needed by the domum-media
+# units that create, prune or read snapshots, so the dependency belongs on those
+# units -- asserted separately below.
+grep -qF -- "/srv/data" <<< "$req" || fail "RequiresMountsFor does not cover /srv/data: '$req'"
 grep -qF -- "/srv/media" <<< "$req" \
-  && fail "RequiresMountsFor names /srv/media, which is not a mount; systemd would wait for a unit that never appears"
+  && fail "RequiresMountsFor names /srv/media, which is not a mount; systemd would resolve it to -.mount, which adds nothing"
+grep -qF -- "/srv/snapshots" <<< "$req" \
+  && fail "RequiresMountsFor names /srv/snapshots on docker.service, but ZERO containers bind a path under it.
+A failure of that filesystem would then stop all eleven containers for no reason.
+Put the dependency on the units that actually use the snapshot root instead."
 
 # Every path a service binds from must be covered by one of the required mounts.
 # This is the check that keeps the drop-in honest as compose fragments change.
@@ -84,5 +105,60 @@ grep -q 'systemd/\*.service /etc/systemd/system/' <<< "$conv" \
 # the daemon here would bounce all eleven containers during a routine convergence.
 grep -qE 'systemctl (restart|try-restart) docker' <<< "$conv" \
   && fail "converge restarts Docker, which would bounce every container on a routine apply"
+
+# ---------------------------------------------------------------------------
+# The other half of the invariant: every unit that touches the protected storage
+# must declare it, and the one that does not touch it must not.
+#
+# domum-media-backup does `mkdir -p "$DOMUM_SNAPSHOT_ROOT"` before the Immich
+# pre-backup snapshot. With /srv/snapshots unmounted that CREATES the snapshot
+# root on the OS disk, and `snapshot prune` would then survey an empty tree and
+# report that it pruned nothing.
+needs_storage=(
+  domum-media-btrfs-snapshot.service
+  domum-media-backup.service
+  domum-media-check.service
+  domum-media-image-refresh.service
+  domum-media-host-update.service
+  domum-media-weekly-report.service
+)
+for u in "${needs_storage[@]}"; do
+  f="$REPO_ROOT/systemd/$u"
+  [[ -r "$f" ]] || fail "unit not found: $f"
+  ureq="$(sed -nE 's/^RequiresMountsFor=(.*)$/\1/p' "$f" | tr '\n' ' ')"
+  [[ -n "$ureq" ]] || fail "$u reads or writes the protected storage but declares no RequiresMountsFor"
+  for p in /srv/data /srv/snapshots; do
+    grep -qF -- "$p" <<< "$ureq" || fail "$u does not require $p (has '$ureq')"
+  done
+  # It must be in [Unit], not [Service], or systemd ignores it.
+  sect="$(awk '/^\[/{s=$0} /^RequiresMountsFor=/{print s; exit}' "$f")"
+  [[ "$sect" == "[Unit]" ]] || fail "$u puts RequiresMountsFor in $sect; it only has meaning in [Unit]"
+done
+
+# The negative control: a unit that writes only /var/log must NOT acquire a
+# dependency on the data tier, or a storage failure would suppress the DR
+# reminder -- exactly when it matters most.
+drr="$REPO_ROOT/systemd/domum-media-dr-reminder.service"
+grep -q '^RequiresMountsFor=' "$drr" \
+  && fail "domum-media-dr-reminder.service requires the protected storage, but it only appends to /var/log.
+A storage failure would then silence the disaster-recovery reminder."
+
+# An explicit RequiresMountsFor must not displace the one systemd derives from
+# CacheDirectory=. Measured: they accumulate (and two assignments accumulate too).
+for u in domum-media-backup.service domum-media-check.service; do
+  grep -q 'CacheDirectory=domum-media-restic' "$REPO_ROOT/systemd/$u" \
+    || fail "$u lost CacheDirectory=domum-media-restic, which is where its implicit /var/cache dependency comes from"
+done
+
+# ---------------------------------------------------------------------------
+# Install safety. The drop-in lives beside units this project does not own.
+conv2="$conv"
+# Per-file install, so an unrelated docker.service.d drop-in is left alone.
+grep -qE 'rm -rf[^\n]*service\.d' <<< "$conv2" \
+  && fail "converge removes a .service.d directory; an unrelated drop-in placed by the operator or a package would be destroyed"
+# Idempotent: install(1) overwrites in place, so a second run is a no-op. Assert
+# there is no "create only if absent" guard that would let a stale drop-in persist.
+grep -qE '\[\[ ! -e .*dropin|\[ ! -f .*dropin' <<< "$conv2" \
+  && fail "the drop-in is installed only when absent, so a corrected version would never replace a stale one"
 
 echo "PASS: boot mount dependency smoke test"

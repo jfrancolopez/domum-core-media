@@ -192,6 +192,24 @@ service would come up as a fresh install, hidden later when the mount lands.
 explicit — it was previously only transitive target ordering, with
 `RequiresMountsFor=` empty. Never add `nofail` to those fstab lines.
 
+**A mount dependency belongs on the unit that needs the path, scoped to what it
+needs.** `docker.service` requires `/srv/data` and nothing else: measured over
+every bind source of all eleven containers, `/srv/media` is a plain directory on
+`/` (so `RequiresMountsFor=` would resolve to `-.mount` and add nothing — never
+invent a dependency for it), and **zero containers bind `/srv/snapshots`**, so
+requiring it there would let a failure of a filesystem no container uses stop all
+eleven. The snapshot root is declared on the domum-media units that create, prune
+or read snapshots; `domum-media-dr-reminder.service` deliberately declares none,
+because a storage failure must not silence the DR reminder. An explicit
+`RequiresMountsFor=` accumulates with the one `CacheDirectory=` implies rather
+than replacing it. `tests/boot-mount-dependency-smoke.sh` enforces the whole
+scope, in both directions.
+
+**Every enabled timer is `Persistent=true`, so a reboot runs missed jobs
+immediately** — including `snapshot prune`, which deletes. Check
+`LastTriggerUSec` against `NextElapseUSecRealtime` before rebooting rather than
+assuming; see `docs/REBOOT-READINESS.md`.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
