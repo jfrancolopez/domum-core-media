@@ -680,6 +680,17 @@ converge_local_installation() {
   install -D -m 0644 "$DOMUM_DIR/logrotate/domum-media" /etc/logrotate.d/domum-media
   install -m 0644 "$DOMUM_DIR"/systemd/*.service /etc/systemd/system/
   install -m 0644 "$DOMUM_DIR"/systemd/*.timer /etc/systemd/system/
+  # Drop-ins for units this project does not own. Currently one: docker.service
+  # must not start before /srv/data is mounted, or it would create the missing
+  # bind-mount sources on the OS disk and every service would come up empty.
+  # Installed here so it survives a reinstall; it changes nothing until the next
+  # boot, and does not restart Docker.
+  local dropin
+  for dropin in "$DOMUM_DIR"/systemd/*.service.d/*.conf; do
+    [[ -e "$dropin" ]] || continue
+    install -D -m 0644 "$dropin" \
+      "/etc/systemd/system/$(basename "$(dirname "$dropin")")/$(basename "$dropin")"
+  done
   systemctl daemon-reload
 }
 
@@ -3610,6 +3621,90 @@ init_host() {
   echo "[domum-media] init complete."
 }
 
+# `apply` must not deploy an application upgrade as a side effect of convergence.
+#
+# The per-service gate lives in `refresh_images`: it calls create_service_snapshot
+# for the service being updated and, when that returns nothing, hands off to
+# snapshot_protection_unavailable, which dies under SNAPSHOT_POLICY=REQUIRED. So
+# `domum-media updates apply` correctly REFUSES plex and calibre-web, whose state
+# directories are not subvolumes.
+#
+# `apply` has no such gate. It takes a fleet-wide `snapshot_create "pre-apply"`,
+# treats failure as a WARNING by design -- it is convergence, not an update -- and
+# then runs `compose up -d --remove-orphans`, which recreates any container whose
+# image has changed. And `domum-media update` is `repo_update`, which ends in
+# `exec domum-media apply`.
+#
+# So the supposedly-gated path was not the gated one. Measured on this host:
+#
+#   plex         staged image, /srv/data/plex          unprotected
+#   calibre-web  staged image, /srv/data/calibre-web   unprotected
+#   uptime-kuma  staged image, no /srv/data path       (state is a volume, in the recovery pack)
+#   traefik      staged image, no /srv/data path       (ACME store, in the recovery pack)
+#
+# `domum-media apply` would have upgraded all four, two of them with no recovery
+# point for the state they are about to migrate.
+#
+# The invariant, service by service: an application image upgrade may proceed only
+# when the state THAT application may mutate has a recovery point appropriate to
+# THAT application. A jellyfin snapshot must never satisfy a plex upgrade. This is
+# the same defect class as `immich reset-db` passing on an unrelated snapshot
+# count, which is why it is checked per service and never counted.
+#
+# A service whose state path does not exist is NOT refused: there is nothing under
+# the protected tier for a snapshot to cover, and what those services keep
+# elsewhere is the recovery-pack question (docs/STATE-CLASSIFICATION.md). It is
+# reported rather than silently passed.
+apply_staged_image_blockers() {  # -> "service state" lines for services that must not be upgraded
+  local svc enable_var path staged state
+  while IFS='|' read -r svc enable_var _ _ _ _ _; do
+    [[ -n "$svc" ]] || continue
+    [[ "${!enable_var:-0}" == "1" ]] || continue
+    staged="$(service_staged_image_changes "$svc" 2>/dev/null | grep '^STAGED ' || true)"
+    [[ -n "$staged" ]] || continue
+    path="$(service_data_path "$svc" 2>/dev/null || true)"
+    if [[ -z "$path" || ! -e "$path" ]]; then
+      printf 'NOSTATE %s\n' "$svc"
+      continue
+    fi
+    state="$(report_snapshot_protection "$svc" "$path" | jq -r '.state')"
+    [[ "$state" == "protected" ]] && continue
+    printf 'BLOCKED %s %s\n' "$svc" "$state"
+  done < <(service_lifecycle_specs)
+}
+
+# The refusal itself, in one place, so a test can run it rather than grep for it.
+apply_assert_staged_images_recoverable() {
+  load_report_lib
+  local blockers nostate
+  blockers="$(apply_staged_image_blockers)"
+  nostate="$(grep '^NOSTATE ' <<< "$blockers" || true)"
+  blockers="$(grep '^BLOCKED ' <<< "$blockers" || true)"
+  if [[ -n "$nostate" ]]; then
+    warn "A newer image is staged for these services, whose durable state is NOT under ${DOMUM_DATA_ROOT:-/srv/data}:"
+    printf '  %s\n' "$nostate" >&2
+    warn "A snapshot cannot cover them; see docs/STATE-CLASSIFICATION.md for what does."
+  fi
+  [[ -n "$blockers" ]] || return 0
+  if [[ "${APPLY_ALLOW_IMAGE_CHANGE:-0}" == "1" ]]; then
+    warn "APPLY_ALLOW_IMAGE_CHANGE=1, so this apply WILL upgrade these unprotected services:"
+    printf '  %s\n' "$blockers" >&2
+    return 0
+  fi
+  die "Refusing: this apply would deploy a staged image for services whose state has no recovery point.
+$blockers
+\`apply\` is convergence, and \`compose up -d\` recreates any container whose image has
+changed -- so it would upgrade the application and migrate its state with nothing to
+go back to. An image upgrade needs a recovery point for the state THAT service may
+mutate; another service's snapshot does not count.
+
+Either:
+  * make the state snapshot-capable first:  sudo domum-media storage migrate-subvolume <service>
+  * or deploy through the gated path, which refuses per service:
+                                            sudo domum-media updates apply
+  * or accept it deliberately:              APPLY_ALLOW_IMAGE_CHANGE=1 sudo domum-media apply"
+}
+
 apply() {
   need_root
   load_cfg
@@ -3649,6 +3744,10 @@ apply() {
     warn "No usable pre-apply snapshot; this apply has no rollback point."
     warn "See the snapshot counts above for whether paths were skipped or a snapshot failed, and docs/SNAPSHOT-MODEL.md."
   fi
+
+  # Convergence must not become an application upgrade. Checked immediately before
+  # the only `up -d` that touches every service.
+  apply_assert_staged_images_recoverable
 
   echo "[domum-media] Applying desired state..."
   compose_cmd up -d --remove-orphans
