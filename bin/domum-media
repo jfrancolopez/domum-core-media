@@ -5969,6 +5969,10 @@ domum_sqlite_check() {  # $1 = path to a disposable COPY
   if cmd_exists sqlite3; then
     ic="$(sqlite3 -readonly "$db" 'PRAGMA integrity_check;' 2>&1 | head -1)"
     fk="$(sqlite3 -readonly "$db" 'PRAGMA foreign_key_check;' 2>&1 | grep -c . || true)"
+    case "$ic" in
+      *"unknown tokenizer"*|*"no such module"*|*"unknown function"*|*"no such collation"*)
+        printf 'unsupported: %s' "$ic"; return 0 ;;
+    esac
     if [[ "$ic" != "ok" ]]; then printf 'integrity_check: %s' "$ic"
     elif [[ "${fk:-0}" != "0" ]]; then printf 'foreign_key_check: %s violation(s)' "$fk"
     else printf 'ok'; fi
@@ -5988,6 +5992,19 @@ try:
         print("foreign_key_check: %d violation(s)" % len(fk), end="")
     else:
         print("ok", end="")
+except sqlite3.OperationalError as e:
+    # A pragma that cannot RUN is not a database that is broken. Plex's databases
+    # carry FTS virtual tables built with its own `collating` tokenizer, which
+    # only Plex's bundled SQLite registers: integrity_check AND quick_check both
+    # raise "unknown tokenizer: collating" on a perfectly sound file. Measured on
+    # the real plex recovery point -- those same two databases returned `ok` with
+    # zero foreign-key violations under /usr/lib/plexmediaserver/Plex SQLite,
+    # while page_count, schema_version and all 254 sqlite_master rows read fine
+    # under the generic one.
+    msg = str(e)
+    unsupported = ("unknown tokenizer" in msg or "no such module" in msg
+                   or "unknown function" in msg or "no such collation" in msg)
+    print(("unsupported: %s" if unsupported else "failed: %s") % msg, end="")
 except Exception as e:
     print("failed: %s" % e, end="")
 finally:
@@ -5996,6 +6013,40 @@ PY
   else
     printf 'unchecked'
   fi
+}
+
+# Some applications build their SQLite with private extensions, so only THEIR
+# binary can run integrity_check over their own schema. Per-service, like
+# service_ready_probe: a generic checker reporting "unsupported" is honest but
+# weak, and this turns it back into a real check.
+service_sqlite_binary() {  # $1 = service -> path INSIDE its container
+  case "$1" in
+    plex) printf '/usr/lib/plexmediaserver/Plex SQLite' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Run the check with the service's own SQLite, on a copy placed in the container's
+# /tmp. It never touches the service's state directory and removes the copy
+# afterwards. Needs a RUNNING container, so it is a fallback, not the primary
+# path: during the pre-cutover verify the service is deliberately stopped and the
+# honest answer there remains "not checked".
+domum_sqlite_check_via_container() {  # $1 = service, $2 = local copy
+  local service="$1" db="$2" bin cid dest ic fk
+  bin="$(service_sqlite_binary "$service" 2>/dev/null)" || return 1
+  cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
+  [[ -n "$cid" ]] || return 1
+  [[ "$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null)" == "running" ]] || return 1
+  dest="/tmp/.domum-sqlite-check.$$.db"
+  docker cp "$db" "$cid:$dest" >/dev/null 2>&1 || return 1
+  ic="$(docker exec "$cid" "$bin" "$dest" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+  fk="$(docker exec "$cid" "$bin" "$dest" 'PRAGMA foreign_key_check;' 2>/dev/null | grep -c . || true)"
+  docker exec "$cid" rm -f "$dest" >/dev/null 2>&1 || true
+  [[ -n "$ic" ]] || return 1
+  if [[ "$ic" != "ok" ]]; then printf 'integrity_check: %s' "$ic"
+  elif [[ "${fk:-0}" != "0" ]]; then printf 'foreign_key_check: %s violation(s)' "$fk"
+  else printf 'ok'; fi
+  return 0
 }
 
 # Every SQLite database in $1, checked from a copy. Returns non-zero only for a
@@ -6044,10 +6095,31 @@ migrate_sqlite_integrity() {  # $1 = tree, $2 = stage label
       continue
     fi
     result="$(domum_sqlite_check "$tmp/probe.db")"
+    # NOTE: the probe copy is removed AFTER the fallback below, not here. It was
+    # deleted first, so `docker cp` had nothing to copy and the fallback silently
+    # never ran -- it reported "not checked" while a real answer was available.
+    # An extension this SQLite LACKS is "I could not check", not "it is broken".
+    # This function's contract has always said it never fails an unchecked
+    # database; the case below sent anything unrecognised to bad=1 anyway, and
+    # that reported plex's two perfectly sound databases as a failed recovery
+    # point. Before giving up, try the application's own SQLite.
+    if [[ "$result" == unsupported:* && -n "${MIGRATE_SQLITE_SERVICE:-}" ]]; then
+      local via
+      if via="$(domum_sqlite_check_via_container "$MIGRATE_SQLITE_SERVICE" "$tmp/probe.db")"; then
+        migrate_stage "$stage" "sqlite $rel: this SQLite cannot read the schema; used the application's own"
+        result="$via"
+      fi
+    fi
     rm -f -- "$tmp/probe.db"
     case "$result" in
       ok)        migrate_stage "$stage" "sqlite $rel: ok"; checked=$(( checked + 1 )) ;;
       unchecked) migrate_stage "$stage" "sqlite $rel: NOT checked (no sqlite3 and no python3)"; skipped=$(( skipped + 1 )) ;;
+      unsupported:*)
+        migrate_stage "$stage" "sqlite $rel: NOT checked -- this SQLite cannot read the schema"
+        migrate_stage "$stage" "  ${result#unsupported: }"
+        migrate_stage "$stage" "  the file opened; header, page count and schema all read fine."
+        migrate_stage "$stage" "  Only the integrity pragma needs an extension this build lacks."
+        skipped=$(( skipped + 1 )) ;;
       *)         warn "sqlite $rel: $result"; bad=1 ;;
     esac
   done < <(find "$tree" -xdev -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -printf '%P\0' 2>/dev/null)
@@ -6204,8 +6276,12 @@ $changed changed, $added added, $lost lost"
   return 0
 }
 
-migrate_verify_recovery_point() {  # $1 = .premigration, $2 = proof snapshot path
+migrate_verify_recovery_point() {  # $1 = .premigration, $2 = proof snapshot, $3 = service
   local premigration="$1" proof_path="$2"
+  # Optional, and only used to pick the application's own SQLite when the generic
+  # one cannot read the schema. Absent means "generic checker only", which is the
+  # honest default rather than a silent downgrade.
+  local MIGRATE_SQLITE_SERVICE="${3:-}"
 
   [[ -d "$premigration" ]] || { warn "the preserved original is missing from $premigration"; return 1; }
   [[ -d "$proof_path" ]] || { warn "the proof snapshot is missing from $proof_path"; return 1; }
@@ -6697,7 +6773,7 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
   # disturb it, and it catches corruption introduced after verification passed.
   local recovery_ok=1
   if [[ -n "$proof" ]]; then
-    if ! migrate_verify_recovery_point "$premigration" "$DOMUM_SNAPSHOT_ROOT/$proof"; then
+    if ! migrate_verify_recovery_point "$premigration" "$DOMUM_SNAPSHOT_ROOT/$proof" "$service"; then
       recovery_ok=0
       warn "The data is migrated and $service is running, but the recovery point did not verify."
       warn "Nothing has been deleted. Investigate before relying on rollback for $service."
@@ -6950,10 +7026,11 @@ storage_protection() {  # $1 = service (optional: all services when omitted)
   return "$rc"
 }
 
-storage_verify_recovery() {  # $1 = service, $2 = recovery point
-  local service="${1:-}" point="${2:-}" meta problem n ident avail img ref ver
+storage_verify_recovery() {  # $1 = service, $2 = recovery point, [--deep]
+  local service="${1:-}" point="${2:-}" deep=0 meta problem n ident avail img ref ver
+  [[ "${3:-}" == "--deep" ]] && deep=1
   [[ -n "$service" && -n "$point" ]] \
-    || die "Usage: domum-media storage verify-recovery <service> <recovery-point>"
+    || die "Usage: domum-media storage verify-recovery <service> <recovery-point> [--deep]"
   meta="$(snapshot_metadata_dir)/${point}.recovery"
 
   if [[ ! -s "$meta" ]]; then
@@ -7008,6 +7085,30 @@ storage_verify_recovery() {  # $1 = service, $2 = recovery point
     fi
     n=$(( n + 1 ))
   done
+
+  # --deep re-proves the INTEGRITY claim for a recovery point that already
+  # exists: .premigration == the proof snapshot, plus the SQLite checks. Without
+  # it the only way to re-run that proof was to re-run a migration, which is not
+  # something you can do twice -- so a false negative (plex's databases reported
+  # as failed because this host's SQLite lacks Plex's `collating` tokenizer) left
+  # no way to reach a clean verdict.
+  if (( deep == 1 )); then
+    echo
+    local prem proof_path
+    prem="$(service_data_path "$service" 2>/dev/null || true).premigration"
+    proof_path="${DOMUM_SNAPSHOT_ROOT%/}/$point"
+    if [[ ! -d "$prem" ]]; then
+      echo "deep verification : NOT POSSIBLE -- $prem is gone"
+      echo "  The integrity claim compares the preserved original against the proof"
+      echo "  snapshot. Once .premigration is removed that comparison cannot be redone."
+      return 1
+    fi
+    if ! migrate_verify_recovery_point "$prem" "$proof_path" "$service"; then
+      echo "deep verification : FAILED -- see the warnings above"
+      return 1
+    fi
+    echo "deep verification : integrity re-proven ($prem == $proof_path)"
+  fi
   return 0
 }
 
@@ -7040,8 +7141,8 @@ storage_cmd() {
       # Read-only, and deliberately does not require root beyond reading the state
       # directory, so an operator can ask months later what a point is paired with.
       load_cfg
-      storage_verify_recovery "${1:-}" "${2:-}" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point>}" ;;
+      storage_verify_recovery "${1:-}" "${2:-}" "${3:-}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]}" ;;
   esac
 }
 
@@ -7106,7 +7207,7 @@ Usage:
                                             snapshottable, degraded,
                                             unprotected or unknown. Exits 0 only
                                             for "protected"
-  domum-media storage verify-recovery <service> <point>
+  domum-media storage verify-recovery <service> <point> [--deep]
                                             What application image a recovery
                                             point is paired with, and whether that
                                             image can still be obtained

@@ -255,6 +255,25 @@ application half turns fragile exactly when it starts to matter. The version is
 recoverable only as a label (`1.43.2.10687-563d026ea-ls308`), which is
 compatibility information, not a retrievable reference.
 
+**"I could not check it" is not "it is broken".** Plex's databases carry FTS
+virtual tables built with its own `collating` tokenizer, which only Plex's
+bundled SQLite registers. The host's SQLite raises `unknown tokenizer: collating`
+on both `integrity_check` and `quick_check` for a perfectly sound file — measured:
+`page_count`, `schema_version`, `journal_mode` and all 254 `sqlite_master` rows
+read fine, exactly 2 objects use that tokenizer, and Plex's own SQLite returns
+`ok` with zero foreign-key violations. `migrate_sqlite_integrity` reported those
+two databases as a **failed recovery point**, contradicting its own comment. An
+extension the local SQLite lacks is now `unsupported:` → **not checked**, while a
+genuinely broken database still fails. When the application ships its own SQLite
+(`service_sqlite_binary`) that is used instead, turning "not checked" back into a
+real check. `tests/sqlite-unsupported-smoke.sh`; 6 mutants, all killed.
+
+**`storage verify-recovery … --deep` re-proves an existing recovery point**
+(`.premigration` == proof snapshot, plus the SQLite checks). Before it, the only
+way to re-run that proof was to re-run a migration — which cannot be done twice,
+so a false negative left no route to a clean verdict. It refuses honestly once
+`.premigration` is gone, because the comparison then has no left-hand side.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
