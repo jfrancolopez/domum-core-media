@@ -110,6 +110,11 @@ jobs:
       - name: Update path gate smoke test
         run: tests/update-path-gate-smoke.sh
 
+      # What the restarted service did to its state since the proof snapshot.
+      # Plex-shaped: spaced paths, rotated logs, dated DB backups, symlinks.
+      - name: Live tree classification smoke test
+        run: tests/live-tree-classification-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh

@@ -866,6 +866,68 @@ service_health_url() {
   return 1
 }
 
+# IN-CONTAINER readiness probe.
+#
+# The health_url column above is empty for every service, and for plex it could
+# not be filled: plex runs on `domum-internal` with no host-published port
+# (measured: 32400/tcp -> []), reachable only through Traefik on an authenticated
+# hostname. A host-side curl cannot see it.
+#
+# So the probe runs INSIDE the container, over loopback, against an endpoint the
+# application already serves. It adds no healthcheck, publishes no port and
+# touches no authentication -- it only reads something that is already there.
+#
+# plex: GET /identity is unauthenticated and returns
+#   <MediaContainer ... machineIdentifier="..." version="1.43.2.10687-563d026ea">
+# which is strictly stronger evidence than the readiness LOG line. The log line
+# is the container entrypoint reporting that a TCP connect to 32400 succeeded --
+# a LISTENER exists. An HTTP 200 carrying a machineIdentifier proves the
+# application answered and had read its own preferences.
+#
+# What it still does NOT prove: that the library database opened. /identity does
+# not touch it, and anything that does requires an X-Plex-Token. The database
+# question is answered separately and more rigorously, by integrity_check and
+# foreign_key_check run on DISPOSABLE COPIES in migrate_sqlite_integrity.
+service_ready_probe() {  # $1 = service -> "url|expected-substring", or non-zero
+  case "$1" in
+    plex) printf 'http://127.0.0.1:32400/identity|machineIdentifier' ;;
+    *) return 1 ;;
+  esac
+}
+
+# 0 = responded as expected, 1 = did not, 2 = no probe defined for this service.
+# "No probe" must never read as "ready": the caller distinguishes them.
+service_probe_ready() {  # $1 = service
+  local spec url want cid out
+  spec="$(service_ready_probe "$1" 2>/dev/null)" || return 2
+  url="${spec%%|*}"; want="${spec##*|}"
+  cid="$(tracked_service_container_id_any "$1" 2>/dev/null || true)"
+  [[ -n "$cid" ]] || return 2
+  out="$(docker exec "$cid" curl -fsS --max-time 10 "$url" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  grep -qF -- "$want" <<< "$out" || return 1
+  return 0
+}
+
+# The application's own version string, read from the same probe. Recorded as
+# recovery evidence so the running application can be tied to the image we
+# believe is running, rather than trusting the image label alone.
+service_probe_version() {  # $1 = service
+  local spec url cid out
+  spec="$(service_ready_probe "$1" 2>/dev/null)" || return 1
+  url="${spec%%|*}"
+  cid="$(tracked_service_container_id_any "$1" 2>/dev/null || true)"
+  [[ -n "$cid" ]] || return 1
+  out="$(docker exec "$cid" curl -fsS --max-time 10 "$url" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  # Anchor on the line that carries the expected marker. Matching `version="`
+  # anywhere grabs the XML declaration first -- measured: it returned "1.0" from
+  # `<?xml version="1.0" encoding="UTF-8"?>` instead of the application version.
+  local want="${spec##*|}"
+  grep -F -- "$want" <<< "$out" \
+    | sed -nE 's/.*[^a-zA-Z]version="([^"]+)".*/\1/p' | head -1
+}
+
 backup_last_success_epoch() {
   local file="${DOMUM_LOG_DIR}/last-success"
   [[ -f "$file" ]] || return 1
@@ -6013,6 +6075,135 @@ migrate_sqlite_integrity() {  # $1 = tree, $2 = stage label
 #
 # A failure here is not recoverable by this command and must not try to be: both
 # copies are intact, and which one is right is a question for the operator.
+# Paths a running service is expected to write, rewrite or remove. THE DATABASE
+# FILE IS DELIBERATELY ABSENT: sidecars appearing proves the service opened its
+# database, but `.db` content changing is a different claim the operator must see.
+#
+# This lived only in the operator wrapper, which is the defect the project keeps
+# re-learning: docs/MIGRATION-LIFECYCLE.md and CLAUDE.md both described the live
+# tree as "classified, not compared", and the CLI had no such stage at all. One
+# canonical implementation, tested in CI, invoked by the operator script.
+#
+# Case matters. `*/logs/*` does not match Plex's `Logs/`, and plugin logs are
+# named `com.plexapp.system.log.5`, so `*.log.*` is needed as well as `*.log`.
+migrate_runtime_expected() {  # $1 = path relative to the tree root
+  case "$1" in
+    */log/*|*/logs/*|*/Log/*|*/Logs/*|*.log|*.log.*|*/.*-log) return 0 ;;
+    */ScheduledTasks/*|*/temp/*|*/tmp/*|*/Temp/*) return 0 ;;
+    # Any directory whose name IS or STARTS WITH cache -- Kavita writes
+    # config/cache-long/update/*.json, which `*/cache/*` does not match, so six
+    # regenerable update-checker files were reported as "NOT obviously runtime
+    # state" for the operator to review. Noise in a safety report is a defect:
+    # it trains the reader to skim the list that exists to be read.
+    */cache/*|*/cache-*/*|*/Cache/*|*/Cache-*/*|*/caches/*) return 0 ;;
+    */thumbnails/*|*/covers/*|*/favicons/*|*/bookmarks/*) return 0 ;;
+    # Plex: crash reports and codec downloads are regenerable, and `Updates/` is
+    # where it stages its own installers.
+    */Crash?Reports/*|*/Codecs/*|*/Updates/*) return 0 ;;
+    *.pid|*.lock|*.sock) return 0 ;;
+    *-wal|*-shm|*-journal) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Classify the live tree against the proof snapshot, and say which differences
+# matter. Emits one record per differing path:
+#
+#   LOST <path>       in the snapshot, gone from the live tree, NOT runtime state
+#   PRUNED <path>     in the snapshot, gone from the live tree, expected churn
+#   CHANGED <path>    in both, content differs, NOT runtime state
+#   ADDED <path>      only in the live tree, NOT runtime state
+#   CHURN <path>      differs or appeared, and is expected runtime state
+#
+# Only LOST is a failure. The caller decides; this function only classifies, so a
+# test can drive it directly.
+#
+# WHY "missing is a hard failure" could not survive Plex. The wrapper aborted
+# unconditionally when any snapshotted file was absent from the live tree. That
+# held for jellyfin, kavita and navidrome and is FALSE for Plex, which rotates
+# `Plex Media Server.N.log` and prunes its own dated database backups
+# (`com.plexapp.plugins.library.db-YYYY-MM-DD`, four kept). A correct migration
+# would have aborted on ordinary log rotation -- the same shape as the stale
+# topology invariant and the prose-grep abort. So a disappearance is split the
+# same way an addition is, and only an unexpected one fails.
+#
+# NUL-delimited throughout. The wrapper iterated `for f in $CHANGED $ADDED`,
+# which word-splits: measured, two real Plex paths became ELEVEN fragments, and
+# because `Server.2.log` matches `*.log` while `Support/Plex` matches nothing,
+# pieces of one path were classified differently from each other. Any service
+# whose paths contain spaces -- Plex is the first -- made that output meaningless.
+migrate_classify_live_tree() {  # $1 = proof snapshot root, $2 = live tree root
+  local snap="$1" live="$2" rel a b
+  [[ -d "$snap" ]] || { warn "proof snapshot not found: $snap"; return 2; }
+  [[ -d "$live" ]] || { warn "live tree not found: $live"; return 2; }
+
+  # Snapshot side: lost, pruned or changed.
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    if [[ ! -e "$live/$rel" ]]; then
+      if migrate_runtime_expected "$rel"; then printf 'PRUNED %s\0' "$rel"
+      else printf 'LOST %s\0' "$rel"; fi
+      continue
+    fi
+    a="$(sha256sum "$snap/$rel" 2>/dev/null | cut -d' ' -f1)"
+    b="$(sha256sum "$live/$rel" 2>/dev/null | cut -d' ' -f1)"
+    # An unreadable file must never read as "identical". Both empty would compare
+    # equal and silently pass, which is how a dropped manifest line hid a real
+    # difference once already.
+    if [[ -z "$a" || -z "$b" ]]; then printf 'LOST %s\0' "$rel"; continue; fi
+    if [[ "$a" != "$b" ]]; then
+      if migrate_runtime_expected "$rel"; then printf 'CHURN %s\0' "$rel"
+      else printf 'CHANGED %s\0' "$rel"; fi
+    fi
+  done < <(cd "$snap" && find . -type f -print0 2>/dev/null | sort -z)
+
+  # Live side: anything that appeared.
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    [[ -e "$snap/$rel" ]] && continue
+    if migrate_runtime_expected "$rel"; then printf 'CHURN %s\0' "$rel"
+    else printf 'ADDED %s\0' "$rel"; fi
+  done < <(cd "$live" && find . -type f -print0 2>/dev/null | sort -z)
+  return 0
+}
+
+# Report the classification, and fail only on a genuine loss.
+migrate_report_live_tree() {  # $1 = proof snapshot root, $2 = live tree root
+  local snap="$1" live="$2" out rec kind path
+  local lost=0 changed=0 added=0 churn=0 pruned=0
+  out="$(mktemp)" || { warn "cannot stage the live-tree classification"; return 1; }
+  if ! migrate_classify_live_tree "$snap" "$live" > "$out"; then
+    rm -f "$out"; warn "the live tree could not be classified"; return 1
+  fi
+  local review=""
+  while IFS= read -r -d '' rec; do
+    kind="${rec%% *}"; path="${rec#* }"
+    case "$kind" in
+      LOST)    lost=$((lost+1));       review="$review  LOST    $path"$'\n' ;;
+      CHANGED) changed=$((changed+1)); review="$review  CHANGED $path"$'\n' ;;
+      ADDED)   added=$((added+1));     review="$review  ADDED   $path"$'\n' ;;
+      CHURN)   churn=$((churn+1)) ;;
+      PRUNED)  pruned=$((pruned+1)) ;;
+    esac
+  done < "$out"
+  rm -f "$out"
+  migrate_stage live "since the proof snapshot: $churn expected-churn, $pruned pruned, \
+$changed changed, $added added, $lost lost"
+  if [[ -n "$review" ]]; then
+    warn "Differences that are NOT obviously runtime state -- review:"
+    printf '%s' "$review" >&2
+    warn "The integrity claim is unaffected: it compares two static trees."
+  else
+    migrate_stage live "all divergence is expected runtime state"
+  fi
+  if (( lost > 0 )); then
+    warn "$lost file(s) present in the proof snapshot are GONE from the live tree,"
+    warn "and are not the kind of path a running service is expected to remove."
+    return 1
+  fi
+  return 0
+}
+
 migrate_verify_recovery_point() {  # $1 = .premigration, $2 = proof snapshot path
   local premigration="$1" proof_path="$2"
 
@@ -6396,6 +6587,40 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
         migrate_stage health "  'running' is the whole claim. Content was verified byte-for-byte;"
         migrate_stage health "  exercise the application yourself before removing $premigration"
       fi
+
+      # The strongest evidence available WITHOUT changing the service: an
+      # in-container request to an endpoint it already serves. For plex this is
+      # GET /identity, which is strictly better than its readiness log line --
+      # that line only reports that a TCP listener exists on 32400, while an HTTP
+      # 200 carrying a machineIdentifier proves the application answered and had
+      # read its own preferences. Polled, not one-shot, because HTTP comes up
+      # after the listener.
+      #
+      # It does NOT prove the library database opened: /identity does not touch
+      # it, and anything that does needs an X-Plex-Token. That question is
+      # answered by integrity_check / foreign_key_check on disposable copies.
+      local probe_waited=0 probe_rc=2 probe_version=""
+      if service_ready_probe "$service" >/dev/null 2>&1; then
+        while (( probe_waited < 120 )); do
+          service_probe_ready "$service" && { probe_rc=0; break; }
+          sleep 5
+          probe_waited=$(( probe_waited + 5 ))
+        done
+        if (( probe_rc == 0 )); then
+          probe_version="$(service_probe_version "$service" 2>/dev/null || true)"
+          migrate_stage health "$service ANSWERED its own endpoint after the migration"
+          [[ -n "$probe_version" ]] \
+            && migrate_stage health "  application reports version $probe_version" \
+            || migrate_stage health "  (endpoint responded; no version string in the reply)"
+          migrate_stage health "  this proves the application served HTTP and read its preferences;"
+          migrate_stage health "  it does NOT prove the library database opened -- see the SQLite checks"
+        else
+          warn "$service did not answer its own endpoint within ${probe_waited}s after the restart."
+          warn "Its container is running and it logged readiness, but the application did not serve."
+          warn "The previous state is intact at $premigration; nothing was deleted."
+          die "Migration completed but $service never answered its endpoint."
+        fi
+      fi
     else
       # `starting` now counts as not-yet-healthy, so this is reached when a real
       # healthcheck has not passed within the timeout -- not merely when a
@@ -6447,6 +6672,22 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
     fi
   fi
 
+  # ---- stage 10: classify the LIVE tree ------------------------------------
+  # Stage 9 compared two static trees, which is the integrity claim. This asks a
+  # different question: what has the restarted service done to its state since
+  # the snapshot was taken? A running service legitimately writes logs, touches
+  # locks and reopens its databases, so the answer is a classification, not an
+  # equality -- and a file that VANISHED is only acceptable when it is the kind of
+  # path a service is expected to remove.
+  #
+  # Reported but deliberately NOT part of the four claims: it describes the live
+  # tree, not the recovery point, and the recovery point is what a rollback uses.
+  # A genuine loss still prints a warning the operator cannot miss.
+  local live_ok=1
+  if [[ -n "$proof" ]]; then
+    migrate_report_live_tree "$DOMUM_SNAPSHOT_ROOT/$proof" "$path" || live_ok=0
+  fi
+
   echo
   # FOUR claims, reported separately. "Migration complete" used to be printed
   # before any of them was known, and the exit status was decided by one. The
@@ -6475,6 +6716,10 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
   else
     echo "  recovery point  : complete -- verified, and paired with the image that wrote it"
     echo "  recovery evidence: $recovery_meta"
+  fi
+
+  if [[ -n "$proof" ]] && (( live_ok == 0 )); then
+    echo "  live tree       : a file in the proof snapshot is GONE and is not expected churn"
   fi
 
   if (( restart_ok == 0 )); then

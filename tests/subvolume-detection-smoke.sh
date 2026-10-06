@@ -171,4 +171,24 @@ $a
 domum_subvolume_nested_children '$TMP_DIR/definitely-absent'" >/dev/null 2>&1 \
   || fail "the detector failed on a missing path instead of reporting nothing"
 
+# ---------------------------------------------------------------------------
+# The backup must NEVER use --one-file-system.
+#
+# A Btrfs subvolume gets its own anonymous st_dev. Measured on this host:
+# /srv/data is 45, while jellyfin=73, kavita=74 and navidrome=68. Every service
+# we protect by migrating it is therefore on a "different filesystem" as far as
+# a traversal is concerned, so `--one-file-system` would silently drop exactly
+# the directories with the highest-value data -- and the backup would still
+# report success. One word, and the most protected services stop being backed up.
+#
+# This asserts the absence of a flag, which is unusual, but the failure mode is
+# silent and the blast radius is the whole point of the project.
+BK="$REPO_ROOT/bin/domum-media-backup"
+[ -r "$BK" ] || fail "cannot read $BK"
+grep -qE -- '--one-file-system|-x[[:space:]]' "$BK" \
+  && fail "bin/domum-media-backup uses --one-file-system (or -x). Every migrated
+service is its own st_dev, so this silently excludes them from the backup."
+grep -q 'restic' "$BK" || fail "this assertion is vacuous: no restic invocation found in $BK"
+echo "  backup does not use --one-file-system (migrated subvolumes stay in scope)"
+
 echo "PASS: subvolume detection smoke test"
