@@ -6303,11 +6303,35 @@ underneath it would make that backup fail. Wait for it to finish and retry."
 
   compose_svcs="$(service_compose_services "$service" || true)"
 
-  # A migration stops and starts the service, and `up -d` deploys whatever image
-  # the tag now resolves to. Refuse rather than upgrade the application as a side
-  # effect of moving its data: the two decisions have different blast radii and
-  # different rollback stories, and bundling them means the proof snapshot holds
-  # the OLD application's data while the NEW application runs.
+  # A migration must not upgrade the application as a side effect of moving its
+  # data: the two decisions have different blast radii and different rollback
+  # stories, and bundling them means the proof snapshot holds the OLD
+  # application's data while the NEW application runs. That is the Kavita
+  # incident (docs/IMAGE-DEPLOYMENT-BY-MIGRATION.md).
+  #
+  # THIS USED TO REFUSE WHENEVER AN IMAGE WAS MERELY STAGED, and its own
+  # justification said "restarting it would DEPLOY that image". That was true when
+  # the migration restarted with `up -d`. It is NOT true of `compose start`, which
+  # is what migrate_restart has used since -- and which fails closed rather than
+  # falling back.
+  #
+  # Measured on this host, with a disposable compose project and no pull, retag or
+  # prune: a container created on image A, stopped, its compose file repointed at
+  # image B, then `compose start` -> the container stayed on A. `up -d` with the
+  # same file recreated it on B. `compose start` resolves no image reference at
+  # all, so a staged image cannot be deployed by this code path.
+  #
+  # Refusing on a merely-staged image therefore deadlocked the project: plex could
+  # not be UPGRADED because its state was unprotected, and could not be MIGRATED
+  # to gain protection because an upgrade was staged. Each gate was individually
+  # right and together they were a trap.
+  #
+  # So the control moves from prediction to verification:
+  #   * a staged image is reported loudly here and does NOT refuse;
+  #   * an image that actually CHANGED across the restart is a HARD failure after
+  #     the fact (see stage 8), not a warning;
+  #   * identity we could not determine still refuses BEFORE the stop, because a
+  #     recovery point whose application is unknown cannot be paired.
   local image_verdicts staged_images unknown_images absent_images
   image_verdicts="$(service_staged_image_changes "$service")"
   staged_images="$(grep '^STAGED '  <<< "$image_verdicts" || true)"
@@ -6325,13 +6349,12 @@ underneath it would make that backup fail. Wait for it to finish and retry."
       printf '  %s\n' "$staged_images$unknown_images" >&2
       warn "If it does, the proof snapshot will hold the previous application's data."
     elif [[ -n "$staged_images" ]]; then
-      die "Refusing: a newer image is already staged for $service, so restarting it would DEPLOY that image.
-$staged_images
-A storage migration must not upgrade the application as a side effect: the proof
-snapshot would hold the old application's data while the new one runs, and an
-application upgrade is a separate operator decision (CLAUDE.md sections 4 and 11).
-Deploy it deliberately first, or migrate a service with no staged image.
-To accept the upgrade as part of this migration, set MIGRATE_ALLOW_IMAGE_CHANGE=1."
+      # Not a refusal any more. `compose start` resolves no image reference, so
+      # this migration cannot deploy it -- and stage 8 FAILS if it somehow did.
+      migrate_stage preflight "a newer image is STAGED for $service and will NOT be deployed:"
+      printf '  %s\n' "$staged_images"
+      migrate_stage preflight "  the restart uses \`compose start\`, which resolves no image reference;"
+      migrate_stage preflight "  stage 8 fails the migration if the image changed anyway"
     else
       # "I could not tell" must never read as "nothing is staged". A migration is
       # attended and nothing has been touched yet, so refusing costs nothing --
@@ -6636,6 +6659,7 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
   # preflight refusal cannot see a tag that is absent locally, where `up -d`
   # pulls. An upgrade that happened anyway must be reported, not discovered later
   # from a schema that no longer matches the recovery point.
+  local image_changed=0
   if [[ -n "$compose_svcs" ]]; then
     local images_after
     images_after="$(service_running_images "$service")"
@@ -6653,6 +6677,14 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
       warn "  after : $(printf '%s' "$images_after" | tr '\n' ' ')"
       warn "The application was upgraded by this migration. The proof snapshot holds the"
       warn "PREVIOUS application's data, so it is a data recovery point, not a full rollback."
+      # HARD, not advisory. The pre-stop check no longer refuses on a merely
+      # staged image, because `compose start` cannot deploy one; this is what
+      # replaces that refusal, so it must not be a warning the summary ignores.
+      if [[ "${MIGRATE_ALLOW_IMAGE_CHANGE:-0}" == "1" ]]; then
+        warn "MIGRATE_ALLOW_IMAGE_CHANGE=1, so this is accepted deliberately."
+      else
+        image_changed=1
+      fi
     else
       migrate_stage health "image unchanged across the restart"
     fi
@@ -6716,6 +6748,11 @@ Check that ${DOMUM_STATE_ROOT:-/var/lib/domum-media}/snapshots is writable."
   else
     echo "  recovery point  : complete -- verified, and paired with the image that wrote it"
     echo "  recovery evidence: $recovery_meta"
+  fi
+
+  if (( image_changed == 1 )); then
+    echo "  application     : UPGRADED by this migration -- the recovery point pairs with the PREVIOUS image"
+    complete=0
   fi
 
   if [[ -n "$proof" ]] && (( live_ok == 0 )); then

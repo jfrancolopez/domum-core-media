@@ -251,14 +251,61 @@ staged_stub='docker() {
 }
 tracked_service_container_id() { printf "cid-%s" "$1"; }'
 
+# A merely STAGED image no longer refuses, and this scenario asserts the new
+# contract rather than the old one.
+#
+# The old assertion was "refuse before anything is touched", justified by
+# "restarting would deploy that image". That was true of `up -d` and is FALSE of
+# `compose start`, which migrate_restart has used since. Measured with a
+# disposable compose project and no pull/retag/prune: a container created on
+# image A, stopped, its compose file repointed at B, then `compose start` -> still
+# A; `up -d` with the same file -> recreated on B.
+#
+# Keeping the refusal deadlocked the project: plex could not be UPGRADED because
+# its state was unprotected, and could not be MIGRATED to gain protection because
+# an upgrade was staged. The control is now verification (below) rather than
+# prediction.
 d="$(run_migration staged-image "$staged_stub")"
-[ "$(cat "$d/rc")" != "0" ] || fail "staged image: the migration proceeded and would have deployed it: $(cat "$d/out.txt")"
-grep -q 'newer image is already staged' "$d/out.txt"   || fail "staged image: refused for the wrong reason: $(cat "$d/out.txt")"
-# Refused BEFORE anything was touched.
-[ ! -e "$d/data/jellyfin.premigration" ] || fail "staged image: refused, but the tree had already been moved"
-[ ! -e "$d/data/jellyfin.new" ] || fail "staged image: refused, but a staging copy was left behind"
-grep -q 'migrate\[stop\]' "$d/out.txt" && fail "staged image: the service was stopped before the refusal"
-assert_data_survives "$d" "staged image refused"
+[ "$(cat "$d/rc")" = "0" ] \
+  || fail "staged image: the migration refused, but \`compose start\` cannot deploy a staged
+image and refusing here is what deadlocked plex: $(cat "$d/out.txt")"
+grep -q 'is STAGED for jellyfin and will NOT be deployed' "$d/out.txt" \
+  || fail "staged image: the staged image was not reported: $(cat "$d/out.txt")"
+grep -q 'resolves no image reference' "$d/out.txt" \
+  || fail "staged image: the reason it is safe was not stated: $(cat "$d/out.txt")"
+grep -q 'Migration COMPLETE' "$d/out.txt" \
+  || fail "staged image: the migration did not complete: $(cat "$d/out.txt")"
+assert_data_survives "$d" "staged image proceeded"
+
+# ...and the backstop that REPLACES the refusal: if the image actually changed
+# across the restart, the migration is INCOMPLETE, not merely warned about.
+# A stateful stub: the FIRST call (before the stop) reports the old image, every
+# later call (after the restart) reports a newer one. `$dir` is not in scope
+# inside the generated harness, but DOMUM_DATA_ROOT is.
+changed_stub="$staged_stub
+service_running_images() {
+  local marker=\"\${DOMUM_DATA_ROOT}/../img-calls\"
+  if [ -e \"\$marker\" ]; then printf 'jellyfin sha256:NEWER\\n'
+  else : > \"\$marker\"; printf 'jellyfin sha256:running\\n'; fi
+}"
+d="$(run_migration image-changed "$changed_stub")"
+grep -q 'IS RUNNING A DIFFERENT IMAGE' "$d/out.txt" \
+  || fail "image changed: the change was not detected: $(cat "$d/out.txt")"
+grep -q 'application     : UPGRADED by this migration' "$d/out.txt" \
+  || fail "image changed: the summary did not report it as an upgrade: $(cat "$d/out.txt")"
+grep -q 'Migration INCOMPLETE' "$d/out.txt" \
+  || fail "image changed: reported COMPLETE despite an application upgrade -- this is the
+backstop for the removed refusal and must be hard: $(cat "$d/out.txt")"
+[ "$(cat "$d/rc")" != "0" ] || fail "image changed: exited 0 despite an upgrade"
+assert_data_survives "$d" "image changed"
+
+# With the deliberate override, the same change is accepted and said out loud.
+d="$(run_migration image-changed-ok "$changed_stub
+MIGRATE_ALLOW_IMAGE_CHANGE=1")"
+grep -q 'accepted deliberately' "$d/out.txt" \
+  || fail "image changed + override: not announced as deliberate: $(cat "$d/out.txt")"
+grep -q 'Migration INCOMPLETE' "$d/out.txt" \
+  && fail "image changed + override: still INCOMPLETE despite the explicit override: $(cat "$d/out.txt")"
 
 # The deliberate override deploys it, and says so rather than going quiet.
 d="$(run_migration staged-override "$staged_stub
@@ -377,7 +424,7 @@ d="$(run_migration image-unknown-override "$unknown_stub
 MIGRATE_ALLOW_IMAGE_CHANGE=1")"
 grep -q 'migrate\[stop\]' "$d/out.txt"   || fail "image unknown override: the migration did not proceed: $(cat "$d/out.txt")"
 
-echo "    staged image refused; undeterminable refused; stopped allowed; drift reported  OK"
+echo "    staged proceeds; actual change is INCOMPLETE; undeterminable refused; stopped allowed; drift reported  OK"
 
 echo "  success path:"
 d="$(run_migration success '')"

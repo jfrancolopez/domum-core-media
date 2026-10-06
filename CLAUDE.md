@@ -118,10 +118,24 @@ Classify every path that restarts a service, and never leave it implicit:
   point; they are gated on backup age, health and a snapshot.
 - **must preserve** — `storage migrate-subvolume`, `rollback apply`. These use
   **`compose start`**, which starts the container that was stopped and therefore
-  resolves no image reference at all. Do not "simplify" them to `up -d`: the
-  preflight staged-image comparison narrows that hole but cannot close it, since a
-  `docker pull` between check and restart re-points the tag and the operation lock
-  does not cover other tools.
+  resolves no image reference at all. Do not "simplify" them to `up -d`.
+
+  **Measured, 2026-10-06**, with a disposable compose project and no pull, retag
+  or prune: a container created on image A, stopped, its compose file repointed at
+  image B, then `compose start` → **still on A**. `up -d` with the same file →
+  recreated on B. So `compose start` is the control; the preflight staged-image
+  comparison is secondary.
+
+  **A merely STAGED image therefore must NOT refuse a migration.** It used to, and
+  the refusal's own text said "restarting it would DEPLOY that image" — true of
+  `up -d`, false of `compose start`. That deadlocked the project: Plex could not be
+  **upgraded** (state unprotected) and could not be **migrated** to gain protection
+  (an upgrade was staged). Each gate was individually right; together they were a
+  trap. The control is now verification, not prediction: a staged image is reported
+  and proceeds, an image that **actually changed** across the restart makes the
+  migration **INCOMPLETE** (not a warning), and identity that could not be
+  determined still refuses before the stop. `tests/staged-image-migration-smoke.sh`
+  pins all three; 6 mutants, all killed.
 - **must refuse when identity is ambiguous** — anything that would start a service
   for which no image identity was captured.
 
