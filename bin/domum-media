@@ -4139,12 +4139,22 @@ domum_image_id_full() {  # $1 = any image reference
 #
 # The selector consulted no recovery metadata at all before this.
 recovery_point_image_ids() {
-  local dir f
+  recovery_point_image_pairs | awk '{print $1}' | sort -u
+}
+
+# "<image-id> <recovery-point>" for every image any recovery point names, so the
+# report can say WHICH point depends on an image rather than only how many.
+recovery_point_image_pairs() {
+  local dir f point id
   dir="$(snapshot_metadata_dir 2>/dev/null)" || return 0
   [[ -n "$dir" && -d "$dir" ]] || return 0
   for f in "$dir"/*.recovery; do
     [[ -e "$f" ]] || continue
-    sed -nE "s/^CONTAINER_[0-9]+_IMAGE_ID='(.*)'\$/\1/p" "$f"
+    point="$(basename "$f" .recovery)"
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      printf '%s %s\n' "$id" "$point"
+    done < <(sed -nE "s/^CONTAINER_[0-9]+_IMAGE_ID='(.*)'\$/\1/p" "$f")
   done | sort -u
 }
 
@@ -4183,7 +4193,12 @@ collect_cleanup_image_ids() {
     # longer resolve is already gone and is not a candidate.
     full="$(domum_image_id_full "$candidate")"
     [[ -n "$full" ]] || continue
-    reason="$(awk -v id="$full" '$1 == id { print $2; exit }' "$protected")"
+    # EVERY reason, joined. First-match-wins reported plex's image as `in-use`
+    # only -- so the production dry run said "0 named by a recovery point" while
+    # the recovery rule was in fact covering that image too, and the output could
+    # not distinguish "the rule found nothing" from "nothing reached this branch".
+    # That ambiguity is what made the report unfalsifiable.
+    reason="$(awk -v id="$full" '$1 == id { printf "%s%s", sep, $2; sep="+" } END { print "" }' "$protected")"
     if [[ -n "$reason" ]]; then
       printf 'SKIP %s %s\n' "$full" "$reason" >&2
       continue
@@ -4208,20 +4223,43 @@ cleanup_images_execute() {
     ids+=("$id")
   done < <(collect_cleanup_image_ids 2>"$skips")
 
-  # Say what was PROTECTED, not just what is pruneable. A deletion tool that
-  # silently omits things gives the operator no way to notice that the protection
-  # stopped working -- and the in-use exclusion had been silently broken.
-  local n_inuse n_recovery
-  n_inuse="$(grep -c ' in-use$' "$skips" || true)"
-  n_recovery="$(grep -c ' recovery-point$' "$skips" || true)"
-  if [[ "${n_inuse:-0}" != "0" || "${n_recovery:-0}" != "0" ]]; then
-    echo "[domum-media] Protected from cleanup: ${n_inuse:-0} in use by a container, ${n_recovery:-0} named by a recovery point."
-    if [[ "${n_recovery:-0}" != "0" ]]; then
-      grep ' recovery-point$' "$skips" | awk '{printf "  kept %s  (a recovery point pairs with it)\n", substr($2,1,19)}'
-      echo "  Deleting one of those would leave the snapshot restorable but the"
-      echo "  application that wrote it unobtainable."
+  # Report the recovery-image SET FIRST, and independently of what it blocked.
+  #
+  # The previous version printed only "N named by a recovery point", counting
+  # candidates BLOCKED by that reason. In production that was 0 -- correctly, and
+  # uninformatively: the only recovery-named image that is also a cleanup
+  # candidate is plex's, and it was attributed to `in-use` because that reason was
+  # checked first. So the line could not distinguish "no recovery metadata exists"
+  # from "the rule found nothing to block", and the operator had no way to tell
+  # whether the protection worked at all. A safety report that cannot be falsified
+  # is not a safety report.
+  local n_named=0 n_present=0 id point
+  while read -r id point; do
+    [[ -n "$id" ]] || continue
+    n_named=$(( n_named + 1 ))
+    if docker image inspect "$id" >/dev/null 2>&1; then
+      n_present=$(( n_present + 1 ))
+      printf '  names %s  %s\n' "${id:0:19}" "$point"
+    else
+      printf '  names %s  %s  (NOT present locally)\n' "${id:0:19}" "$point"
     fi
+  done < <(recovery_point_image_pairs) > "$skips.named"
+  if (( n_named > 0 )); then
+    echo "[domum-media] Recovery points name $n_named image(s); $n_present present on this host:"
+    cat "$skips.named"
+    echo "  Deleting one of those leaves the snapshot restorable and the application"
+    echo "  that wrote it unobtainable."
+  else
+    echo "[domum-media] No recovery point names any image -- nothing to protect on that basis."
   fi
+  rm -f "$skips.named"
+
+  # Then what was actually withheld, by every applicable reason.
+  local n_inuse n_recovery n_both
+  n_inuse="$(grep -c ' in-use' "$skips" || true)"
+  n_recovery="$(grep -c 'recovery-point' "$skips" || true)"
+  n_both="$(grep -c ' in-use+recovery-point$\| recovery-point+in-use$' "$skips" || true)"
+  echo "[domum-media] Withheld from cleanup: $(grep -c '^SKIP ' "$skips" || true) image(s) -- ${n_inuse:-0} in use by a container, ${n_recovery:-0} named by a recovery point (${n_both:-0} by both)."
   rm -f "$skips"
 
   if (( ${#ids[@]} == 0 )); then
