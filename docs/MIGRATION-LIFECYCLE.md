@@ -66,18 +66,60 @@ foreign-key violations in all three.
 
 Not ignored — **classified**:
 
-1. **Hard failure** if any file present in E is *missing* from F. Files may be
-   added or rewritten by a running service; a file that vanished is different.
-2. **Reported** otherwise, split into expected runtime state and anything else:
+This is **migration stage 10**, `migrate_report_live_tree`, which classifies
+rather than compares. Every differing path gets exactly one record:
 
-   | pattern | why it is expected |
-   |---|---|
-   | `*/log/*`, `*.log`, `*/.*-log` | a running service logs |
-   | `*/ScheduledTasks/*` | task run timestamps are rewritten on startup |
-   | `*.pid`, `*.lock`, `*.sock` | runtime locks |
-   | `*-wal`, `*-shm`, `*-journal` | SQLite sidecars exist only while the DB is open |
+| record | meaning | fails the stage? |
+|---|---|---|
+| `CHURN` | changed or appeared, and is expected runtime state | no |
+| `PRUNED` | gone from the live tree, and is expected runtime state | no |
+| `CHANGED` | in both, content differs, **not** runtime state | no — reported |
+| `ADDED` | only in the live tree, **not** runtime state | no — reported |
+| `LOST` | gone from the live tree, **not** runtime state | **yes** |
 
-   Anything outside that list is printed for review.
+Expected runtime state is `migrate_runtime_expected`:
+
+| pattern | why it is expected |
+|---|---|
+| `*/log/*`, `*/logs/*`, `*/Log/*`, `*/Logs/*`, `*.log`, `*.log.*` | a running service logs |
+| `*/ScheduledTasks/*`, `*/temp/*`, `*/tmp/*`, `*/Temp/*` | task timestamps and scratch |
+| `*/cache/*`, `*/cache-*/*`, `*/Cache/*`, `*/caches/*` | regenerable |
+| `*/thumbnails/*`, `*/covers/*`, `*/favicons/*`, `*/bookmarks/*` | regenerable |
+| `*/Crash Reports/*`, `*/Codecs/*`, `*/Updates/*` | Plex: regenerable or re-downloadable |
+| `*.pid`, `*.lock`, `*.sock` | runtime locks |
+| `*-wal`, `*-shm`, `*-journal` | SQLite sidecars exist only while the DB is open |
+
+Anything outside that list is printed for review.
+
+### It was documented here long before it existed in the CLI
+
+This section described the classification as part of the migration while the CLI
+had no such stage: stages ran 1–9, ending at the recovery-point proof. The only
+implementation lived in the operator wrapper, outside CI — the same shape as the
+topology invariant that aborted a correct deployment. It is now
+`migrate_classify_live_tree` / `migrate_report_live_tree` in `bin/domum-media`,
+covered by `tests/live-tree-classification-smoke.sh` (12 cases, 9 mutants), and
+the wrapper invokes it instead of carrying a copy.
+
+### Two things Plex broke that the wrapper's version got wrong
+
+**Paths with spaces.** The wrapper iterated `for f in $CHANGED $ADDED`, which
+word-splits. Measured on real Plex paths, two entries became **eleven
+fragments** — and because `Server.2.log` matches `*.log` while `Support/Plex`
+matches nothing, pieces of a single path were classified differently from each
+other. `config/Library/Application Support/Plex Media Server/…` makes that
+output meaningless. Everything is NUL-delimited now.
+
+**"Missing is a hard failure" is false for Plex.** The wrapper aborted
+unconditionally when a snapshotted file was absent from the live tree. That held
+for Jellyfin, Kavita and Navidrome. Plex rotates `Plex Media Server.N.log` and
+prunes its own dated database backups (`com.plexapp.plugins.library.db-YYYY-MM-DD`,
+four retained) — so ordinary log rotation would have failed a correct migration.
+A disappearance is now split the same way an addition is: `PRUNED` when it is
+expected churn, `LOST` otherwise, and only `LOST` fails.
+
+A dated backup is still a *database*, so its removal reports `LOST` rather than
+being filed as churn: the operator sees it, and decides.
 
 The **database file itself is deliberately not on that list.** Sidecars appearing
 proves the service opened its database; the `.db` content changing is a different

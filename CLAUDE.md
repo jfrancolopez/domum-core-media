@@ -227,6 +227,20 @@ naming no line, so the finding could not be acted on. An unactionable `FAIL`
 trains the operator to ignore it. Prefer an explicit allow-list of expected keys
 over an entropy heuristic.
 
+**Never add `--one-file-system` (or `-x`) to the restic backup.** A Btrfs
+subvolume gets its own anonymous `st_dev` — measured: `/srv/data` is 45 while
+jellyfin=73, kavita=74, navidrome=68 — so that one flag would silently drop every
+migrated service, i.e. exactly the highest-value data, and the backup would still
+report success. `tests/subvolume-detection-smoke.sh` asserts its absence.
+
+**Plex's running image is `identity,local` only.** Measured: `RepoTags: []` **and**
+`RepoDigests: []` — it is dangling, because a newer `:latest` was pulled and moved
+the tag. It survives solely because a running container references it, so the
+moment Plex is upgraded the old image becomes prunable and the recovery point's
+application half turns fragile exactly when it starts to matter. The version is
+recoverable only as a label (`1.43.2.10687-563d026ea-ls308`), which is
+compatibility information, not a retrievable reference.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
@@ -465,10 +479,24 @@ was moved aside against a snapshot of the copy that replaced it. Both are static
 so a running application cannot disturb the comparison, and it catches corruption
 introduced after `migrate_verify` has already passed.
 
-The live tree is **classified, not compared**: a hard failure if a snapshotted
-file is missing, otherwise reported and split into expected runtime state (logs,
-locks, scheduled tasks, SQLite `-wal`/`-shm`) and anything else. A database file
-is never on that allowlist.
+The live tree is **classified, not compared** — migration stage 10,
+`migrate_report_live_tree`. Each differing path gets one record: `CHURN`/`PRUNED`
+for expected runtime state, `CHANGED`/`ADDED` reported for review, and `LOST`
+(gone and *not* expected churn) is the only one that fails. A database file is
+never on the expected-churn allowlist, including a dated backup.
+
+**"Missing is a hard failure" was false, and only Plex showed it.** That rule
+held for the first three services and would have aborted a correct Plex
+migration on ordinary log rotation and on Plex pruning its own dated database
+backups. A disappearance is split the same way an addition is.
+
+**This check lived only in the operator wrapper while two docs claimed the CLI
+did it** — stages ran 1–9. It is now one implementation in `bin/domum-media`,
+tested by `tests/live-tree-classification-smoke.sh`, invoked by the wrapper. The
+wrapper's copy also iterated `for f in $CHANGED $ADDED`, which word-splits: two
+real Plex paths became eleven fragments, classified inconsistently with each
+other. Anything walking service paths must be NUL-delimited; Plex is the first
+service whose paths contain spaces.
 
 Full detail and the measured evidence: `docs/MIGRATION-LIFECYCLE.md`.
 
