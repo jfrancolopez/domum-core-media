@@ -124,6 +124,11 @@ jobs:
       - name: SQLite unsupported classification smoke test
         run: tests/sqlite-unsupported-smoke.sh
 
+      # `cleanup images` must not delete an image a container uses, nor one a
+      # recovery point pairs with.
+      - name: Cleanup image protection smoke test
+        run: tests/cleanup-image-protection-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh

@@ -4113,10 +4113,60 @@ image_ids_used_by_any_container() {
   done | sort -u
 }
 
+# Canonicalise an image reference to its full sha256 id, through docker, so no
+# comparison can be defeated by format.
+#
+# THIS IS WHY. `docker images -q` yields SHORT ids (`58f13a1df833`) while
+# `{{.Image}}` yields `sha256:<64 hex>`, and the in-use exclusion below compared
+# the two with `grep -Fxq` -- which can never match. Measured on this host: FOUR
+# images belonging to RUNNING containers were offered as deletion candidates
+# (plex 58f13a1df833, calibre-web 6cf7dab48a4a, traefik 9c3b91d5fb77,
+# uptime-kuma a8610b3b4c38) because each is dangling: a newer `:latest` moved the
+# tag off it. Docker would refuse to remove an image a container uses, but the
+# whole batch goes to one `docker image rm`, and the moment such a service is
+# upgraded its old image stops being in use and the deletion succeeds.
+domum_image_id_full() {  # $1 = any image reference
+  docker image inspect -f '{{.Id}}' "$1" 2>/dev/null
+}
+
+# Image ids a recovery point's evidence names.
+#
+# Deleting one of these destroys the APPLICATION half of a recovery point: the
+# snapshot still restores the data, but the application that wrote it can no
+# longer be obtained, and restoring that data under a different build is exactly
+# the pairing failure the evidence exists to prevent. Plex's is `identity,local`
+# -- RepoTags and RepoDigests both empty -- so the local object is the ONLY copy.
+#
+# The selector consulted no recovery metadata at all before this.
+recovery_point_image_ids() {
+  local dir f
+  dir="$(snapshot_metadata_dir 2>/dev/null)" || return 0
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  for f in "$dir"/*.recovery; do
+    [[ -e "$f" ]] || continue
+    sed -nE "s/^CONTAINER_[0-9]+_IMAGE_ID='(.*)'\$/\1/p" "$f"
+  done | sort -u
+}
+
+# Prints "<full-id> <reason>" for every image that must NOT be deleted.
+cleanup_protected_image_ids() {
+  local id full
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    full="$(domum_image_id_full "$id")"
+    [[ -n "$full" ]] && printf '%s in-use\n' "$full"
+  done < <(image_ids_used_by_any_container)
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    full="$(domum_image_id_full "$id")"
+    [[ -n "$full" ]] && printf '%s recovery-point\n' "$full"
+  done < <(recovery_point_image_ids)
+}
+
 collect_cleanup_image_ids() {
-  local tmp
-  tmp="$(mktemp)"
-  image_ids_used_by_any_container > "$tmp"
+  local protected candidate full reason
+  protected="$(mktemp)" || return 1
+  cleanup_protected_image_ids > "$protected"
 
   {
     docker images --filter dangling=true -q 2>/dev/null || true
@@ -4127,14 +4177,21 @@ collect_cleanup_image_ids() {
       [[ -n "${IMAGE_BEFORE:-}" ]] && printf '%s\n' "$IMAGE_BEFORE"
       [[ -n "${IMAGE_AFTER:-}" ]] && printf '%s\n' "$IMAGE_AFTER"
     done
-  } | sort -u | while IFS= read -r image_id; do
-    [[ -n "$image_id" ]] || continue
-    docker image inspect "$image_id" >/dev/null 2>&1 || continue
-    grep -Fxq "$image_id" "$tmp" && continue
-    printf '%s\n' "$image_id"
+  } | sort -u | while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    # Resolve BOTH sides to a full id before comparing. A candidate docker can no
+    # longer resolve is already gone and is not a candidate.
+    full="$(domum_image_id_full "$candidate")"
+    [[ -n "$full" ]] || continue
+    reason="$(awk -v id="$full" '$1 == id { print $2; exit }' "$protected")"
+    if [[ -n "$reason" ]]; then
+      printf 'SKIP %s %s\n' "$full" "$reason" >&2
+      continue
+    fi
+    printf '%s\n' "$full"
   done
 
-  rm -f "$tmp"
+  rm -f "$protected"
 }
 
 cleanup_images_execute() {
@@ -4144,10 +4201,28 @@ cleanup_images_execute() {
   local total_size=0
   local size
 
+  local skips
+  skips="$(mktemp)" || return 1
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     ids+=("$id")
-  done < <(collect_cleanup_image_ids)
+  done < <(collect_cleanup_image_ids 2>"$skips")
+
+  # Say what was PROTECTED, not just what is pruneable. A deletion tool that
+  # silently omits things gives the operator no way to notice that the protection
+  # stopped working -- and the in-use exclusion had been silently broken.
+  local n_inuse n_recovery
+  n_inuse="$(grep -c ' in-use$' "$skips" || true)"
+  n_recovery="$(grep -c ' recovery-point$' "$skips" || true)"
+  if [[ "${n_inuse:-0}" != "0" || "${n_recovery:-0}" != "0" ]]; then
+    echo "[domum-media] Protected from cleanup: ${n_inuse:-0} in use by a container, ${n_recovery:-0} named by a recovery point."
+    if [[ "${n_recovery:-0}" != "0" ]]; then
+      grep ' recovery-point$' "$skips" | awk '{printf "  kept %s  (a recovery point pairs with it)\n", substr($2,1,19)}'
+      echo "  Deleting one of those would leave the snapshot restorable but the"
+      echo "  application that wrote it unobtainable."
+    fi
+  fi
+  rm -f "$skips"
 
   if (( ${#ids[@]} == 0 )); then
     echo "[domum-media] No pruneable images found."

@@ -287,6 +287,22 @@ way to re-run that proof was to re-run a migration — which cannot be done twic
 so a false negative left no route to a clean verdict. It refuses honestly once
 `.premigration` is gone, because the comparison then has no left-hand side.
 
+**`cleanup images` must never delete an image a recovery point pairs with, and
+its in-use exclusion was broken.** `docker images -q` yields SHORT ids while
+`{{.Image}}` yields `sha256:<64 hex>`, and the exclusion compared them with
+`grep -Fxq` — which can never match. Measured: **four images belonging to RUNNING
+containers** were offered as deletion candidates (plex, calibre-web, traefik,
+uptime-kuma — each dangling because a newer `:latest` moved the tag off it).
+Separately, the selector consulted no recovery metadata at all, so upgrading a
+service would make its paired image deletable: the snapshot would still restore
+the data while the application that wrote it became unobtainable. Plex's pairing
+is `identity,local`, so the local object is the only copy. Both sides are now
+canonicalised through `docker image inspect -f '{{.Id}}'`, recovery-point images
+are protected by name, and the dry run **says what it protected** — a deletion
+tool that silently omits things gives no way to notice the protection broke.
+`tests/cleanup-image-protection-smoke.sh`; 6 mutants, all killed. `cleanup` stays
+operator-initiated: `--confirm` required, and on no timer.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
