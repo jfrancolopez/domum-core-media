@@ -161,3 +161,47 @@ refuses to start the service is worse than one that starts it on a newer image,
 and `apply` is convergence, where recreating containers is the point. The honest
 fix for those is backlog task-24 — roll the image back with the data — not a
 refusal. They are named here so the gap is not mistaken for coverage.
+
+
+## Update, 2026-10-06: the refusal was over-broad and had to be narrowed
+
+The control this incident produced was: refuse the migration whenever a newer
+image is merely *staged*. Preparing Plex showed that this had become wrong in two
+ways.
+
+**Its justification no longer matched the code.** The refusal said "restarting it
+would DEPLOY that image". That was true when the migration restarted with
+`up -d` — the mechanism that caused this incident. `migrate_restart` has used
+`compose start` since, and fails closed rather than falling back.
+
+Measured on the N100, with a disposable compose project and no pull, retag or
+prune:
+
+| step | container image |
+|---|---|
+| `up -d` with `image: A` | A |
+| `stop`, repoint the compose file at `image: B` | — |
+| **`compose start`** | **still A** |
+| `up -d` with the same file | recreated on B |
+
+`compose start` resolves no image reference at all, so a staged image cannot be
+deployed by that path.
+
+**And it deadlocked the project.** Plex could not be upgraded, because the
+upgrade gate correctly requires a service-specific recovery point and Plex's
+state was `unprotected`. Plex could not be migrated to *create* that recovery
+point, because an upgrade was staged. Two correct gates composed into a trap, and
+the only escapes were `MIGRATE_ALLOW_IMAGE_CHANGE=1` — i.e. re-committing this
+incident — or deleting the staged image.
+
+The control moved from prediction to verification:
+
+- a **staged** image is reported loudly and does **not** refuse;
+- an image that **actually changed** across the restart makes the migration
+  **INCOMPLETE**, hard, not a warning the summary ignores — this is what replaces
+  the refusal;
+- identity that could **not be determined** still refuses *before* the stop,
+  because a recovery point whose application is unknown cannot be paired.
+
+`MIGRATE_ALLOW_IMAGE_CHANGE=1` now means "I accept an actual image change", which
+is the only thing left worth overriding.

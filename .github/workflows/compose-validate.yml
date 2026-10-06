@@ -115,6 +115,11 @@ jobs:
       - name: Live tree classification smoke test
         run: tests/live-tree-classification-smoke.sh
 
+      # A staged image must not refuse the migration (compose start cannot deploy
+      # it), but an image that actually changed must fail it.
+      - name: Staged image migration smoke test
+        run: tests/staged-image-migration-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
