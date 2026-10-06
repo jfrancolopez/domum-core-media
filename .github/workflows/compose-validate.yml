@@ -120,6 +120,10 @@ jobs:
       - name: Staged image migration smoke test
         run: tests/staged-image-migration-smoke.sh
 
+      # "I could not check this database" is not "it is broken".
+      - name: SQLite unsupported classification smoke test
+        run: tests/sqlite-unsupported-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
