@@ -210,6 +210,23 @@ immediately** — including `snapshot prune`, which deletes. Check
 `LastTriggerUSec` against `NextElapseUSecRealtime` before rebooting rather than
 assuming; see `docs/REBOOT-READINESS.md`.
 
+**A reboot is not an image-deployment vector — demonstrated, not argued.** The
+2026-10-05 reboot (`6.12.107` → `6.12.111`) brought back all eleven containers as
+the *same objects*, original IDs and `Created` timestamps intact, with only
+`StartedAt` moving. Four services had a newer image staged locally under the same
+tag and all four stayed on the old one. Nothing at boot runs compose, so no tag is
+resolved. Keep it that way: no `domum-media-*.service` may gain `WantedBy`, and no
+timer may gain `OnBootSec`/`OnStartupSec`.
+
+**A safety check must be tested against the data it will actually see, and a
+failing check must name what it matched.** The capture validator's first "no
+secrets" assertion matched `[A-Za-z0-9+/]{60,}={0,2}$` and failed on the real
+capture — because a 64-character hex digest matches that shape, and digests are
+the capture's most ordinary field. It then said only "a secret-looking value",
+naming no line, so the finding could not be acted on. An unactionable `FAIL`
+trains the operator to ignore it. Prefer an explicit allow-list of expected keys
+over an entropy heuristic.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
