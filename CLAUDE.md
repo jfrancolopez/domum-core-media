@@ -303,6 +303,28 @@ tool that silently omits things gives no way to notice the protection broke.
 `tests/cleanup-image-protection-smoke.sh`; 6 mutants, all killed. `cleanup` stays
 operator-initiated: `--confirm` required, and on no timer.
 
+**A safety report that cannot be falsified is not a safety report.** The
+`cleanup images` dry run printed "`0 named by a recovery point`" in production.
+That number counted candidates *blocked by that reason*, and it was genuinely 0 —
+the only recovery-named image that is also a cleanup candidate is Plex's, and
+`in-use` was checked first and won under first-match-wins. So the line could not
+distinguish "no recovery metadata exists" from "nothing reached that branch", and
+neither reading could be ruled out. It now reports the recovery-image **set**
+(how many images recovery points name, how many are present locally, and which
+point names each) independently of what it withheld, and attributes **every**
+applicable reason rather than the first. `tests/cleanup-image-protection-smoke.sh`
+drives `cleanup_cmd` itself for exactly this reason; 7 mutants, all killed.
+
+**A fixture-backed probe is not production evidence.** The verification that
+missed the above stubbed `snapshot_metadata_dir` to a scratch directory and wrote
+a `.recovery` file naming an image of its own choosing — then reported the result
+as confirmation that production was protected. The real command disagreed. When a
+check cannot read the real input, say that; do not substitute an input and
+present the outcome as evidence. Relatedly, `grep -qx "<id>"` against
+`cleanup images` output can never match, because the command prints
+`<id> [tags]` — three absence assertions were vacuously true until that was
+found.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
