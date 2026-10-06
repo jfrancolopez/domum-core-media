@@ -47,7 +47,20 @@ directories, dry runs, or an isolated scratch restore location.
 
 ## 3. Btrfs truth
 
-**`jellyfin` is migrated and protected as of 2026-09-25.** `/srv/data/jellyfin` is
+**Four services are migrated and protected: `jellyfin` (2026-09-25), `kavita`
+(2026-09-29), `navidrome` (2026-09-29) and `plex` (2026-10-06).** Each is a real
+Btrfs subvolume with a verified read-only proof snapshot and retained
+`.premigration`. Plex is the one with symlinks (7, one absolute into the
+container's `/config` namespace) and the weakest application pairing
+(`identity,local`: both `RepoTags` and `RepoDigests` empty, so the image is
+dangling and survives only because a container references it). Its migration
+deliberately did **not** deploy its staged image, which was the point of doing
+it. `docs/PLEX-MIGRATION-RESULT.md` holds the evidence.
+
+**Still ordinary directories: `calibre-web` and `immich`** — so their upgrades
+remain correctly blocked, and `calibre-web` still has a staged image waiting.
+
+**`jellyfin` was the first, on 2026-09-25.** `/srv/data/jellyfin` is
 a real Btrfs subvolume (inode 256, `st_dev` 51 vs the parent's 45) with a verified
 read-only proof snapshot. `docs/JELLYFIN-PILOT-RESULT.md` holds the evidence.
 `/srv/data/jellyfin.premigration` and that snapshot are both retained deliberately
