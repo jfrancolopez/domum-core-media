@@ -190,12 +190,17 @@ note "captured $N_BEFORE container identities"
 before upgrading: the scope proof compares this set before and after."
 # The old image must be protected AFTERWARDS. Record whether cleanup can even
 # see it now, so "protected after" cannot be confused with "never considered".
-if cleanup_says_candidate "$OLD_IMG"; then
-  note "NOTE: the old image is currently a cleanup candidate (no recovery point"
-  note "      names it yet). The upgrade is what creates that protection."
-else
-  note "the old image is not currently a cleanup candidate"
-fi
+cleanup_says_candidate "$OLD_IMG"; CAND_RC=$?
+case "$CAND_RC" in
+  0) note "NOTE: the old image is currently a cleanup candidate (no recovery point"
+     note "      names it yet). The upgrade is what creates that protection." ;;
+  1) note "the old image is not currently a cleanup candidate" ;;
+  # rc 2 means the QUERY failed, which is not the same as "not a candidate".
+  # Reading a failed query as reassurance is the shape of defect this project
+  # keeps finding; the post-upgrade check below treats it as fatal.
+  *) note "WARNING: could not read the structured cleanup records (exit $CAND_RC)."
+     note "         Nothing can be concluded about the old image's protection yet." ;;
+esac
 
 if [ "$PREFLIGHT_ONLY" = 1 ]; then
   printf '\nPREFLIGHT ONLY — every check above passed and nothing was changed.\n'
