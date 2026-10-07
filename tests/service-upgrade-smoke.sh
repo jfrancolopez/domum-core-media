@@ -180,7 +180,17 @@ application on restored data -- task-24's exact defect."
 echo "  pins <SERVICE>_IMAGE; deliberately recreates instead of start"
 
 echo "== 11. ROLLBACK preserves the failed state and deletes nothing =="
-grep -q 'failed-\$(date' <<< "$rb" || fail "the failed state is not preserved under a timestamped name"
+# Behaviour, not a literal: the SC2155 fix split this into `stamp=$(date ...)`
+# plus `failed="${path}.failed-${stamp}"`, and an assertion on the old one-liner
+# broke on correct code.
+grep -q 'failed="\${path}.failed-' <<< "$rb" \
+  || fail "the failed state is not preserved under a .failed-<timestamp> name"
+grep -qE 'stamp="\$\(date ' <<< "$rb" \
+  || fail "the preserved name carries no timestamp, so a second rollback would
+collide with the first"
+grep -q 'die "cannot read the clock"' <<< "$rb" \
+  || fail "a failing date is not checked, so the name could lose its timestamp
+silently (SC2155: declare and assign separately)"
 grep -qE '^\s*rm -rf|^\s*btrfs subvolume delete' <<< "$rb" \
   && fail "the rollback deletes something; the failed state must be retained for investigation"
 grep -q 'retained deliberately' <<< "$rb" || fail "it does not tell the operator the failed state was kept"

@@ -78,4 +78,43 @@ grep -q 'logrotate.d/domum-media' "$REPO_ROOT/bin/domum-media" \
 grep -E 'logrotate/domum-media' "$REPO_ROOT/install.sh" | grep -q -- '-m 0644' \
   || fail "4: the logrotate config itself should be installed 0644"
 
+# ---------------------------------------------------------------------------
+# The --help text lives in an UNQUOTED `cat <<EOF`, so a backtick or $( ) in it
+# is command substitution, not documentation.
+#
+# Measured: usage text containing a backticked `apply --service <s>` printed as
+# "  upgrades ONE ... Bare  is the" -- the backticked words were EXECUTED and
+# vanished, and `<s>` inside the substitution parsed as an input redirection.
+# shellcheck reported it as a parse error; `--help` would have shown it to anyone
+# who looked.
+#
+# Scoped deliberately. A first version flagged every heredoc and tripped on
+# `TIMESTAMP='$(date -Iseconds)'` inside a QUOTED one, which is literal and
+# correct. A second flagged every unquoted `cat <<EOF` and tripped on
+# "$(immich_postgres_data_dir)", which deliberately interpolates a real path into
+# a message.
+#
+# So: a BACKTICK is always wrong in message text, and $( ) is only wrong in the
+# `Usage:` block, where everything is documentation rather than a value.
+for cli in "$REPO_ROOT/bin/domum-media" "$REPO_ROOT/bin/domum-media-backup" "$REPO_ROOT/bin/domum-media-report"; do
+  [ -r "$cli" ] || continue
+  all_unquoted="$(awk '/^[[:space:]]*cat <<EOF$/{inside=1; next} inside && /^EOF$/{inside=0} inside' "$cli")"
+  if [ -n "$all_unquoted" ] && grep -q '`' <<< "$all_unquoted"; then
+    grep -n '`' <<< "$all_unquoted" | head -3 >&2
+    fail "$(basename "$cli"): a backtick in an unquoted heredoc is command
+substitution. Message text would be executed and silently disappear."
+  fi
+  usage="$(awk '
+    /^[[:space:]]*cat <<EOF$/ { buf=""; inside=1; next }
+    inside && /^EOF$/         { if (buf ~ /Usage:/) printf "%s", buf; inside=0; next }
+    inside                    { buf = buf $0 "\n" }
+  ' "$cli")"
+  if [ -n "$usage" ] && grep -qE '\$\(' <<< "$usage"; then
+    grep -nE '\$\(' <<< "$usage" | head -3 >&2
+    fail "$(basename "$cli"): \$( ) in the Usage heredoc. Help text is
+documentation, not a value: quote the heredoc or build that line separately."
+  fi
+done
+echo "  no backticks in unquoted heredocs; no substitution in the Usage block"
+
 echo "PASS: log hygiene smoke test"

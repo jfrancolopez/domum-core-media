@@ -384,6 +384,24 @@ recreates deliberately; and preserves the failed state as `.failed-<timestamp>`.
 time while a text-grep test still passes. `export_env_for_compose` uses
 `${PLEX_IMAGE:-default}`, so a value exported first is preserved.
 
+**The `--help` text lives in an UNQUOTED `cat <<EOF`, so a backtick or `$( )`
+there is command substitution, not documentation.** Measured: usage text
+containing a backticked `apply --service <s>` printed as
+`"  upgrades ONE … Bare  is the"` — the backticked words were **executed and
+vanished**, and `<s>` inside the substitution parsed as an input redirection
+(shellcheck reported it as a parse error). `tests/log-hygiene-smoke.sh` now
+rejects a backtick in any unquoted heredoc, and `$( )` in the `Usage:` block
+specifically — a deliberate `$(immich_postgres_data_dir)` in a *message* heredoc
+is fine, which is why the check distinguishes them.
+
+**A metadata key read but never written is silently empty.**
+`sed -nE "s/^KEY='(.*)'$/\1/p"` against a key nobody emits matches nothing: no
+error, well-formed output, wrong answer. It happened — new code read
+`..._IMAGE_VERSION` while the writer emits `..._IMAGE_LABEL_VERSION`.
+`tests/recovery-metadata-keys-audit.py` compares the written and read sets across
+the whole file and fails if its own extraction patterns stop matching, so it
+cannot pass vacuously.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded

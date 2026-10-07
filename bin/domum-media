@@ -7519,7 +7519,9 @@ could not, and starting it under a different build is the failure this prevents.
   compose_cmd stop $compose_svcs || die "Could not stop $compose_svcs; nothing was restored"
 
   # ---- 3. preserve the failed state; never delete it ------------------------
-  local failed="${path}.failed-$(date +%Y%m%d-%H%M%S)"
+  local failed stamp
+  stamp="$(date +%Y%m%d-%H%M%S)" || die "cannot read the clock"
+  failed="${path}.failed-${stamp}"
   echo "[domum-media] 3/5: preserving the current state at $failed"
   mv -- "$path" "$failed" || die "Could not move $path aside; nothing was restored"
 
@@ -7585,7 +7587,7 @@ could not, and starting it under a different build is the failure this prevents.
 storage_archives() {
   need_root
   load_cfg
-  local dir meta_dir f base img point svc ver sha bytes want_sha needed n=0 orphans=0
+  local dir meta_dir f base img point svc ver sha bytes want_sha n=0 orphans=0
   dir="$(image_archive_dir)"
   meta_dir="$(snapshot_metadata_dir)"
 
@@ -7621,7 +7623,6 @@ storage_archives() {
     echo "  path            : $f"
     echo "  bytes           : $bytes"
     if [[ -n "$point" ]]; then
-      needed=yes
       echo "  needed by       : $point   (service ${svc:-?})"
       echo "  image id        : ${img:-<not recorded>}"
       [[ -n "$ver" ]] && echo "  version         : $ver"
@@ -7640,7 +7641,6 @@ storage_archives() {
       fi
       echo "  safe to delete  : NO"
     else
-      needed=no
       orphans=$(( orphans + 1 ))
       echo "  needed by       : nothing -- no retained recovery point names it"
       echo "  safe to delete  : operator review (nothing here deletes it)"
@@ -8004,10 +8004,10 @@ Usage:
   domum-media status [--counts]
   domum-media update
   domum-media updates {summary|check|apply [--service <service> [--dry-run]]|history}
-                                            `apply --service <s>` upgrades ONE
-                                            service, with pre-upgrade protection
-                                            it cannot skip. Bare `apply` is the
-                                            fleet path and cannot target one
+                                            apply --service upgrades ONE service,
+                                            with pre-upgrade protection it cannot
+                                            skip. Bare apply is the fleet path
+                                            and cannot target one service
   domum-media refresh-images [--force] [--check-only] [--apply-now]
   domum-media host-upgrade [--force]
   domum-media logs <service>
