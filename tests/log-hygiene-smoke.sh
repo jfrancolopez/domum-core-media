@@ -139,12 +139,21 @@ echo "== every unquoted heredoc in the repository =="
 hits="$(
   while IFS= read -r f; do
     awk -v F="$f" '
+      # A QUOTED heredoc body is literal data: skip it entirely, INCLUDING when
+      # it contains an unquoted opener. That nesting is how this check first
+      # flagged its own probe fixtures.
+      quoted { if ($0 == qterm) quoted = 0; next }
       inside {
         if ($0 == term) { inside = 0; next }
-        if (index($0, "`") > 0) printf "%s:%d: %s\n", F, NR, $0
+        if (index($0, "\140") > 0) printf "%s:%d: %s\n", F, NR, $0
         next
       }
-      # An UNQUOTED heredoc opener only: <<WORD or <<-WORD, never <<"WORD"/<<\x27WORD\x27
+      match($0, /<<-?[[:space:]]*["\047][A-Za-z_][A-Za-z0-9_]*["\047][[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        gsub(/^<<-?[[:space:]]*["\047]|["\047][[:space:]]*$/, "", t)
+        qterm = t; quoted = 1; next
+      }
+      # An UNQUOTED opener only: <<WORD or <<-WORD.
       match($0, /<<-?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$/) {
         t = substr($0, RSTART, RLENGTH)
         sub(/^<<-?[[:space:]]*/, "", t)
@@ -178,17 +187,28 @@ INNER
 PROBE
 scan_one() {  # $1 = file -> prints violations
   awk -v F="$1" '
-    inside {
-      if ($0 == term) { inside = 0; next }
-      if (index($0, "`") > 0) printf "%s:%d\n", F, NR
-      next
-    }
-    match($0, /<<-?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$/) {
-      t = substr($0, RSTART, RLENGTH)
-      sub(/^<<-?[[:space:]]*/, "", t); sub(/[[:space:]]*$/, "", t)
-      term = t; inside = 1
-    }
-  ' "$1"
+      # A QUOTED heredoc body is literal data: skip it entirely, INCLUDING when
+      # it contains an unquoted opener. That nesting is how this check first
+      # flagged its own probe fixtures.
+      quoted { if ($0 == qterm) quoted = 0; next }
+      inside {
+        if ($0 == term) { inside = 0; next }
+        if (index($0, "\140") > 0) printf "%s:%d\n", F, NR
+        next
+      }
+      match($0, /<<-?[[:space:]]*["\047][A-Za-z_][A-Za-z0-9_]*["\047][[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        gsub(/^<<-?[[:space:]]*["\047]|["\047][[:space:]]*$/, "", t)
+        qterm = t; quoted = 1; next
+      }
+      # An UNQUOTED opener only: <<WORD or <<-WORD.
+      match($0, /<<-?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/^<<-?[[:space:]]*/, "", t)
+        sub(/[[:space:]]*$/, "", t)
+        term = t; inside = 1
+      }
+    ' "$1"
 }
 [ -n "$(scan_one "$probe_dir/bad.sh")" ] \
   || { rm -rf "$probe_dir"; fail "the scan does NOT detect a backtick in an unquoted

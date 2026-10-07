@@ -264,7 +264,7 @@ docker() {
     esac
     return 0
   fi
-  # Readiness is matched against `docker logs` output. With no logs the
+  # Readiness is matched against "docker logs" output. With no logs the
   # post-restart wait burned its full 120-second timeout and then reported the
   # service as never ready -- on every service, for every section after the
   # migration started working.
