@@ -4279,7 +4279,8 @@ cleanup_image_decisions() {
   done < "$prunable" | sort -u > "$prunable_full"
 
   local id present reasons points tags candidate
-  while read -r ref id present; do
+  # The original reference is not needed here, only its canonical id.
+  while read -r _ id present; do
     [[ -n "$id" ]] || continue
     # EVERY applicable reason, joined. First-match-wins reported plex's image as
     # `in-use` only, so the recovery rule looked like it had found nothing.
@@ -4331,8 +4332,8 @@ collect_cleanup_image_ids() {
   # A filter over cleanup_image_decisions, NOT a second implementation. Keeping
   # the SKIP lines on stderr and the candidates on stdout preserves the existing
   # contract for cleanup_images_execute.
-  local id candidate reasons present points tags
-  while read -r id candidate reasons present points tags; do
+  local id candidate reasons
+  while read -r id candidate reasons _ _ _; do
     [[ -n "$id" ]] || continue
     if (( candidate == 1 )); then
       printf '%s\n' "$id"
@@ -8121,7 +8122,7 @@ EOF
 # Read-only, and deliberately does NOT require root: a preflight must be able to
 # ask what the installed binary supports before escalating.
 capabilities_cmd() {
-  local mode="${1:-list}" want="" token argv impl
+  local mode="${1:-list}" want="" token impl
   case "$mode" in
     list) ;;
     --has)
@@ -8131,7 +8132,9 @@ capabilities_cmd() {
   esac
 
   local known=0 supported=0
-  while IFS='|' read -r token argv impl; do
+  # The argv field is for tests/capabilities-contract-audit.py to read from the
+  # table; run time only needs the token and its implementation.
+  while IFS='|' read -r token _ impl; do
     [[ -n "$token" ]] || continue
     if [[ -n "$want" ]]; then
       [[ "$token" == "$want" ]] || continue

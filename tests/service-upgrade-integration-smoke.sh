@@ -125,13 +125,24 @@ if (( IS_COMPOSE )); then
     stop)  echo "STOPPED \$*" >> "\$LOG"; exit 0 ;;
     start) echo "STARTED \$*" >> "\$LOG"; exit 0 ;;
     up)
-      # RECONCILE: each named service moves to whatever its tag resolves to.
+      # RECONCILE: each named service moves to whatever its image reference
+      # resolves to -- a PINNED <SVC>_IMAGE if compose was given one, else the tag.
       if [[ -f "\$ST/repoint" ]]; then
         echo "sha256:deadbeef00000000000000000000000000000000000000000000000000000099" > "\$ST/tag-plex"
       fi
       for a in "\$@"; do
         [[ "\$a" == -* ]] && continue
-        [[ -f "\$ST/tag-\$a" ]] && cp "\$ST/tag-\$a" "\$ST/img-\$a"
+        # compose resolves the service's image from <SVC>_IMAGE when one is set.
+        # Honouring that pin is what lets a rollback which selects by image ID be
+        # told apart from one that resolves a mutable tag -- the task-24 defect.
+        var="\$(printf '%s' "\$a" | tr 'a-z-' 'A-Z_')_IMAGE"
+        pin="\${!var:-}"
+        if [[ "\$pin" == sha256:* ]]; then
+          printf '%s\n' "\$pin" > "\$ST/img-\$a"
+          echo "PINNED \$a \$pin" >> "\$LOG"
+        elif [[ -f "\$ST/tag-\$a" ]]; then
+          cp "\$ST/tag-\$a" "\$ST/img-\$a"
+        fi
         echo "RECREATED \$a" >> "\$LOG"
       done
       exit 0 ;;
@@ -197,7 +208,11 @@ if [[ "\$1" == "image" ]]; then
       esac
       # Canonicalise a reference to a full id, or fail if unknown.
       case "\$ref" in
-        sha256:*) echo "\$ref"; exit 0 ;;
+        sha256:*)
+          # A PRUNED image is gone. This is what forces a rollback to go through
+          # the archive rather than finding a convenient local object.
+          [[ -f "\$ST/pruned-\${ref#sha256:}" ]] && exit 1
+          echo "\$ref"; exit 0 ;;
       esac
       for c in $CONTAINERS; do
         i="\$(img_of "\$c")"
@@ -208,12 +223,22 @@ if [[ "\$1" == "image" ]]; then
       exit 1 ;;
     save)
       [[ -f "\$ST/archive-fails" ]] && exit 1
-      out=""; prev=""
-      for a in "\$@"; do [[ "\$prev" == "-o" ]] && out="\$a"; prev="\$a"; done
-      [[ -n "\$out" ]] && printf 'FAKE-IMAGE-ARCHIVE
-' > "\$out"
+      out=""; prev=""; ref=""
+      for a in "\$@"; do
+        [[ "\$prev" == "-o" ]] && out="\$a"
+        [[ "\$a" == sha256:* ]] && ref="\$a"
+        prev="\$a"
+      done
+      [[ -n "\$out" ]] && printf 'FAKE-IMAGE-ARCHIVE\nARCHIVED_ID=%s\n' "\$ref" > "\$out"
       echo "SAVED \$out" >> "\$LOG"; exit 0 ;;
-    load) echo "Loaded image ID: \$(img_of plex)"; exit 0 ;;
+    load)
+      # Report what the ARCHIVE holds. A stub echoing the running image would
+      # make the identity comparison in rollback_upgrade vacuous.
+      f=""; prev=""
+      for a in "\$@"; do [[ "\$prev" == "-i" ]] && f="\$a"; prev="\$a"; done
+      [[ -n "\$f" && -r "\$f" ]] \\
+        && echo "Loaded image ID: \$(sed -n 's/^ARCHIVED_ID=//p' "\$f" | head -1)"
+      exit 0 ;;
     rm) echo "DELETED \$*" >> "\$LOG"; exit 0 ;;
   esac
 fi
@@ -221,12 +246,22 @@ fi
 case "\$1" in
   save)
     [[ -f "\$ST/archive-fails" ]] && exit 1
-    out=""; prev=""
-    for a in "\$@"; do [[ "\$prev" == "-o" ]] && out="\$a"; prev="\$a"; done
-    [[ -n "\$out" ]] && printf 'FAKE-IMAGE-ARCHIVE
-' > "\$out"
+    out=""; prev=""; ref=""
+    for a in "\$@"; do
+      [[ "\$prev" == "-o" ]] && out="\$a"
+      [[ "\$a" == sha256:* ]] && ref="\$a"
+      prev="\$a"
+    done
+    [[ -n "\$out" ]] && printf 'FAKE-IMAGE-ARCHIVE\nARCHIVED_ID=%s\n' "\$ref" > "\$out"
     echo "SAVED \$out" >> "\$LOG"; exit 0 ;;
-  load) echo "Loaded image ID: \$(img_of plex)"; exit 0 ;;
+  load)
+    # Report what the ARCHIVE holds. A stub echoing the running image would
+    # make the identity comparison in rollback_upgrade vacuous.
+    f=""; prev=""
+    for a in "\$@"; do [[ "\$prev" == "-i" ]] && f="\$a"; prev="\$a"; done
+    [[ -n "\$f" && -r "\$f" ]] \\
+      && echo "Loaded image ID: \$(sed -n 's/^ARCHIVED_ID=//p' "\$f" | head -1)"
+    exit 0 ;;
 esac
 exit 0
 STUB
@@ -445,6 +480,132 @@ rc="$(run_cli refresh-images plex)"
 [ "$rc" != "0" ] || fail "refresh_images accepted a positional service argument;
 `updates apply --service` and the fleet path would no longer be distinct operations"
 echo "  refresh_images still refuses a positional argument"
+
+# ===========================================================================
+# ROLLBACK (task-24), proven in integration rather than from helper tests.
+#
+# The defect being guarded: the OLD auto-rollback restored the snapshot and then
+# used `compose start` -- on the container the upgrade had just created, i.e. the
+# NEW image. Old data under a newer application: the exact pairing failure.
+# Restoring data is the easy half; restoring the application it pairs with is
+# the half that was missing.
+# ===========================================================================
+
+upgrade_then_find_point() {  # leaves plex upgraded; echoes the recovery point
+  setup
+  run_cli updates apply --service plex >/dev/null
+  find "$ENV_DIR/snapshots" -maxdepth 1 -name 'plex-*pre-upgrade' -printf '%f\n' | head -1
+}
+
+echo "== 14. rollback restores BOTH halves: data AND the recorded image =="
+point="$(upgrade_then_find_point)"
+[ -n "$point" ] || fail "no recovery point to roll back to"
+[ "$(img plex)" = "$PLEX_NEW" ] || fail "precondition: plex should be on the new image"
+# Mark something in the restored tree so the data restore is observable.
+echo "UPGRADED" > "$ENV_DIR/data/plex/marker"
+rc="$(run_cli rollback-upgrade plex "$point")"
+[ "$rc" = "0" ] || fail "rollback failed: $(out)"
+[ "$(img plex)" = "$PLEX_OLD" ] \
+  || fail "after rollback plex runs $(img plex), not the recorded old image $PLEX_OLD.
+Restoring the data under a newer application is the task-24 pairing failure."
+[ -f "$ENV_DIR/data/plex/com.plexapp.plugins.library.db" ] \
+  || fail "the restored tree is missing the database that was snapshotted"
+[ -f "$ENV_DIR/data/plex/marker" ] \
+  && fail "the live tree was not replaced by the snapshot; post-upgrade state survived"
+echo "  plex back on $PLEX_OLD, data restored from the snapshot"
+
+echo "== 15. the failed state is PRESERVED, never deleted =="
+failed="$(find "$ENV_DIR/data" -maxdepth 1 -name 'plex.failed-*' | head -1)"
+[ -n "$failed" ] || fail "the post-upgrade state was not preserved as plex.failed-*"
+grep -qx UPGRADED "$failed/marker" \
+  || fail "the preserved directory is not the state that was running: $(ls "$failed")"
+echo "  preserved at $(basename "$failed"), with its contents intact"
+
+echo "== 16. a MUTABLE TAG does not decide the rollback =="
+# tag-plex still resolves to the NEW image. If the rollback had recreated without
+# pinning, plex would have come straight back up on it.
+[ "$(cat "$ENV_DIR/st/tag-plex")" = "$PLEX_NEW" ] \
+  || fail "precondition: the tag should still point at the new image"
+grep -q "^PINNED plex $PLEX_OLD$" <<< "$(calls)" \
+  || fail "the rollback did not pin the image by ID. The tag still resolves to
+$PLEX_NEW, so anything that merely recreated would be running the NEW build:
+$(grep -E 'PINNED|RECREATED' <<< "$(calls)")"
+echo "  pinned by image ID while the tag still points at $PLEX_NEW"
+
+echo "== 17. the image comes from the ARCHIVE when the local object is gone =="
+# Plex's pairing is identity,local -- the local object is the only copy, and the
+# moment plex is upgraded that object becomes prunable.
+point="$(upgrade_then_find_point)"
+touch "$ENV_DIR/st/pruned-${PLEX_OLD#sha256:}"
+rc="$(run_cli rollback-upgrade plex "$point")"
+[ "$rc" = "0" ] || fail "rollback failed with the old image pruned: $(out)"
+grep -q 'loading .* from ' "$ENV_DIR/out" || fail "it did not load from the archive: $(out)"
+grep -q 'identity CONFIRMED equal to the record' "$ENV_DIR/out" \
+  || fail "the loaded image's identity was not confirmed against the record: $(out)"
+echo "  loaded from the archive and its identity confirmed against the record"
+
+echo "== 18. rollback REFUSES when the archive holds a different image =="
+point="$(upgrade_then_find_point)"
+touch "$ENV_DIR/st/pruned-${PLEX_OLD#sha256:}"
+arch="$(find "$ENV_DIR/data/backups/images" -type f ! -name '*.sha256' | head -1)"
+[ -n "$arch" ] || fail "no archive to tamper with"
+# Same FILE (checksum still matches), different IMAGE inside. Only the identity
+# comparison can catch this -- the checksum cannot.
+sed -i 's/^ARCHIVED_ID=.*/ARCHIVED_ID=sha256:0bad0bad0bad0000000000000000000000000000000000000000000000000bad/' "$arch"
+sha256sum "$arch" | awk '{print $1}' > "$arch.sha256.new"
+meta="$ENV_DIR/state/snapshots/$point.recovery"
+newsha="$(cat "$arch.sha256.new")"
+sed -i "s/^IMAGE_ARCHIVE_SHA256='.*'/IMAGE_ARCHIVE_SHA256='$newsha'/" "$meta"
+rc="$(run_cli rollback-upgrade plex "$point")"
+[ "$rc" != "0" ] \
+  || fail "the rollback accepted an archive containing a DIFFERENT image than the
+recovery point records. The checksum matched; only the identity check could
+catch it, and it did not."
+grep -q 'restored a DIFFERENT image' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
+grep -q '^PINNED' <<< "$(calls)" && fail "it pinned something despite refusing"
+echo "  refused on identity although the file checksum matched"
+
+echo "== 19. rollback REFUSES on a corrupted archive file =="
+point="$(upgrade_then_find_point)"
+touch "$ENV_DIR/st/pruned-${PLEX_OLD#sha256:}"
+arch="$(find "$ENV_DIR/data/backups/images" -type f ! -name '*.sha256' | head -1)"
+printf 'CORRUPTED\n' >> "$arch"
+rc="$(run_cli rollback-upgrade plex "$point")"
+[ "$rc" != "0" ] || fail "the rollback loaded an archive whose checksum did not match"
+grep -q 'does not match its recorded sha256' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
+echo "  refused before loading, and said which checksum disagreed"
+
+echo "== 20. rollback REFUSES when the recovery metadata is incomplete =="
+point="$(upgrade_then_find_point)"
+meta="$ENV_DIR/state/snapshots/$point.recovery"
+sed -i "/^CONTAINER_1_IMAGE_ID=/d" "$meta"
+rc="$(run_cli rollback-upgrade plex "$point")"
+[ "$rc" != "0" ] \
+  || fail "the rollback proceeded with no recorded image identity. It would have
+restored the data under whatever is running now -- the pairing failure."
+grep -q 'records no image identity' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
+[ "$(img plex)" = "$PLEX_NEW" ] || fail "it changed the running image before refusing"
+find "$ENV_DIR/data" -maxdepth 1 -name 'plex.failed-*' | grep -q . \
+  && fail "it moved the live data aside before refusing"
+echo "  refused, and nothing was moved or restarted"
+
+echo "== 21. rollback REFUSES when the snapshot itself is missing =="
+point="$(upgrade_then_find_point)"
+rm -rf "$ENV_DIR/snapshots/$point"
+rc="$(run_cli rollback-upgrade plex "$point")"
+[ "$rc" != "0" ] || fail "the rollback proceeded with no snapshot to restore from"
+grep -q 'is missing; this point cannot be restored' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
+echo "  refused"
+
+echo "== 22. an unknown service and an unknown point both refuse =="
+point="$(upgrade_then_find_point)"
+rc="$(run_cli rollback-upgrade plexx "$point")"
+[ "$rc" != "0" ] || fail "an unknown service exited 0"
+rc="$(run_cli rollback-upgrade plex no-such-point)"
+[ "$rc" != "0" ] || fail "an unknown recovery point exited 0"
+grep -q 'No recovery evidence' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
+[ "$(img plex)" = "$PLEX_NEW" ] || fail "the running image changed on a refusal"
+echo "  both refused; nothing touched"
 
 echo
 echo "PASS: service upgrade integration smoke"
