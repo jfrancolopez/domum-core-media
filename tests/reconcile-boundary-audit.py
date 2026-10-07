@@ -54,6 +54,18 @@ DEPLOYING = {
     "refresh_images",         # the update path; gated on backup age, health, snapshot
     "immich_refresh_bundle",  # an explicit Immich deployment
     "apply",                  # convergence: recreating on a config change is the point
+    # Upgrading ONE service. Recreating is the whole point, and it is gated on a
+    # pre-upgrade recovery point whose archive verified first -- it cannot reach
+    # the `up -d` otherwise. The image it deploys is read from the local staged
+    # object, not pulled at upgrade time, so what was reviewed is what runs.
+    "service_upgrade",
+    # Undoing one. This recreates DELIBERATELY and PINNED: <SERVICE>_IMAGE is set
+    # to the id recorded in the recovery evidence, so compose recreates onto the
+    # old image instead of resolving a mutable tag. The container that exists
+    # belongs to the image being rolled back FROM, so `compose start` would be
+    # exactly wrong here -- it would restart the failed application on restored
+    # data, which is task-24's defect.
+    "rollback_upgrade",
 }
 # Not service containers at all: one-shot utilities that exit, in no compose
 # project, and cannot change what is running.

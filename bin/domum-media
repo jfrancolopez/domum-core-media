@@ -3397,9 +3397,24 @@ updates_cmd() {
   case "$sub" in
     ""|summary) show_update_inventory ;;
     check) shift; show_update_inventory; echo; refresh_images --check-only; [[ "${ENABLE_IMMICH:-0}" == "1" ]] && immich_refresh_bundle --check-only ;;
-    apply) shift; refresh_images --apply-now --force; [[ "${ENABLE_IMMICH:-0}" == "1" ]] && immich_refresh_bundle --force ;;
+    apply)
+      shift
+      # --service <name> is a DIFFERENT operation, not a filter bolted onto the
+      # fleet path. refresh_images cannot take a service argument (it dies on any
+      # positional) and its scope is every service with ENABLE_*=1 and
+      # *_AUTO_UPDATE=1. service_upgrade upgrades exactly one, with pre-upgrade
+      # protection it cannot skip.
+      if [[ "${1:-}" == "--service" ]]; then
+        shift
+        [[ -n "${1:-}" ]] || die "Usage: domum-media updates apply --service <service> [--dry-run]"
+        service_upgrade "$1" "${2:-}"
+      else
+        refresh_images --apply-now --force
+        [[ "${ENABLE_IMMICH:-0}" == "1" ]] && immich_refresh_bundle --force
+      fi
+      ;;
     history) shift; updates_history ;;
-    *) die "Usage: domum-media updates {summary|check|apply|history}" ;;
+    *) die "Usage: domum-media updates {summary|check|apply [--service <service> [--dry-run]]|history}" ;;
   esac
 }
 
@@ -7331,6 +7346,14 @@ could not be bound to it. That is a DATA-only point. Investigate before upgradin
   else
     echo "  image archive   : none (re-run with --archive-image for a durable copy)"
   fi
+  # Reported so an orchestrator binds its later phases to the EXACT artefacts
+  # this produced, rather than re-deriving them from a name. No split of this
+  # function was needed: domum_acquire_lock is re-entrant
+  # (`[[ -n "${DOMUM_LOCK_FD:-}" ]] && return 0`), as are need_root, load_cfg and
+  # ensure_dirs, so a caller already holding the lock can call this directly.
+  PRE_UPGRADE_POINT="$proof"
+  PRE_UPGRADE_META="$meta"
+  PRE_UPGRADE_ARCHIVE="$arch"
   if (( restart_ok == 1 )); then
     echo "  service         : $runtime_after on the SAME image"
     echo
@@ -7339,6 +7362,387 @@ could not be bound to it. That is a DATA-only point. Investigate before upgradin
   fi
   echo "[domum-media] Pre-upgrade point INCOMPLETE -- read the warnings above."
   return 1
+}
+
+# Every container that is NOT part this service, as "<name> <id> <image>".
+# The scope proof for a single-service upgrade: captured before, compared after.
+other_container_identities() {  # $1 = service being upgraded
+  local service="$1" mine c
+  mine=" $(service_compose_services "$service" 2>/dev/null || true) "
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    [[ "$mine" == *" $c "* ]] && continue
+    printf '%s %s %s\n' "$c" \
+      "$(docker inspect -f '{{.Id}}' "$c" 2>/dev/null)" \
+      "$(docker inspect -f '{{.Image}}' "$c" 2>/dev/null)"
+  done < <(docker ps -a --format '{{.Names}}' | LC_ALL=C sort)
+}
+
+# Verify an image archive independently of any upgrade: the file is intact, and
+# the identity it restores is the one recorded.
+#
+# The checksum and the identity are DIFFERENT claims and are reported as such.
+# Measured on this host: the archive's config-blob digest does NOT equal the
+# image ID (Id is the manifest digest), so a matching .sha256 proves only that
+# the FILE is unchanged. `docker load` is what proves identity, and a load is a
+# mutation, so this reports what it verified and what it did not.
+storage_verify_archive() {  # $1 = recovery point
+  need_root
+  load_cfg
+  local point="${1:-}" meta img arch want_sha got_sha bytes
+  [[ -n "$point" ]] || die "Usage: domum-media storage verify-archive <recovery-point>"
+  meta="$(snapshot_metadata_dir)/${point}.recovery"
+  [[ -s "$meta" ]] || die "No recovery evidence for $point at $meta"
+
+  img="$(sed -nE "s/^CONTAINER_1_IMAGE_ID='(.*)'\$/\1/p" "$meta" | head -1)"
+  arch="$(sed -nE "s/^IMAGE_ARCHIVE='(.*)'\$/\1/p" "$meta" | head -1)"
+  want_sha="$(sed -nE "s/^IMAGE_ARCHIVE_SHA256='(.*)'\$/\1/p" "$meta" | head -1)"
+  bytes="$(sed -nE "s/^IMAGE_ARCHIVE_BYTES='(.*)'\$/\1/p" "$meta" | head -1)"
+
+  echo "recovery point    : $point"
+  echo "  service         : $(sed -nE "s/^SERVICE='(.*)'\$/\1/p" "$meta" | head -1)"
+  echo "  kind            : $(sed -nE "s/^POINT_KIND='(.*)'\$/\1/p" "$meta" | head -1)"
+  echo "  image id        : ${img:-<none recorded>}"
+  if [[ -z "$arch" ]]; then
+    echo "  image archive   : NONE recorded for this point"
+    echo "  -> the snapshot restores the data; the application it pairs with exists"
+    echo "     only as a local Docker object, which nothing here can guarantee."
+    [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1 \
+      && echo "  local object    : present today" \
+      || echo "  local object    : ABSENT -- this point has no recoverable application"
+    return 1
+  fi
+  echo "  image archive   : $arch"
+  if [[ ! -r "$arch" ]]; then
+    echo "  archive         : MISSING from disk"
+    return 1
+  fi
+  echo "  archive bytes   : $(stat -c %s "$arch") (recorded ${bytes:-?})"
+  got_sha="$(sha256sum "$arch" | awk '{print $1}')"
+  if [[ "$got_sha" != "$want_sha" ]]; then
+    echo "  archive sha256  : MISMATCH"
+    echo "    recorded      : $want_sha"
+    echo "    on disk       : $got_sha"
+    return 1
+  fi
+  echo "  archive sha256  : matches ($got_sha)"
+  echo "  -> the FILE is intact. That is not the same as the identity it restores:"
+  echo "     'docker load' is what proves the image id, and loading is a mutation,"
+  echo "     so it is not done here. The rollback path does it and then compares."
+  [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1 \
+    && echo "  local object    : present today (a load would be a no-op)" \
+    || echo "  local object    : absent -- a rollback would load it from this archive"
+  return 0
+}
+
+# Roll back an application upgrade: BOTH halves, or refuse.
+#
+# TASK-24. The existing auto-rollback restores the snapshot and brings the
+# service back with `compose start` -- on the container the upgrade created, i.e.
+# the NEW image. Old data under a newer application is the exact pairing failure
+# the recovery evidence exists to prevent, and for Plex it means a newer build
+# forward-migrating a database restored from before the upgrade.
+#
+# This restores the data AND pins the recorded image:
+#   * the image id comes from the recovery evidence, never from a mutable tag;
+#   * if that object is absent it is loaded from the archive, and the id that
+#     comes back is COMPARED to the recorded one;
+#   * the service is started with that id pinned via <SERVICE>_IMAGE, so compose
+#     recreates onto the old image deliberately rather than resolving `:latest`;
+#   * the failed state is PRESERVED, never deleted.
+rollback_upgrade() {  # $1 = service, $2 = recovery point
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+
+  local service="${1:-}" point="${2:-}"
+  [[ -n "$service" && -n "$point" ]] \
+    || die "Usage: domum-media rollback-upgrade <service> <recovery-point>"
+  managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
+    || die "Refusing: '$service' is not a service this command knows about"
+
+  local meta path snap want_img arch want_sha compose_svcs
+  meta="$(snapshot_metadata_dir)/${point}.recovery"
+  [[ -s "$meta" ]] || die "No recovery evidence for $point at $meta"
+  path="$(service_data_path "$service")"
+  snap="${DOMUM_SNAPSHOT_ROOT%/}/$point"
+  [[ -d "$snap" ]] || die "The snapshot $snap is missing; this point cannot be restored"
+  compose_svcs="$(service_compose_services "$service" || true)"
+  [[ -n "$compose_svcs" ]] || die "No compose services mapped for $service"
+
+  want_img="$(sed -nE "s/^CONTAINER_1_IMAGE_ID='(.*)'\$/\1/p" "$meta" | head -1)"
+  arch="$(sed -nE "s/^IMAGE_ARCHIVE='(.*)'\$/\1/p" "$meta" | head -1)"
+  want_sha="$(sed -nE "s/^IMAGE_ARCHIVE_SHA256='(.*)'\$/\1/p" "$meta" | head -1)"
+  [[ -n "$want_img" ]] \
+    || die "Refusing: $point records no image identity, so the application half of
+this rollback is unknown. Restoring the data under whatever is running now is the
+pairing failure this refuses to perform."
+
+  echo "[domum-media] Rollback plan for $service"
+  echo "  recovery point  : $point"
+  echo "  restore data    : $snap -> $path"
+  echo "  pin image       : $want_img"
+  echo "  from archive    : ${arch:-<none; relying on the local object>}"
+
+  domum_acquire_lock "rollback-upgrade $service" 0 \
+    || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
+
+  # ---- 1. make the recorded image available, and PROVE it is the right one ----
+  if docker image inspect "$want_img" >/dev/null 2>&1; then
+    echo "[domum-media] 1/5: recorded image already present locally"
+  elif [[ -n "$arch" && -r "$arch" ]]; then
+    local got_sha loaded
+    got_sha="$(sha256sum "$arch" | awk '{print $1}')"
+    [[ "$got_sha" == "$want_sha" ]] \
+      || die "The archive at $arch does not match its recorded sha256.
+  recorded: $want_sha
+  on disk : $got_sha
+Refusing to load it. Nothing was changed."
+    echo "[domum-media] 1/5: loading $want_img from $arch"
+    loaded="$(docker load -i "$arch" 2>&1 | sed -nE 's/.*Loaded image ID: (sha256:[0-9a-f]+).*/\1/p' | head -1)"
+    [[ "$loaded" == "$want_img" ]] \
+      || die "The archive restored a DIFFERENT image than the point records.
+  recorded: $want_img
+  loaded  : ${loaded:-<none reported>}
+Refusing to continue. Nothing was restored."
+    echo "[domum-media] 1/5: loaded and identity CONFIRMED equal to the record"
+  else
+    die "Refusing: $want_img is not present locally and there is no readable
+archive for $point. The data could be restored but the application it pairs with
+could not, and starting it under a different build is the failure this prevents."
+  fi
+
+  # ---- 2. stop the current (failed) service, preserving its state ------------
+  echo "[domum-media] 2/5: stopping $compose_svcs"
+  # shellcheck disable=SC2086
+  compose_cmd stop $compose_svcs || die "Could not stop $compose_svcs; nothing was restored"
+
+  # ---- 3. preserve the failed state; never delete it ------------------------
+  local failed="${path}.failed-$(date +%Y%m%d-%H%M%S)"
+  echo "[domum-media] 3/5: preserving the current state at $failed"
+  mv -- "$path" "$failed" || die "Could not move $path aside; nothing was restored"
+
+  # ---- 4. restore the snapshot as the live tree -----------------------------
+  echo "[domum-media] 4/5: restoring $point"
+  if ! btrfs subvolume snapshot "$snap" "$path" >/dev/null 2>&1; then
+    warn "Could not create a writable subvolume from $snap."
+    mv -- "$failed" "$path" 2>/dev/null \
+      && warn "The previous state was put back at $path." \
+      || warn "CRITICAL: $path is missing and the previous state is at $failed."
+    die "Rollback failed. Nothing was deleted."
+  fi
+
+  # ---- 5. start on the PINNED image, not on whatever the tag resolves to ----
+  local image_var
+  image_var="$(printf '%s_IMAGE' "$(uppercase_token "$service")")"
+  echo "[domum-media] 5/5: starting $compose_svcs with $image_var=$want_img"
+  # A deliberate recreate, pinned: this is the one place recreating is correct,
+  # because the container that exists belongs to the image being rolled back FROM.
+  #
+  # The pin is an EXPORT IN A SUBSHELL, not `env VAR=... compose_cmd`: compose_cmd
+  # is a shell function and `env` can only exec a real binary -- measured,
+  # `env X=1 f` gives "env: 'f': No such file or directory", so that form would
+  # have failed outright every time. The subshell keeps the override from leaking
+  # into the rest of this function, and compose_cmd's own
+  # export_env_for_compose uses `${PLEX_IMAGE:-default}`, so a value set first is
+  # preserved rather than overwritten.
+  # shellcheck disable=SC2086
+  if ! ( export "$image_var=$want_img"; compose_cmd up -d $compose_svcs ); then
+    warn "Could not start $compose_svcs on the restored image."
+    warn "The restored data is at $path and the failed state at $failed."
+    die "Rollback incomplete. Nothing was deleted."
+  fi
+
+  local now_img
+  now_img="$(service_running_images "$service" | awk 'NR==1{print $2}')"
+  echo
+  if [[ "$now_img" == "$want_img" ]]; then
+    echo "[domum-media] Rollback COMPLETE for $service."
+    echo "  running image   : $now_img (the image the recovery point pairs with)"
+    echo "  restored from   : $point"
+    echo "  failed state    : $failed   (retained deliberately; remove it yourself)"
+    return 0
+  fi
+  warn "$service came back on $now_img, not the recorded $want_img."
+  echo "[domum-media] Rollback INCOMPLETE -- the data is restored but the application"
+  echo "  does not match the recovery point. Failed state retained at $failed."
+  return 1
+}
+
+# Upgrade ONE service, and prove it was one.
+#
+# This is deliberately NOT refresh_images. That function cannot take a service
+# argument at all -- it dies on any positional -- and its scope is every service
+# with ENABLE_*=1 and *_AUTO_UPDATE=1, pulling each. With staged images for plex,
+# calibre-web, traefik and uptime-kuma, using it for a plex upgrade risks a
+# four-service deployment. It also snapshots while the service RUNS and writes no
+# recovery metadata, so its rollback point is crash-consistent and unpaired.
+#
+# Here, the pre-upgrade protection is not optional and not a separate operator
+# step: the point is created, archived and verified under the same lock, and the
+# staged image cannot start until that has succeeded.
+service_upgrade() {  # $1 = service, [--dry-run]
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+
+  local service="${1:-}" dry=0
+  [[ "${2:-}" == "--dry-run" ]] && dry=1
+  [[ -n "$service" ]] || die "Usage: domum-media updates apply --service <service> [--dry-run]"
+  # Fail CLOSED on an unknown name. A typo must never widen to every service.
+  managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
+    || die "Refusing: '$service' is not an upgradable service.
+Known: $(managed_image_specs | cut -d'|' -f1 | tr '\n' ' ')"
+  assert_pre_upgrade_possible "$service"
+
+  local compose_svcs old_images staged_verdicts target_image others_before
+  compose_svcs="$(service_compose_services "$service" || true)"
+  [[ -n "$compose_svcs" ]] || die "No compose services mapped for $service"
+  old_images="$(service_running_images "$service")"
+  others_before="$(other_container_identities "$service")"
+
+  # The target must already be local. Pulling here would resolve a mutable tag at
+  # upgrade time and change what is being deployed between review and execution.
+  staged_verdicts="$(service_staged_image_changes "$service")"
+  target_image="$(grep '^STAGED ' <<< "$staged_verdicts" | awk 'NR==1{print $4}')"
+  if [[ -z "$target_image" ]]; then
+    echo "[domum-media] $service has no staged image locally; nothing to upgrade."
+    echo "$staged_verdicts" | sed 's/^/  /'
+    return 0
+  fi
+
+  echo "[domum-media] Upgrade plan for $service"
+  echo "  compose services : $compose_svcs"
+  echo "  from image       : $(printf '%s' "$old_images" | awk 'NR==1{print $2}')"
+  echo "  to image         : $target_image"
+  echo "  other containers : $(printf '%s' "$others_before" | grep -c .) will be left untouched"
+  if (( dry == 1 )); then
+    echo "[domum-media] --dry-run: nothing was changed."
+    return 0
+  fi
+
+  domum_acquire_lock "upgrade $service" 0 \
+    || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
+  verify_backup_freshness "$service"
+
+  # ---- phase 1: the recovery point, archived, before anything is deployed ----
+  echo "[domum-media] phase 1/4: pre-upgrade recovery point (with image archive)"
+  if ! create_upgrade_rollback_point "$service"; then
+    die "Pre-upgrade protection failed. The staged image was NOT deployed and
+$service is on its original image. Nothing was deleted."
+  fi
+  local point="$PRE_UPGRADE_POINT" meta="$PRE_UPGRADE_META" arch="$PRE_UPGRADE_ARCHIVE"
+  [[ -n "$point" && -n "$meta" && -n "$arch" ]] \
+    || die "Pre-upgrade protection did not produce a point, metadata and an archive.
+The staged image was NOT deployed."
+
+  echo "[domum-media] phase 2/4: verifying the archive before deploying"
+  storage_verify_archive "$point" \
+    || die "The pre-upgrade archive did not verify. The staged image was NOT deployed."
+
+  # ---- phase 3: deploy ONLY this service -------------------------------------
+  echo "[domum-media] phase 3/4: deploying $target_image to $compose_svcs only"
+  # shellcheck disable=SC2086
+  compose_cmd up -d $compose_svcs \
+    || die "Deployment failed. The pre-upgrade point $point is intact; see the
+rollback instructions in $meta."
+
+  # ---- phase 4: prove it ------------------------------------------------------
+  echo "[domum-media] phase 4/4: verification"
+  local rc=0 new_images others_after
+  new_images="$(service_running_images "$service")"
+  others_after="$(other_container_identities "$service")"
+
+  if [[ "$(printf '%s' "$new_images" | awk 'NR==1{print $2}')" == "$target_image" ]]; then
+    echo "  image           : $service is running the intended staged image"
+  else
+    warn "$service is NOT running the intended image:"
+    warn "  intended: $target_image"
+    warn "  actual  : $(printf '%s' "$new_images" | tr '\n' ' ')"
+    rc=1
+  fi
+
+  # THE SCOPE PROOF. Every other container must be byte-identical, id and image.
+  if [[ "$others_before" == "$others_after" ]]; then
+    echo "  scope           : all $(printf '%s' "$others_before" | grep -c .) other containers unchanged (id and image)"
+  else
+    warn "OTHER SERVICES CHANGED. This was supposed to be a $service-only upgrade:"
+    diff <(printf '%s\n' "$others_before") <(printf '%s\n' "$others_after") | sed 's/^/    /' >&2
+    rc=1
+  fi
+
+  if wait_for_service_health "$service" 180 5; then
+    echo "  health          : $(service_health_state "$service")"
+  else
+    warn "$service did not become healthy within 180s (state: $(service_health_state "$service"))."
+    rc=1
+  fi
+  if service_ready_probe "$service" >/dev/null 2>&1; then
+    local waited=0
+    while (( waited < 180 )); do service_probe_ready "$service" && break; sleep 5; waited=$(( waited + 5 )); done
+    if service_probe_ready "$service"; then
+      echo "  application     : answered its endpoint, version $(service_probe_version "$service" 2>/dev/null)"
+    else
+      warn "$service never answered its own endpoint after the upgrade."
+      rc=1
+    fi
+  fi
+
+  # The pre-upgrade artefacts must still be exactly as created.
+  domum_is_subvolume "$(service_data_path "$service")" \
+    && echo "  storage         : still a Btrfs subvolume" \
+    || { warn "$(service_data_path "$service") is no longer a subvolume"; rc=1; }
+  [[ "$(btrfs property get -ts "$DOMUM_SNAPSHOT_ROOT/$point" 2>/dev/null | tr -d ' ')" == "ro=true" ]] \
+    && echo "  pre-upgrade snap: $point still read-only" \
+    || { warn "$point is not read-only any more"; rc=1; }
+  storage_verify_archive "$point" >/dev/null \
+    && echo "  image archive   : still verifies" \
+    || { warn "the pre-upgrade archive no longer verifies"; rc=1; }
+
+  # ---- the metadata-only cleanup proof ---------------------------------------
+  # The old image is now unreferenced by any container, so this is the first time
+  # recovery-metadata-only protection can be demonstrated in production. DRY RUN.
+  echo "[domum-media] cleanup dry run (no --confirm): the old image must be withheld"
+  local old_id
+  old_id="$(printf '%s' "$old_images" | awk 'NR==1{print $2}')"
+  # Two separate things, deliberately not one.
+  #
+  # cleanup_images_execute writes a HUMAN report, so its stdout is shown, never
+  # captured: capturing a function that logs makes the log the value, which is
+  # what tests/lib-stdout-purity-audit.py exists to catch -- and did catch here.
+  cleanup_images_execute 1 0 || true
+  # The CHECK reads the value-returning selector instead, and matches the whole
+  # line rather than grepping prose.
+  if collect_cleanup_image_ids 2>/dev/null | grep -qxF "$old_id"; then
+    warn "THE OLD IMAGE IS A DELETION CANDIDATE: $old_id"
+    warn "Its recovery point depends on it. Do NOT run cleanup --confirm."
+    rc=1
+  else
+    echo "  old image       : $old_id withheld from cleanup (metadata-only protection)"
+  fi
+
+  echo
+  if (( rc == 0 )); then
+    echo "[domum-media] Upgrade COMPLETE for $service."
+    echo "  rollback point  : $point   ($meta)"
+    echo "  old image       : $old_id, archived at $arch"
+    echo "  To roll back:    sudo domum-media rollback-upgrade $service $point"
+    return 0
+  fi
+  echo "[domum-media] Upgrade INCOMPLETE for $service -- read the warnings above."
+  echo "  Nothing was deleted. The pre-upgrade point $point and its archive are intact."
+  echo "  To roll back:    sudo domum-media rollback-upgrade $service $point"
+  return 1
+}
+
+# Always archived. A named shim so the orchestrator cannot accidentally create an
+# UNARCHIVED point: for an upgrade the archive is the half that makes the point a
+# rollback rather than a museum piece, and `--archive-image` being optional on the
+# standalone command must not leak into the upgrade path as a default.
+create_upgrade_rollback_point() {  # $1 = service
+  storage_pre_upgrade_point "$1" --archive-image
 }
 
 storage_verify_recovery() {  # $1 = service, $2 = recovery point, [--deep]
@@ -7463,7 +7867,12 @@ storage_cmd() {
         # running image, bind metadata, restart the same container on the same
         # image. The complete rollback artifact for a later upgrade.
         storage_pre_upgrade_point "${1:-}" "${2:-}" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]}" ;;
+      verify-archive)
+        shift
+        # Read-only. Checks the archive FILE against its recorded sha256 and
+        # says plainly that this is not the same claim as image identity.
+        storage_verify_archive "${1:-}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|verify-archive <point>}" ;;
   esac
 }
 
@@ -7508,13 +7917,23 @@ Usage:
   domum-media apply
   domum-media status [--counts]
   domum-media update
-  domum-media updates {summary|check|apply|history}
+  domum-media updates {summary|check|apply [--service <service> [--dry-run]]|history}
+                                            `apply --service <s>` upgrades ONE
+                                            service, with pre-upgrade protection
+                                            it cannot skip. Bare `apply` is the
+                                            fleet path and cannot target one
   domum-media refresh-images [--force] [--check-only] [--apply-now]
   domum-media host-upgrade [--force]
   domum-media logs <service>
   domum-media backup {init <target> [--adopt-existing]|plan <target>|verify <target>|verify-restore <target>|adopt-repo <target>|--check|--check-deep [repo]|--restore <snapshot> <target>}
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
+  domum-media rollback-upgrade <service> <recovery-point>
+                                            Undo an application upgrade: restores
+                                            the pre-upgrade state AND the exact
+                                            image it pairs with, loading it from
+                                            the archive if needed. Refuses if the
+                                            identity cannot be matched
   domum-media checkup [--json]
   domum-media report [--json|--write]
   domum-media storage migrate-subvolume <service>
@@ -7529,6 +7948,10 @@ Usage:
                                             unprotected or unknown. Exits 0 only
                                             for "protected"
   domum-media storage verify-recovery <service> <point> [--deep]
+  domum-media storage verify-archive <point>
+                                            Whether a recovery point's image
+                                            archive is intact, and what that does
+                                            and does not prove
   domum-media storage pre-upgrade-point <service> [--archive-image]
                                             Application-consistent recovery point
                                             for a later upgrade: stop, prove
@@ -7568,6 +7991,12 @@ main() {
     apply)     shift; apply "$@" ;;
     status)    shift; status "$@" ;;
     update)    shift; repo_update "$@" ;;
+    rollback-upgrade)
+      shift
+      # Restores BOTH halves: the pre-upgrade data AND the exact recorded image,
+      # loaded from its archive if the local object is gone. Refuses rather than
+      # pairing old data with a newer application (task-24).
+      rollback_upgrade "${1:-}" "${2:-}" ;;
     updates)   shift; updates_cmd "$@" ;;
     refresh-images) shift; refresh_images "$@" ;;
     host-upgrade) shift; host_upgrade "$@" ;;

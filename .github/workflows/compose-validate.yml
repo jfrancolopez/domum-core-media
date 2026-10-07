@@ -134,6 +134,10 @@ jobs:
       - name: Pre-upgrade point smoke test
         run: tests/pre-upgrade-point-smoke.sh
 
+      # One service upgraded, proven to be one; rollback restores both halves.
+      - name: Service upgrade smoke test
+        run: tests/service-upgrade-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
