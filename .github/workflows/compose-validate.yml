@@ -15,12 +15,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Bash syntax check
-        run: bash -n bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh
+        run: bash -n bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh
 
       - name: shellcheck
         # Fail on real warnings/errors; info-level notes (e.g. sourcing
         # /etc/os-release, intentional subshell-scoped exports) are advisory.
-        run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh
+        run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh
 
       - name: Immich secret propagation smoke test
         run: tests/immich-secret-propagation-smoke.sh
@@ -168,6 +168,15 @@ jobs:
       # earlier test asserted on its text, which is why an undefined call shipped.
       - name: Service upgrade integration smoke test
         run: tests/service-upgrade-integration-smoke.sh
+
+      # Operator wrappers are IN the repository so that this can run on them:
+      # three of them aborted correct production states by asserting on
+      # internals or prose, and none was in CI.
+      - name: Operator wrapper audit
+        run: python3 tests/operator-wrapper-audit.py
+
+      - name: Operator wrapper audit smoke test
+        run: tests/operator-wrapper-audit-smoke.sh
 
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test

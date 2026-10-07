@@ -71,6 +71,11 @@ setup() {  # $1.. = options: no-subvol, no-staged, archive-fails, snapshot-fails
   [[ "$opts" == *" snapshot-fails "* ]] && touch "$ENV_DIR/st/snapshot-fails"
 
   cat > "$ENV_DIR/cfg" <<EOF
+# SECRETS_DIR defaults to /etc/domum-core-media/secrets, which ensure_dirs
+# creates. Overriding it is what makes this test hermetic: without it the suite
+# passed on this host only because that directory already existed, and failed in
+# CI with "install: cannot create directory '/etc/domum-core-media'".
+SECRETS_DIR=$ENV_DIR/secrets
 DOMUM_DATA_ROOT=$ENV_DIR/data
 DOMUM_MEDIA_ROOT=$ENV_DIR/media
 DOMUM_SNAPSHOT_ROOT=$ENV_DIR/snapshots
@@ -321,6 +326,27 @@ run_cli() {  # $@ = argv for domum-media
 img()   { cat "$ENV_DIR/st/img-$1"; }
 calls() { cat "$ENV_DIR/calls.log"; }
 out()   { cat "$ENV_DIR/out" "$ENV_DIR/err"; }
+
+echo "== 0. the fixture is hermetic: no host path outside it is touched =="
+# This suite passed locally and failed in CI because SECRETS_DIR defaulted to
+# /etc/domum-core-media, which happens to exist on the development host. A test
+# that depends on host state is not a test.
+setup
+for host_path in /etc/domum-core-media /var/lib/domum-media /var/log/domum-media \
+                 /srv/data /srv/snapshots /srv/media; do
+  grep -q "^[A-Z_]*=$host_path" "$ENV_DIR/cfg" \
+    && fail "the fixture config points at the real $host_path"
+done
+for v in SECRETS_DIR DOMUM_DATA_ROOT DOMUM_MEDIA_ROOT DOMUM_SNAPSHOT_ROOT \
+         DOMUM_STATE_ROOT DOMUM_LOG_DIR; do
+  grep -q "^$v=$ENV_DIR/" "$ENV_DIR/cfg" \
+    || fail "$v is not redirected into the fixture; the run would touch a host path"
+done
+before_etc="$(ls -1 /etc 2>/dev/null | wc -l)"
+run_cli updates apply --service plex >/dev/null 2>&1
+[ "$(ls -1 /etc 2>/dev/null | wc -l)" = "$before_etc" ] \
+  || fail "the run created something under /etc"
+echo "  all six roots redirected into the fixture; /etc untouched"
 
 echo "== 1. the real dispatcher reaches service_upgrade and it RUNS =="
 # The assertion the old suite could not make. An undefined helper, a typo in a
