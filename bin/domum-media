@@ -7139,6 +7139,208 @@ storage_protection() {  # $1 = service (optional: all services when omitted)
   return "$rc"
 }
 
+# Where a durable image archive lives.
+#
+# /srv/data/backups is the right tier, and the alternatives are wrong:
+#   * it is on the protected Btrfs tier and `restic backup` is given
+#     "$DOMUM_DATA_ROOT" with only immich-tmp and media-cache excluded, so an
+#     archive here IS in the off-host backup set (measured);
+#   * it is a top-level ordinary directory, NOT inside any service subvolume, so
+#     it does not duplicate into per-service snapshots;
+#   * /srv/media is the deliberately replaceable tier, and / is not backed up.
+image_archive_dir() {
+  printf '%s/backups/images' "${DOMUM_DATA_ROOT%/}"
+}
+
+# Archive an image by ID, with a checksum beside it.
+#
+# `docker save <image-id>` records RepoTags: null, which is correct: the identity
+# worth preserving is the image ID, not a mutable tag. Measured on this host with
+# a disposable image: `docker load` of such an archive reported
+# "Loaded image ID: sha256:fd7dc98638c8…", byte-identical to the original, so the
+# round trip preserves identity.
+#
+# NOTE: the archive's config-blob digest does NOT equal the image ID here (this
+# host records Id as the manifest digest), so identity cannot be checked from the
+# blob alone. The .sha256 beside the archive proves the FILE is intact; `docker
+# load` is what proves the identity. Both are recorded, and neither is presented
+# as the other.
+archive_image_to_file() {  # $1 = image id, $2 = destination .tar
+  local img="$1" dest="$2" dir
+  dir="$(dirname "$dest")"
+  install -d -m 0750 "$dir" || { warn "cannot create $dir"; return 1; }
+  [[ -e "$dest" ]] && { warn "refusing to overwrite an existing archive: $dest"; return 1; }
+  docker image inspect "$img" >/dev/null 2>&1     || { warn "image $img is not present locally; nothing to archive"; return 1; }
+  if ! docker save "$img" -o "$dest.partial" 2>/dev/null; then
+    rm -f -- "$dest.partial"
+    warn "docker save failed for $img"
+    return 1
+  fi
+  # Checksum the partial, then publish atomically: an archive that exists under
+  # its final name must always be complete.
+  sha256sum "$dest.partial" | awk '{print $1}' > "$dest.sha256.partial"     || { rm -f -- "$dest.partial" "$dest.sha256.partial"; warn "could not checksum the archive"; return 1; }
+  sync -f "$dest.partial" 2>/dev/null || sync 2>/dev/null || true
+  mv -- "$dest.partial" "$dest" && mv -- "$dest.sha256.partial" "$dest.sha256"     || { warn "could not publish the archive"; return 1; }
+  chmod 0640 "$dest" "$dest.sha256" 2>/dev/null || true
+  return 0
+}
+
+# A PRE-UPGRADE recovery point: the complete rollback artifact for an application
+# upgrade, created WITHOUT deploying anything.
+#
+# WHY THE EXISTING UPDATE PATH IS NOT ENOUGH. Measured in refresh_images:
+#
+#   * it calls create_service_snapshot while the service is RUNNING. There is no
+#     stop, no open-handle check and no WAL gate anywhere in that function, so
+#     the snapshot is CRASH-consistent, not application-consistent -- and Plex
+#     holds a live non-empty WAL (93 KB at the last measurement). The migration
+#     path stops, proves quiescence and only then snapshots; the update path
+#     would quietly use a weaker model for the same data.
+#   * create_service_snapshot writes NO recovery metadata -- zero references to
+#     it -- so a pre-update snapshot is a DATA-only point. Which application
+#     wrote the state is not recorded.
+#   * and because the cleanup protection keys off `.recovery` files, the old
+#     image a pre-update snapshot depends on would NOT be protected from
+#     `cleanup images`.
+#
+# So this exists as a separate, reversible operation. It stops the service,
+# proves it quiesced, takes a read-only snapshot, optionally archives the exact
+# running image, binds complete metadata tying the two together, and restarts the
+# SAME container on the SAME image via `compose start`. It never resolves an
+# image reference and never deploys.
+storage_pre_upgrade_point() {  # $1 = service, [--archive-image]
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+
+  local service="${1:-}" archive=0
+  [[ "${2:-}" == "--archive-image" ]] && archive=1
+  [[ -n "$service" ]] || die "Usage: domum-media storage pre-upgrade-point <service> [--archive-image]"
+  migrate_allowed_service "$service"     || die "Refusing: '$service' is not a service this command knows about"
+
+  local path
+  path="$(service_data_path "$service")" || die "No data path mapping for $service"
+  [[ -d "$path" ]] || die "Refusing: $path does not exist"
+  domum_is_subvolume "$path"     || die "Refusing: $path is not a Btrfs subvolume, so no snapshot can be taken.
+Migrate it first:  sudo domum-media storage migrate-subvolume $service"
+
+  domum_acquire_lock "pre-upgrade-point $service" 0     || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
+
+  local compose_svcs runtime_before images_before staged
+  compose_svcs="$(service_compose_services "$service" || true)"
+  runtime_before="$(service_runtime_state "$service")"
+  images_before="$(service_running_images "$service")"
+  migrate_stage preflight "service=$service path=$path runtime=$runtime_before"
+  migrate_stage preflight "images: $(printf '%s' "$images_before" | tr '\n' ' ')"
+
+  # Staged BEFORE the stop, so the running image is recorded while it is still
+  # observably running -- the same ordering the migration uses.
+  staged="$(stage_recovery_point_metadata "$service" "$runtime_before")"     || die "Could not stage recovery evidence; nothing has been touched."
+  migrate_stage preflight "recovery evidence staged: $staged"
+
+  local started=0
+  migrate_restart() {
+    (( started == 1 )) || return 0
+    [[ -n "$compose_svcs" ]] || return 0
+    # shellcheck disable=SC2086
+    compose_cmd start $compose_svcs >/dev/null 2>&1 && return 0
+    warn "Could not restart $compose_svcs with \`compose start\`."
+    warn "NOT recreating: that resolves the image tag and could deploy the staged image."
+    warn "$service is DOWN. Nothing was deleted and no snapshot was published."
+    return 1
+  }
+
+  if [[ "$runtime_before" == "running" && -n "$compose_svcs" ]]; then
+    migrate_stage stop "stopping $compose_svcs"
+    # shellcheck disable=SC2086
+    compose_cmd stop $compose_svcs || { rm -f "$staged"; die "Could not stop $compose_svcs"; }
+    started=1
+  fi
+
+  # Application-consistent, or refuse. This is the gate the update path lacks.
+  if ! migrate_assert_quiesced "$path"; then
+    migrate_restart
+    rm -f "$staged"
+    die "Refusing: $path is not quiesced after the stop. No snapshot was taken."
+  fi
+  migrate_stage stop "quiesced: no open handles, no non-empty WAL, no hot journal"
+
+  local proof
+  if ! proof="$(create_service_snapshot "$service" "pre-upgrade" "" "")" || [[ -z "$proof" ]]; then
+    migrate_restart
+    rm -f "$staged"
+    die "Could not create a pre-upgrade snapshot. Nothing was changed."
+  fi
+  migrate_stage proof "snapshot created: $DOMUM_SNAPSHOT_ROOT/$proof"
+
+  # The archive, while the service is still stopped and the image still pinned by
+  # its container. Failure here is fatal BEFORE the restart: a recovery point that
+  # claims an archive it does not have is worse than one that admits it has none.
+  local arch="" arch_sha=""
+  if (( archive == 1 )); then
+    local img
+    img="$(printf '%s' "$images_before" | awk 'NR==1{print $2}')"
+    [[ -n "$img" ]] || { migrate_restart; rm -f "$staged"; die "No image id to archive for $service"; }
+    arch="$(image_archive_dir)/${service}-${img#sha256:}.tar"
+    arch="${arch:0:200}"
+    migrate_stage archive "saving $img -> $arch"
+    if ! archive_image_to_file "$img" "$arch"; then
+      migrate_restart; rm -f "$staged"
+      die "Could not archive $img. The snapshot exists but no metadata was bound."
+    fi
+    arch_sha="$(cat "$arch.sha256")"
+    migrate_stage archive "archived $(stat -c %s "$arch") bytes, sha256 ${arch_sha:0:16}…"
+    printf "IMAGE_ARCHIVE='%s'\n" "$arch" >> "$staged"
+    printf "IMAGE_ARCHIVE_SHA256='%s'\n" "$arch_sha" >> "$staged"
+    printf "IMAGE_ARCHIVE_BYTES='%s'\n" "$(stat -c %s "$arch")" >> "$staged"
+  fi
+  printf "POINT_KIND='pre-upgrade'\n" >> "$staged"
+
+  local meta
+  if ! meta="$(bind_recovery_point_metadata "$staged" "$service" "$proof")"; then
+    migrate_restart
+    die "The snapshot exists at $DOMUM_SNAPSHOT_ROOT/$proof but recovery evidence
+could not be bound to it. That is a DATA-only point. Investigate before upgrading."
+  fi
+  migrate_stage proof "recovery evidence: $meta"
+
+  local restart_ok=1
+  migrate_restart || restart_ok=0
+
+  local runtime_after images_after
+  runtime_after="$(service_runtime_state "$service")"
+  images_after="$(service_running_images "$service")"
+  [[ "$runtime_after" == "$runtime_before" ]]     && migrate_stage health "runtime state preserved: $runtime_after"     || warn "runtime state changed: $runtime_before -> $runtime_after"
+  if [[ "$images_after" == "$images_before" ]]; then
+    migrate_stage health "image unchanged -- nothing was deployed"
+  else
+    warn "$service IS RUNNING A DIFFERENT IMAGE than before:"
+    warn "  before: $(printf '%s' "$images_before" | tr '\n' ' ')"
+    warn "  after : $(printf '%s' "$images_after" | tr '\n' ' ')"
+    restart_ok=0
+  fi
+
+  echo
+  echo "[domum-media] Pre-upgrade recovery point for $service"
+  echo "  snapshot        : $proof"
+  echo "  recovery evidence: $meta"
+  if (( archive == 1 )); then
+    echo "  image archive   : $arch"
+    echo "  archive sha256  : $arch_sha"
+  else
+    echo "  image archive   : none (re-run with --archive-image for a durable copy)"
+  fi
+  if (( restart_ok == 1 )); then
+    echo "  service         : $runtime_after on the SAME image"
+    echo
+    echo "[domum-media] Pre-upgrade point COMPLETE. Nothing was deployed."
+    return 0
+  fi
+  echo "[domum-media] Pre-upgrade point INCOMPLETE -- read the warnings above."
+  return 1
+}
+
 storage_verify_recovery() {  # $1 = service, $2 = recovery point, [--deep]
   local service="${1:-}" point="${2:-}" deep=0 meta problem n ident avail img ref ver
   [[ "${3:-}" == "--deep" ]] && deep=1
@@ -7255,7 +7457,13 @@ storage_cmd() {
       # directory, so an operator can ask months later what a point is paired with.
       load_cfg
       storage_verify_recovery "${1:-}" "${2:-}" "${3:-}" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]}" ;;
+      pre-upgrade-point)
+        shift
+        # Deploys nothing: stop, prove quiescence, snapshot, archive the EXACT
+        # running image, bind metadata, restart the same container on the same
+        # image. The complete rollback artifact for a later upgrade.
+        storage_pre_upgrade_point "${1:-}" "${2:-}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]}" ;;
   esac
 }
 
@@ -7321,6 +7529,13 @@ Usage:
                                             unprotected or unknown. Exits 0 only
                                             for "protected"
   domum-media storage verify-recovery <service> <point> [--deep]
+  domum-media storage pre-upgrade-point <service> [--archive-image]
+                                            Application-consistent recovery point
+                                            for a later upgrade: stop, prove
+                                            quiescence, snapshot, archive the
+                                            exact running image, bind metadata,
+                                            restart the SAME image. Deploys
+                                            nothing
                                             What application image a recovery
                                             point is paired with, and whether that
                                             image can still be obtained
