@@ -151,6 +151,24 @@ jobs:
       - name: Function definition audit smoke test
         run: tests/function-definition-audit-smoke.sh
 
+      # A capability token is a promise to operator scripts; it must be backed by
+      # a dispatchable command, not just a function that happens to exist.
+      - name: Capabilities contract audit
+        run: python3 tests/capabilities-contract-audit.py
+
+      - name: Capabilities contract smoke test
+        run: tests/capabilities-contract-smoke.sh
+
+      # JSON and the human report must not be able to disagree about what is
+      # protected from deletion.
+      - name: Cleanup images JSON smoke test
+        run: tests/cleanup-images-json-smoke.sh
+
+      # Enters through the real dispatcher and lets service_upgrade RUN. Every
+      # earlier test asserted on its text, which is why an undefined call shipped.
+      - name: Service upgrade integration smoke test
+        run: tests/service-upgrade-integration-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
