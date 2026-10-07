@@ -168,4 +168,41 @@ grep -q 'nothing was deployed' <<< "$fn" \
   || fail "the summary does not state that nothing was deployed"
 echo "  stated in both the usage text and the result"
 
+echo "== 13. the archive inventory answers the lifecycle questions =="
+ar="$(awk '/^storage_archives\(\) \{/,/^\}/' "$CLI")"
+[ -n "$ar" ] || fail "storage_archives is missing"
+# The questions the operator has to be able to answer without reading two
+# directories by hand.
+for want in 'needed by' 'image id' 'checksum' 'local object' 'safe to delete' 'orphan'; do
+  grep -qi -- "$want" <<< "$ar" || fail "the inventory does not report: $want"
+done
+# It must decide "needed" from the METADATA, not from the filename, which is
+# only a convenience.
+grep -q "IMAGE_ARCHIVE='" <<< "$ar" \
+  || fail "the inventory does not match archives against IMAGE_ARCHIVE in the metadata"
+# And it must never delete.
+grep -qE '^\s*(rm|btrfs subvolume delete|docker image rm)' <<< "$ar" \
+  && fail "storage_archives deletes something; it is an inventory"
+grep -q 'Nothing was deleted' <<< "$ar" || fail "it does not state that it deleted nothing"
+echo "  reports need, id, checksum, local object, orphans; deletes nothing"
+
+echo "== 14. an archive whose only copy is the file is called out =="
+grep -q 'this archive is the only copy' <<< "$ar" \
+  || fail "when the local Docker object is gone, the inventory must say the archive
+is the only remaining copy of the application"
+grep -q 'a rollback would not need this archive' <<< "$ar" \
+  || fail "when the local object is present it should say so, or the operator cannot
+tell which archives are load-bearing today"
+echo "  distinguishes 'only copy' from 'local object also present'"
+
+echo "== 15. every metadata key the new code reads is one the writer emits =="
+# A reader using a key the writer never produces does not fail -- sed matches
+# nothing and the value is silently empty. That happened: the inventory read
+# ..._IMAGE_VERSION while the writer emits ..._IMAGE_LABEL_VERSION.
+python3 "$REPO_ROOT/tests/recovery-metadata-keys-audit.py" >/dev/null \
+  || fail "the recovery-metadata key audit fails; a key is read but never written"
+grep -q 'IMAGE_LABEL_VERSION' <<< "$ar" \
+  || fail "the inventory no longer reads the version key the writer actually emits"
+echo "  key audit passes; the inventory reads IMAGE_LABEL_VERSION"
+
 echo "PASS: pre-upgrade point smoke test"

@@ -7570,6 +7570,87 @@ could not, and starting it under a different build is the failure this prevents.
   return 1
 }
 
+# Every image archive on disk, and whether anything still needs it.
+#
+# Lifecycle, deliberately WITHOUT any automatic deletion:
+#
+#   a retained recovery point names the image  ->  the archive is NEEDED
+#   no retained recovery point names it        ->  ORPHAN, eligible for operator
+#                                                  review, never removed here
+#
+# This exists so the questions have answers that do not require reading two
+# directories by hand: which point needs this, which image, which version, does
+# the checksum still match, is the local Docker object still there, and is it
+# safe to delete. An unmanaged pile of opaque tarballs is the failure mode.
+storage_archives() {
+  need_root
+  load_cfg
+  local dir meta_dir f base img point svc ver sha bytes want_sha needed n=0 orphans=0
+  dir="$(image_archive_dir)"
+  meta_dir="$(snapshot_metadata_dir)"
+
+  if [[ ! -d "$dir" ]] || ! compgen -G "$dir/*.tar" >/dev/null 2>&1; then
+    echo "No image archives in $dir."
+    return 0
+  fi
+
+  for f in "$dir"/*.tar; do
+    [[ -e "$f" ]] || continue
+    n=$(( n + 1 ))
+    base="$(basename "$f")"
+    # Which retained recovery point names this archive? Ask the metadata, not the
+    # filename -- the filename is a convenience, the metadata is the record.
+    point=""; img=""; svc=""; ver=""
+    while IFS= read -r m; do
+      [[ -e "$m" ]] || continue
+      if grep -qF "IMAGE_ARCHIVE='$f'" "$m"; then
+        point="$(basename "$m" .recovery)"
+        img="$(sed -nE "s/^CONTAINER_1_IMAGE_ID='(.*)'\$/\1/p" "$m" | head -1)"
+        svc="$(sed -nE "s/^SERVICE='(.*)'\$/\1/p" "$m" | head -1)"
+        # ..._IMAGE_LABEL_VERSION is what the writer emits. The obvious shorter
+        # guess matches nothing and would have left the version silently blank
+        # forever; tests/recovery-metadata-keys-audit.py now catches that class.
+        ver="$(sed -nE "s/^CONTAINER_1_IMAGE_LABEL_VERSION='(.*)'\$/\1/p" "$m" | head -1)"
+        want_sha="$(sed -nE "s/^IMAGE_ARCHIVE_SHA256='(.*)'\$/\1/p" "$m" | head -1)"
+        break
+      fi
+    done < <(compgen -G "$meta_dir/*.recovery" || true)
+
+    bytes="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    echo "$base"
+    echo "  path            : $f"
+    echo "  bytes           : $bytes"
+    if [[ -n "$point" ]]; then
+      needed=yes
+      echo "  needed by       : $point   (service ${svc:-?})"
+      echo "  image id        : ${img:-<not recorded>}"
+      [[ -n "$ver" ]] && echo "  version         : $ver"
+      sha="$(sha256sum "$f" | awk '{print $1}')"
+      if [[ -n "$want_sha" && "$sha" == "$want_sha" ]]; then
+        echo "  checksum        : matches the record"
+      elif [[ -n "$want_sha" ]]; then
+        echo "  checksum        : MISMATCH -- recorded $want_sha, on disk $sha"
+      else
+        echo "  checksum        : nothing recorded to compare against"
+      fi
+      if [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1; then
+        echo "  local object    : present (a rollback would not need this archive)"
+      else
+        echo "  local object    : ABSENT -- this archive is the only copy"
+      fi
+      echo "  safe to delete  : NO"
+    else
+      needed=no
+      orphans=$(( orphans + 1 ))
+      echo "  needed by       : nothing -- no retained recovery point names it"
+      echo "  safe to delete  : operator review (nothing here deletes it)"
+    fi
+    echo
+  done
+  echo "$n archive(s), $orphans orphan(s). Nothing was deleted."
+  return 0
+}
+
 # Upgrade ONE service, and prove it was one.
 #
 # This is deliberately NOT refresh_images. That function cannot take a service
@@ -7872,7 +7953,12 @@ storage_cmd() {
         # Read-only. Checks the archive FILE against its recorded sha256 and
         # says plainly that this is not the same claim as image identity.
         storage_verify_archive "${1:-}" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|verify-archive <point>}" ;;
+      archives)
+        shift
+        # Read-only inventory: which recovery point needs each archive, and
+        # which are orphans. Deletes nothing.
+        storage_archives ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|verify-archive <point>|archives}" ;;
   esac
 }
 
@@ -7948,6 +8034,9 @@ Usage:
                                             unprotected or unknown. Exits 0 only
                                             for "protected"
   domum-media storage verify-recovery <service> <point> [--deep]
+  domum-media storage archives              Which recovery point needs each
+                                            image archive, and which are
+                                            orphans. Deletes nothing
   domum-media storage verify-archive <point>
                                             Whether a recovery point's image
                                             archive is intact, and what that does

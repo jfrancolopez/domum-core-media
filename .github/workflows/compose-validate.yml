@@ -138,6 +138,10 @@ jobs:
       - name: Service upgrade smoke test
         run: tests/service-upgrade-smoke.sh
 
+      # A metadata key read but never written is silently always empty.
+      - name: Recovery metadata keys audit
+        run: python3 tests/recovery-metadata-keys-audit.py
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
