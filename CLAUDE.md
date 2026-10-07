@@ -356,6 +356,52 @@ and neither is presented as the other. Archives live in
 backup set, and **outside every service subvolume** so they do not duplicate into
 per-service snapshots.
 
+**`updates apply --service <s>` upgrades ONE service; bare `updates apply` is the
+fleet path and cannot target one.** They are different operations, not a filter:
+`refresh_images` dies on any positional argument, and its scope is every service
+with `ENABLE_*=1` and `*_AUTO_UPDATE=1`. `service_upgrade` validates the name
+against `managed_image_specs` with an exact whole-line match and **dies** on an
+unknown one — a typo must never widen to the fleet. It deploys the image already
+staged locally and never pulls, so what was reviewed is what runs, and it
+captures every other container's id and image with `ps -a` before and compares
+after. That before/after comparison is the scope proof.
+
+**Pre-upgrade protection is not a separate operator step.** `service_upgrade`
+creates the point, archives the image and verifies the archive under the same
+lock, and cannot reach `up -d` unless all three succeeded.
+
+**Rollback restores BOTH halves or refuses (task-24).** The old auto-rollback
+restored the snapshot and used `compose start` — onto the container the upgrade
+created, i.e. the **new** image: old data under a newer application, the exact
+pairing failure. `rollback_upgrade` takes the image id from the recovery
+evidence, never from a tag; loads it from the archive if the local object is
+gone and **compares the loaded id to the record**; pins `<SERVICE>_IMAGE` and
+recreates deliberately; and preserves the failed state as `.failed-<timestamp>`.
+
+**Pin an image with a subshell `export`, never `env VAR=… compose_cmd`.**
+`compose_cmd` is a shell function and `env` can only exec a binary — measured,
+`env X=1 f` gives `env: 'f': No such file or directory`, so that form fails every
+time while a text-grep test still passes. `export_env_for_compose` uses
+`${PLEX_IMAGE:-default}`, so a value exported first is preserved.
+
+**The `--help` text lives in an UNQUOTED `cat <<EOF`, so a backtick or `$( )`
+there is command substitution, not documentation.** Measured: usage text
+containing a backticked `apply --service <s>` printed as
+`"  upgrades ONE … Bare  is the"` — the backticked words were **executed and
+vanished**, and `<s>` inside the substitution parsed as an input redirection
+(shellcheck reported it as a parse error). `tests/log-hygiene-smoke.sh` now
+rejects a backtick in any unquoted heredoc, and `$( )` in the `Usage:` block
+specifically — a deliberate `$(immich_postgres_data_dir)` in a *message* heredoc
+is fine, which is why the check distinguishes them.
+
+**A metadata key read but never written is silently empty.**
+`sed -nE "s/^KEY='(.*)'$/\1/p"` against a key nobody emits matches nothing: no
+error, well-formed output, wrong answer. It happened — new code read
+`..._IMAGE_VERSION` while the writer emits `..._IMAGE_LABEL_VERSION`.
+`tests/recovery-metadata-keys-audit.py` compares the written and read sets across
+the whole file and fails if its own extraction patterns stop matching, so it
+cannot pass vacuously.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
