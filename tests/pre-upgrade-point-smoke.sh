@@ -85,11 +85,19 @@ deploy the staged image this point exists to protect against"
 echo "  'compose start' only, no executable 'up -d'"
 
 echo "== 5. it refuses on a path that is not a subvolume =="
-grep -q 'domum_is_subvolume "$path"' <<< "$fn" \
-  || fail "it does not check that the path can be snapshotted"
-grep -q 'migrate-subvolume' <<< "$fn" \
+# The check lives in assert_pre_upgrade_possible, shared with service_upgrade so
+# the two cannot disagree about what counts as protectable. Assert the routing
+# plus the check, not the inlined text -- this test failed the extraction once
+# while the behaviour was intact.
+grep -q 'assert_pre_upgrade_possible' <<< "$fn" \
+  || fail "it does not assert that a pre-upgrade point is possible"
+helper="$(awk '/^assert_pre_upgrade_possible\(\) \{/,/^\}$/' "$CLI")"
+[ -n "$helper" ] || fail "assert_pre_upgrade_possible is not defined"
+grep -q 'domum_is_subvolume "$path"' <<< "$helper" \
+  || fail "the assertion does not check that the path can be snapshotted"
+grep -q 'migrate-subvolume' <<< "$helper" \
   || fail "the refusal does not tell the operator how to fix it"
-echo "  refuses, and names the fix"
+echo "  refuses via the shared assertion, and names the fix"
 
 echo "== 6. every failure path restarts the service and leaves nothing behind =="
 # A half-finished pre-upgrade point must not leave the service down or publish a

@@ -7223,6 +7223,34 @@ archive_image_to_file() {  # $1 = image id, $2 = destination .tar
 # running image, binds complete metadata tying the two together, and restarts the
 # SAME container on the SAME image via `compose start`. It never resolves an
 # image reference and never deploys.
+# Can a pre-upgrade recovery point exist for this service AT ALL?
+#
+# Answering this is cheap, read-only, and must happen BEFORE anything is stopped.
+# service_upgrade asks first so a service whose state cannot be snapshotted is
+# refused while it is still running, rather than after the stop -- and
+# storage_pre_upgrade_point asks through the same function so the two can never
+# disagree about what counts as protectable. There is one implementation of this
+# check for the same reason the topology check has one: a second copy is how a
+# stale invariant escapes review.
+#
+# Prints the service's data path on success. Everything else is a refusal.
+assert_pre_upgrade_possible() {  # $1 = service -> prints data path
+  local service="${1:-}" path
+  [[ -n "$service" ]] || die "assert_pre_upgrade_possible: no service given"
+  migrate_allowed_service "$service" \
+    || die "Refusing: '$service' is not a service this command knows about"
+  path="$(service_data_path "$service")" || die "No data path mapping for $service"
+  [[ -n "$path" ]] || die "No data path mapping for $service"
+  # A path that does not exist is NOT "nothing to protect": for a service that
+  # should have state it means the mount is missing or the name is wrong, and
+  # upgrading on top of that would create a fresh install.
+  [[ -d "$path" ]] || die "Refusing: $path does not exist"
+  domum_is_subvolume "$path" \
+    || die "Refusing: $path is not a Btrfs subvolume, so no snapshot can be taken.
+Migrate it first:  sudo domum-media storage migrate-subvolume $service"
+  printf '%s\n' "$path"
+}
+
 storage_pre_upgrade_point() {  # $1 = service, [--archive-image]
   need_root
   load_cfg
@@ -7232,13 +7260,9 @@ storage_pre_upgrade_point() {  # $1 = service, [--archive-image]
   local service="${1:-}" archive=0
   [[ "${2:-}" == "--archive-image" ]] && archive=1
   [[ -n "$service" ]] || die "Usage: domum-media storage pre-upgrade-point <service> [--archive-image]"
-  migrate_allowed_service "$service"     || die "Refusing: '$service' is not a service this command knows about"
 
   local path
-  path="$(service_data_path "$service")" || die "No data path mapping for $service"
-  [[ -d "$path" ]] || die "Refusing: $path does not exist"
-  domum_is_subvolume "$path"     || die "Refusing: $path is not a Btrfs subvolume, so no snapshot can be taken.
-Migrate it first:  sudo domum-media storage migrate-subvolume $service"
+  path="$(assert_pre_upgrade_possible "$service")"
 
   domum_acquire_lock "pre-upgrade-point $service" 0     || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
 
