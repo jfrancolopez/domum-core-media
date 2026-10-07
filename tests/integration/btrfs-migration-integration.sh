@@ -197,6 +197,7 @@ svc_lifecycle_log() { printf '%s\n' "\$1" >> "$SVC/config/service.log"; }
 
 svc_start() {
   svc_lifecycle_log "startup \$(date +%s%N)"
+  : > "$FIXTURE/container.exists"
   : > "$SVC/config/service.lock"
   printf 'wal-data\n' > "$SVC/config/data/library.db-wal"
   [[ -e "\$RUNPID" ]] && return 0
@@ -219,16 +220,75 @@ svc_stop() {
 compose_cmd() {
   printf 'compose %s\n' "\$*" >> "\$LIFECYCLE"
   case "\${1:-}" in
+    # The ps subcommand must be modelled, and it was not.
+    #
+    # The CLI moved from "compose ps -q" to "compose ps -qa" -- deliberately,
+    # because -q lists only RUNNING containers and so conflates stopped with
+    # absent. This stub was never updated, so every ps fell through to the bare
+    # "return 0" below and produced no output. service_runtime_state then read
+    # "absent", the migration skipped the stop entirely, the simulated service
+    # kept its file handle, and the quiescence gate refused:
+    # (No backticks in here: this heredoc is UNQUOTED, so they would EXECUTE.)
+    #
+    #   migrate[stop] jellyfin was absent before this migration
+    #   ERROR: Migration aborted: the service is not quiesced.
+    #
+    # The suite has been failing on that since the -qa change, invisibly,
+    # because CI has no Btrfs and skips this file. A container that has been
+    # created still EXISTS once stopped, so -qa answers from a marker that
+    # svc_stop does not clear, while -q answers from the live pid.
+    ps)
+      case "\$*" in
+        *-qa*) [[ -e "$FIXTURE/container.exists" ]] && printf 'cid-jellyfin\n' ;;
+        *)     [[ -s "\$RUNPID" ]] && printf 'cid-jellyfin\n' ;;
+      esac
+      return 0 ;;
     stop) \${SIMULATE_STOP_FAILS:+return 1}; \${SIMULATE_STOP_IGNORED:-svc_stop} ;;
-    up)   \${SIMULATE_RESTART_FAILS:+return 1}
+    # BOTH up and start must be modelled. A migration deliberately restarts with
+    # "compose start", which resolves no image reference, and only the deployment
+    # paths use "up -d". The stub modelled only up, so the migration's restart
+    # did nothing and the service appeared to write nothing afterwards.
+    up|start)
+          \${SIMULATE_RESTART_FAILS:+return 1}
           if [[ -n "\${DOMUM_LOCK_FD:-}" ]]; then svc_start {DOMUM_LOCK_FD}>&-; else svc_start; fi ;;
   esac
   return 0
 }
 # docker ps must agree with the simulated lifecycle.
+FIXTURE_IMG=sha256:1111111111111111111111111111111111111111111111111111111111111111
 docker() {
   if [[ "\${1:-}" == "ps" ]]; then
-    [[ -s "\$RUNPID" ]] && printf 'jellyfin\n'
+    case "\$*" in
+      *-a*) [[ -e "$FIXTURE/container.exists" ]] && printf 'jellyfin\n' ;;
+      *)    [[ -s "\$RUNPID" ]] && printf 'jellyfin\n' ;;
+    esac
+    return 0
+  fi
+  # Readiness is matched against "docker logs" output. With no logs the
+  # post-restart wait burned its full 120-second timeout and then reported the
+  # service as never ready -- on every service, for every section after the
+  # migration started working.
+  if [[ "\${1:-}" == "logs" ]]; then
+    printf 'Navidrome server is ready!\n'
+    printf 'Connection to localhost (::1) 32400 port [tcp/*] succeeded!\n'
+    return 0
+  fi
+  # Image identity. Now that ps is modelled, the migration reaches the identity
+  # capture it must perform before stopping anything -- a path this suite could
+  # not previously enter at all. The tag resolves to the SAME id the container
+  # runs, so the fixture models a service with nothing staged: restarting it
+  # cannot deploy a different image.
+  if [[ "\${1:-}" == "inspect" || "\${2:-}" == "inspect" ]]; then
+    case "\$*" in
+      *'{{.State.Status}}'*) [[ -s "\$RUNPID" ]] && printf 'running\n' || printf 'exited\n' ;;
+      *'{{.Config.Image}}'*) printf 'jellyfin:latest\n' ;;
+      *'{{.Image}}'*|*'{{.Id}}'*) printf '%s\n' "\$FIXTURE_IMG" ;;
+      *'RepoDigests'*) printf '\n' ;;
+      *'{{.Created}}'*) printf '2026-01-01T00:00:00Z\n' ;;
+      *'{{.Size}}'*) printf '1000\n' ;;
+      *'Labels'*) printf '\n' ;;
+      *) printf '\n' ;;
+    esac
     return 0
   fi
   return 0
@@ -416,7 +476,19 @@ ok "proof snapshot taken while quiesced" "before restart"
 
 # --- the service really was stopped and really came back -------------------
 grep -q 'compose stop jellyfin' "$FIXTURE/lifecycle.log" || fail "the service was never stopped"
-grep -q 'compose up -d jellyfin' "$FIXTURE/lifecycle.log" || fail "the service was never restarted"
+# It must come back with `compose start`, NOT `up -d`.
+#
+# This assertion previously required `compose up -d jellyfin`, i.e. it required
+# the behaviour that was deliberately removed: `up -d` reconciles and would
+# deploy whatever the tag resolves to, which is how the Kavita migration
+# recreated its container on a newer staged image. `compose start` restarts the
+# container that was stopped and resolves no image reference at all. The test
+# was pinning the defect.
+grep -q 'compose start jellyfin' "$FIXTURE/lifecycle.log" \
+  || fail "the service was never restarted with 'compose start'"
+grep -q 'compose up -d jellyfin' "$FIXTURE/lifecycle.log" \
+  && fail "the migration restarted with 'up -d', which RECONCILES and can deploy a
+staged image. It must use 'compose start'."
 [[ -s "$FIXTURE/service.pid" ]] || fail "the simulated service is not running after the migration"
 HOLDER_PID="$(cat "$FIXTURE/service.pid")"
 ok "service stopped for the migration and restarted afterwards" "pid=$HOLDER_PID"
@@ -439,10 +511,25 @@ CAP="$FIXTURE/topology.capture"
 run "storage_topology" > "$CAP"
 grep -q "^subvolume $SVC\$" "$CAP" \
   || fail "storage_topology does not list the real migrated subvolume: $(cat "$CAP")"
-grep -q "^snapshot $(basename -- "$PROOF")\$" "$CAP" \
+grep -q "^snapshot $PROOF\$" "$CAP" \
   || fail "storage_topology does not list the real proof snapshot: $(cat "$CAP")"
-grep -q '^# topology-format 1 detector=btrfs-tool ' "$CAP" \
-  || fail "as root with btrfs present the capture must record the tool detector: $(cat "$CAP")"
+# The invariant is that the capture RECORDS which detector produced it, so a
+# capture taken with a different one is refused rather than silently diffed.
+# WHICH detector runs depends on privilege: domum_is_subvolume uses
+# `btrfs subvolume show` only as uid 0 and otherwise falls back to inode+fstype.
+# This assertion demanded detector=btrfs-tool unconditionally while the header of
+# this very file says "Runs unprivileged" -- so it could only ever pass under
+# sudo, and nothing said so.
+DETECTOR="$(sed -nE 's/^# topology-format 1 detector=([^ ]+) .*/\1/p' "$CAP" | head -1)"
+case "$DETECTOR" in
+  btrfs-tool|inode+fstype) : ;;
+  *) fail "the capture records no recognised detector (got '${DETECTOR:-<none>}'): $(cat "$CAP")" ;;
+esac
+if [[ "$(id -u)" == "0" ]]; then
+  [[ "$DETECTOR" == "btrfs-tool" ]] \
+    || fail "as root the capture must record the tool detector, got '$DETECTOR'"
+fi
+ok "the capture records its detector" "detector=$DETECTOR$([[ "$(id -u)" == 0 ]] || printf ' (unprivileged)')"
 # Ordinary sibling directories must NOT be listed. This is the half of the
 # inventory a stubbed detector cannot prove.
 mkdir -p "$DATA/ordinary-dir"
@@ -467,17 +554,33 @@ out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
 (( rc == 1 )) || fail "a real new subvolume was not reported as a change (rc=$rc): $out"
 grep -q "APPEARED    subvolume $DATA/interloper" <<< "$out" \
   || fail "the new real subvolume was not named: $out"
-btrfs subvolume delete "$DATA/interloper" >/dev/null 2>&1 \
+# Remove it the way this file's own teardown does.
+#
+# `btrfs subvolume delete` needs root on this filesystem even for an EMPTY
+# subvolume -- measured: "ERROR: Could not destroy subvolume/snapshot: Operation
+# not permitted", because user_subvol_rm_allowed is not set. `rmdir` on an empty
+# subvolume succeeds unprivileged, which is exactly what the header means by
+# "teardown is complete without root". Using the btrfs tool here contradicted
+# that and made the suite root-only from this line onward.
+rmdir "$DATA/interloper" 2>/dev/null \
+  || btrfs subvolume delete "$DATA/interloper" >/dev/null 2>&1 \
   || fail "could not remove the interloping subvolume"
+[[ -e "$DATA/interloper" ]] && fail "the interloping subvolume is still present"
 ok "verify reports a real subvolume appearing" "and names it"
 
 # A real snapshot disappearing -- the recovery point itself -- must be caught.
 # Moved aside, not deleted: this is the proof snapshot.
-mv "$PROOF" "$SNAPS/.held-aside"
+# PROOF is a snapshot NAME, not a path -- every other use in this file prefixes
+# $SNAPS/. These two did not, so the mv silently failed ("cannot stat
+# 'jellyfin-...-post-migration'"), the snapshot never moved, and the assertion
+# below reported that a vanished snapshot was not detected -- blaming the code
+# under test for the test's own bug. Latent until the migration above started
+# succeeding, because PROOF was empty before that.
+mv "$SNAPS/$PROOF" "$SNAPS/.held-aside" || fail "could not move the proof snapshot aside"
 out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
-mv "$SNAPS/.held-aside" "$PROOF"
+mv "$SNAPS/.held-aside" "$SNAPS/$PROOF" || fail "could not restore the proof snapshot"
 (( rc == 1 )) || fail "a vanished real snapshot was not reported (rc=$rc): $out"
-grep -q "DISAPPEARED snapshot $(basename -- "$PROOF")" <<< "$out" \
+grep -q "DISAPPEARED snapshot $PROOF" <<< "$out" \
   || fail "the vanished snapshot was not named: $out"
 out="$(run "storage_topology_verify '$CAP'" 2>&1)"; rc=$?
 (( rc == 0 )) || fail "restoring the snapshot did not restore the topology (rc=$rc): $out"
@@ -485,7 +588,14 @@ ok "verify reports a real snapshot disappearing, and clears when it returns"
 
 # A capture taken with the other detector must be refused, not diffed: it answers
 # a different question, and "I cannot tell" must never read as "unchanged".
-sed 's/detector=btrfs-tool/detector=inode+fstype/' "$CAP" > "$FIXTURE/topology.other"
+# Swap to whichever detector is NOT the one that produced this capture.
+if [[ "$DETECTOR" == "btrfs-tool" ]]; then
+  sed 's/detector=btrfs-tool/detector=inode+fstype/' "$CAP" > "$FIXTURE/topology.other"
+else
+  sed 's/detector=inode+fstype/detector=btrfs-tool/' "$CAP" > "$FIXTURE/topology.other"
+fi
+cmp -s "$CAP" "$FIXTURE/topology.other" \
+  && fail "the detector swap changed nothing, so the refusal below proves nothing"
 out="$(run "storage_topology_verify '$FIXTURE/topology.other'" 2>&1)"; rc=$?
 (( rc == 2 )) || fail "a capture from the other detector must be 'not comparable' (rc=$rc): $out"
 ok "a capture from a different detector is refused, not diffed" "rc=2"
@@ -659,7 +769,7 @@ INTRUDER="$(cat "$FIXTURE/intruder.pid" 2>/dev/null || true)"
 
 out="$(run "service_data_path() { printf '%s' '$SVC3'; }
 service_compose_services() { printf 'navidrome'; }
-docker() { return 0; }
+docker() { case \"\$*\" in *'{{.State.Status}}'*) printf 'running\n' ;; *'{{.Config.Image}}'*) printf 'svc:latest\n' ;; *'{{.Image}}'*|*'{{.Id}}'*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;; ps*) printf 'cid-svc\n' ;; logs*) printf 'Navidrome server is ready!\n' ;; *) printf '\n' ;; esac; return 0; }
 storage_migrate_subvolume navidrome")"; rc=$?
 kill "$INTRUDER" 2>/dev/null; wait 2>/dev/null
 (( rc != 0 )) || fail "the migration proceeded with an external process holding a handle"
@@ -675,12 +785,18 @@ SVC3_FP="$(fingerprint "$SVC3")"
 : > "$FIXTURE/lifecycle.log"
 out="$(run "service_data_path() { printf '%s' '$SVC3'; }
 service_compose_services() { printf 'navidrome'; }
-docker() { return 0; }
+docker() { case \"\$*\" in *'{{.State.Status}}'*) printf 'running\n' ;; *'{{.Config.Image}}'*) printf 'svc:latest\n' ;; *'{{.Image}}'*|*'{{.Id}}'*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;; ps*) printf 'cid-svc\n' ;; logs*) printf 'Navidrome server is ready!\n' ;; *) printf '\n' ;; esac; return 0; }
 storage_migrate_subvolume navidrome")"; rc=$?
 (( rc != 0 )) || fail "the migration proceeded with a non-empty WAL"
 grep -qi 'write-ahead log' <<< "$out" || fail "the WAL refusal did not explain itself: $out"
 grep -qi 'has been restarted' <<< "$out" || fail "the abort did not restart the service"
-grep -q 'compose up -d' "$FIXTURE/lifecycle.log" || fail "the service was left stopped after the WAL abort"
+# Restarted with `compose start`, not `up -d` -- same reason as the successful
+# path: an abort must not become an image deployment.
+grep -qE 'compose (start|up -d)' "$FIXTURE/lifecycle.log" \
+  || fail "the service was left stopped after the WAL abort"
+grep -q 'compose up -d' "$FIXTURE/lifecycle.log" \
+  && fail "the WAL abort restarted with 'up -d', which reconciles and can deploy a
+staged image. An abort must restore, not deploy."
 [[ "$(fingerprint "$SVC3")" == "$SVC3_FP" ]] || fail "the refused migration damaged state"
 ok "non-empty WAL refused, and the service was restarted"
 rm -f "$SVC3/data/navidrome.db-wal"
@@ -691,7 +807,7 @@ rm -f "$SVC3/data/navidrome.db-wal"
 SVC3_FP="$(fingerprint "$SVC3")"
 out="$(run "service_data_path() { printf '%s' '$SVC3'; }
 service_compose_services() { printf 'navidrome'; }
-docker() { return 0; }
+docker() { case \"\$*\" in *'{{.State.Status}}'*) printf 'running\n' ;; *'{{.Config.Image}}'*) printf 'svc:latest\n' ;; *'{{.Image}}'*|*'{{.Id}}'*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;; ps*) printf 'cid-svc\n' ;; logs*) printf 'Navidrome server is ready!\n' ;; *) printf '\n' ;; esac; return 0; }
 cp() { command cp -a --reflink=always \"\${@: -2:1}\" \"\${@: -1}\" >/dev/null 2>&1; return 1; }
 storage_migrate_subvolume navidrome")"; rc=$?
 (( rc != 0 )) || fail "a failed copy did not abort the migration"
@@ -706,7 +822,7 @@ ok "failed copy: partial removed, original untouched"
 # unverified subvolume must be removed and the original kept.
 out="$(run "service_data_path() { printf '%s' '$SVC3'; }
 service_compose_services() { printf 'navidrome'; }
-docker() { return 0; }
+docker() { case \"\$*\" in *'{{.State.Status}}'*) printf 'running\n' ;; *'{{.Config.Image}}'*) printf 'svc:latest\n' ;; *'{{.Image}}'*|*'{{.Id}}'*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;; ps*) printf 'cid-svc\n' ;; logs*) printf 'Navidrome server is ready!\n' ;; *) printf '\n' ;; esac; return 0; }
 migrate_verify() { warn 'forced mismatch'; return 1; }
 storage_migrate_subvolume navidrome")"; rc=$?
 (( rc != 0 )) || fail "a verification mismatch did not abort the migration"
@@ -722,13 +838,25 @@ ok "verification mismatch: unverified copy removed, original in place"
 # not established.
 out="$(run "service_data_path() { printf '%s' '$SVC3'; }
 service_compose_services() { printf 'navidrome'; }
-docker() { return 0; }
+docker() { case \"\$*\" in *'{{.State.Status}}'*) printf 'running\n' ;; *'{{.Config.Image}}'*) printf 'svc:latest\n' ;; *'{{.Image}}'*|*'{{.Id}}'*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;; ps*) printf 'cid-svc\n' ;; logs*) printf 'Navidrome server is ready!\n' ;; *) printf '\n' ;; esac; return 0; }
 create_service_snapshot() { return 1; }
 storage_migrate_subvolume navidrome")"; rc=$?
 (( rc != 0 )) || fail "a failed proof snapshot reported success"
 grep -qi 'rollback protection was not established' <<< "$out" \
   || fail "the missing proof snapshot was not explained: $out"
-grep -qi 'Migration complete' <<< "$out" || fail "the migration did not actually complete"
+# It must NOT claim completion.
+#
+# This assertion previously REQUIRED the words "Migration complete" here -- i.e.
+# it required the behaviour that was deliberately removed. A filesystem migration
+# can succeed while the recovery point is incomplete, and the summary was split
+# into four separate claims precisely so that case stops being reported as
+# success. The test was pinning the "warn and continue" defect.
+grep -q 'data migrated   : yes' <<< "$out" \
+  || fail "the data migration itself was not reported as having succeeded: $out"
+grep -qi 'Migration complete' <<< "$out" \
+  && fail "a migration whose proof snapshot FAILED still claimed 'Migration complete'.
+Either the operation refuses, or its result is reported as something other than
+success."
 [[ "$(stat -c %i "$SVC3")" == "256" ]] || fail "the migration did not actually migrate"
 [[ "$(fingerprint "$SVC3")" == "$SVC3_FP" ]] || fail "the migrated tree differs from the original"
 [[ -d "$DATA/navidrome.premigration" ]] || fail ".premigration was not retained"
@@ -741,7 +869,7 @@ printf 'kavita-state\n' > "$SVC4/config/kavita.db"
 SVC4_FP="$(fingerprint "$SVC4")"
 out="$(run "service_data_path() { printf '%s' '$SVC4'; }
 service_compose_services() { printf 'kavita'; }
-docker() { return 0; }
+docker() { case \"\$*\" in *'{{.State.Status}}'*) printf 'running\n' ;; *'{{.Config.Image}}'*) printf 'svc:latest\n' ;; *'{{.Image}}'*|*'{{.Id}}'*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;; ps*) printf 'cid-svc\n' ;; logs*) printf 'Navidrome server is ready!\n' ;; *) printf '\n' ;; esac; return 0; }
 wait_for_service_health() { return 1; }
 storage_migrate_subvolume kavita")"; rc=$?
 (( rc != 0 )) || fail "an unhealthy service after migration reported success"

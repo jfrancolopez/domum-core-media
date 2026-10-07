@@ -117,4 +117,106 @@ documentation, not a value: quote the heredoc or build that line separately."
 done
 echo "  no backticks in unquoted heredocs; no substitution in the Usage block"
 
+# ---------------------------------------------------------------------------
+# The same rule, EVERY unquoted heredoc, every shell file in the repository.
+#
+# The scoped check above only inspected `cat <<EOF` in the three bin files, so it
+# could not see the places this actually keeps happening -- test harnesses, which
+# write stubs through unquoted heredocs. Two live instances were found when this
+# was widened:
+#
+#   tests/integration/btrfs-migration-integration.sh -- a comment mentioning
+#     a backticked flag, whose words were executed and printed
+#     "-qa: command not found" before the fixture had even been built;
+#   tests/fail-closed-recovery-smoke.sh -- a comment containing a backticked
+#     `set -e`, which EXECUTED set -e in the test shell at heredoc-write time,
+#     silently changing errexit for the rest of the suite.
+#
+# Neither is message text a user would ever see, which is why both survived: the
+# damage is done where the heredoc is WRITTEN, not where it is read.
+# ---------------------------------------------------------------------------
+echo "== every unquoted heredoc in the repository =="
+hits="$(
+  while IFS= read -r f; do
+    awk -v F="$f" '
+      # A QUOTED heredoc body is literal data: skip it entirely, INCLUDING when
+      # it contains an unquoted opener. That nesting is how this check first
+      # flagged its own probe fixtures.
+      quoted { if ($0 == qterm) quoted = 0; next }
+      inside {
+        if ($0 == term) { inside = 0; next }
+        if (index($0, "\140") > 0) printf "%s:%d: %s\n", F, NR, $0
+        next
+      }
+      match($0, /<<-?[[:space:]]*["\047][A-Za-z_][A-Za-z0-9_]*["\047][[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        gsub(/^<<-?[[:space:]]*["\047]|["\047][[:space:]]*$/, "", t)
+        qterm = t; quoted = 1; next
+      }
+      # An UNQUOTED opener only: <<WORD or <<-WORD.
+      match($0, /<<-?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/^<<-?[[:space:]]*/, "", t)
+        sub(/[[:space:]]*$/, "", t)
+        term = t; inside = 1
+      }
+    ' "$f"
+  done < <(find "$REPO_ROOT/bin" "$REPO_ROOT/tests" "$REPO_ROOT/operator" \
+                -type f -name '*.sh' -o -type f -path '*/bin/*' 2>/dev/null | sort -u)
+)"
+if [ -n "$hits" ]; then
+  printf '%s\n' "$hits" | head -10 >&2
+  fail "a backtick inside an UNQUOTED heredoc is command substitution. It runs when
+the heredoc is WRITTEN, so the words vanish and whatever they name executes.
+Quote the heredoc terminator, or write the word without backticks."
+fi
+echo "  no backticks in any unquoted heredoc, across bin/ tests/ operator/"
+
+# Non-vacuity: the scan must actually detect the shape, and must NOT flag the
+# same text inside a QUOTED heredoc, where it is literal and correct.
+probe_dir="$(mktemp -d)"
+cat > "$probe_dir/bad.sh" <<'PROBE'
+cat <<INNER
+this mentions `date` in message text
+INNER
+PROBE
+cat > "$probe_dir/good.sh" <<'PROBE'
+cat <<'INNER'
+this mentions `date` but the terminator is quoted, so it is literal
+INNER
+PROBE
+scan_one() {  # $1 = file -> prints violations
+  awk -v F="$1" '
+      # A QUOTED heredoc body is literal data: skip it entirely, INCLUDING when
+      # it contains an unquoted opener. That nesting is how this check first
+      # flagged its own probe fixtures.
+      quoted { if ($0 == qterm) quoted = 0; next }
+      inside {
+        if ($0 == term) { inside = 0; next }
+        if (index($0, "\140") > 0) printf "%s:%d\n", F, NR
+        next
+      }
+      match($0, /<<-?[[:space:]]*["\047][A-Za-z_][A-Za-z0-9_]*["\047][[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        gsub(/^<<-?[[:space:]]*["\047]|["\047][[:space:]]*$/, "", t)
+        qterm = t; quoted = 1; next
+      }
+      # An UNQUOTED opener only: <<WORD or <<-WORD.
+      match($0, /<<-?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$/) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/^<<-?[[:space:]]*/, "", t)
+        sub(/[[:space:]]*$/, "", t)
+        term = t; inside = 1
+      }
+    ' "$1"
+}
+[ -n "$(scan_one "$probe_dir/bad.sh")" ] \
+  || { rm -rf "$probe_dir"; fail "the scan does NOT detect a backtick in an unquoted
+heredoc, so its pass above means nothing"; }
+[ -z "$(scan_one "$probe_dir/good.sh")" ] \
+  || { rm -rf "$probe_dir"; fail "the scan flags a QUOTED heredoc, where a backtick is
+literal and correct. Whoever hits that will delete the check."; }
+rm -rf "$probe_dir"
+echo "  the scan detects the real shape and ignores quoted heredocs"
+
 echo "PASS: log hygiene smoke test"
