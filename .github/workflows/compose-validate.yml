@@ -129,6 +129,11 @@ jobs:
       - name: Cleanup image protection smoke test
         run: tests/cleanup-image-protection-smoke.sh
 
+      # The complete rollback artifact for an upgrade: application-consistent
+      # state + the exact old image + metadata tying them together.
+      - name: Pre-upgrade point smoke test
+        run: tests/pre-upgrade-point-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh

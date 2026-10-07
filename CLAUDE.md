@@ -325,6 +325,37 @@ present the outcome as evidence. Relatedly, `grep -qx "<id>"` against
 `<id> [tags]` — three absence assertions were vacuously true until that was
 found.
 
+**The update path's pre-update snapshot is NOT application-consistent, and
+carries no recovery metadata.** Measured in `refresh_images`: it calls
+`create_service_snapshot` while the service is **running** — no stop, no
+open-handle check, no WAL gate anywhere in that function — so the snapshot is
+crash-consistent while Plex holds a live non-empty WAL. `create_service_snapshot`
+also writes **zero** recovery metadata, so a pre-update snapshot is a DATA-only
+point, and because `cleanup images` protection keys off `.recovery` files, the
+old image it depends on would not be protected either. `refresh_images` also
+rejects any positional argument, so **it cannot upgrade a single service**;
+scope is governed by `*_AUTO_UPDATE` config flags. Do not treat
+`updates apply` as a Plex-only upgrade.
+
+**`storage pre-upgrade-point <service> [--archive-image]`** is the complete
+rollback artifact, and it deploys nothing: stage metadata → stop → prove
+quiescence → read-only snapshot → archive the exact running image → bind
+metadata → `compose start` the same container on the same image. Ordering is
+asserted, not assumed: staging must precede the stop (the running image has to
+be recorded while it is observably running) and binding must precede the restart
+(once the application runs again it can mutate the state the point describes).
+
+**A `docker save` archive preserves image identity, and its checksum does not
+prove that.** Measured: `docker load` of an archive saved by image ID reported
+`Loaded image ID: sha256:fd7dc98638c8…`, byte-identical. But the archive's
+config-blob digest does **not** equal the image ID on this host (Id is the
+manifest digest), so identity cannot be checked from the blob — the `.sha256`
+beside the archive proves the FILE is intact, `docker load` proves the identity,
+and neither is presented as the other. Archives live in
+`$DOMUM_DATA_ROOT/backups/images`: on the protected tier, inside the restic
+backup set, and **outside every service subvolume** so they do not duplicate into
+per-service snapshots.
+
 **Identity is not recoverability.** `IMAGE_ID=sha256:…` proves which image wrote a
 state; it does not prove that image can still be obtained. A local object can be
 pruned and a mutable tag says nothing about next year, so availability is recorded
