@@ -325,7 +325,7 @@ compose_cmd() { :; }
 service_compose_services() { printf '%s' "\$1"; }
 tracked_service_container_id_any() { printf 'cid-x'; }
 docker() { [[ "\$1" == logs ]] && printf '%s\n' '$2'; return 0; }
-# Guarded: sourcing bin/domum-media re-enables `set -e` in this shell, so a
+# Guarded: sourcing bin/domum-media re-enables errexit in this shell, so a
 # non-zero return would kill the probe before it could report the code.
 rc=0
 service_logged_ready_since '$1' '${3:-2026-01-01T00:00:00}' || rc=\$?
