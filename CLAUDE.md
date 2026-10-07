@@ -190,6 +190,81 @@ on files, or on a subcommand written for the purpose (`storage verify-recovery`,
 `storage topology --verify`). If a script needs a fact, give the CLI a way to state
 it.
 
+**Operator scripts live in `operator/`, in this repository, and are in CI.**
+Three of them aborted correct production states -- a stale topology invariant, a
+grep for the prose `recovery point  : verified`, and a grep for
+`make_pre_upgrade_point()`, a private helper from a reverted refactor that had
+never existed. All three escaped review because operator scripts were not in the
+repository. `tests/operator-wrapper-audit.py` now fails on: grepping the CLI's
+source (the rule is "never grep the binary", not "never grep for a function
+name" -- the historical form looped over names held in a **variable**, so no
+literal name appeared on the grep line); piping a `domum-media` invocation into
+grep/sed/awk; and requiring a capability the CLI does not advertise. It is
+mutation-tested against the real historical wrapper, which it must reject.
+
+**A wrapper asserts on behaviour, never on internals or prose.** Permitted: exit
+status, `capabilities --has <token>`, `--json` output, files on disk, and
+external contracts (`docker inspect`, `stat -c %i`, `btrfs property get`,
+`systemctl`, `sha256sum`, `git rev-parse`). Forbidden: the CLI's wording, the
+CLI's source text, absolute claims about mutable state, and a revision constant
+baked into the repository it pins -- that goes stale by construction. What is
+always checked instead is that the installed binary's sha256 equals the
+production checkout's; a revision pin alone says nothing about `/usr/local/bin`.
+See `docs/OPERATOR-CONTRACT.md`.
+
+**`domum-media capabilities [--has <token>]` is the stable surface.** `--has`
+exits 0 supported, 1 implementation absent, **2 token unknown** -- a script
+asking about a token this binary never heard of must not read that as a yes.
+Tokens are promises about behaviour and are never renamed in place. At run time
+each is gated on `declare -F` of its implementation, so a token disappears if its
+implementation does; in CI `tests/capabilities-contract-audit.py` proves the
+advertised argv path actually reaches that implementation. Never advertise a
+capability from an unchecked static list.
+
+**`cleanup images --json` is how automation asks about images.** Its record set is
+deliberately WIDER than the candidate set, because "is this image still
+protected?" cannot be answered from a candidate list -- that cannot distinguish
+*protected* from *never considered*, which is the ambiguity that made
+`0 named by a recovery point` unfalsifiable. `--json` and the human report are
+thin filters over one decision function, `cleanup_image_decisions`, so they
+cannot disagree; `--json --confirm` is refused.
+
+**A test that asserts on a function's TEXT does not prove the function runs.**
+`service_upgrade` shipped calling an undefined helper while 41 suites passed,
+because every assertion about it read its source and none executed it.
+`tests/service-upgrade-integration-smoke.sh` enters through
+`main updates apply --service plex` against a production-shaped fixture and
+asserts on observed behaviour. It found four defects reading could not, all of
+the same family -- `set -euo pipefail` aborting an assignment before the branch
+written to handle the failure could run:
+
+- `target_image="$(grep '^STAGED ' … | awk …)"` -- nothing staged means grep
+  matches nothing, pipefail discards awk's 0, and the graceful "nothing to
+  upgrade" branch was UNREACHABLE (exit 1, no message);
+- `rollback_entries` ran `find` on a directory that need not exist, so
+  `cleanup_image_decisions` aborted part-way and reported an EMPTY image set,
+  i.e. "nothing to protect";
+- `full="$(domum_image_id_full "$ref")"` aborted the resolve loop before its own
+  absent-image branch;
+- and a rollback record's `IMAGE_BEFORE=unknown` sentinel was reported as an
+  image whose id is the literal string `unknown`.
+
+When a function's failure is EXPECTED and handled, capture it with `|| true`.
+
+**Rehearse an operator wrapper; do not merely review it.** The wrapper's roots
+are overridable only for that purpose and default to the production paths. Do
+not weaken a check to suit the test: the root check is satisfied by running the
+rehearsal under `unshare -r`, where the caller maps to uid 0, so
+`[ "$(id -u)" -eq 0 ]` runs as written. The rehearsal proves the wrapper's scope
+proof is INDEPENDENT of the CLI's, by blinding the CLI's own before/after
+comparison and requiring the wrapper to still catch a non-Plex change.
+
+**A test that depends on host state is not a test.** The integration suite passed
+here and failed in CI with `install: cannot create directory
+'/etc/domum-core-media'`, because `SECRETS_DIR` defaults to a host path that
+happens to exist on this machine. Every root a fixture uses must be redirected
+into it, and asserted to be.
+
 `tests/reconcile-boundary-audit.py` enforces the classification rather than
 trusting it: an image-preserving function containing an executable reconcile fails,
 a deployment function that stops reconciling fails, and a reconcile in an

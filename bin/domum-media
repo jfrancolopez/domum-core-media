@@ -3981,7 +3981,15 @@ snapshot_cmd() {
 }
 
 rollback_entries() {
-  find "$(rollback_index_dir)" -type f -name '*.env' | sort
+  # A missing index directory means NO rollback entries, not an error. `find`
+  # exits 1 on it, and under `set -euo pipefail` that propagated through every
+  # caller's pipeline: cleanup_image_decisions aborted silently part-way and
+  # reported an EMPTY image set -- i.e. "nothing to protect" -- on a host whose
+  # index simply had not been created yet.
+  local dir
+  dir="$(rollback_index_dir)"
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -type f -name '*.env' 2>/dev/null | sort
 }
 
 # The recorded STATUS says what this index believes. The snapshot store is what
@@ -4188,11 +4196,36 @@ cleanup_protected_image_ids() {
   done < <(recovery_point_image_ids)
 }
 
-collect_cleanup_image_ids() {
-  local protected candidate full reason
+# The ONE decision function for image cleanup.
+#
+# The human report, the structured output and the candidate list all derive from
+# this, so they cannot disagree. The previous shape computed candidacy inline
+# inside the human report, which is how the unfalsifiable "0 named by a recovery
+# point" line survived for so long: there was no separate representation of the
+# decision to check the prose against.
+#
+# One record per RELEVANT image, space-delimited -- image ids, reason words,
+# recovery-point names and image tags all contain no spaces:
+#
+#   <full-id> <candidate 0|1> <reasons|-> <local 0|1> <points|-> <tags|->
+#
+# The universe is deliberately WIDER than the candidate set. An image a recovery
+# point names is relevant even when nothing would ever have proposed deleting it,
+# because "is this image still protected?" is the question automation actually
+# asks -- and answering it from the candidate list alone cannot distinguish
+# "protected" from "never considered".
+cleanup_image_decisions() {
+  local protected pairs prunable universe resolved
   protected="$(mktemp)" || return 1
-  cleanup_protected_image_ids > "$protected"
+  pairs="$(mktemp)" || { rm -f "$protected"; return 1; }
+  prunable="$(mktemp)" || { rm -f "$protected" "$pairs"; return 1; }
+  universe="$(mktemp)" || { rm -f "$protected" "$pairs" "$prunable"; return 1; }
+  resolved="$(mktemp)" || { rm -f "$protected" "$pairs" "$prunable" "$universe"; return 1; }
 
+  cleanup_protected_image_ids > "$protected"
+  recovery_point_image_pairs > "$pairs"
+
+  # Prunable: what docker or a rollback record would ever propose removing.
   {
     docker images --filter dangling=true -q 2>/dev/null || true
     rollback_entries | while IFS= read -r file; do
@@ -4202,26 +4235,112 @@ collect_cleanup_image_ids() {
       [[ -n "${IMAGE_BEFORE:-}" ]] && printf '%s\n' "$IMAGE_BEFORE"
       [[ -n "${IMAGE_AFTER:-}" ]] && printf '%s\n' "$IMAGE_AFTER"
     done
-  } | sort -u | while IFS= read -r candidate; do
-    [[ -n "$candidate" ]] || continue
-    # Resolve BOTH sides to a full id before comparing. A candidate docker can no
-    # longer resolve is already gone and is not a candidate.
-    full="$(domum_image_id_full "$candidate")"
-    [[ -n "$full" ]] || continue
-    # EVERY reason, joined. First-match-wins reported plex's image as `in-use`
-    # only -- so the production dry run said "0 named by a recovery point" while
-    # the recovery rule was in fact covering that image too, and the output could
-    # not distinguish "the rule found nothing" from "nothing reached this branch".
-    # That ambiguity is what made the report unfalsifiable.
-    reason="$(awk -v id="$full" '$1 == id { printf "%s%s", sep, $2; sep="+" } END { print "" }' "$protected")"
-    if [[ -n "$reason" ]]; then
-      printf 'SKIP %s %s\n' "$full" "$reason" >&2
-      continue
-    fi
-    printf '%s\n' "$full"
-  done
+  } | sort -u > "$prunable" || true
 
-  rm -f "$protected"
+  # Relevant: prunable, plus every image a container uses or a recovery point
+  # names, so the record set can answer the protection question directly.
+  {
+    cat "$prunable"
+    image_ids_used_by_any_container
+    awk '{print $1}' "$pairs"
+  } | sort -u > "$universe" || true
+
+  # Canonicalise every reference to a full id ONCE. A reference docker can no
+  # longer resolve is recorded as absent rather than dropped: a recovery point
+  # naming an image that is gone is the most important case to be able to see.
+  local ref full
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    # `|| true` is load-bearing: domum_image_id_full exits non-zero for a
+    # reference docker cannot resolve, and under `set -e` the ASSIGNMENT aborts
+    # the whole function before the absent-image branch below can run. That
+    # turned one unresolvable reference into an EMPTY decision set, i.e. a
+    # report that nothing needs protecting.
+    full="$(domum_image_id_full "$ref" || true)"
+    if [[ -n "$full" ]]; then
+      printf '%s %s 1\n' "$ref" "$full"
+    elif [[ "$ref" == sha256:* ]]; then
+      # A digest docker cannot resolve: a real identity that is no longer here.
+      # Kept, because a recovery point naming an image this host has lost is the
+      # single most important thing for an operator to be able to see.
+      printf '%s %s 0\n' "$ref" "$ref"
+    fi
+    # Anything else unresolvable is NOT an image identity and is dropped. A
+    # rollback record writes IMAGE_BEFORE=unknown when it could not determine
+    # one, and that sentinel was being reported as an image whose id is the
+    # literal string `unknown`.
+  done < "$universe" > "$resolved"
+
+  local prunable_full
+  prunable_full="$(mktemp)" || { rm -f "$protected" "$pairs" "$prunable" "$universe" "$resolved"; return 1; }
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    awk -v r="$ref" '$1 == r { print $2 }' "$resolved"
+  done < "$prunable" | sort -u > "$prunable_full"
+
+  local id present reasons points tags candidate
+  # The original reference is not needed here, only its canonical id.
+  while read -r _ id present; do
+    [[ -n "$id" ]] || continue
+    # EVERY applicable reason, joined. First-match-wins reported plex's image as
+    # `in-use` only, so the recovery rule looked like it had found nothing.
+    reasons="$(awk -v id="$id" '$1 == id { printf "%s%s", sep, $2; sep="+" } END { print "" }' "$protected")"
+    # A recovery point that names an image docker cannot resolve contributes the
+    # recovery reason too -- cleanup_protected_image_ids can only speak about
+    # images it could canonicalise.
+    if [[ "$reasons" != *recovery-point* ]] \
+       && awk -v id="$id" '$1 == id { found = 1 } END { exit !found }' "$pairs"; then
+      reasons="${reasons:+$reasons+}recovery-point"
+    fi
+    points="$(awk -v id="$id" '$1 == id { printf "%s%s", sep, $2; sep="," } END { print "" }' "$pairs")"
+    tags="$(docker image inspect "$id" --format '{{range .RepoTags}}{{.}},{{end}}' 2>/dev/null | sed 's/,$//')"
+    candidate=0
+    if [[ -z "$reasons" ]] && (( present == 1 )) \
+       && awk -v id="$id" '$1 == id { found = 1 } END { exit !found }' "$prunable_full"; then
+      candidate=1
+    fi
+    printf '%s %s %s %s %s %s\n' \
+      "$id" "$candidate" "${reasons:--}" "$present" "${points:--}" "${tags:--}"
+  done < "$resolved" | sort -u
+
+  rm -f "$protected" "$pairs" "$prunable" "$universe" "$resolved" "$prunable_full"
+}
+
+# Structured form of exactly the records above. Operator scripts must not parse
+# the human report: a wrapper grepping `cleanup images` output for an image id
+# was one of the fragile-prose dependencies this replaces.
+cleanup_images_json() {
+  local first=1 id candidate reasons present points tags
+  printf '{\n  "images": [\n'
+  while read -r id candidate reasons present points tags; do
+    [[ -n "$id" ]] || continue
+    (( first == 1 )) || printf ',\n'
+    first=0
+    printf '    {"id": "%s", "candidate": %s, "in_use": %s, "recovery_referenced": %s, "local": %s, "recovery_points": [%s], "tags": [%s]}' \
+      "$id" \
+      "$( (( candidate == 1 )) && echo true || echo false )" \
+      "$( [[ "$reasons" == *in-use* ]] && echo true || echo false )" \
+      "$( [[ "$reasons" == *recovery-point* ]] && echo true || echo false )" \
+      "$( (( present == 1 )) && echo true || echo false )" \
+      "$( [[ "$points" == "-" ]] || printf '%s' "$points" | awk -v RS=, 'NF{printf "%s\"%s\"", sep, $0; sep=", "}' )" \
+      "$( [[ "$tags" == "-" ]] || printf '%s' "$tags" | awk -v RS=, 'NF{printf "%s\"%s\"", sep, $0; sep=", "}' )"
+  done < <(cleanup_image_decisions)
+  printf '\n  ]\n}\n'
+}
+
+collect_cleanup_image_ids() {
+  # A filter over cleanup_image_decisions, NOT a second implementation. Keeping
+  # the SKIP lines on stderr and the candidates on stdout preserves the existing
+  # contract for cleanup_images_execute.
+  local id candidate reasons
+  while read -r id candidate reasons _ _ _; do
+    [[ -n "$id" ]] || continue
+    if (( candidate == 1 )); then
+      printf '%s\n' "$id"
+    elif [[ "$reasons" != "-" ]]; then
+      printf 'SKIP %s %s\n' "$id" "$reasons" >&2
+    fi
+  done < <(cleanup_image_decisions)
 }
 
 cleanup_images_execute() {
@@ -4380,19 +4499,31 @@ cleanup_cmd() {
   local sub="${1:-summary}"
   local dry_run=1
   local confirm=0
+  local as_json=0
   shift || true
   while (( $# )); do
     case "$1" in
       --dry-run) dry_run=1 ;;
       --confirm) dry_run=0; confirm=1 ;;
+      --json) as_json=1 ;;
       *) die "Unknown cleanup arg: $1" ;;
     esac
     shift
   done
+  # Structured output is read-only by construction: there is no path from --json
+  # to a delete, so automation can ask what cleanup thinks without any risk of
+  # performing it.
+  (( as_json == 1 && confirm == 1 )) \
+    && die "Refusing: --json is a read-only query and cannot be combined with --confirm"
 
   case "$sub" in
     summary) cleanup_summary ;;
-    images) cleanup_images_execute "$dry_run" "$confirm" ;;
+    images)
+      if (( as_json == 1 )); then
+        cleanup_images_json
+      else
+        cleanup_images_execute "$dry_run" "$confirm"
+      fi ;;
     snapshots)
       # A second snapshot DELETER, and until now the only one without the lock.
       # A rollback checks its snapshot exists and then creates from it; a
@@ -4404,7 +4535,7 @@ cleanup_cmd() {
 Refusing to delete snapshots while it runs."
       fi
       cleanup_snapshots_execute "$dry_run" "$confirm" ;;
-    *) die "Usage: domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]" ;;
+    *) die "Usage: domum-media cleanup {summary|images [--json]|snapshots} [--dry-run|--confirm]" ;;
   esac
 }
 
@@ -7700,7 +7831,10 @@ service_upgrade() {  # $1 = service, [--dry-run]
   managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
     || die "Refusing: '$service' is not an upgradable service.
 Known: $(managed_image_specs | cut -d'|' -f1 | tr '\n' ' ')"
-  assert_pre_upgrade_possible "$service"
+  # Refuse while the service is still RUNNING if its state cannot be snapshotted.
+  # The path it prints is not needed here, only the refusal -- and leaving its
+  # stdout unredirected printed the data path into the operator's upgrade log.
+  assert_pre_upgrade_possible "$service" >/dev/null
 
   local compose_svcs old_images staged_verdicts target_image others_before
   compose_svcs="$(service_compose_services "$service" || true)"
@@ -7711,7 +7845,14 @@ Known: $(managed_image_specs | cut -d'|' -f1 | tr '\n' ' ')"
   # The target must already be local. Pulling here would resolve a mutable tag at
   # upgrade time and change what is being deployed between review and execution.
   staged_verdicts="$(service_staged_image_changes "$service")"
-  target_image="$(grep '^STAGED ' <<< "$staged_verdicts" | awk 'NR==1{print $4}')"
+  # `|| true` is load-bearing. Under `set -euo pipefail` a `grep | awk` whose
+  # grep matches NOTHING makes the pipeline return grep's 1 -- awk's own 0 is
+  # discarded by pipefail -- so the assignment aborts the function. That made the
+  # graceful "nothing to upgrade" branch below UNREACHABLE: with no staged image
+  # the upgrade exited 1 with no message at all. Same family as the
+  # `cmd | grep -q` rule in CLAUDE.md, found by running the code rather than
+  # reading it.
+  target_image="$(grep '^STAGED ' <<< "$staged_verdicts" | awk 'NR==1{print $4}' || true)"
   if [[ -z "$target_image" ]]; then
     echo "[domum-media] $service has no staged image locally; nothing to upgrade."
     echo "$staged_verdicts" | sed 's/^/  /'
@@ -7936,6 +8077,86 @@ storage_verify_recovery() {  # $1 = service, $2 = recovery point, [--deep]
   return 0
 }
 
+# The STABLE capability contract for operator scripts.
+#
+# WHY IT EXISTS. The Plex upgrade wrapper feature-detected by grepping the
+# installed binary for private Bash function names:
+#
+#   for fn in service_upgrade rollback_upgrade make_pre_upgrade_point ...; do
+#     grep -q "^$fn()" /usr/local/bin/domum-media || abort ...
+#
+# `make_pre_upgrade_point` was a helper from a refactor that was abandoned, so it
+# never existed in any merged revision and the wrapper aborted a correct
+# production state. That is the same failure shape as the wrapper that grepped
+# for the prose `recovery point  : verified`, and as the stale topology
+# invariant: a script asserting on something that was never a contract.
+#
+# A capability token is a promise about BEHAVIOUR. Private function names,
+# dispatcher wiring and prose may all change freely underneath it.
+#
+# Each row is  <token>|<argv path>|<implementation>:
+#   token           what operator scripts name. Stable. Never renamed in place.
+#   argv path       the supported invocation. tests/capabilities-contract-audit.py
+#                   proves the dispatcher actually routes it to the
+#                   implementation, so a capability cannot advertise something
+#                   that is not reachable from the command line.
+#   implementation  checked at RUN TIME with `declare -F`, so a token disappears
+#                   if its implementation does. This is the half that the static
+#                   audit cannot cover on the operator's host: it tells the
+#                   script about the binary that is actually installed.
+domum_capability_specs() {
+  cat <<'EOF'
+service-scoped-upgrade|updates apply --service|service_upgrade
+pre-upgrade-point|storage pre-upgrade-point|storage_pre_upgrade_point
+archive-image|storage pre-upgrade-point --archive-image|archive_image_to_file
+verify-image-archive|storage verify-archive|storage_verify_archive
+image-archive-inventory|storage archives|storage_archives
+rollback-upgrade|rollback-upgrade|rollback_upgrade
+recovery-image-protection|cleanup images|cleanup_protected_image_ids
+machine-readable-cleanup-images|cleanup images --json|cleanup_images_json
+verify-recovery-deep|storage verify-recovery|storage_verify_recovery
+protection-state|storage protection|storage_protection
+topology-verify|storage topology --verify|storage_topology_verify
+EOF
+}
+
+# Read-only, and deliberately does NOT require root: a preflight must be able to
+# ask what the installed binary supports before escalating.
+capabilities_cmd() {
+  local mode="${1:-list}" want="" token impl
+  case "$mode" in
+    list) ;;
+    --has)
+      want="${2:-}"
+      [[ -n "$want" ]] || die "Usage: domum-media capabilities [--has <token>]" ;;
+    *) die "Usage: domum-media capabilities [--has <token>]" ;;
+  esac
+
+  local known=0 supported=0
+  # The argv field is for tests/capabilities-contract-audit.py to read from the
+  # table; run time only needs the token and its implementation.
+  while IFS='|' read -r token _ impl; do
+    [[ -n "$token" ]] || continue
+    if [[ -n "$want" ]]; then
+      [[ "$token" == "$want" ]] || continue
+      known=1
+      declare -F "$impl" >/dev/null 2>&1 && supported=1
+      break
+    fi
+    # Listing advertises only what is actually present in THIS binary.
+    declare -F "$impl" >/dev/null 2>&1 && printf '%s\n' "$token"
+  done < <(domum_capability_specs)
+
+  if [[ -n "$want" ]]; then
+    # An unknown token and a known-but-missing one are both "not supported", and
+    # both must be non-zero: a script asking about a token this binary has never
+    # heard of must not read that as a yes.
+    (( known == 1 )) || return 2
+    (( supported == 1 )) || return 1
+  fi
+  return 0
+}
+
 storage_cmd() {
   local sub="${1:-}"
   case "$sub" in
@@ -8085,7 +8306,8 @@ Usage:
                                             installation's fragment layering
                                             (there is no compose.yml to use
                                             directly)
-  domum-media cleanup {summary|images|snapshots} [--dry-run|--confirm]
+  domum-media cleanup {summary|images [--json]|snapshots} [--dry-run|--confirm]
+  domum-media capabilities [--has <token>]
   domum-media recovery-pack {create [--no-email]|status}
   domum-media doctor {immich|traefik|backups|secrets|navidrome}
   domum-media immich {refresh-bundle [--force]|check-bundle|apply-bundle|rollback|reset-db [--wipe-uploads]}
@@ -8122,6 +8344,11 @@ main() {
     storage)   shift; storage_cmd "$@" ;;
     compose)   shift; compose_passthrough "$@" ;;
     cleanup)   shift; cleanup_cmd "$@" ;;
+    capabilities)
+      shift
+      # The stable surface operator scripts assert on instead of grepping this
+      # file for private function names. Read-only; no root.
+      capabilities_cmd "${1:-list}" "${2:-}" ;;
     recovery-pack) shift; recovery_pack_cmd "$@" ;;
     doctor)    shift; doctor_cmd "$@" ;;
     immich)    shift; immich_cmd "$@" ;;
