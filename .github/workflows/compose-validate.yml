@@ -142,6 +142,15 @@ jobs:
       - name: Recovery metadata keys audit
         run: python3 tests/recovery-metadata-keys-audit.py
 
+      # A function called but never defined is syntactically perfect and dies at
+      # run time. bash -n and shellcheck both pass on it; service_upgrade shipped
+      # to production calling a helper a reverted refactor had removed.
+      - name: Function definition audit
+        run: python3 tests/function-definition-audit.py
+
+      - name: Function definition audit smoke test
+        run: tests/function-definition-audit-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
