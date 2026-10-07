@@ -8115,6 +8115,7 @@ rollback-upgrade|rollback-upgrade|rollback_upgrade
 recovery-image-protection|cleanup images|cleanup_protected_image_ids
 machine-readable-cleanup-images|cleanup images --json|cleanup_images_json
 verify-recovery-deep|storage verify-recovery|storage_verify_recovery
+protection-state|storage protection|storage_protection
 topology-verify|storage topology --verify|storage_topology_verify
 EOF
 }

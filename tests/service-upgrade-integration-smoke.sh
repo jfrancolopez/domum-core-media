@@ -52,6 +52,16 @@ setup() {  # $1.. = options: no-subvol, no-staged, archive-fails, snapshot-fails
   # Plausible application state so quiescence has something to look at.
   printf 'db\n' > "$ENV_DIR/data/plex/com.plexapp.plugins.library.db"
 
+  # Production accuracy: each migrated service RETAINS its post-migration proof
+  # snapshot, which is what makes its protection state `protected` rather than
+  # `snapshottable`. Without these the wrapper correctly refused, because a
+  # subvolume with no snapshot has never actually been snapshotted.
+  [[ "$opts" == *" no-subvol "* ]] || for svc in plex jellyfin kavita navidrome; do
+    snap="$ENV_DIR/snapshots/$svc-20261006-120000-post-migration"
+    mkdir -p "$snap"
+    touch "$snap/.is-subvol" "$snap/.ro"
+  done
+
   printf '%s\n' "$PLEX_OLD" > "$ENV_DIR/st/img-plex"
   printf '%s\n' "$CW_OLD"   > "$ENV_DIR/st/img-calibre-web"
   printf '%s\n' "$JF_IMG"   > "$ENV_DIR/st/img-jellyfin"
@@ -107,19 +117,28 @@ LOG=$ENV_DIR/calls.log
 echo "docker \$*" >> "\$LOG"
 img_of() { cat "\$ST/img-\$1" 2>/dev/null; }
 
+# Strip compose's -f <file> arguments ONLY for a compose invocation. The first
+# version stripped them unconditionally, which also ate the format argument of
+# docker inspect -f ... -- so every such query returned the fallback. The CLI
+# uses --format and was unaffected; the operator wrapper uses -f and broke,
+# which is precisely why the wrapper is rehearsed and not merely reviewed.
+# (No backticks here: this heredoc is unquoted, so they would EXECUTE.)
 IS_COMPOSE=0
-declare -a A=()
-while (( \$# )); do
-  case "\$1" in
-    compose) IS_COMPOSE=1; shift ;;
-    -f|--file|--env-file|-p|--project-name) shift 2 ;;
-    *) A+=("\$1"); shift ;;
-  esac
-done
-set -- "\${A[@]}"
+if [[ "\${1:-}" == compose ]]; then
+  IS_COMPOSE=1
+  shift
+  declare -a A=()
+  while (( \$# )); do
+    case "\$1" in
+      -f|--file|--env-file|-p|--project-name) shift 2 ;;
+      *) A+=("\$1"); shift ;;
+    esac
+  done
+  set -- "\${A[@]}"
+fi
 
 if (( IS_COMPOSE )); then
-  sub="\$1"; shift
+  sub="\${1:-}"; shift || true
   case "\$sub" in
     ps)
       # -qa <svc>
@@ -132,6 +151,12 @@ if (( IS_COMPOSE )); then
     up)
       # RECONCILE: each named service moves to whatever its image reference
       # resolves to -- a PINNED <SVC>_IMAGE if compose was given one, else the tag.
+      if [[ -f "\$ST/stray" ]]; then
+        # A stray reconcile of ANOTHER service during the plex upgrade. Used to
+        # prove the wrapper's scope proof is independent of the CLI's.
+        cp "\$ST/tag-calibre-web" "\$ST/img-calibre-web"
+        echo "RECREATED calibre-web" >> "\$LOG"
+      fi
       if [[ -f "\$ST/repoint" ]]; then
         echo "sha256:deadbeef00000000000000000000000000000000000000000000000000000099" > "\$ST/tag-plex"
       fi
@@ -186,10 +211,13 @@ if [[ "\$1" == "inspect" ]]; then
     *"config-hash"*) echo "fixture-hash"; exit 0 ;;
     "{{.State.Health.Status}}") echo healthy; exit 0 ;;
     "{{.Id}}")
-      # A TAG reference: what is staged locally for it.
-      t="\${ref%%:*}"
-      if [[ -f "\$ST/tag-\$t" ]]; then cat "\$ST/tag-\$t"; exit 0; fi
+      # docker inspect on a CONTAINER yields a container id. Only a reference
+      # carrying a tag, like plex:latest, resolves through the staged-image table.
+      if [[ "\$ref" == *:* && -f "\$ST/tag-\${ref%%:*}" ]]; then
+        cat "\$ST/tag-\${ref%%:*}"; exit 0
+      fi
       echo "cid-\$n"; exit 0 ;;
+    "{{.Created}}") echo "2026-01-01T00:00:00Z"; exit 0 ;;
     *) echo "cid-\$n"; exit 0 ;;
   esac
 fi
@@ -291,6 +319,23 @@ case "\$1 \$2" in
 esac
 exit 0
 STUB
+  # ---- the systemctl stub -------------------------------------------------
+  # systemd is an external contract like docker and btrfs, and the rehearsal
+  # runs in a user namespace where the system bus is unreachable.
+  cat > "$ENV_DIR/bin/systemctl" <<STUB
+#!/usr/bin/env bash
+echo "systemctl \$*" >> $ENV_DIR/calls.log
+case "\$*" in
+  "--failed --no-legend --plain")
+    [[ -f $ENV_DIR/st/failed-units ]] && echo "some.service loaded failed failed Some"
+    exit 0 ;;
+  "is-enabled domum-media-image-refresh.timer")
+    if [[ -f $ENV_DIR/st/refresh-enabled ]]; then echo enabled; exit 0; fi
+    echo disabled; exit 1 ;;
+esac
+exit 0
+STUB
+  chmod +x "$ENV_DIR/bin/systemctl"
   chmod +x "$ENV_DIR/bin/docker" "$ENV_DIR/bin/btrfs"
 }
 
@@ -632,6 +677,227 @@ rc="$(run_cli rollback-upgrade plex no-such-point)"
 grep -q 'No recovery evidence' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
 [ "$(img plex)" = "$PLEX_NEW" ] || fail "the running image changed on a refusal"
 echo "  both refused; nothing touched"
+
+# ===========================================================================
+# REHEARSAL: the actual operator wrapper, against the same fixture.
+#
+# operator/domum-media-upgrade-plex.sh is the one command the operator runs. It
+# is rehearsed here rather than only reviewed, because every previous wrapper
+# defect was found by running it in production.
+#
+# Its roots are overridable for exactly this purpose; an unset environment gives
+# the production paths.
+# ===========================================================================
+
+WRAPPER="$REPO_ROOT/operator/domum-media-upgrade-plex.sh"
+
+# A shim that looks like the installed binary but carries the fixture's
+# environment. The wrapper invokes the CLI as a COMMAND, so this is the only way
+# to exercise it without a real installation.
+make_installed_cli() {
+  mkdir -p "$ENV_DIR/inst" "$ENV_DIR/repo/bin" "$ENV_DIR/clisrc"
+  # The shim SOURCES the CLI, so a test that needs to change the CLI's behaviour
+  # (drop a capability, blind a check) must edit this copy -- editing the shim
+  # itself changes nothing, which is how section 26 first passed for the wrong
+  # reason.
+  cp "$CLI" "$ENV_DIR/clisrc/domum-media"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -uo pipefail\n'
+    printf 'export PATH=%q:"$PATH"\n' "$ENV_DIR/bin"
+    printf 'DOMUM_DIR=%q\n' "$REPO_ROOT"
+    printf 'CFG_FILE=%q\n' "$ENV_DIR/cfg"
+    printf 'source %q\n' "$ENV_DIR/clisrc/domum-media"
+    printf 'need_root() { :; }\n'
+    printf 'domum_is_subvolume() { [[ -n "${1:-}" && -f "$1/.is-subvol" ]]; }\n'
+    printf 'wait_for_service_health() { return 0; }\n'
+    printf 'service_health_state() { printf healthy; }\n'
+    printf 'service_ready_probe() { return 1; }\n'
+    printf 'verify_backup_freshness() { return 0; }\n'
+    printf 'main "$@"\n'
+  } > "$ENV_DIR/inst/domum-media"
+  chmod +x "$ENV_DIR/inst/domum-media"
+  # The wrapper requires the installed binary to equal the checkout's, so the
+  # fake checkout holds the same bytes.
+  cp "$ENV_DIR/inst/domum-media" "$ENV_DIR/repo/bin/domum-media"
+  ( cd "$ENV_DIR/repo" \
+    && git init -q . \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm fixture ) >/dev/null 2>&1
+}
+
+mutate_cli() {  # $1 = sed program applied to the fixture's CLI source
+  sed -i "$1" "$ENV_DIR/clisrc/domum-media" \
+    || fail "could not apply the CLI mutation: $1"
+  cmp -s "$CLI" "$ENV_DIR/clisrc/domum-media" \
+    && fail "the CLI mutation changed nothing, so the case below would pass for
+the wrong reason: $1"
+}
+
+wrapper_env() {
+  printf 'DOMUM_REPO=%s\n' "$ENV_DIR/repo"
+  printf 'DOMUM_CLI=%s\n' "$ENV_DIR/inst/domum-media"
+  printf 'DOMUM_DATA_ROOT_OVERRIDE=%s\n' "$ENV_DIR/data"
+  printf 'DOMUM_SNAPSHOT_ROOT_OVERRIDE=%s\n' "$ENV_DIR/snapshots"
+  printf 'DOMUM_STATE_ROOT_OVERRIDE=%s\n' "$ENV_DIR/state"
+  printf 'DOMUM_EXPECT_INODE=%s\n' "$(stat -c %i "$ENV_DIR/data/plex")"
+}
+
+# The wrapper requires root, and CI is not root. Rather than make that check
+# overridable -- which would weaken the real thing to suit the test -- the
+# rehearsal runs it inside a USER NAMESPACE, where `unshare -r` maps the calling
+# user to uid 0. The root check runs exactly as written and passes honestly.
+AS_ROOT=()
+if [ "$(id -u)" -ne 0 ]; then
+  AS_ROOT=(unshare -r)
+fi
+
+run_wrapper() {  # $@ = wrapper args; honours a pre-set DOMUM_EXPECT_CONTAINERS
+  local n_expect="${DOMUM_EXPECT_CONTAINERS:-$(printf '%s\n' $CONTAINERS | wc -w)}"
+  "${AS_ROOT[@]}" env $(wrapper_env) "DOMUM_EXPECT_CONTAINERS=$n_expect" \
+      "PATH=$ENV_DIR/bin:$PATH" "HOME=$ENV_DIR" \
+    bash "$WRAPPER" "$@" >"$ENV_DIR/wout" 2>"$ENV_DIR/werr"
+  echo $?
+}
+wout() { cat "$ENV_DIR/wout" "$ENV_DIR/werr"; }
+
+if [ "$(id -u)" -ne 0 ] && ! unshare -r true 2>/dev/null; then
+  echo "== 23-31. REHEARSAL skipped: not root and no user namespaces =="
+  echo "  (the wrapper's root refusal is exercised by operator-wrapper-audit-smoke)"
+else
+  [ "$(id -u)" -eq 0 ] || echo "  (rehearsing under unshare -r; uid 0 in a user namespace)"
+
+echo "== 23. the wrapper's full preflight passes on the production shape =="
+setup
+make_installed_cli
+rc="$(run_wrapper --preflight-only)"
+[ "$rc" = "0" ] || { wout; fail "preflight failed (rc=$rc) on a production-shaped fixture"; }
+for want in "no tracked drift" "required capabilities supported" \
+            "is a subvolume" "the CLI independently reports protection" \
+            "container identities" "archive needs"; do
+  grep -q "$want" "$ENV_DIR/wout" || { wout; fail "preflight did not report '$want'"; }
+done
+grep -q 'nothing was changed' "$ENV_DIR/wout" || fail "preflight did not say it changed nothing"
+[ "$(img plex)" = "$PLEX_OLD" ] || fail "preflight changed plex's image"
+grep -qE '^RECREATED|^STOPPED' <<< "$(calls)" && fail "preflight stopped or recreated something"
+echo "  every preflight check passed; nothing stopped, nothing recreated"
+
+echo "== 24. it refuses on tracked drift, and on a hash mismatch, separately =="
+# (a) Uncommitted change in the checkout: what is running is not what is
+#     committed, so the revision printed above would describe nothing.
+setup; make_installed_cli
+printf '\n# drift\n' >> "$ENV_DIR/repo/bin/domum-media"
+rc="$(run_wrapper --preflight-only)"
+[ "$rc" != "0" ] || fail "it accepted uncommitted drift in the checkout"
+grep -q 'tracked drift' "$ENV_DIR/werr" || { wout; fail "wrong refusal for drift"; }
+
+# (b) A clean checkout whose committed binary differs from the INSTALLED one.
+#     This is the check that actually matters: a revision pin says nothing about
+#     /usr/local/bin. Edit only the installed copy, so git stays clean.
+setup; make_installed_cli
+printf '\n# installed-only change\n' >> "$ENV_DIR/inst/domum-media"
+[ -z "$(git -C "$ENV_DIR/repo" status --porcelain --untracked-files=no)" ] \
+  || fail "the fixture checkout is dirty; this case would test the drift rule instead"
+rc="$(run_wrapper --preflight-only)"
+[ "$rc" != "0" ] || fail "it accepted an installed binary that differs from the checkout
+while git was clean -- the revision pin alone would have said everything was fine"
+grep -q 'does not match' "$ENV_DIR/werr" || { wout; fail "wrong refusal for hash mismatch"; }
+echo "  drift and hash mismatch each refused, with distinct messages"
+
+echo "== 25. it refuses a revision that is not what was reviewed =="
+setup; make_installed_cli
+rc="$(run_wrapper --preflight-only --expect-revision 0000000000000000000000000000000000000000)"
+[ "$rc" != "0" ] || fail "it accepted the wrong revision"
+grep -q 'not the expected' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+head_sha="$(git -C "$ENV_DIR/repo" rev-parse HEAD)"
+rc="$(run_wrapper --preflight-only --expect-revision "$head_sha")"
+[ "$rc" = "0" ] || { wout; fail "it refused the revision that IS deployed"; }
+echo "  wrong revision refused, correct revision accepted"
+
+echo "== 26. it refuses when a required capability is missing =="
+setup; make_installed_cli
+# Drop the token from the shim AND the checkout, so the hash check still passes
+# and the capability check is what fails.
+mutate_cli 's|^machine-readable-cleanup-images|disabled-for-test|' 
+rc="$(run_wrapper --preflight-only)"
+[ "$rc" != "0" ] || fail "it proceeded without a capability it requires"
+grep -q 'does not support' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+grep -q 'machine-readable-cleanup-images' "$ENV_DIR/werr" \
+  || fail "the refusal does not name the missing capability"
+echo "  refused, naming the missing capability"
+
+echo "== 27. it refuses an unexpected container count =="
+setup; make_installed_cli
+rc="$(DOMUM_EXPECT_CONTAINERS=99 run_wrapper --preflight-only)"
+[ "$rc" != "0" ] || fail "it accepted a container count it did not expect"
+grep -q 'expected 99 containers' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+echo "  refused"
+
+echo "== 28. it refuses when nothing is staged =="
+setup no-staged; make_installed_cli
+rc="$(run_wrapper --preflight-only)"
+[ "$rc" != "0" ] || fail "it proceeded with nothing staged"
+grep -q 'nothing to upgrade' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+echo "  refused"
+
+echo "== 29. it refuses unprotected state =="
+setup no-subvol; make_installed_cli
+rc="$(run_wrapper --preflight-only)"
+[ "$rc" != "0" ] || fail "it proceeded with unprotected state"
+grep -qE 'not a Btrfs subvolume|protection' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+echo "  refused"
+
+echo "== 30. the FULL run: the wrapper drives the upgrade and verifies it =="
+setup; make_installed_cli
+rc="$(run_wrapper)"
+[ "$rc" = "0" ] || { wout; fail "the full wrapper run failed (rc=$rc)"; }
+for want in "PLEX UPGRADED and independently verified" \
+            "containers are unchanged" \
+            "running the intended staged image" \
+            "pre-upgrade point:" \
+            "is read-only and has recovery evidence" \
+            "storage verify-archive" \
+            "archive verifies independently" \
+            "NOT a candidate" \
+            "image refresh still disabled" \
+            "rollback:"; do
+  grep -q "$want" "$ENV_DIR/wout" || { wout; fail "the final report omits '$want'"; }
+done
+[ "$(img plex)" = "$PLEX_NEW" ] || fail "plex is not on the staged image"
+[ "$(img calibre-web)" = "$CW_OLD" ] \
+  || fail "calibre-web moved to its staged image during a plex-only upgrade"
+echo "  upgraded, verified independently, and the rollback command printed"
+
+echo "== 30b. it refuses if a failed unit appeared, or image refresh got enabled =="
+# Two host invariants that must not silently change during an upgrade.
+setup; make_installed_cli
+touch "$ENV_DIR/st/failed-units"
+rc="$(run_wrapper)"
+[ "$rc" != "0" ] || fail "it reported success with a failed systemd unit present"
+grep -q 'failed systemd units appeared' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+setup; make_installed_cli
+touch "$ENV_DIR/st/refresh-enabled"
+rc="$(run_wrapper)"
+[ "$rc" != "0" ] || fail "it reported success with the image-refresh timer ENABLED.
+That timer is the automatic deployment path and must stay disabled."
+grep -q 'no longer disabled' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+echo "  both refused"
+
+echo "== 31. the wrapper's scope proof is INDEPENDENT of the CLI's =="
+# Blind the CLI's own before/after comparison and let another service move. The
+# wrapper must still catch it -- otherwise "asserted twice by two
+# implementations" is not true.
+setup; make_installed_cli
+mutate_cli 's|\[\[ "$others_before" == "$others_after" \]\]|[[ 1 == 1 ]]|' 
+touch "$ENV_DIR/st/stray"
+rc="$(run_wrapper)"
+[ "$rc" != "0" ] \
+  || fail "a NON-PLEX container changed and the wrapper reported success. Its scope
+proof is not independent of the CLI's -- blinding the CLI blinded both."
+grep -q 'a NON-PLEX container changed' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+echo "  caught by the wrapper even with the CLI's own check blinded"
+
+fi
 
 echo
 echo "PASS: service upgrade integration smoke"

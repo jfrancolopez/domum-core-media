@@ -137,13 +137,13 @@ echo "  an empty operator/ fails instead of passing"
 echo "== 9. the wrapper requires every capability the upgrade actually needs =="
 for cap in service-scoped-upgrade pre-upgrade-point archive-image \
            verify-image-archive rollback-upgrade recovery-image-protection \
-           machine-readable-cleanup-images; do
+           machine-readable-cleanup-images protection-state; do
   grep -q "$cap" "$WRAPPER" || fail "the wrapper does not require '$cap'"
 done
 # And it must actually CHECK them, not merely list them.
 grep -q 'capabilities --has "$cap"' "$WRAPPER" \
   || fail "NEEDED_CAPS is listed but never checked against the installed CLI"
-echo "  all seven required and checked against the installed binary"
+echo "  all eight required and checked against the installed binary"
 
 echo
 echo "PASS: operator wrapper audit smoke"

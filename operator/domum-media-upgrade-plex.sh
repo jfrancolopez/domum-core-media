@@ -42,11 +42,18 @@
 
 set -u
 
-REPO=/opt/domum-core-media
-CLI=/usr/local/bin/domum-media
-SVC=plex
-SVC_PATH=/srv/data/$SVC
-EXPECT_CONTAINERS=11
+# Production defaults. Overridable ONLY so this script can be rehearsed against
+# a disposable production-shaped fixture before it is ever pointed at the real
+# host -- which is the point of it living in the repository. An unset
+# environment gives exactly the production values.
+REPO="${DOMUM_REPO:-/opt/domum-core-media}"
+CLI="${DOMUM_CLI:-/usr/local/bin/domum-media}"
+SVC="${DOMUM_SVC:-plex}"
+DATA_ROOT="${DOMUM_DATA_ROOT_OVERRIDE:-/srv/data}"
+SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT_OVERRIDE:-/srv/snapshots}"
+STATE_ROOT="${DOMUM_STATE_ROOT_OVERRIDE:-/var/lib/domum-media}"
+SVC_PATH="$DATA_ROOT/$SVC"
+EXPECT_CONTAINERS="${DOMUM_EXPECT_CONTAINERS:-11}"
 PREFLIGHT_ONLY=0
 EXPECT_REVISION=""
 
@@ -66,7 +73,7 @@ head2() { printf '\n== %s ==\n' "$*"; }
 # implementation may be refactored freely as long as the behaviour remains.
 NEEDED_CAPS="service-scoped-upgrade pre-upgrade-point archive-image
 verify-image-archive rollback-upgrade recovery-image-protection
-machine-readable-cleanup-images"
+machine-readable-cleanup-images protection-state"
 
 identities() {  # all container identities, one per line, sorted
   docker ps -a --format '{{.Names}}' | LC_ALL=C sort | while IFS= read -r c; do
@@ -146,14 +153,30 @@ note "old image   : ${OLD_IMG:0:19}  $(docker image inspect -f '{{index .Config.
 note "new image   : ${NEW_IMG:0:19}  $(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$NEW_IMG" 2>/dev/null)"
 
 head2 "4. protection and capacity preconditions"
-[ "$(stat -c %i "$SVC_PATH")" = 256 ] \
-  || abort "$SVC_PATH is not a Btrfs subvolume; no pre-upgrade snapshot could be taken"
-note "$SVC_PATH is a subvolume (inode 256)"
+# TWO independent judgments, because one implementation checking itself is not
+# a second opinion.
+#
+# (a) The filesystem fact, read here: a Btrfs subvolume root is inode 256. The
+#     expected value is overridable only so this script can be rehearsed on an
+#     ordinary filesystem; production leaves it at 256.
+EXPECT_INODE="${DOMUM_EXPECT_INODE:-256}"
+[ "$(stat -c %i "$SVC_PATH")" = "$EXPECT_INODE" ] \
+  || abort "$SVC_PATH is not a Btrfs subvolume (inode $(stat -c %i "$SVC_PATH"), expected
+$EXPECT_INODE); no pre-upgrade snapshot could be taken"
+note "$SVC_PATH is a subvolume (inode $EXPECT_INODE)"
+# (b) The CLI's own verdict, by EXIT STATUS. `storage protection` prints the
+#     state word and exits 0 only when it is `protected`, which is exactly why
+#     it exists -- so a script tests the command instead of matching its prose.
+PROT="$("$CLI" storage protection "$SVC" 2>/dev/null)"; PROT_RC=$?
+[ "$PROT_RC" -eq 0 ] \
+  || abort "the CLI reports $SVC protection as '${PROT:-unknown}' (exit $PROT_RC), not
+protected. It would refuse the upgrade, and this script agrees with it."
+note "the CLI independently reports protection: $PROT" 
 WAL="$(find "$SVC_PATH" -xdev -type f -name '*-wal' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)"
 note "largest live WAL: ${WAL:-none} (the CLI stops and re-checks after the stop)"
-AVAIL_MIB=$(( $(df --output=avail -k /srv/data | tail -1 | tr -d ' ') / 1024 ))
+AVAIL_MIB=$(( $(df --output=avail -k "$DATA_ROOT" | tail -1 | tr -d ' ') / 1024 ))
 IMG_MIB=$(( $(docker image inspect -f '{{.Size}}' "$OLD_IMG") / 1024 / 1024 ))
-note "archive needs <= ${IMG_MIB} MiB; ${AVAIL_MIB} MiB free on /srv/data"
+note "archive needs <= ${IMG_MIB} MiB; ${AVAIL_MIB} MiB free on $DATA_ROOT"
 [ "$AVAIL_MIB" -gt $(( IMG_MIB * 2 )) ] || abort "not enough room for the image archive"
 
 head2 "5. independent baseline: ALL container identities"
@@ -228,13 +251,19 @@ note "the other $(( N_BEFORE - 1 )) containers are unchanged (id and image)"
 note "$SVC is running the intended staged image"
 
 # The pre-upgrade point, found by kind rather than by guessing its name.
-POINT="$(ls -1 /srv/snapshots | grep "^${SVC}-.*-pre-upgrade$" | sort | tail -1)"
+# A glob, not `ls | grep`: snapshot names are timestamped YYYYMMDD-HHMMSS, so
+# lexical order is chronological and the last match is the newest.
+POINT=""
+for _d in "$SNAPSHOT_ROOT/$SVC"-*-pre-upgrade; do
+  [ -d "$_d" ] || continue
+  POINT="${_d##*/}"
+done
 [ -n "$POINT" ] || abort "no ${SVC}-*-pre-upgrade snapshot exists; the recovery point
 was not created, yet the staged image is deployed. Do NOT run cleanup."
 note "pre-upgrade point: $POINT"
-[ "$(btrfs property get -ts "/srv/snapshots/$POINT" | tr -d ' ')" = "ro=true" ] \
+[ "$(btrfs property get -ts "$SNAPSHOT_ROOT/$POINT" | tr -d ' ')" = "ro=true" ] \
   || abort "$POINT is not read-only"
-META=/var/lib/domum-media/snapshots/$POINT.recovery
+META="$STATE_ROOT/snapshots/$POINT.recovery"
 [ -s "$META" ] || abort "no recovery evidence at $META"
 note "$POINT is read-only and has recovery evidence"
 
