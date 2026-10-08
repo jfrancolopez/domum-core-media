@@ -199,10 +199,13 @@ grep -q '^BLOCKED uptime-kuma docker-volume' <<< "$out" \
   || fail "uptime-kuma was not BLOCKED as docker-volume: $out"
 grep -q '^NOSTATE' <<< "$out" \
   && fail "NOSTATE is still emitted; it conflated 'no /srv/data path' with 'stateless'"
-# The reason must name the volume, or the operator cannot act on it.
-grep -q 'BLOCKED traefik docker-volume.*letsencrypt' <<< "$out" \
-  || fail "the traefik refusal does not name the volume: $out"
-echo "  traefik and uptime-kuma BLOCKED, each naming its volume"
+# NOT asserted here: that the reason names /letsencrypt. This fixture stubs
+# service_compose_services and has no such container, so the live mount lookup
+# finds nothing -- and in CI there is no running stack at all. The
+# volume-naming assertion belongs where the mounts are controlled, and lives in
+# tests/state-model-smoke.sh section 2. Asserting it here made the suite pass
+# only on a host with the real stack running.
+echo "  traefik and uptime-kuma BLOCKED as docker-volume"
 
 # ---------------------------------------------------------------------------
 echo "== 8. the refusal itself REFUSES, with the real names in the message =="
