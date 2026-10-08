@@ -136,19 +136,41 @@ $ub"
 echo "  no recorded identity -> refuses"
 
 echo "== 8. ROLLBACK verifies the archive BEFORE loading it =="
-l_sha="$(line_in "$rb" 'got_sha="\$(sha256sum')"
-l_load="$(line_in "$rb" 'docker load -i "\$arch"')"
+# This logic now lives in ensure_recorded_image_available, shared by the
+# snapshot and the DOCKER-VOLUME rollback so the two cannot drift apart about
+# what counts as having the right application back. The assertions below moved
+# with it; the rollback must still REACH it.
+grep -q 'ensure_recorded_image_available' <<< "$rb" \
+  || fail "the rollback no longer makes the recorded image available"
+rb_img="$(awk '/^ensure_recorded_image_available\(\) \{/,/^\}$/' "$CLI")"
+[ -n "$rb_img" ] || fail "ensure_recorded_image_available is not defined"
+l_sha="$(line_in "$rb_img" 'got_sha="\$(sha256sum')"
+l_load="$(line_in "$rb_img" 'docker load -i "\$arch"')"
 [ -n "$l_sha" ] && [ -n "$l_load" ] || fail "could not locate the checksum and the load"
 [ "$l_sha" -lt "$l_load" ] || fail "the archive is loaded before its checksum is checked ($l_load vs $l_sha)"
-shab="$(awk '/\[\[ "\$got_sha" == "\$want_sha" \]\]/,/^$/' <<< "$rb")"
+shab="$(awk '/\[\[ "\$got_sha" == "\$want_sha" \]\]/,/^$/' <<< "$rb_img")"
 grep -q 'die ' <<< "$shab" || fail "a checksum mismatch does not refuse to load:
 $shab"
 echo "  checksum($l_sha) < load($l_load); mismatch refuses"
 
+# BOTH rollbacks must go through it. If one re-derived the image-availability
+# rules, the snapshot and volume paths could disagree about whether the right
+# application is back -- which is the half of a recovery point that is easy to
+# get wrong and hard to notice.
+for fn in rollback_upgrade rollback_volume_upgrade; do
+  body="$(awk "/^${fn}\(\) \{/,/^\}\$/" "$CLI")"
+  [ -n "$body" ] || fail "could not isolate $fn"
+  grep -q 'ensure_recorded_image_available' <<< "$body" \
+    || fail "$fn does not use the shared image-availability helper"
+  grep -q 'docker load -i' <<< "$body" \
+    && fail "$fn loads an image itself instead of going through the shared helper"
+done
+echo "  both rollbacks share ensure_recorded_image_available"
+
 echo "== 9. ROLLBACK compares the LOADED id to the recorded id =="
-grep -q 'Loaded image ID' <<< "$rb" \
+grep -q 'Loaded image ID' <<< "$rb_img" \
   || fail "the rollback does not read back what docker load actually restored"
-lb="$(awk '/\[\[ "\$loaded" == "\$want_img" \]\]/,/^$/' <<< "$rb")"
+lb="$(awk '/\[\[ "\$loaded" == "\$want_img" \]\]/,/^$/' <<< "$rb_img")"
 grep -q 'die ' <<< "$lb" \
   || fail "a load that restores a DIFFERENT image does not abort. The checksum proves
 the file; only this comparison proves the identity:

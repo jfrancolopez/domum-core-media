@@ -4395,6 +4395,99 @@ cleanup_protected_image_ids() {
   done < <(recovery_point_image_ids)
 }
 
+# ---------------------------------------------------------------------------
+# Pre-upgrade recovery points for DOCKER-VOLUME services.
+#
+# traefik and uptime-kuma keep durable state in Docker volumes, so no Btrfs
+# snapshot can reach it and the upgrade gate blocks them. That is honest but it
+# is a dead end: the fix is a recovery point that works for volume-backed state,
+# built to the same contract as the Btrfs one --
+#
+#   application-consistent + the exact image that wrote it + metadata binding
+#   the two together
+#
+# The thing that makes this tractable: a Docker volume HAS a host path.
+#
+#   docker volume inspect domum-media_traefik-letsencrypt -f '{{.Mountpoint}}'
+#   -> /var/lib/docker/volumes/domum-media_traefik-letsencrypt/_data
+#
+# so migrate_assert_quiesced -- open handles, hot journals, non-empty WALs --
+# applies unchanged, and the quiescence proof is the same proof. Only the
+# "capture" step differs: a tar of the volume instead of a read-only snapshot.
+#
+# Dumps live beside the image archives on the protected tier, for the same
+# reasons: inside the restic set and outside every service subvolume, so they do
+# not duplicate into per-service snapshots.
+volume_dump_dir() {
+  printf '%s/backups/volumes' "${DOMUM_DATA_ROOT%/}"
+}
+
+docker_volume_mountpoint() {  # $1 = volume name
+  docker volume inspect "$1" --format '{{.Mountpoint}}' 2>/dev/null
+}
+
+# The rw NAMED volumes a service's containers mount, with their destinations.
+# Prints "<volume> <destination>" per line. Anonymous volumes are deliberately
+# excluded: their names change when the container is recreated, so a dump keyed
+# on one could not be restored to the same place.
+service_named_volumes() {  # $1 = service
+  local svc="$1" compose_svcs c
+  compose_svcs="$(service_compose_services "$svc" 2>/dev/null || true)"
+  [[ -n "$compose_svcs" ]] || return 0
+  for c in $compose_svcs; do
+    docker inspect -f \
+      '{{range .Mounts}}{{if and (eq .Type "volume") .RW}}{{.Name}} {{.Destination}}{{"\n"}}{{end}}{{end}}' \
+      "$c" 2>/dev/null || true
+  done | sed '/^$/d' | grep -vE '^[0-9a-f]{64} ' | sort -u
+}
+
+# A tar of the volume, published atomically with its checksum.
+#
+# Mirrors archive_image_to_file exactly: .partial -> checksum -> sync -> rename,
+# and it refuses to overwrite. A dump that exists under its final name is always
+# complete.
+#
+# --numeric-owner --xattrs --acls because this is a restore source, not a backup
+# for reading: traefik's acme.json is mode 0600 owned by root and must come back
+# that way. Restoring it world-readable would turn a recovery into a disclosure.
+dump_volume_to_file() {  # $1 = volume name, $2 = destination .tar
+  local vol="$1" dest="$2" dir mp
+  dir="$(dirname "$dest")"
+  install -d -m 0750 "$dir" || { warn "cannot create $dir"; return 1; }
+  [[ -e "$dest" ]] && { warn "refusing to overwrite an existing dump: $dest"; return 1; }
+  mp="$(docker_volume_mountpoint "$vol")"
+  [[ -n "$mp" && -d "$mp" ]] \
+    || { warn "volume $vol has no readable mountpoint"; return 1; }
+  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$dest.partial" . 2>/dev/null; then
+    rm -f -- "$dest.partial"
+    warn "could not archive volume $vol from $mp"
+    return 1
+  fi
+  sha256sum "$dest.partial" | awk '{print $1}' > "$dest.sha256.partial" \
+    || { rm -f -- "$dest.partial" "$dest.sha256.partial"; warn "could not checksum the dump"; return 1; }
+  sync -f "$dest.partial" 2>/dev/null || sync 2>/dev/null || true
+  mv -- "$dest.partial" "$dest" && mv -- "$dest.sha256.partial" "$dest.sha256" \
+    || { warn "could not publish the dump"; return 1; }
+  chmod 0640 "$dest" "$dest.sha256" 2>/dev/null || true
+  return 0
+}
+
+# Does a dump still match what was recorded? File integrity only -- the same
+# distinction the image archive makes, and for the same reason: a checksum
+# proves the FILE, and only unpacking proves what is inside it.
+verify_volume_dump_file() {  # $1 = dump path -> 0 if it matches its .sha256
+  local dump="$1" want got
+  [[ -r "$dump" ]] || { warn "dump is missing or unreadable: $dump"; return 1; }
+  [[ -r "$dump.sha256" ]] || { warn "no checksum beside $dump"; return 1; }
+  want="$(cat "$dump.sha256")"
+  got="$(sha256sum "$dump" | awk '{print $1}')"
+  [[ "$want" == "$got" ]] && return 0
+  warn "dump checksum mismatch for $dump
+  recorded: $want
+  on disk : $got"
+  return 1
+}
+
 # The ONE decision function for image cleanup.
 #
 # The human report, the structured output and the candidate list all derive from
@@ -7654,6 +7747,294 @@ Migrate it first:  sudo domum-media storage migrate-subvolume $service"
   printf '%s\n' "$path"
 }
 
+# The volumes a recovery point records, as "<name> <dest> <dump> <sha256>".
+#
+# Read from the metadata, never re-derived from the live container: the point of
+# the record is that it describes what WAS, and a container recreated by the
+# upgrade may mount something different.
+recovery_point_volumes() {  # $1 = recovery metadata file
+  local meta="$1" n=1 name dest dump sha
+  [[ -s "$meta" ]] || return 0
+  while :; do
+    name="$(sed -nE "s/^VOLUME_${n}_NAME='(.*)'\$/\1/p" "$meta" | head -1)"
+    [[ -n "$name" ]] || break
+    dest="$(sed -nE "s/^VOLUME_${n}_DEST='(.*)'\$/\1/p" "$meta" | head -1)"
+    dump="$(sed -nE "s/^VOLUME_${n}_DUMP='(.*)'\$/\1/p" "$meta" | head -1)"
+    sha="$(sed -nE "s/^VOLUME_${n}_DUMP_SHA256='(.*)'\$/\1/p" "$meta" | head -1)"
+    printf '%s %s %s %s\n' "$name" "$dest" "$dump" "$sha"
+    n=$(( n + 1 ))
+  done
+}
+
+# Read-only: does every dump a point records still match its recorded checksum?
+storage_verify_volume_dumps() {  # $1 = recovery point
+  need_root
+  load_cfg
+  local point="${1:-}" meta n=0 bad=0 name dest dump sha got
+  [[ -n "$point" ]] || die "Usage: domum-media storage verify-volume-dumps <recovery-point>"
+  meta="$(snapshot_metadata_dir)/${point}.recovery"
+  [[ -s "$meta" ]] || die "No recovery evidence for $point at $meta"
+
+  echo "recovery point    : $point"
+  echo "  service         : $(sed -nE "s/^SERVICE='(.*)'\$/\1/p" "$meta" | head -1)"
+  echo "  kind            : $(sed -nE "s/^POINT_KIND='(.*)'\$/\1/p" "$meta" | head -1)"
+  while read -r name dest dump sha; do
+    [[ -n "$name" ]] || continue
+    n=$(( n + 1 ))
+    echo "  volume          : $name -> $dest"
+    echo "    dump          : $dump"
+    if [[ ! -r "$dump" ]]; then
+      echo "    state         : MISSING -- this point cannot be restored"
+      bad=$(( bad + 1 )); continue
+    fi
+    got="$(sha256sum "$dump" | awk '{print $1}')"
+    if [[ "$got" == "$sha" ]]; then
+      echo "    checksum      : matches the record ($(stat -c %s "$dump") bytes)"
+    else
+      echo "    checksum      : MISMATCH -- recorded $sha, on disk $got"
+      bad=$(( bad + 1 ))
+    fi
+  done < <(recovery_point_volumes "$meta")
+
+  if (( n == 0 )); then
+    die "$point records no volumes. It is not a volume recovery point."
+  fi
+  echo "  -> the FILES are intact. That is not the same claim as the application"
+  echo "     state inside them being usable; only a restore proves that."
+  (( bad == 0 )) || return 1
+  return 0
+}
+
+# Restore a volume from a dump, preserving what was there.
+#
+# The current contents are dumped aside FIRST, under .failed-<stamp>, and only
+# then replaced. Nothing is deleted: the same rule the Btrfs rollback follows
+# when it renames the live tree rather than removing it.
+#
+# Refuses before touching anything if the dump does not match its checksum.
+restore_volume_from_file() {  # $1 = volume, $2 = dump .tar, $3 = stamp
+  local vol="$1" dump="$2" stamp="$3" mp aside
+  verify_volume_dump_file "$dump" || return 1
+  mp="$(docker_volume_mountpoint "$vol")"
+  [[ -n "$mp" && -d "$mp" ]] || { warn "volume $vol has no readable mountpoint"; return 1; }
+
+  aside="$(volume_dump_dir)/${vol}.failed-${stamp}.tar"
+  if [[ -e "$aside" ]]; then
+    warn "refusing to overwrite an existing preserved dump: $aside"
+    return 1
+  fi
+  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$aside.partial" . 2>/dev/null; then
+    rm -f -- "$aside.partial"
+    warn "could not preserve the current contents of $vol; nothing was restored"
+    return 1
+  fi
+  sync -f "$aside.partial" 2>/dev/null || sync 2>/dev/null || true
+  mv -- "$aside.partial" "$aside" || { warn "could not publish $aside"; return 1; }
+  chmod 0640 "$aside" 2>/dev/null || true
+  echo "[domum-media] preserved the current $vol contents at $aside"
+
+  # Clear, then unpack. `find -delete` rather than `rm -rf "$mp"`: the volume
+  # mountpoint itself must survive, because docker owns it.
+  find "$mp" -mindepth 1 -delete 2>/dev/null \
+    || { warn "could not clear $mp; the preserved copy is at $aside"; return 1; }
+  if ! tar -C "$mp" --numeric-owner --xattrs --acls -xf "$dump" 2>/dev/null; then
+    warn "could not unpack $dump into $mp. The previous contents are at $aside."
+    return 1
+  fi
+  return 0
+}
+
+# A pre-upgrade recovery point for a DOCKER-VOLUME service.
+#
+# Same contract as the Btrfs one, same ordering, same refusals -- only the
+# capture differs. Stage metadata while the service is observably running; stop;
+# prove quiescence on each volume's HOST PATH; dump each volume; archive the
+# exact running image; bind the evidence; restart with `compose start`, which
+# resolves no image reference.
+#
+# It deploys nothing, and every failure before the bind restarts the service and
+# leaves no published artefact.
+storage_volume_pre_upgrade_point() {  # $1 = service, [--archive-image]
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+
+  local service="${1:-}" archive=0
+  [[ "${2:-}" == "--archive-image" ]] && archive=1
+  [[ -n "$service" ]] \
+    || die "Usage: domum-media storage volume-pre-upgrade-point <service> [--archive-image]"
+
+  local model_line model
+  model_line="$(service_state_model "$service")"
+  model="${model_line%% *}"
+  [[ "$model" == "docker-volume" ]] \
+    || die "Refusing: $service is '$model', not docker-volume. A protected-tier
+service takes its point with \`storage pre-upgrade-point\`, which snapshots."
+
+  local volumes
+  volumes="$(service_named_volumes "$service")"
+  [[ -n "$volumes" ]] \
+    || die "Refusing: $service is declared docker-volume but mounts no NAMED rw
+volume. An anonymous volume cannot be a recovery point: its name changes when
+the container is recreated, so a dump could not be restored to the same place."
+
+  domum_acquire_lock "volume-pre-upgrade-point $service" 0 \
+    || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
+
+  local compose_svcs runtime_before images_before staged stamp point
+  compose_svcs="$(service_compose_services "$service" || true)"
+  runtime_before="$(service_runtime_state "$service")"
+  images_before="$(service_running_images "$service")"
+  stamp="$(date +%Y%m%d-%H%M%S)" || die "cannot read the clock"
+  point="${service}-${stamp}-pre-upgrade-volume"
+  migrate_stage preflight "service=$service model=docker-volume runtime=$runtime_before"
+  migrate_stage preflight "volumes: $(printf '%s' "$volumes" | tr '\n' ' ')"
+  migrate_stage preflight "images: $(printf '%s' "$images_before" | tr '\n' ' ')"
+
+  staged="$(stage_recovery_point_metadata "$service" "$runtime_before")" \
+    || die "Could not stage recovery evidence; nothing has been touched."
+  migrate_stage preflight "recovery evidence staged: $staged"
+
+  local started=0
+  volume_restart() {
+    (( started == 1 )) || return 0
+    [[ -n "$compose_svcs" ]] || return 0
+    # shellcheck disable=SC2086
+    compose_cmd start $compose_svcs >/dev/null 2>&1 && return 0
+    warn "Could not restart $compose_svcs with \`compose start\`."
+    warn "NOT recreating: that resolves the image tag and could deploy a staged image."
+    warn "$service is DOWN. Nothing was deleted and no dump was published."
+    return 1
+  }
+
+  if [[ "$runtime_before" == "running" && -n "$compose_svcs" ]]; then
+    migrate_stage stop "stopping $compose_svcs"
+    # shellcheck disable=SC2086
+    compose_cmd stop $compose_svcs || { rm -f "$staged"; die "Could not stop $compose_svcs"; }
+    started=1
+  fi
+
+  # Application-consistent, or refuse -- on the volume's host path, with the
+  # same checks the migration uses. uptime-kuma's kuma.db runs in WAL mode, so
+  # this is not a formality: a dump taken with a non-empty WAL is a torn
+  # database.
+  local vol dest mp n=0 dumps=""
+  while read -r vol dest; do
+    [[ -n "$vol" ]] || continue
+    mp="$(docker_volume_mountpoint "$vol")"
+    if [[ -z "$mp" || ! -d "$mp" ]]; then
+      volume_restart; rm -f "$staged"
+      die "Refusing: volume $vol has no readable mountpoint. Nothing was changed."
+    fi
+    if ! migrate_assert_quiesced "$mp"; then
+      volume_restart; rm -f "$staged"
+      die "Refusing: $vol ($mp) is not quiesced after the stop. No dump was taken."
+    fi
+    migrate_stage stop "quiesced: $vol at $mp"
+  done <<< "$volumes"
+
+  # Dump every volume before publishing any evidence. A point that names a dump
+  # it does not have is worse than one that admits it has none.
+  while read -r vol dest; do
+    [[ -n "$vol" ]] || continue
+    n=$(( n + 1 ))
+    local dump dump_sha
+    dump="$(volume_dump_dir)/${service}-${stamp}-${vol}.tar"
+    migrate_stage archive "dumping $vol -> $dump"
+    if ! dump_volume_to_file "$vol" "$dump"; then
+      volume_restart; rm -f "$staged"
+      die "Could not dump volume $vol. Nothing was published."
+    fi
+    dump_sha="$(cat "$dump.sha256")"
+    migrate_stage archive "dumped $(stat -c %s "$dump") bytes, sha256 ${dump_sha:0:16}…"
+    {
+      printf "VOLUME_%s_NAME='%s'\n" "$n" "$vol"
+      printf "VOLUME_%s_DEST='%s'\n" "$n" "$dest"
+      printf "VOLUME_%s_DUMP='%s'\n" "$n" "$dump"
+      printf "VOLUME_%s_DUMP_SHA256='%s'\n" "$n" "$dump_sha"
+      printf "VOLUME_%s_DUMP_BYTES='%s'\n" "$n" "$(stat -c %s "$dump")"
+    } >> "$staged" || { volume_restart; rm -f "$staged"; die "could not record dump evidence"; }
+    dumps="${dumps}${dumps:+ }$dump"
+  done <<< "$volumes"
+  printf "VOLUME_COUNT='%s'\n" "$n" >> "$staged"
+
+  local arch="" arch_sha=""
+  if (( archive == 1 )); then
+    local img
+    img="$(printf '%s' "$images_before" | awk 'NR==1{print $2}')"
+    [[ -n "$img" ]] || { volume_restart; rm -f "$staged"; die "No image id to archive for $service"; }
+    arch="$(image_archive_dir)/${service}-${img#sha256:}.tar"
+    arch="${arch:0:200}"
+    if [[ -e "$arch" ]]; then
+      migrate_stage archive "image already archived at $arch"
+      arch_sha="$(cat "$arch.sha256" 2>/dev/null || true)"
+    else
+      migrate_stage archive "saving $img -> $arch"
+      if ! archive_image_to_file "$img" "$arch"; then
+        volume_restart; rm -f "$staged"
+        die "Could not archive $img. The dumps exist but no metadata was bound."
+      fi
+      arch_sha="$(cat "$arch.sha256")"
+      migrate_stage archive "archived $(stat -c %s "$arch") bytes, sha256 ${arch_sha:0:16}…"
+    fi
+    printf "IMAGE_ARCHIVE='%s'\n" "$arch" >> "$staged"
+    printf "IMAGE_ARCHIVE_SHA256='%s'\n" "$arch_sha" >> "$staged"
+    printf "IMAGE_ARCHIVE_BYTES='%s'\n" "$(stat -c %s "$arch")" >> "$staged"
+  fi
+  printf "POINT_KIND='pre-upgrade-volume'\n" >> "$staged"
+
+  local meta
+  if ! meta="$(bind_recovery_point_metadata "$staged" "$service" "$point")"; then
+    volume_restart
+    die "The volume dumps exist but recovery evidence could not be bound to
+$point. That is a DATA-only point. Investigate before upgrading."
+  fi
+  migrate_stage proof "recovery evidence: $meta"
+
+  local restart_ok=1
+  volume_restart || restart_ok=0
+
+  local runtime_after images_after
+  runtime_after="$(service_runtime_state "$service")"
+  images_after="$(service_running_images "$service")"
+  [[ "$runtime_after" == "$runtime_before" ]] \
+    && migrate_stage health "runtime state preserved: $runtime_after" \
+    || warn "runtime state changed: $runtime_before -> $runtime_after"
+  if [[ "$images_before" == "$images_after" ]]; then
+    migrate_stage health "image unchanged -- nothing was deployed"
+  else
+    warn "the running image CHANGED across the restart; this point may not pair"
+    warn "  before: $(printf '%s' "$images_before" | tr '\n' ' ')"
+    warn "  after : $(printf '%s' "$images_after" | tr '\n' ' ')"
+    restart_ok=0
+  fi
+
+  echo
+  echo "[domum-media] Pre-upgrade recovery point for $service (docker-volume)"
+  echo "  recovery point  : $point"
+  echo "  recovery evidence: $meta"
+  echo "  volume dumps    : $n"
+  printf '%s\n' "$dumps" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/    /'
+  if (( archive == 1 )); then
+    echo "  image archive   : $arch"
+    echo "  archive sha256  : $arch_sha"
+  else
+    echo "  image archive   : none (re-run with --archive-image for a durable copy)"
+  fi
+  PRE_UPGRADE_POINT="$point"
+  PRE_UPGRADE_META="$meta"
+  PRE_UPGRADE_ARCHIVE="$arch"
+  if (( restart_ok == 1 )); then
+    echo "  service         : $runtime_after on the SAME image"
+    echo
+    echo "[domum-media] Pre-upgrade point COMPLETE. Nothing was deployed."
+    return 0
+  fi
+  echo "[domum-media] Pre-upgrade point INCOMPLETE -- read the warnings above."
+  return 1
+}
+
 storage_pre_upgrade_point() {  # $1 = service, [--archive-image]
   need_root
   load_cfg
@@ -7877,6 +8258,168 @@ storage_verify_archive() {  # $1 = recovery point
 #   * the service is started with that id pinned via <SERVICE>_IMAGE, so compose
 #     recreates onto the old image deliberately rather than resolving `:latest`;
 #   * the failed state is PRESERVED, never deleted.
+# Make the image a recovery point RECORDS available, and prove it is that image.
+#
+# Shared by the Btrfs and the Docker-volume rollback, so the two cannot drift
+# apart about what counts as having the right application back. The three
+# outcomes are deliberately distinct:
+#
+#   present locally   nothing to do
+#   loaded from the archive, and the LOADED id compared to the record. The
+#                     checksum proves the FILE; only `docker load` proves the
+#                     identity, and an archive whose sha256 matches while
+#                     holding a different image must still be refused.
+#   neither           refuse. The data could be restored but the application it
+#                     pairs with could not, and starting it under a different
+#                     build is the failure this exists to prevent.
+ensure_recorded_image_available() {  # $1 = image id, $2 = archive, $3 = sha, $4 = point, $5 = step label
+  local want_img="$1" arch="$2" want_sha="$3" point="$4" step="$5"
+  if docker image inspect "$want_img" >/dev/null 2>&1; then
+    echo "[domum-media] $step: recorded image already present locally"
+    return 0
+  fi
+  if [[ -n "$arch" && -r "$arch" ]]; then
+    local got_sha loaded
+    got_sha="$(sha256sum "$arch" | awk '{print $1}')"
+    [[ "$got_sha" == "$want_sha" ]] \
+      || die "The archive at $arch does not match its recorded sha256.
+  recorded: $want_sha
+  on disk : $got_sha
+Refusing to load it. Nothing was changed."
+    echo "[domum-media] $step: loading $want_img from $arch"
+    loaded="$(docker load -i "$arch" 2>&1 | sed -nE 's/.*Loaded image ID: (sha256:[0-9a-f]+).*/\1/p' | head -1)"
+    [[ "$loaded" == "$want_img" ]] \
+      || die "The archive restored a DIFFERENT image than the point records.
+  recorded: $want_img
+  loaded  : ${loaded:-<none reported>}
+Refusing to continue. Nothing was restored."
+    echo "[domum-media] $step: loaded and identity CONFIRMED equal to the record"
+    return 0
+  fi
+  die "Refusing: $want_img is not present locally and there is no readable
+archive for $point. The data could be restored but the application it pairs with
+could not, and starting it under a different build is the failure this prevents."
+}
+
+# Rollback for a DOCKER-VOLUME recovery point.
+#
+# Deliberately a separate function from rollback_upgrade rather than a branch
+# inside it: that one is proven, and its first act is to require a Btrfs
+# snapshot. Both restore BOTH halves or refuse, and both go through
+# ensure_recorded_image_available so they cannot disagree about the application
+# half.
+#
+# CLASSIFICATION: may deploy. It recreates deliberately, pinned to the recorded
+# image id -- the one place recreating is correct, because the container that
+# exists belongs to the image being rolled back FROM.
+rollback_volume_upgrade() {  # $1 = service, $2 = recovery point
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+
+  local service="${1:-}" point="${2:-}"
+  [[ -n "$service" && -n "$point" ]] \
+    || die "Usage: domum-media rollback-volume-upgrade <service> <recovery-point>"
+  managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
+    || die "Refusing: '$service' is not a service this command knows about"
+
+  local meta kind want_img arch want_sha compose_svcs volumes
+  meta="$(snapshot_metadata_dir)/${point}.recovery"
+  [[ -s "$meta" ]] || die "No recovery evidence for $point at $meta"
+  kind="$(sed -nE "s/^POINT_KIND='(.*)'\$/\1/p" "$meta" | head -1)"
+  [[ "$kind" == "pre-upgrade-volume" ]] \
+    || die "Refusing: $point is kind '${kind:-<none>}', not pre-upgrade-volume.
+A snapshot-backed point is restored with \`rollback-upgrade\`."
+
+  volumes="$(recovery_point_volumes "$meta")"
+  [[ -n "$volumes" ]] || die "Refusing: $point records no volumes to restore"
+  compose_svcs="$(service_compose_services "$service" || true)"
+  [[ -n "$compose_svcs" ]] || die "No compose services mapped for $service"
+
+  want_img="$(sed -nE "s/^CONTAINER_1_IMAGE_ID='(.*)'\$/\1/p" "$meta" | head -1)"
+  arch="$(sed -nE "s/^IMAGE_ARCHIVE='(.*)'\$/\1/p" "$meta" | head -1)"
+  want_sha="$(sed -nE "s/^IMAGE_ARCHIVE_SHA256='(.*)'\$/\1/p" "$meta" | head -1)"
+  [[ -n "$want_img" ]] \
+    || die "Refusing: $point records no image identity, so the application half of
+this rollback is unknown. Restoring the volumes under whatever is running now is
+the pairing failure this refuses to perform."
+
+  # Every dump must be intact BEFORE anything is stopped. A rollback that gets
+  # half way and finds a corrupt dump has already taken the service down.
+  local vname vdest vdump vsha
+  while read -r vname vdest vdump vsha; do
+    [[ -n "$vname" ]] || continue
+    [[ -r "$vdump" ]] || die "Refusing: the dump for $vname is missing at $vdump.
+Nothing was changed."
+    [[ "$(sha256sum "$vdump" | awk '{print $1}')" == "$vsha" ]] \
+      || die "Refusing: the dump for $vname does not match its recorded sha256.
+Nothing was changed."
+  done <<< "$volumes"
+
+  echo "[domum-media] Rollback plan for $service (docker-volume)"
+  echo "  recovery point  : $point"
+  echo "  pin image       : $want_img"
+  echo "  from archive    : ${arch:-<none; relying on the local object>}"
+  printf '%s\n' "$volumes" | awk 'NF{printf "  restore volume  : %s -> %s\n", $1, $3}'
+
+  domum_acquire_lock "rollback-volume-upgrade $service" 0 \
+    || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
+
+  ensure_recorded_image_available "$want_img" "$arch" "$want_sha" "$point" "1/5"
+
+  echo "[domum-media] 2/5: stopping $compose_svcs"
+  # shellcheck disable=SC2086
+  compose_cmd stop $compose_svcs || die "Could not stop $compose_svcs; nothing was restored"
+
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)" || die "cannot read the clock"
+  echo "[domum-media] 3/5: restoring volumes (the current contents are preserved first)"
+  while read -r vname vdest vdump vsha; do
+    [[ -n "$vname" ]] || continue
+    restore_volume_from_file "$vname" "$vdump" "$stamp" \
+      || die "Could not restore $vname. Read the warnings above: the preserved copy
+of whatever was there is named in them, and $service is stopped."
+    echo "[domum-media] 3/5: restored $vname"
+  done <<< "$volumes"
+
+  echo "[domum-media] 4/5: starting $compose_svcs with the recorded image"
+  # Same derivation the Btrfs rollback uses: there is no service_image_env_var,
+  # which the undefined-function audit caught before this could run.
+  local image_var
+  image_var="$(printf '%s_IMAGE' "$(uppercase_token "$service")")"
+  # The pin is an EXPORT IN A SUBSHELL, not `env VAR=... compose_cmd`:
+  # compose_cmd is a shell function and `env` can only exec a real binary.
+  # shellcheck disable=SC2086
+  if ! ( export "$image_var=$want_img"; compose_cmd up -d $compose_svcs ); then
+    warn "Could not start $compose_svcs on the recorded image."
+    die "Rollback incomplete. The volumes are restored and nothing was deleted."
+  fi
+
+  echo "[domum-media] 5/5: verification"
+  local rc=0 now_img
+  now_img="$(service_running_images "$service" | awk 'NR==1{print $2}')"
+  if [[ "$now_img" == "$want_img" ]]; then
+    echo "  image           : $service is running the recorded image"
+  else
+    warn "$service came back on $now_img, not the recorded $want_img."
+    rc=1
+  fi
+  while read -r vname vdest vdump vsha; do
+    [[ -n "$vname" ]] || continue
+    echo "  preserved       : $(volume_dump_dir)/${vname}.failed-${stamp}.tar"
+  done <<< "$volumes"
+  if (( rc == 0 )); then
+    echo
+    echo "[domum-media] Rollback COMPLETE for $service."
+    return 0
+  fi
+  echo
+  echo "[domum-media] Rollback INCOMPLETE -- the volumes are restored but the
+  application does not match the recovery point. Nothing was deleted."
+  return 1
+}
+
 rollback_upgrade() {  # $1 = service, $2 = recovery point
   need_root
   load_cfg
@@ -7894,7 +8437,18 @@ rollback_upgrade() {  # $1 = service, $2 = recovery point
   [[ -s "$meta" ]] || die "No recovery evidence for $point at $meta"
   path="$(service_data_path "$service")"
   snap="${DOMUM_SNAPSHOT_ROOT%/}/$point"
-  [[ -d "$snap" ]] || die "The snapshot $snap is missing; this point cannot be restored"
+  if [[ ! -d "$snap" ]]; then
+    # Accurate refusal: a volume point legitimately has no snapshot, and saying
+    # "the snapshot is missing" would send the operator looking for a deleted
+    # one. Same lesson as the traefik message.
+    local k
+    k="$(sed -nE "s/^POINT_KIND='(.*)'\$/\1/p" "$meta" | head -1)"
+    [[ "$k" == "pre-upgrade-volume" ]] \
+      && die "Refusing: $point is a DOCKER-VOLUME recovery point, which has no
+snapshot by design. Restore it with:
+  sudo domum-media rollback-volume-upgrade $service $point"
+    die "The snapshot $snap is missing; this point cannot be restored"
+  fi
   compose_svcs="$(service_compose_services "$service" || true)"
   [[ -n "$compose_svcs" ]] || die "No compose services mapped for $service"
 
@@ -7916,29 +8470,7 @@ pairing failure this refuses to perform."
     || die "Another domum-media operation holds the lock: $(domum_lock_holder)"
 
   # ---- 1. make the recorded image available, and PROVE it is the right one ----
-  if docker image inspect "$want_img" >/dev/null 2>&1; then
-    echo "[domum-media] 1/5: recorded image already present locally"
-  elif [[ -n "$arch" && -r "$arch" ]]; then
-    local got_sha loaded
-    got_sha="$(sha256sum "$arch" | awk '{print $1}')"
-    [[ "$got_sha" == "$want_sha" ]] \
-      || die "The archive at $arch does not match its recorded sha256.
-  recorded: $want_sha
-  on disk : $got_sha
-Refusing to load it. Nothing was changed."
-    echo "[domum-media] 1/5: loading $want_img from $arch"
-    loaded="$(docker load -i "$arch" 2>&1 | sed -nE 's/.*Loaded image ID: (sha256:[0-9a-f]+).*/\1/p' | head -1)"
-    [[ "$loaded" == "$want_img" ]] \
-      || die "The archive restored a DIFFERENT image than the point records.
-  recorded: $want_img
-  loaded  : ${loaded:-<none reported>}
-Refusing to continue. Nothing was restored."
-    echo "[domum-media] 1/5: loaded and identity CONFIRMED equal to the record"
-  else
-    die "Refusing: $want_img is not present locally and there is no readable
-archive for $point. The data could be restored but the application it pairs with
-could not, and starting it under a different build is the failure this prevents."
-  fi
+  ensure_recorded_image_available "$want_img" "$arch" "$want_sha" "$point" "1/5"
 
   # ---- 2. stop the current (failed) service, preserving its state ------------
   echo "[domum-media] 2/5: stopping $compose_svcs"
@@ -8416,10 +8948,13 @@ domum_capability_specs() {
   cat <<'EOF'
 service-scoped-upgrade|updates apply --service|service_upgrade
 pre-upgrade-point|storage pre-upgrade-point|storage_pre_upgrade_point
+volume-pre-upgrade-point|storage volume-pre-upgrade-point|storage_volume_pre_upgrade_point
+verify-volume-dumps|storage verify-volume-dumps|storage_verify_volume_dumps
 archive-image|storage pre-upgrade-point --archive-image|archive_image_to_file
 verify-image-archive|storage verify-archive|storage_verify_archive
 image-archive-inventory|storage archives|storage_archives
 rollback-upgrade|rollback-upgrade|rollback_upgrade
+rollback-volume-upgrade|rollback-volume-upgrade|rollback_volume_upgrade
 recovery-image-protection|cleanup images|cleanup_protected_image_ids
 machine-readable-cleanup-images|cleanup images --json|cleanup_images_json
 verify-recovery-deep|storage verify-recovery|storage_verify_recovery
@@ -8501,6 +9036,18 @@ storage_cmd() {
         # running image, bind metadata, restart the same container on the same
         # image. The complete rollback artifact for a later upgrade.
         storage_pre_upgrade_point "${1:-}" "${2:-}" ;;
+      volume-pre-upgrade-point)
+        shift
+        # The docker-volume counterpart of pre-upgrade-point. Deploys nothing:
+        # stop, prove quiescence on each volume's host path, dump, archive the
+        # exact running image, bind, restart with `compose start`.
+        storage_volume_pre_upgrade_point "${1:-}" "${2:-}" ;;
+      verify-volume-dumps)
+        shift
+        # Read-only. Checks every dump a point records against its recorded
+        # sha256, and says plainly that file integrity is not the same claim as
+        # the application state being usable.
+        storage_verify_volume_dumps "${1:-}" ;;
       verify-archive)
         shift
         # Read-only. Checks the archive FILE against its recorded sha256 and
@@ -8511,7 +9058,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|verify-archive <point>|archives}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives}" ;;
   esac
 }
 
@@ -8568,6 +9115,8 @@ Usage:
   domum-media snapshot {create [tag]|list|prune}
   domum-media rollback {list|show <id>|apply <id> [--dry-run]}
   domum-media rollback-upgrade <service> <recovery-point>
+  domum-media rollback-volume-upgrade <service> <recovery-point>
+                                            Same, for a DOCKER-VOLUME point
                                             Undo an application upgrade: restores
                                             the pre-upgrade state AND the exact
                                             image it pairs with, loading it from
@@ -8595,6 +9144,11 @@ Usage:
                                             archive is intact, and what that does
                                             and does not prove
   domum-media storage pre-upgrade-point <service> [--archive-image]
+  domum-media storage volume-pre-upgrade-point <service> [--archive-image]
+                                            Same contract, for a service whose
+                                            durable state is in a Docker volume
+  domum-media storage verify-volume-dumps <point>
+                                            Are a volume point's dumps intact
                                             Application-consistent recovery point
                                             for a later upgrade: stop, prove
                                             quiescence, snapshot, archive the
@@ -8634,6 +9188,12 @@ main() {
     apply)     shift; apply "$@" ;;
     status)    shift; status "$@" ;;
     update)    shift; repo_update "$@" ;;
+    rollback-volume-upgrade)
+      shift
+      # Restores BOTH halves of a DOCKER-VOLUME point: every recorded volume
+      # dump, plus the exact recorded image, loaded from its archive if the
+      # local object is gone. The replaced contents are preserved, never deleted.
+      rollback_volume_upgrade "${1:-}" "${2:-}" ;;
     rollback-upgrade)
       shift
       # Restores BOTH halves: the pre-upgrade data AND the exact recorded image,
