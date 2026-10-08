@@ -8078,11 +8078,24 @@ storage_archives() {
       # It matters: the first Plex archive was created at 08:15 while the night's
       # backup had run at 02:36, so for most of a day the only copies of that
       # application were both on this one host.
+      # backup_last_success_epoch is the ONE parser for this marker, and it
+      # already existed. The first version of this check rolled its own --
+      # `cat … | tr -cd '0-9'` -- against a marker that holds an ISO-8601
+      # timestamp, not an epoch:
+      #
+      #   2026-10-08T02:37:27-04:00  ->  202610080237270400
+      #
+      # an 18-digit number larger than any real mtime, so the comparison was
+      # ALWAYS true and the check could only ever answer "yes". It reported
+      # "yes" in production for an archive the backup predated by six hours,
+      # and `date -d @202610080237270400` fails, which is why that line printed
+      # with the timestamp missing. A check that cannot produce its alarming
+      # answer is not a check.
       local arch_mtime backup_at
       arch_mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
-      backup_at="$(cat "$DOMUM_LOG_DIR/last-success" 2>/dev/null | tr -cd '0-9' || true)"
+      backup_at="$(backup_last_success_epoch || true)"
       if [[ -z "$backup_at" ]]; then
-        echo "  off-host copy   : UNKNOWN -- no successful-backup marker to compare against"
+        echo "  off-host copy   : UNKNOWN -- no readable successful-backup marker to compare against"
       elif (( backup_at > arch_mtime )); then
         echo "  off-host copy   : yes -- a backup succeeded $(date -d "@$backup_at" '+%Y-%m-%d %H:%M') after this file appeared"
       else

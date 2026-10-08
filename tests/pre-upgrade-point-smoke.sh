@@ -189,20 +189,123 @@ done
 # read-only inventory must not need the repository password to answer a question
 # about scheduling. Sound because the archive lives under $DOMUM_DATA_ROOT, which
 # the backup includes and no exclude covers.
-grep -q 'last-success' <<< "$ar" \
-  || fail "the off-host answer does not consult the successful-backup marker"
-# Comments stripped first: the explanation above legitimately mentions restic,
-# and matching the word rather than the invocation flagged it.
 grep -vE '^\s*#' <<< "$ar" | grep -qE '(^|[;&|[:space:]])restic' \
   && fail "the inventory invokes restic; that needs secrets and this is read-only"
-# All three answers must exist: yes, not yet, and unknown. Collapsing the third
-# into either of the others is the failure that matters -- "I cannot tell" must
-# never read as "yes".
-for want in 'off-host copy   : yes' 'NOT YET' 'UNKNOWN'; do
-  grep -qF -- "$want" <<< "$ar" \
-    || fail "the off-host answer has no '$want' branch; a missing marker would be
-reported as one of the definite answers"
-done
+# It must use the ONE parser for the marker, which already existed. Rolling its
+# own was the bug: see section 13b.
+grep -q 'backup_last_success_epoch' <<< "$ar" \
+  || fail "the off-host answer does not use backup_last_success_epoch, the single
+parser for the successful-backup marker"
+# Comments stripped: the explanation in that function legitimately quotes the
+# broken form, and matching the text rather than the code flagged it -- twice in
+# this same section now, once for `restic` and once for this.
+grep -vE '^\s*#' <<< "$ar" | grep -qE "tr -cd '0-9'" \
+  && fail "the inventory digit-strips the marker again. It holds an ISO-8601
+timestamp, not an epoch, and stripping it yields an 18-digit number larger than
+any mtime -- so the comparison is always true and the check can only say yes."
+echo "  reports need, id, checksum, local object, orphans, off-host; deletes nothing"
+
+echo "== 13b. the off-host answer is EXECUTED, in all three directions =="
+#
+# WHY THIS IS NOT A GREP. The first version of this assertion checked that the
+# strings 'yes', 'NOT YET' and 'UNKNOWN' appeared in the function's SOURCE. They
+# did, so it passed -- while the comparison itself could only ever reach 'yes',
+# because the marker was being digit-stripped into an 18-digit number. The check
+# shipped and reported "yes" in production for an archive the last backup
+# predated by six hours.
+#
+# That is the lesson already written down for service_upgrade: asserting on a
+# function's text does not prove the function runs. So this drives
+# storage_archives against real files with controlled timestamps.
+offhost_probe() {  # $1 = marker contents ("" = no file), $2 = archive mtime
+  local root="$TMP_DIR/oh"
+  rm -rf "$root"
+  mkdir -p "$root/data/backups/images" "$root/state/snapshots" "$root/log"
+  local arch="$root/data/backups/images/plex-abc.tar"
+  printf 'ARCHIVE\n' > "$arch"
+  sha256sum "$arch" | awk '{print $1}' > "$arch.sha256"
+  touch -d "$2" "$arch"
+  cat > "$root/state/snapshots/plex-x-pre-upgrade.recovery" <<EOF
+FORMAT='1'
+SERVICE='plex'
+CONTAINER_1_IMAGE_ID='sha256:deadbeef'
+IMAGE_ARCHIVE='$arch'
+IMAGE_ARCHIVE_SHA256='$(cat "$arch.sha256")'
+EOF
+  [ -n "$1" ] && printf '%s\n' "$1" > "$root/log/last-success"
+  {
+    printf 'set -uo pipefail\n'
+    printf 'DOMUM_DIR=%q\n' "$REPO_ROOT"
+    printf 'CFG_FILE=%q\n' "$TMP_DIR/absent.conf"
+    printf 'source %q\n' "$CLI"
+    printf 'set +e\n'
+    printf 'need_root() { :; }\n'
+    printf 'load_cfg() { :; }\n'
+    printf 'DOMUM_DATA_ROOT=%q\n' "$root/data"
+    printf 'DOMUM_LOG_DIR=%q\n' "$root/log"
+    printf 'snapshot_metadata_dir() { printf %q; }\n' "$root/state/snapshots"
+    printf 'image_archive_dir() { printf %q; }\n' "$root/data/backups/images"
+    printf 'docker() { return 1; }\n'
+    printf 'storage_archives\n'
+  } > "$root/probe.sh"
+  bash "$root/probe.sh" 2>&1 | sed -n 's/.*off-host copy   : //p' | head -1
+}
+
+# (a) A backup that succeeded AFTER the archive appeared -> yes.
+got="$(offhost_probe '2026-10-08T12:00:00-04:00' '2026-10-08 06:00:00')"
+case "$got" in
+  yes*) : ;;
+  *) fail "13b(a): a backup newer than the archive gave '$got', expected yes" ;;
+esac
+# ...and it must name the timestamp. The broken version printed a blank there,
+# which is what gave the bug away in the deployment log.
+grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<< "$got" \
+  || fail "13b(a): the 'yes' answer does not state WHEN: '$got'"
+
+# (b) A backup that predates the archive -> NOT YET. This is the case the
+#     broken version could never produce, and the one that matters.
+got="$(offhost_probe '2026-10-08T02:37:27-04:00' '2026-10-08 08:15:00')"
+case "$got" in
+  NOT\ YET*) : ;;
+  *) fail "13b(b): a backup OLDER than the archive gave '$got', expected NOT YET.
+This is production's exact shape -- marker 02:37, archive 08:15 -- and it was
+reported as 'yes'." ;;
+esac
+
+# (c) No marker at all -> UNKNOWN, not either definite answer.
+got="$(offhost_probe '' '2026-10-08 08:15:00')"
+case "$got" in
+  UNKNOWN*) : ;;
+  *) fail "13b(c): a missing marker gave '$got', expected UNKNOWN" ;;
+esac
+
+# (d) An unparseable marker -> UNKNOWN. Fail closed: garbage must not read as yes.
+got="$(offhost_probe 'not-a-timestamp' '2026-10-08 08:15:00')"
+case "$got" in
+  UNKNOWN*) : ;;
+  *) fail "13b(d): an unparseable marker gave '$got', expected UNKNOWN" ;;
+esac
+echo "  yes / NOT YET / UNKNOWN(absent) / UNKNOWN(garbage) all reached"
+
+echo "== 13c. mutation: the original defect is caught by 13b =="
+# Put the digit-stripping back and require case (b) to flip. If it does not, 13b
+# is not actually testing the comparison.
+mut="$TMP_DIR/mut-archives"; rm -rf "$mut"; mkdir -p "$mut"
+cp "$CLI" "$mut/domum-media"
+# sed, not a nested python heredoc: the replacement is full of quotes and the
+# nesting broke. The pattern deliberately avoids "$(" -- a BRE containing it is
+# the shape that silently matches nothing.
+sed -i 's@backup_last_success_epoch || true@tr -cd 0-9 < "$DOMUM_LOG_DIR/last-success" 2>/dev/null || true@' \
+  "$mut/domum-media"
+cmp -s "$CLI" "$mut/domum-media" && fail "13c: the mutation changed nothing"
+saved="$CLI"; CLI="$mut/domum-media"
+got="$(offhost_probe '2026-10-08T02:37:27-04:00' '2026-10-08 08:15:00')"
+CLI="$saved"
+case "$got" in
+  NOT\ YET*) fail "13c: restoring the digit-stripping still answered NOT YET, so
+13b(b) is not exercising the comparison" ;;
+esac
+echo "  digit-stripping flips (b) to '$(printf '%.20s' "$got")…' -- 13b holds it"
 # It must decide "needed" from the METADATA, not from the filename, which is
 # only a convenience.
 grep -q "IMAGE_ARCHIVE='" <<< "$ar" \
@@ -211,7 +314,7 @@ grep -q "IMAGE_ARCHIVE='" <<< "$ar" \
 grep -qE '^\s*(rm|btrfs subvolume delete|docker image rm)' <<< "$ar" \
   && fail "storage_archives deletes something; it is an inventory"
 grep -q 'Nothing was deleted' <<< "$ar" || fail "it does not state that it deleted nothing"
-echo "  reports need, id, checksum, local object, orphans; deletes nothing"
+echo "  'needed' decided from the metadata, not the filename"
 
 echo "== 14. an archive whose only copy is the file is called out =="
 grep -q 'this archive is the only copy' <<< "$ar" \
