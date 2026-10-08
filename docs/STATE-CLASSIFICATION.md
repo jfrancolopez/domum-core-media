@@ -214,3 +214,90 @@ point is possible for volume-backed state. That is a **missing capability**, not
 a policy to relax: the honest state is "blocked, for a stated reason", and
 `APPLY_ALLOW_IMAGE_CHANGE=1` remains the documented, loud override if the
 operator decides the risk is acceptable for a patch bump.
+
+---
+
+## Calibre-Web — the decision, and why it is not "because Plex was migrated"
+
+Re-measured 2026-10-08:
+
+```
+/srv/data/calibre-web            260 KB, 6 files, inode 4375 (ordinary directory)
+  config/app.db              118,784 b   21 tables: users, settings, shelves
+  config/gdrive.db            24,576 b   2 tables
+  config/.key                     44 b   secret key
+  config/calibre-web.log.1    99,969 b   log
+  config/calibre-web.log      11,308 b   log
+  config/client_secrets.json       3 b
+staged                           0.6.26-ls386 -> 0.6.27-ls399
+app.db                           integrity_check -> ok
+                                 journal_mode -> DELETE  (no WAL, unlike Plex)
+```
+
+So the durable configuration is about **145 KB across three files**; the 111 KB
+of logs is most of the apparent size. The book library and Calibre's own
+`metadata.db` (409,600 b) live on `/srv/media/books`, the media tier.
+
+The three options, against the recovery requirement rather than against symmetry:
+
+**A. Migrate it to a Btrfs subvolume.** *Chosen.*
+
+Calibre-Web is the one remaining service whose durable state is **already on the
+protected tier** — it is an ordinary directory in the right place, not state in
+the wrong place. Migration is therefore the natural fix rather than a data
+relocation, and it is the only change that makes the *proven* upgrade pipeline
+available to it: `storage migrate-subvolume` → `updates apply --service`, the
+exact path validated end to end on Plex.
+
+It is also the easiest migration yet attempted: 6 files, 260 KB, `journal_mode
+DELETE` so there is no WAL to quiesce, and no symlinks — strictly simpler than
+Plex, which had 7 symlinks (one absolute into the container namespace) and a
+649,792-byte live WAL and still migrated cleanly.
+
+**B. A smaller application-aware backup/recovery mechanism**, like
+`uptime_kuma_dump`. *Rejected for this purpose.*
+
+It would work, and it is the right answer for state that cannot move. But a pack
+dump is **disaster recovery, not a rollback point**: periodic, no image
+identity, not created before an upgrade. It would leave Calibre-Web exactly as
+blocked as it is now, while looking like progress. The distinction is the whole
+content of the section above.
+
+**C. Leave it blocked.** *Rejected*, but note that this is the honest status quo
+and costs nothing except the pending 0.6.27 upgrade. It is the correct answer
+for traefik and uptime-kuma today.
+
+**Explicitly not the reasoning:** "Plex was migrated, so migrate this too."
+Jellyfin, Kavita, Navidrome and Plex were migrated because their state is on the
+protected tier and they hold data worth a rollback point. Calibre-Web qualifies
+on the same grounds, measured. Uptime Kuma does **not** qualify and must not be
+migrated by analogy — its state is in a volume, moving it carries the ordering
+hazard described above, and it currently holds one user account and nothing else.
+
+Migrating `/srv/data` is an operator boundary (`CLAUDE.md` §11), so this is a
+decision recorded here, not an action taken.
+
+## Traefik and Uptime Kuma — what they actually need
+
+Not migration. A **pre-upgrade recovery point for volume-backed state**, which
+does not exist yet: stop the service, prove quiescence, dump the volume to the
+protected tier with a checksum, archive the exact old image, and bind the three
+together — the same shape as `storage pre-upgrade-point`, with a volume dump
+where the Btrfs snapshot goes.
+
+Until that exists they are correctly blocked, and the blocking is the useful
+outcome: before this change a `domum-media apply` would have upgraded both.
+
+Risk notes for when it does exist:
+
+* **traefik** is the one that matters. `acme.json` holds the ACME *account*
+  private key plus 9 certificates; losing it means re-issuing under Let's
+  Encrypt rate limits, with a TLS outage window. The staged change is a patch
+  bump (v3.7.10 → v3.7.12) which almost certainly does not touch the file
+  format — but "almost certainly" is exactly the judgement the framework exists
+  so that nobody has to make. A v3 → v4 bump is the dangerous shape.
+* **uptime-kuma** holds 1 user and nothing else: 0 monitors, 0 notifications,
+  0 status pages, 0 heartbeats, 0 maintenance windows. Its database is live and
+  WAL-mode, so it must still be quiesced rather than copied, but the data at
+  risk today is an admin account. That is a reason to sequence it second, not a
+  reason to exempt it.

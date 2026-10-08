@@ -1023,6 +1023,18 @@ service_ready_log_pattern() {  # $1 = service
     # image says so itself -- which is why readiness is matched on a positive
     # signal rather than inferred from an absence of scary words.
     plex)        printf 'port [tcp/*] succeeded!' ;;
+    # Same LinuxServer.io init probe, measured on this host 2026-10-08:
+    #
+    #   Connection to localhost (::1) 8083 port [tcp/*] succeeded!
+    #   [ls.io-init] done.
+    #
+    # WEAKER than navidrome's for the same reason as Plex's: it proves the
+    # listener came up, not that the application opened its database. The
+    # startup log additionally carries a calibre desktop-integration failure and
+    # "There were 1 warnings" -- the image states itself that these are expected
+    # and harmless, which is why readiness is matched on the positive signal
+    # rather than inferred from an absence of alarming words.
+    calibre-web) printf 'port [tcp/*] succeeded!' ;;
     # kavita has a real HTTP healthcheck (curl /api/health), which is a stronger
     # signal than a log line, so nothing is added here.
     *)           printf '' ;;
@@ -3822,9 +3834,12 @@ service_state_model() {  # $1 = service -> prints "<model> <reason>"
 
   case "$model" in
     docker-volume)
+      # The reason names the volume when it can be read. When it cannot -- no
+      # running container, or no docker at all -- the classification still
+      # stands, because it is DECLARED. Saying so is better than implying the
+      # mount was inspected.
       printf 'docker-volume durable state in a Docker volume (%s)\n' \
-        "${undeclared:-no rw volume found, which contradicts the declaration}"
-      [[ -n "$undeclared" ]] || printf '' ;;
+        "${undeclared:-declared; live mounts not readable here}" ;;
     protected-tier)
       if [[ -n "$undeclared" ]]; then
         printf 'unknown %s is declared %s but mounts undeclared rw volume(s): %s\n' \
@@ -6465,6 +6480,13 @@ PY
 service_sqlite_binary() {  # $1 = service -> path INSIDE its container
   case "$1" in
     plex) printf '/usr/lib/plexmediaserver/Plex SQLite' ;;
+    # calibre-web ships sqlite3 3.45.1 at /usr/bin/sqlite3 (measured). Without
+    # this, app.db was reported `unsupported: not checked` -- honest, because
+    # there is no sqlite3 on the host at all, but weaker than what is available.
+    # Measured against the live database: integrity_check -> ok,
+    # journal_mode -> delete (so no WAL hazard, unlike Plex and Uptime Kuma),
+    # 21 tables, 2 users.
+    calibre-web) printf '/usr/bin/sqlite3' ;;
     *) return 1 ;;
   esac
 }

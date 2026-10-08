@@ -413,8 +413,23 @@ DOMUM_DIR='$REPO_ROOT'; CFG_FILE='$TMP_DIR/absent.conf'
 source '$REPO_ROOT/bin/domum-media'
 service_ready_log_pattern plex")"
 [[ "$plexpat" == "port [tcp/*] succeeded!" ]] || fail "5: the plex readiness pattern changed to [$plexpat]"
+# calibre-web now HAS a pattern -- measured 2026-10-08, it logs the same
+# LinuxServer.io init line as Plex:
+#   Connection to localhost (::1) 8083 port [tcp/*] succeeded!
+# It was in the list below as a service with nothing to look for, which was true
+# when this was written and is a fixture fact, not a contract.
+cwpat="$(bash -c "
+set -uo pipefail
+DOMUM_DIR='$REPO_ROOT'; CFG_FILE='$TMP_DIR/absent.conf'
+source '$REPO_ROOT/bin/domum-media'
+service_ready_log_pattern calibre-web")"
+[[ "$cwpat" == "port [tcp/*] succeeded!" ]] \
+  || fail "5: the calibre-web readiness pattern is [$cwpat], expected the LinuxServer line"
+[[ "$(ready calibre-web '2026-10-08T12:00:00.000000000Z Connection to localhost (::1) 8083 port [tcp/*] succeeded!' 2026-10-08T11:59:00)" == "RC=0" ]] \
+  || fail "5: calibre-web's own readiness line was not recognised"
+
 # Services with no known pattern must still say so rather than claim readiness.
-for svc in jellyfin calibre-web immich traefik; do
+for svc in jellyfin immich traefik kavita; do
   [[ "$(ready "$svc" 'anything')" == "RC=2" ]] \
     || fail "5: $svc has no readiness pattern but did not report 'nothing to look for'"
 done
