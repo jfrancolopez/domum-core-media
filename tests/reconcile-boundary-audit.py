@@ -66,6 +66,12 @@ DEPLOYING = {
     # exactly wrong here -- it would restart the failed application on restored
     # data, which is task-24's defect.
     "rollback_upgrade",
+    # The DOCKER-VOLUME rollback. Deliberately a separate function from
+    # rollback_upgrade, whose first act is to require a Btrfs snapshot a volume
+    # point does not have. Recreating is correct here for the same reason: the
+    # container that exists belongs to the image being rolled back FROM, and the
+    # recreate is pinned to the recorded image id.
+    "rollback_volume_upgrade",
 }
 # Not service containers at all: one-shot utilities that exit, in no compose
 # project, and cannot change what is running.

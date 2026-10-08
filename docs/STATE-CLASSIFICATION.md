@@ -301,3 +301,108 @@ Risk notes for when it does exist:
   WAL-mode, so it must still be quiesced rather than copied, but the data at
   risk today is an admin account. That is a reason to sequence it second, not a
   reason to exempt it.
+
+---
+
+## A recovery point for volume-backed state
+
+Blocking traefik and uptime-kuma was honest but it was a dead end. The capability
+they were missing now exists, built to the same contract as the Btrfs one:
+
+> application-consistent state **+** the exact image that wrote it **+**
+> metadata binding the two together
+
+```
+domum-media storage volume-pre-upgrade-point <service> [--archive-image]
+domum-media storage verify-volume-dumps <point>
+domum-media rollback-volume-upgrade <service> <point>
+```
+
+### What made it tractable
+
+**A Docker volume has a host path.**
+
+```
+docker volume inspect domum-media_traefik-letsencrypt -f '{{.Mountpoint}}'
+-> /var/lib/docker/volumes/domum-media_traefik-letsencrypt/_data
+```
+
+So `migrate_assert_quiesced` — open handles via a real `/proc` scan, hot
+rollback journals, non-empty SQLite WALs — applies **unchanged**, and the
+quiescence proof is the same proof the migrations use. Only the *capture* step
+differs: a tar of the volume where the read-only snapshot goes.
+
+That is not a formality for uptime-kuma: `kuma.db` is WAL-mode with a live
+`-wal` (8,272 bytes measured), so a dump taken without quiescing is a torn
+database.
+
+### Ordering, and why each step is where it is
+
+1. stage metadata **while the service is observably running** — the running
+   image has to be recorded before anything stops it
+2. `compose stop`
+3. prove quiescence **on each volume's host path** — refuse otherwise
+4. dump **every** volume before publishing any evidence; a point that names a
+   dump it does not have is worse than one that admits it has none
+5. archive the exact running image
+6. bind the evidence
+7. `compose start` — resolves no image reference, so the restart cannot deploy
+
+Steps 1–7 deploy nothing. Every failure before the bind restarts the service and
+leaves no published artefact.
+
+### `--numeric-owner --xattrs --acls`, deliberately
+
+A dump is a **restore source**, not a backup for reading. `acme.json` is mode
+0600 owned by root; restoring it world-readable would turn a recovery into a
+disclosure. The test asserts the mode survives both the dump and the restore.
+
+### Anonymous volumes cannot be recovery points
+
+`service_named_volumes` excludes 64-hex names. An anonymous volume's name
+changes when its container is recreated, so a dump keyed on one could not be
+restored to the same place. A `docker-volume` service mounting only anonymous
+volumes is **refused**, before anything is stopped.
+
+Immich's two anonymous volumes are the reason this matters in practice — they
+are excluded from the named set, and separately declared benign because its
+primary state is on the protected tier.
+
+### Rollback: both halves, or refuse
+
+`rollback_volume_upgrade` is deliberately a **separate function** from
+`rollback_upgrade`, whose first act is to require a Btrfs snapshot a volume point
+does not have. Both go through one `ensure_recorded_image_available`, so they
+cannot drift apart about what counts as having the right application back:
+present locally → nothing to do; loaded from the archive **and the loaded id
+compared to the record**; neither → refuse.
+
+Two properties worth stating:
+
+* **Every dump is verified before anything is stopped.** A rollback that gets
+  half way and finds a corrupt dump has already taken the service down. A
+  mutation removing that loop proves the service *does* get stopped without it.
+* **The replaced contents are preserved, never deleted** — dumped aside as
+  `<volume>.failed-<stamp>.tar` before the volume is cleared, the same rule the
+  Btrfs rollback follows when it renames the live tree.
+
+And the two rollbacks refuse each other's points **accurately**: a volume point
+handed to the snapshot rollback is identified as volume-backed and told which
+command restores it, rather than reporting "the snapshot is missing" — which
+would send the operator looking for something that never existed. Same lesson as
+the traefik refusal.
+
+### The gate is still closed, deliberately
+
+The point and its rollback exist and are tested; `updates apply --service` has
+**not** been wired to use them. So traefik and uptime-kuma remain blocked, and
+the operator can now create a real, verified rollback artefact by hand before
+deciding anything:
+
+```
+sudo domum-media storage volume-pre-upgrade-point traefik --archive-image
+sudo domum-media storage verify-volume-dumps <point>
+```
+
+Wiring the orchestration is the next step, and it deserves its own pass: that is
+the part that deploys.

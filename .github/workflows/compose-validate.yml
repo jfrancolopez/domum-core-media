@@ -184,6 +184,16 @@ jobs:
       - name: State model smoke test
         run: tests/state-model-smoke.sh
 
+      # A recovery point for volume-backed state: dump, checksum, metadata,
+      # restore, and the file modes a private key depends on.
+      - name: Volume recovery point smoke test
+        run: tests/volume-recovery-point-smoke.sh
+
+      # The migration wrapper decides eligibility by asking the CLI, not from a
+      # hardcoded list of which services are already migrated.
+      - name: Migrate wrapper eligibility smoke test
+        run: tests/migrate-wrapper-eligibility-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh
