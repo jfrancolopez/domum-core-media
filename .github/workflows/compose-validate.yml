@@ -178,6 +178,12 @@ jobs:
       - name: Operator wrapper audit smoke test
         run: tests/operator-wrapper-audit-smoke.sh
 
+      # "No /srv/data/<service>" is not "stateless": traefik keeps the Let's
+      # Encrypt account key and uptime-kuma a live SQLite database, both in
+      # Docker volumes, and both were waved through the upgrade gate.
+      - name: State model smoke test
+        run: tests/state-model-smoke.sh
+
       # Docker must not start before /srv/data is mounted.
       - name: Boot mount dependency smoke test
         run: tests/boot-mount-dependency-smoke.sh

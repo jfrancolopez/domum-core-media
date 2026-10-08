@@ -286,6 +286,43 @@ under `/srv/data` is reported, not blocked — a snapshot could never cover a Do
 volume, and that is the recovery-pack question. A path that exists whose protection
 is `unknown` IS blocked. See `docs/UPGRADE-PROTECTION.md`.
 
+**"No `/srv/data/<service>`" is NOT "stateless", and the upgrade gate used to
+treat them as the same thing.** `apply_staged_image_blockers` emitted `NOSTATE`
+whenever the path was absent, and NOSTATE was reported and then **allowed**.
+Measured 2026-10-08, with a staged image waiting for both: `traefik` keeps
+`acme.json` (116,015 bytes, mode 0600 — the Let's Encrypt **account private key**
+plus 9 issued certificates) in `domum-media_traefik-letsencrypt`, and
+`uptime-kuma` keeps `kuma.db` (286,720 bytes **with a non-empty `-wal`**, a live
+SQLite database it forward-migrates on startup) in `domum-media_uptime-kuma-data`.
+
+The recovery pack does capture both, so this was never "no coverage" — it is the
+wrong KIND. A pack is periodic and operator-driven, records **no image identity**,
+and is not created before an upgrade, so it cannot pair state with the
+application that wrote it. Disaster recovery and rollback are different artefacts.
+
+`service_state_models` now **declares** a model per service — `protected-tier`,
+`docker-volume` or `stateless` — because durability cannot be inferred from a
+mount list: a volume holding a model cache and one holding a private key look
+identical. The declaration is then **checked against the live mounts and fails
+closed**: an undeclared rw volume, an rw bind under the protected root beneath a
+service declared stateless, or a `protected-tier` service whose path is absent
+all become `unknown`/`missing-state-path` and are **blocked**. `docker-volume` is
+blocked too — not because the state is unprotected, but because no pre-upgrade
+recovery point is *possible* for it yet. Undeclared services fail closed.
+`storage protection` reports the model and exits 0 only for genuinely protected
+state. Never add a benign destination to make a gate pass.
+`tests/state-model-smoke.sh`; 3 mutants, all killed. See
+`docs/STATE-CLASSIFICATION.md`.
+
+**A test can assert a defect.** Fixing the above broke three suites, and two of
+them were requiring the old behaviour outright: `update-path-gate-smoke` demanded
+`NOSTATE traefik` and *failed if traefik was blocked*, and
+`upgrade-protection-gate-smoke` required that a service with no state path be
+allowed. The reasoning in both — "a snapshot cannot cover a Docker volume" — was
+true, and the conclusion did not follow. Before adapting a test to a change, ask
+which of the two is wrong; here the btrfs integration suite had three of the same
+shape (`up -d` restarts, "Migration complete" on a failed proof snapshot).
+
 **Docker must not start before `/srv/data` is mounted.** Containers are
 `restart: unless-stopped`, so the daemon starts them at boot without compose; with
 the mount absent it would create the bind-mount sources on the OS disk and every

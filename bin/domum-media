@@ -3698,6 +3698,161 @@ init_host() {
   echo "[domum-media] init complete."
 }
 
+# WHERE A SERVICE'S DURABLE STATE ACTUALLY LIVES.
+#
+# "No /srv/data/<service>" is NOT "stateless", and conflating the two let a
+# staged image through for two services holding real data. Measured on this host
+# 2026-10-08, after the Plex upgrade:
+#
+#   traefik      volume domum-media_traefik-letsencrypt -> /letsencrypt
+#                acme.json, 116,015 bytes, mode 0600: the Let's Encrypt ACCOUNT
+#                KEY and every issued certificate. Losing it means re-issuing
+#                under Let's Encrypt's rate limits.
+#   uptime-kuma  volume domum-media_uptime-kuma-data -> /app/data
+#                kuma.db 286,720 bytes WITH a non-empty -wal and a -shm: a live
+#                SQLite database the application forward-migrates on startup --
+#                exactly the Plex situation, and exactly what makes
+#                `snapshot + whichever image is running now` not a pair.
+#
+# Neither has a /srv/data path, so both were classified NOSTATE, reported, and
+# ALLOWED. Both had a staged image waiting at the time: traefik v3.7.10 ->
+# v3.7.12 and uptime-kuma a8610b3b4c38 -> 3e24e96c89ef.
+#
+# The recovery pack does capture both (uptime_kuma_dump, traefik_acme_source), so
+# this was never "no coverage". It is the wrong KIND of coverage for an upgrade:
+# a recovery pack is periodic, operator-driven disaster recovery that records no
+# image identity, so it cannot pair state with the application that wrote it. A
+# rollback point must be fresh, application-consistent, and image-paired.
+#
+# DECLARED, not inferred. Durability cannot be read off a mount list: a volume
+# holding a model cache and one holding a private key are indistinguishable. The
+# declaration is then CHECKED against what the containers actually mount, and a
+# contradiction fails CLOSED -- so a new volume cannot quietly appear under a
+# service declared stateless.
+#
+#   <service>|<model>|<benign rw volume destinations>
+#
+# model is one of:
+#   protected-tier  durable state under $DOMUM_DATA_ROOT; report_snapshot_protection
+#                   then decides whether it is actually protected
+#   docker-volume   durable state in a Docker volume, which no Btrfs snapshot can
+#                   reach
+#   stateless       no durable state at all
+#
+# A benign destination is a mount measured to hold only derived or reacquirable
+# data. immich's are listed because its primary state is on the protected tier:
+# /cache is an ML model cache (4 KiB, refetched) and /data is redis's dump.rdb
+# (1.1 MiB of queue state, rebuilt from the database) plus an empty server
+# scratch dir. Never add a destination here to make a gate pass.
+service_state_models() {
+  cat <<'EOF'
+traefik|docker-volume|
+tailscale|stateless|
+uptime-kuma|docker-volume|
+jellyfin|protected-tier|
+plex|protected-tier|
+navidrome|protected-tier|
+calibre-web|protected-tier|
+kavita|protected-tier|
+immich|protected-tier|/cache /data
+restic-rest-server|stateless|
+EOF
+}
+
+# Every rw VOLUME destination a service's containers mount. Bind mounts are
+# excluded deliberately: those are visible to the protected-tier question
+# already, and read-only mounts cannot carry state the application writes.
+service_volume_destinations() {  # $1 = service
+  local svc compose_svcs c
+  svc="$1"
+  compose_svcs="$(service_compose_services "$svc" 2>/dev/null || true)"
+  [[ -n "$compose_svcs" ]] || return 0
+  for c in $compose_svcs; do
+    docker inspect -f \
+      '{{range .Mounts}}{{if and (eq .Type "volume") .RW}}{{.Destination}}{{"\n"}}{{end}}{{end}}' \
+      "$c" 2>/dev/null || true
+  done | sed '/^$/d' | sort -u
+}
+
+# Every rw BIND mount whose SOURCE is under the protected data root.
+#
+# The volume check alone cannot catch a service declared `stateless` that
+# bind-mounts durable state instead -- different mechanism, same consequence.
+service_bind_sources_under_data() {  # $1 = service
+  local svc compose_svcs c root
+  svc="$1"
+  root="${DOMUM_DATA_ROOT%/}"
+  [[ -n "$root" ]] || return 0
+  compose_svcs="$(service_compose_services "$svc" 2>/dev/null || true)"
+  [[ -n "$compose_svcs" ]] || return 0
+  for c in $compose_svcs; do
+    docker inspect -f \
+      '{{range .Mounts}}{{if and (eq .Type "bind") .RW}}{{.Source}}{{"\n"}}{{end}}{{end}}' \
+      "$c" 2>/dev/null || true
+  done | sed '/^$/d' | while IFS= read -r src; do
+    [[ "$src" == "$root" || "$src" == "$root"/* ]] && printf '%s\n' "$src"
+  done | sort -u
+}
+
+# The declared model, VERIFIED against the live mounts. Prints "<model> <reason>".
+#
+# Fails closed in both directions: an undeclared service is `unknown`, and a
+# service declared protected-tier or stateless that nonetheless mounts an
+# undeclared rw volume is `unknown` with the offending destination named. That
+# second case is the one that matters -- it is how a volume added later cannot
+# silently inherit a permissive classification.
+service_state_model() {  # $1 = service -> prints "<model> <reason>"
+  local svc="$1" model="" benign="" found dest undeclared=""
+  while IFS='|' read -r name m b; do
+    [[ "$name" == "$svc" ]] || continue
+    model="$m"; benign="$b"; break
+  done < <(service_state_models)
+
+  if [[ -z "$model" ]]; then
+    printf 'unknown no state model is declared for %s\n' "$svc"
+    return 0
+  fi
+
+  found="$(service_volume_destinations "$svc")"
+  while IFS= read -r dest; do
+    [[ -n "$dest" ]] || continue
+    [[ " $benign " == *" $dest "* ]] && continue
+    undeclared="${undeclared:+$undeclared }$dest"
+  done <<< "$found"
+
+  case "$model" in
+    docker-volume)
+      printf 'docker-volume durable state in a Docker volume (%s)\n' \
+        "${undeclared:-no rw volume found, which contradicts the declaration}"
+      [[ -n "$undeclared" ]] || printf '' ;;
+    protected-tier)
+      if [[ -n "$undeclared" ]]; then
+        printf 'unknown %s is declared %s but mounts undeclared rw volume(s): %s\n' \
+          "$svc" "$model" "$undeclared"
+      else
+        printf '%s declared, and no undeclared rw volume is mounted\n' "$model"
+      fi ;;
+    stateless)
+      # Stateless is the only permissive answer, so it is checked hardest: an
+      # undeclared rw volume OR any rw bind under the protected data root
+      # contradicts it.
+      local binds
+      binds="$(service_bind_sources_under_data "$svc" | tr '\n' ' ')"
+      binds="${binds% }"
+      if [[ -n "$undeclared" ]]; then
+        printf 'unknown %s is declared stateless but mounts undeclared rw volume(s): %s\n' \
+          "$svc" "$undeclared"
+      elif [[ -n "$binds" ]]; then
+        printf 'unknown %s is declared stateless but writes under %s: %s\n' \
+          "$svc" "${DOMUM_DATA_ROOT%/}" "$binds"
+      else
+        printf 'stateless declared, no undeclared rw volume and nothing written under %s\n' \
+          "${DOMUM_DATA_ROOT%/}"
+      fi ;;
+    *) printf 'unknown unrecognised state model %s for %s\n' "$model" "$svc" ;;
+  esac
+}
+
 # `apply` must not deploy an application upgrade as a side effect of convergence.
 #
 # The per-service gate lives in `refresh_images`: it calls create_service_snapshot
@@ -3739,9 +3894,38 @@ apply_staged_image_blockers() {  # -> "service state" lines for services that mu
     [[ "${!enable_var:-0}" == "1" ]] || continue
     staged="$(service_staged_image_changes "$svc" 2>/dev/null | grep '^STAGED ' || true)"
     [[ -n "$staged" ]] || continue
+    # WHICH question to ask comes from the declared state model, not from
+    # whether a /srv/data path happens to exist. The previous form asked only
+    # the latter, so a service keeping a private key or a live SQLite database
+    # in a Docker volume was reported as having nothing to protect.
+    local model_line model reason
+    model_line="$(service_state_model "$svc")"
+    model="${model_line%% *}"
+    reason="${model_line#* }"
+    case "$model" in
+      stateless)
+        printf 'STATELESS %s %s\n' "$svc" "$reason"
+        continue ;;
+      docker-volume)
+        # BLOCKED, not reported. A Btrfs snapshot cannot reach a Docker volume,
+        # so there is no pre-upgrade recovery point for this service yet -- and
+        # the recovery pack is not one: it is periodic, records no image
+        # identity, and so cannot pair state with the application that wrote it.
+        printf 'BLOCKED %s docker-volume %s\n' "$svc" "$reason"
+        continue ;;
+      protected-tier) : ;;
+      *)
+        printf 'BLOCKED %s unknown %s\n' "$svc" "$reason"
+        continue ;;
+    esac
     path="$(service_data_path "$svc" 2>/dev/null || true)"
     if [[ -z "$path" || ! -e "$path" ]]; then
-      printf 'NOSTATE %s\n' "$svc"
+      # Declared protected-tier, but the path is not there. That is a
+      # contradiction, not an absence of state: either the mount is missing or
+      # the declaration is wrong, and upgrading on top of it would create a
+      # fresh install.
+      printf 'BLOCKED %s missing-state-path %s is declared protected-tier but %s does not exist\n' \
+        "$svc" "$svc" "${path:-<no mapping>}"
       continue
     fi
     state="$(report_snapshot_protection "$svc" "$path" | jq -r '.state')"
@@ -3753,14 +3937,14 @@ apply_staged_image_blockers() {  # -> "service state" lines for services that mu
 # The refusal itself, in one place, so a test can run it rather than grep for it.
 apply_assert_staged_images_recoverable() {
   load_report_lib
-  local blockers nostate
+  local blockers stateless
   blockers="$(apply_staged_image_blockers)"
-  nostate="$(grep '^NOSTATE ' <<< "$blockers" || true)"
+  stateless="$(grep '^STATELESS ' <<< "$blockers" || true)"
   blockers="$(grep '^BLOCKED ' <<< "$blockers" || true)"
-  if [[ -n "$nostate" ]]; then
-    warn "A newer image is staged for these services, whose durable state is NOT under ${DOMUM_DATA_ROOT:-/srv/data}:"
-    printf '  %s\n' "$nostate" >&2
-    warn "A snapshot cannot cover them; see docs/STATE-CLASSIFICATION.md for what does."
+  if [[ -n "$stateless" ]]; then
+    warn "A newer image is staged for these services, which hold no durable state:"
+    printf '  %s\n' "$stateless" >&2
+    warn "Nothing needs a recovery point, so they are reported rather than blocked."
   fi
   [[ -n "$blockers" ]] || return 0
   if [[ "${APPLY_ALLOW_IMAGE_CHANGE:-0}" == "1" ]]; then
@@ -7272,11 +7456,31 @@ storage_protection() {  # $1 = service (optional: all services when omitted)
       [[ -n "$svc" ]] || continue
       path="$(service_data_path "$svc" 2>/dev/null || true)"
       [[ -n "$path" ]] || continue
+      local m
+      m="$(service_state_model "$svc")"
+      case "${m%% *}" in
+        docker-volume|stateless|unknown) printf '%-14s %s\n' "$svc" "${m%% *}"; continue ;;
+      esac
       state="$(report_snapshot_protection "$svc" "$path" | jq -r '.state')"
       printf '%-14s %s\n' "$svc" "$state"
     done < <(service_lifecycle_specs)
     return 0
   fi
+  # The state MODEL first. For a service whose durable state lives in a Docker
+  # volume, report_snapshot_protection would answer `unknown -- state path is
+  # missing`, which reads as a measurement failure rather than as the fact that
+  # a snapshot cannot reach that state at all.
+  local model_line model
+  model_line="$(service_state_model "$service")"
+  model="${model_line%% *}"
+  case "$model" in
+    docker-volume|stateless|unknown)
+      printf '%s\n' "$model"
+      # Exit 0 ONLY for genuinely protected state. An operator wrapper tests the
+      # exit status, so `stateless` must not read as `protected`.
+      return 1 ;;
+  esac
+
   path="$(service_data_path "$service" 2>/dev/null || true)"
   [[ -n "$path" ]] || die "No data path mapping for $service"
   state="$(report_snapshot_protection "$service" "$path" | jq -r '.state')"
@@ -7370,6 +7574,34 @@ assert_pre_upgrade_possible() {  # $1 = service -> prints data path
   [[ -n "$service" ]] || die "assert_pre_upgrade_possible: no service given"
   migrate_allowed_service "$service" \
     || die "Refusing: '$service' is not a service this command knows about"
+
+  # Explain the Docker-volume case accurately. It used to fall through to
+  # "/srv/data/<svc> does not exist", which is true and useless: the operator
+  # would reasonably create the directory, and that would protect nothing
+  # because the application never writes there.
+  local model_line model
+  model_line="$(service_state_model "$service")"
+  model="${model_line%% *}"
+  case "$model" in
+    docker-volume)
+      die "Refusing: $service keeps its durable state in a DOCKER VOLUME, which a
+Btrfs snapshot cannot reach -- ${model_line#* }.
+There is no pre-upgrade recovery point for this service yet. The recovery pack
+captures its state but records no image identity, so it cannot pair that state
+with the application that wrote it, which is what a rollback needs.
+Creating $DOMUM_DATA_ROOT/$service would protect nothing: the application does
+not write there." ;;
+    stateless)
+      die "Refusing: $service is declared to hold no durable state, so there is
+nothing for a pre-upgrade recovery point to cover. If that is wrong, fix the
+declaration in service_state_models rather than working around this." ;;
+    protected-tier) : ;;
+    *)
+      die "Refusing: the state model for $service could not be established --
+${model_line#* }.
+Failing closed: an upgrade must not proceed on an unclassified state model." ;;
+  esac
+
   path="$(service_data_path "$service")" || die "No data path mapping for $service"
   [[ -n "$path" ]] || die "No data path mapping for $service"
   # A path that does not exist is NOT "nothing to protect": for a service that

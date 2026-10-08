@@ -172,12 +172,37 @@ $out6"
 echo "  50 unrelated snapshots present -> plex still BLOCKED"
 
 # ---------------------------------------------------------------------------
-echo "== 7. docker-volume services are REPORTED, not blocked =="
-grep -q '^NOSTATE traefik$'     <<< "$out" || fail "traefik should be NOSTATE (volume), got:
+echo "== 7. docker-volume services are BLOCKED, not merely reported =="
+#
+# THIS SECTION PREVIOUSLY ASSERTED THE OPPOSITE, and that was the defect.
+#
+# It required `NOSTATE traefik` and explicitly failed if traefik was BLOCKED,
+# on the reasoning that "a snapshot cannot cover a docker volume". The premise
+# is true and the conclusion does not follow: a snapshot being unable to protect
+# the state is a reason the upgrade has NO recovery point, not a reason to allow
+# it.
+#
+# Measured on this host 2026-10-08, with both services holding a staged image:
+#   traefik      /letsencrypt  acme.json 116,015 bytes mode 0600 -- the Let's
+#                Encrypt ACCOUNT KEY and 9 issued certificates
+#   uptime-kuma  /app/data     kuma.db 286,720 bytes with a non-empty -wal
+#
+# The recovery pack captures both, which is why this looked acceptable. But a
+# recovery pack is periodic, operator-driven, and records NO image identity, so
+# it cannot pair state with the application that wrote it -- which is the whole
+# content of a rollback point.
+grep -q '^BLOCKED traefik docker-volume' <<< "$out" \
+  || fail "traefik was not BLOCKED as docker-volume. A staged image would deploy
+over the Let's Encrypt account key with no recovery point:
 $out"
-grep -q '^NOSTATE uptime-kuma$' <<< "$out" || fail "uptime-kuma should be NOSTATE (volume)"
-grep -q '^BLOCKED traefik'      <<< "$out" && fail "traefik must not be BLOCKED: a snapshot cannot cover a docker volume"
-echo "  traefik, uptime-kuma -> NOSTATE (a snapshot could never cover them)"
+grep -q '^BLOCKED uptime-kuma docker-volume' <<< "$out" \
+  || fail "uptime-kuma was not BLOCKED as docker-volume: $out"
+grep -q '^NOSTATE' <<< "$out" \
+  && fail "NOSTATE is still emitted; it conflated 'no /srv/data path' with 'stateless'"
+# The reason must name the volume, or the operator cannot act on it.
+grep -q 'BLOCKED traefik docker-volume.*letsencrypt' <<< "$out" \
+  || fail "the traefik refusal does not name the volume: $out"
+echo "  traefik and uptime-kuma BLOCKED, each naming its volume"
 
 # ---------------------------------------------------------------------------
 echo "== 8. the refusal itself REFUSES, with the real names in the message =="
@@ -198,12 +223,23 @@ out9="$(probe "$CLEAN_ALL" "$PROT_REAL" "" "apply_assert_staged_images_recoverab
 $out9"
 echo "  nothing staged -> rc=0"
 
-# And with everything staged but everything protected.
+# And with every PROTECTED-TIER service staged, and all of them protected.
+#
+# Deliberately not "everything staged": traefik and uptime-kuma are classified
+# docker-volume by declaration and never reach report_snapshot_protection, so
+# stubbing that to return `protected` cannot make them pass -- nor should it.
+# Staging them is section 7's case.
 PROT_ALL='report_snapshot_protection() { printf "{\"service\":\"%s\",\"state\":\"protected\"}" "$1"; }'
-out9b="$(probe "$STAGED_ALL" "$PROT_ALL" "" "apply_assert_staged_images_recoverable")"; rc9b=$?
-[ "$rc9b" -eq 0 ] || fail "everything staged AND protected should pass:
+STAGED_TIER='service_staged_image_changes() {
+  case "$1" in
+    traefik|uptime-kuma|tailscale|restic-rest-server) printf "" ;;
+    *) printf "STAGED %s old new\n" "$1" ;;
+  esac
+}'
+out9b="$(probe "$STAGED_TIER" "$PROT_ALL" "" "apply_assert_staged_images_recoverable")"; rc9b=$?
+[ "$rc9b" -eq 0 ] || fail "every protected-tier service staged AND protected should pass:
 $out9b"
-echo "  everything staged but protected -> rc=0"
+echo "  every protected-tier service staged but protected -> rc=0"
 
 # ---------------------------------------------------------------------------
 echo "== 10. the deliberate override is explicit and LOUD =="

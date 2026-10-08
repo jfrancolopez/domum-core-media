@@ -45,6 +45,20 @@ need_root() { :; }
 load_cfg() { :; }
 ENABLE_ALPHA=1
 ENABLE_BETA=1
+# The synthetic services need a declared state model too. An UNDECLARED service
+# is now classified unknown and blocked -- correct, and fail-closed, but it
+# would mask the unprotected path this suite exists to exercise.
+# (No backticks: this heredoc is unquoted, so they would EXECUTE. The widened
+# check in log-hygiene-smoke caught exactly that here.)
+service_state_models() {
+  printf 'alpha|protected-tier|\n'
+  printf 'beta|protected-tier|\n'
+  printf 'gamma|protected-tier|\n'
+  printf 'delta|protected-tier|\n'
+}
+service_volume_destinations() { :; }
+service_bind_sources_under_data() { :; }
+
 service_lifecycle_specs() {
   printf 'alpha|ENABLE_ALPHA|B|21|alpha|ALPHA_IMAGE|\n'
   printf 'beta|ENABLE_BETA|B|21|beta|BETA_IMAGE|\n'
@@ -109,16 +123,27 @@ PROT_beta=unprotected")"
 [[ -z "$out" ]] || fail "3: convergence was blocked with no staged image anywhere: [$out]"
 
 # ---------------------------------------------------------------------------
-# 4. A service with NO state path under the protected tier is reported, not
-#    blocked. traefik and uptime-kuma keep their durable state in volumes that
-#    the recovery pack captures; a snapshot could never cover them, and refusing
-#    would be refusing the wrong thing.
+# 4. A service DECLARED protected-tier whose state path is missing is BLOCKED.
+#
+#    This case previously asserted the opposite -- that such a service is
+#    reported and allowed -- on the reasoning that traefik and uptime-kuma keep
+#    their state in volumes a snapshot could never cover, so refusing would be
+#    refusing the wrong thing. Those two services are now classified
+#    docker-volume by declaration and blocked for that reason, which leaves this
+#    case meaning something different and sharper:
+#
+#    a service that is SUPPOSED to have state under the protected tier, and does
+#    not, is a contradiction. Either the mount is missing or the declaration is
+#    wrong, and upgrading on top of it creates a fresh install. "Nothing to
+#    protect" is the one reading that must not be chosen.
 # ---------------------------------------------------------------------------
 out="$(blockers "$STAGED
 PROT_alpha=protected
 PROT_beta=unknown" nobeta)"
-grep -q '^NOSTATE beta$' <<< "$out" || fail "4: a service with no state path was not reported: [$out]"
-grep -q '^BLOCKED beta' <<< "$out" && fail "4: a service with no state path was BLOCKED: [$out]"
+grep -q '^BLOCKED beta missing-state-path' <<< "$out" \
+  || fail "4: a protected-tier service whose state path is absent was not blocked: [$out]"
+grep -q '^STATELESS beta' <<< "$out" \
+  && fail "4: a missing state path was read as 'stateless': [$out]"
 
 # ...but a path that EXISTS whose protection cannot be determined IS blocked.
 # `unknown` means the path is missing or btrfs is unavailable; with the path
@@ -178,12 +203,22 @@ grep -q 'updates apply' <<< "$out" || fail "6: the gated path was not named: $ou
 out="$(refuse 'apply_staged_image_blockers() { printf ""; }')"
 grep -q 'RC=0' <<< "$out" || fail "6: convergence was refused with nothing blocked: $out"
 
-# NOSTATE alone -> reported, and proceeds.
-out="$(refuse 'apply_staged_image_blockers() { printf "NOSTATE traefik
-"; }')"
-grep -q 'RC=0' <<< "$out" || fail "6: a service with no state under the tier was refused: $out"
-grep -q 'NOT under' <<< "$out" || fail "6: the no-state case was not reported: $out"
-grep -q 'STATE-CLASSIFICATION' <<< "$out" || fail "6: it does not say what covers them instead: $out"
+# STATELESS alone -> reported, and proceeds. (This was NOSTATE, which meant
+# "no /srv/data path" and covered services holding a private key or a live
+# database in a Docker volume. STATELESS means what it says: nothing durable.)
+out="$(refuse 'apply_staged_image_blockers() { printf "STATELESS tailscale declared\n"; }')"
+grep -q 'RC=0' <<< "$out" || fail "6: a genuinely stateless service was refused: $out"
+grep -q 'no durable state' <<< "$out" || fail "6: the stateless case was not reported: $out"
+# ...and a docker-volume blocker must NOT be waved through the same way.
+out="$(refuse 'apply_staged_image_blockers() { printf "BLOCKED traefik docker-volume /letsencrypt\n"; }')"
+grep -q 'RC=0' <<< "$out" \
+  && fail "6: a docker-volume blocker let convergence proceed: $out"
+# The refusal must NAME the service, so the operator knows which one to act on.
+# It used to point at docs/STATE-CLASSIFICATION.md for "what covers them
+# instead" -- accurate for the recovery pack, but it was attached to a message
+# that then ALLOWED the upgrade. Pointing at the coverage is not a substitute
+# for having a rollback point.
+grep -q 'traefik' <<< "$out" || fail "6: the refusal does not name the service: $out"
 
 # The override works -- and announces.
 out="$(refuse 'APPLY_ALLOW_IMAGE_CHANGE=1
