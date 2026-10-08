@@ -153,7 +153,6 @@ fingerprint_strict() {
 head2 "1. preflight"
 # Revision, drift and the installed-vs-checkout hash are stage 0's job; they are
 # not repeated here. What follows is about the SERVICE.
-missing=""
 # The behaviours this migration depends on, asked of the installed CLI as
 # CAPABILITIES.
 #
