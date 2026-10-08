@@ -181,8 +181,27 @@ ar="$(awk '/^storage_archives\(\) \{/,/^\}/' "$CLI")"
 [ -n "$ar" ] || fail "storage_archives is missing"
 # The questions the operator has to be able to answer without reading two
 # directories by hand.
-for want in 'needed by' 'image id' 'checksum' 'local object' 'safe to delete' 'orphan'; do
+for want in 'needed by' 'image id' 'checksum' 'local object' 'safe to delete' \
+            'orphan' 'off-host copy'; do
   grep -qi -- "$want" <<< "$ar" || fail "the inventory does not report: $want"
+done
+# The off-host question is answered by TIMESTAMP, not by querying restic: a
+# read-only inventory must not need the repository password to answer a question
+# about scheduling. Sound because the archive lives under $DOMUM_DATA_ROOT, which
+# the backup includes and no exclude covers.
+grep -q 'last-success' <<< "$ar" \
+  || fail "the off-host answer does not consult the successful-backup marker"
+# Comments stripped first: the explanation above legitimately mentions restic,
+# and matching the word rather than the invocation flagged it.
+grep -vE '^\s*#' <<< "$ar" | grep -qE '(^|[;&|[:space:]])restic' \
+  && fail "the inventory invokes restic; that needs secrets and this is read-only"
+# All three answers must exist: yes, not yet, and unknown. Collapsing the third
+# into either of the others is the failure that matters -- "I cannot tell" must
+# never read as "yes".
+for want in 'off-host copy   : yes' 'NOT YET' 'UNKNOWN'; do
+  grep -qF -- "$want" <<< "$ar" \
+    || fail "the off-host answer has no '$want' branch; a missing marker would be
+reported as one of the definite answers"
 done
 # It must decide "needed" from the METADATA, not from the filename, which is
 # only a convenience.

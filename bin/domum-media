@@ -8048,6 +8048,29 @@ storage_archives() {
       else
         echo "  local object    : ABSENT -- this archive is the only copy"
       fi
+      # Is it off-host yet?
+      #
+      # Inferred from timestamps, NOT by querying restic: that needs the
+      # repository password, and a read-only inventory must not need secrets to
+      # answer a question about scheduling. The inference is sound because the
+      # archive lives under $DOMUM_DATA_ROOT, which the backup includes and no
+      # exclude pattern covers -- so the only question is whether a successful
+      # run has happened SINCE the file appeared.
+      #
+      # It matters: the first Plex archive was created at 08:15 while the night's
+      # backup had run at 02:36, so for most of a day the only copies of that
+      # application were both on this one host.
+      local arch_mtime backup_at
+      arch_mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+      backup_at="$(cat "$DOMUM_LOG_DIR/last-success" 2>/dev/null | tr -cd '0-9' || true)"
+      if [[ -z "$backup_at" ]]; then
+        echo "  off-host copy   : UNKNOWN -- no successful-backup marker to compare against"
+      elif (( backup_at > arch_mtime )); then
+        echo "  off-host copy   : yes -- a backup succeeded $(date -d "@$backup_at" '+%Y-%m-%d %H:%M') after this file appeared"
+      else
+        echo "  off-host copy   : NOT YET -- last successful backup $(date -d "@$backup_at" '+%Y-%m-%d %H:%M') predates this file."
+        echo "                    Both copies are on this host until the next scheduled run."
+      fi
       echo "  safe to delete  : NO"
     else
       orphans=$(( orphans + 1 ))
