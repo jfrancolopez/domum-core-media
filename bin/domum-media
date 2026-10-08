@@ -8347,8 +8347,8 @@ the pairing failure this refuses to perform."
 
   # Every dump must be intact BEFORE anything is stopped. A rollback that gets
   # half way and finds a corrupt dump has already taken the service down.
-  local vname vdest vdump vsha
-  while read -r vname vdest vdump vsha; do
+  local vname vdump vsha
+  while read -r vname _ vdump vsha; do
     [[ -n "$vname" ]] || continue
     [[ -r "$vdump" ]] || die "Refusing: the dump for $vname is missing at $vdump.
 Nothing was changed."
@@ -8375,7 +8375,7 @@ Nothing was changed."
   local stamp
   stamp="$(date +%Y%m%d-%H%M%S)" || die "cannot read the clock"
   echo "[domum-media] 3/5: restoring volumes (the current contents are preserved first)"
-  while read -r vname vdest vdump vsha; do
+  while read -r vname _ vdump vsha; do
     [[ -n "$vname" ]] || continue
     restore_volume_from_file "$vname" "$vdump" "$stamp" \
       || die "Could not restore $vname. Read the warnings above: the preserved copy
@@ -8405,7 +8405,7 @@ of whatever was there is named in them, and $service is stopped."
     warn "$service came back on $now_img, not the recorded $want_img."
     rc=1
   fi
-  while read -r vname vdest vdump vsha; do
+  while read -r vname _ _ _; do
     [[ -n "$vname" ]] || continue
     echo "  preserved       : $(volume_dump_dir)/${vname}.failed-${stamp}.tar"
   done <<< "$volumes"
@@ -8959,6 +8959,10 @@ recovery-image-protection|cleanup images|cleanup_protected_image_ids
 machine-readable-cleanup-images|cleanup images --json|cleanup_images_json
 verify-recovery-deep|storage verify-recovery|storage_verify_recovery
 protection-state|storage protection|storage_protection
+service-migration|storage migrate-subvolume|storage_migrate_subvolume
+migration-integrity-proof|storage migrate-subvolume|migrate_verify_recovery_point
+migration-live-tree-classification|storage migrate-subvolume|migrate_report_live_tree
+recovery-point-identity|storage migrate-subvolume|stage_recovery_point_metadata
 topology-verify|storage topology --verify|storage_topology_verify
 EOF
 }
