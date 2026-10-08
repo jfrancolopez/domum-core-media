@@ -7594,8 +7594,20 @@ archive_image_to_file() {  # $1 = image id, $2 = destination .tar
 assert_pre_upgrade_possible() {  # $1 = service -> prints data path
   local service="${1:-}" path
   [[ -n "$service" ]] || die "assert_pre_upgrade_possible: no service given"
-  migrate_allowed_service "$service" \
-    || die "Refusing: '$service' is not a service this command knows about"
+  # The STATE MODEL is consulted before migrate_allowed_service, deliberately.
+  #
+  # migrate_allowed_service lists the services whose state can be MIGRATED to a
+  # subvolume -- jellyfin, plex, navidrome, calibre-web, kavita, immich. traefik
+  # and uptime-kuma are absent from it because migrating them is not the answer,
+  # and asking it first produced:
+  #
+  #   Refusing: 'traefik' is not a service this command knows about
+  #
+  # which is wrong in the way that matters: traefik IS a service this project
+  # manages, with a declared state model and a staged image. The operator would
+  # go looking for a typo instead of reading that its state is in a volume no
+  # snapshot can reach. Found by dry-running the refusal before putting the
+  # assertion in a deployment script.
 
   # Explain the Docker-volume case accurately. It used to fall through to
   # "/srv/data/<svc> does not exist", which is true and useless: the operator
@@ -7623,6 +7635,12 @@ declaration in service_state_models rather than working around this." ;;
 ${model_line#* }.
 Failing closed: an upgrade must not proceed on an unclassified state model." ;;
   esac
+
+  # Only now: is this a service whose tier state this command can work with?
+  # Reached only for protected-tier services, so the message is accurate.
+  migrate_allowed_service "$service" \
+    || die "Refusing: '$service' is declared protected-tier but is not a service
+this command knows how to take a pre-upgrade point for."
 
   path="$(service_data_path "$service")" || die "No data path mapping for $service"
   [[ -n "$path" ]] || die "No data path mapping for $service"
