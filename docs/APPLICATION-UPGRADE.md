@@ -154,3 +154,141 @@ This happened: new code read `..._IMAGE_VERSION` while the writer emits
 `..._IMAGE_LABEL_VERSION`. `tests/recovery-metadata-keys-audit.py` compares the
 written and read sets across the whole file, and fails if its own extraction
 patterns stop matching, so it cannot pass vacuously.
+
+---
+
+# The Plex upgrade, 2026-10-08 — the reference implementation
+
+The first protected application upgrade on this host. It is recorded here
+because it is now the pattern every future upgrade is measured against, and
+because the measurements settle several questions that had only been argued.
+
+```
+old   sha256:58f13a1df833…   1.43.2.10687-563d026ea-ls308
+new   sha256:7f9a1d574958…   1.43.3.10896-cb3ebc72d-ls322
+point plex-20261008-121553-pre-upgrade
+```
+
+## Three Plex artefacts exist, and they prove different things
+
+Confusing them is easy and expensive, so they are named separately.
+
+| artefact | created by | what it proves | what it does NOT prove |
+|---|---|---|---|
+| `plex-20261006-133511-post-migration` | `storage migrate-subvolume` | the migration copied the state faithfully — it is a snapshot of the *copy*, compared against `.premigration`, the original moved aside | nothing about any later application version; its database is schema 1017 |
+| `plex-20261008-121553-pre-upgrade` | `storage pre-upgrade-point` inside `service_upgrade` | the state as the **old application left it**, taken while stopped and quiesced | that the old image can still be *obtained* |
+| `plex-58f13a1df833….tar` + `.sha256` | `archive_image_to_file` | the old application itself is retained, byte-identical on `docker load` | that the *file* being intact means the identity is right — only a load proves that |
+| `.premigration` | the migration | the original bytes, untouched | — retained deliberately |
+
+A rollback needs the **second and third together**. The migration proof snapshot
+is evidence about the migration, not a rollback point for an upgrade.
+
+## Measured: the schema did NOT change, and that is the point
+
+| database | schema_version | pages |
+|---|---|---|
+| `.premigration` | 1017 | 412 |
+| post-migration proof (10-06) | 1017 | 412 |
+| pre-upgrade snapshot (10-08) | **1018** | 400 |
+| live, after the upgrade | **1018** | 400 |
+
+Plex 1.43.3 did **not** migrate the schema: 1018 before and after. The 1017→1018
+step happened earlier, during ordinary operation on 1.43.2.
+
+This is the most instructive number in the whole run, because it is the *opposite*
+of the Kavita case — where a container recreated on a newer staged image
+forward-migrated its database and left the proof snapshot holding an older schema
+than the running binary. Both outcomes are normal. Neither is predictable from
+outside the application.
+
+So the pairing requirement is not "schemas always differ". It is that **you cannot
+know in advance**, and an upgrade that assumed compatibility would have been right
+this time and wrong for Kavita. The archive is insurance against the case you
+cannot predict, not against the case you measured afterwards.
+
+A useful consequence: because both Plex recovery points name the same old image
+and that image is archived once, *both* remain complete rollback points. The
+`cleanup images` dry run reports exactly that:
+
+```
+names sha256:58f13a1df833  plex-20261006-133511-post-migration
+names sha256:58f13a1df833  plex-20261008-121553-pre-upgrade
+```
+
+## Measured: the ordering the safety argument rests on
+
+From the production run, in order:
+
+1. recovery evidence **staged** while the service was still observably running
+2. `compose stop plex` — one container, 3.4 s
+3. quiescence **proven**: no open handles, no non-empty WAL, no hot journal.
+   The live WAL had been 649,792 bytes at preflight and was gone after the stop
+4. read-only snapshot created
+5. old image archived — 170,408,960 bytes, `sha256 277f5e7f7ffa221d…`
+6. recovery metadata **bound** to the snapshot
+7. `compose start` — **runtime state preserved, image unchanged, nothing deployed**
+8. archive verified *before* deploying
+9. `compose up -d plex` — the only reconcile, scoped to one service
+10. verification: intended image, all ten other container identities unchanged,
+    endpoint answered `1.43.3.10896`, storage still a subvolume, snapshot still
+    read-only, archive still verifies
+
+Steps 1–7 deploy nothing. That is what makes the pre-upgrade point a point rather
+than a side effect of the upgrade.
+
+## Measured: metadata-only image retention finally demonstrated
+
+This had been argued and tested but never *observed* in production, because until
+an upgrade happened the old image was always still in use by a running container.
+
+After the upgrade:
+
+```
+old image now used by 0 container(s)
+old image present in the cleanup records and NOT a candidate
+```
+
+`RepoTags: []` and `RepoDigests: []` — the image is dangling, so nothing but the
+recovery metadata stands between it and `cleanup images --confirm`. That is the
+`identity,local` exposure, now real rather than hypothetical, and the protection
+held.
+
+52 images totalling ~39 GiB are cleanup candidates. None of them is reclaimed
+while the recovery framework is still being validated.
+
+## Measured: off-host protection of the archive is PENDING, not done
+
+The archive is at `/srv/data/backups/images/`, which is under `$DOMUM_DATA_ROOT`
+and matched by neither restic exclude — so it **will** be included. But:
+
+```
+archive created   2026-10-08 12:15 UTC  (08:15 EDT)
+last backup run   2026-10-08 02:36 EDT  success   -- BEFORE the archive existed
+next backup       2026-10-09 02:31 EDT
+```
+
+So until that run, **the only copies of the old Plex application are on this one
+host**: the local Docker object and the archive file. The snapshot root
+`/srv/snapshots` is deliberately *not* in the restic path — snapshots are local
+rollback, not disaster recovery — so the off-host story is "restore `/srv/data`
+from restic, load the image from the archive", and that becomes true after the
+next scheduled backup. No backup was forced to make this neater.
+
+## Post-upgrade health, recorded as follow-up evidence
+
+```
+container   5bcb73d3f378 (recreated, as an upgrade must)
+started     2026-10-08T12:16:02Z     restarts 0      oom false
+endpoint    machineIdentifier 90527a4e3017aea6…  version 1.43.3.10896-cb3ebc72d
+database    integrity_check -> ok   (via Plex's own SQLite, read-only)
+            schema 1018, journal_mode wal, 254 sqlite_master rows
+logs        0 error/fail/corrupt lines since the upgrade; no sqlite or schema
+            complaints; only the documented-benign `Critical: libusb_init failed`
+storage     /srv/data/plex still inode 256
+snapshot    plex-20261008-121553-pre-upgrade still ro=true, no -wal/-shm inside it
+units       0 failed; image refresh still disabled/inactive
+```
+
+The `machineIdentifier` surviving is worth noting: it is stored in the config the
+snapshot covers, so an unchanged identifier is evidence the upgrade read the
+preserved state rather than initialising fresh.

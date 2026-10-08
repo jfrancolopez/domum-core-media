@@ -188,6 +188,19 @@ case "\$*" in
 ' "\$(img_of plex | cut -c8-19)"; exit 0 ;;
 esac
 
+# Mount queries, for the state-model classification. Every fixture service
+# keeps its state in a BIND under the data root, like production: none of them
+# mounts a named volume. Without this the fallback below returned a container
+# id as if it were a mount destination, which classified plex as an
+# undeclared-volume contradiction and refused the upgrade.
+case "\$*" in
+  *'eq .Type "volume"'*) exit 0 ;;
+  *'eq .Type "bind"'*)
+    n="\${*##* }"; n="\${n#cid-}"
+    [[ -d "$ENV_DIR/data/\$n" ]] && printf '%s\n' "$ENV_DIR/data/\$n"
+    exit 0 ;;
+esac
+
 # docker inspect [-f|--format] <fmt> <ref>
 if [[ "\$1" == "inspect" ]]; then
   fmt=""; ref=""
