@@ -243,5 +243,51 @@ wrapper tests this status: a non-protected state must not exit 0."
 done
 echo "  protected=0; docker-volume, stateless and unprotected all non-zero"
 
+echo "== 12. each state model gets its OWN refusal, and the order matters =="
+#
+# migrate_allowed_service lists the services whose tier state can be migrated:
+# jellyfin, plex, navidrome, calibre-web, kavita, immich. traefik and
+# uptime-kuma are deliberately absent. Asking it FIRST produced:
+#
+#   Refusing: 'traefik' is not a service this command knows about
+#
+# which is wrong in the way that matters -- traefik IS a managed service, with a
+# declared state model and a staged image -- and would send the operator looking
+# for a typo instead of reading that its state is in a volume. The state model
+# is therefore consulted first. Found by dry-running the refusal before putting
+# an assertion about it into a deployment script.
+REFUSE_STUB="$STUB_VOLUME"'
+need_root() { :; }
+load_cfg() { :; }
+export_env_for_compose() { :; }
+ensure_dirs() { :; }'
+mkdir -p "$TMP_DIR/data/plex"
+check_refusal() {  # $1 = service, $2 = expected substring
+  local out
+  out="$(probe "$REFUSE_STUB" '( assert_pre_upgrade_possible '"$1"' ) 2>&1' )"
+  grep -qF -- "$2" <<< "$out" \
+    || fail "assert_pre_upgrade_possible $1 did not say '$2':
+$out"
+  grep -q 'is not a service this command knows about' <<< "$out" \
+    && fail "assert_pre_upgrade_possible $1 fell through to the generic
+'not a service this command knows about', which sends the operator looking for a
+typo instead of reading the real reason:
+$out"
+}
+check_refusal traefik     'DOCKER VOLUME'
+check_refusal uptime-kuma 'DOCKER VOLUME'
+check_refusal tailscale   'no durable state'
+check_refusal no-such-svc 'could not be established'
+# And the volume refusal must warn against the wrong fix.
+out="$(probe "$REFUSE_STUB" '( assert_pre_upgrade_possible traefik ) 2>&1')"
+grep -q 'would protect nothing' <<< "$out" \
+  || fail "the volume refusal does not warn that creating the directory protects
+nothing, which is the fix an operator would reasonably reach for: $out"
+# A protected-tier service must still get through to the path check.
+out="$(probe "$REFUSE_STUB" 'assert_pre_upgrade_possible plex 2>&1')"
+grep -q "$TMP_DIR/data/plex" <<< "$out" \
+  || fail "a protected-tier service no longer reaches the path check: $out"
+echo "  docker-volume, stateless, unknown and protected-tier each distinct"
+
 echo
 echo "PASS: state model smoke"
