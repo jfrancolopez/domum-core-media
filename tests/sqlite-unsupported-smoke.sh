@@ -169,4 +169,31 @@ if [ -n "$r_line" ]; then
 fi
 echo "  --deep parsed, re-runs the proof, refuses without .premigration, reachable"
 
+echo "== 9. a service that ships its own sqlite3 declares it =="
+# "I could not check it" is honest, but it is weaker than a real check whenever
+# the application ships a usable sqlite. There is no sqlite3 on this HOST at
+# all, so without a declaration every service's database is `not checked`.
+#
+# Measured 2026-10-08: calibre-web ships /usr/bin/sqlite3 3.45.1, and against
+# its live app.db reports integrity_check -> ok, journal_mode -> delete,
+# 21 tables, 2 users. Plex ships its own because the host's cannot load its
+# private `collating` FTS tokenizer.
+for pair in "plex:/usr/lib/plexmediaserver/Plex SQLite" "calibre-web:/usr/bin/sqlite3"; do
+  svc="${pair%%:*}"; want="${pair#*:}"
+  got="$(probe "service_sqlite_binary $svc")"
+  [ "$got" = "$want" ] || fail "service_sqlite_binary $svc gave '$got', expected '$want'"
+done
+echo "  plex and calibre-web each declare their own sqlite"
+
+echo "== 10. a service with a readiness signal declares it =="
+# An upgrade that cannot tell whether the application came back is weaker than
+# one that can. calibre-web logs the same LinuxServer.io init line as Plex:
+#   Connection to localhost (::1) 8083 port [tcp/*] succeeded!
+for svc in plex calibre-web navidrome; do
+  got="$(probe "service_ready_log_pattern $svc")"
+  [ -n "$got" ] || fail "$svc has no readiness log pattern, so an upgrade could not
+confirm the application came back"
+done
+echo "  plex, calibre-web and navidrome all have readiness patterns"
+
 echo "PASS: sqlite unsupported classification smoke test"
