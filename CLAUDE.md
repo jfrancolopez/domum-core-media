@@ -251,6 +251,29 @@ written to handle the failure could run:
 
 When a function's failure is EXPECTED and handled, capture it with `|| true`.
 
+**I broke that rule in the same session I wrote it.** The `storage archives`
+off-host check rolled its own parser for the successful-backup marker --
+`cat … | tr -cd '0-9'` -- against a file holding an ISO-8601 timestamp, not an
+epoch: `2026-10-08T02:37:27-04:00` becomes `202610080237270400`, an 18-digit
+number larger than any `mtime`. So the comparison was ALWAYS true and the check
+could only ever answer "yes". It reported "yes" in production for an archive the
+last backup predated by six hours, and the missing timestamp in that line --
+`date -d @202610080237270400` fails -- was the only visible symptom.
+
+The test asserted that the strings `yes`, `NOT YET` and `UNKNOWN` appeared in the
+function's SOURCE. They did. It passed without ever executing the comparison.
+A branch-coverage claim made by grepping for branch text is not coverage: drive
+the function against fixtures with controlled inputs and assert the ANSWER. And
+`backup_last_success_epoch` already existed -- one implementation of a check, as
+with the topology invariant.
+
+**Strip comments before asserting that code does NOT contain something.** Three
+assertions in one section flagged their own explanatory comments: a test for
+"does not invoke restic", one for "does not digit-strip the marker", and the
+capability audit's reachability walk, which was fooled by a comment naming
+`service_upgrade`. A comment quoting the broken form is how the fix documents
+itself.
+
 **Rehearse an operator wrapper; do not merely review it.** The wrapper's roots
 are overridable only for that purpose and default to the production paths. Do
 not weaken a check to suit the test: the root check is satisfied by running the
