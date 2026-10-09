@@ -702,6 +702,64 @@ clean `0 matched` having compared nothing. `tests/backup-exclusion-audit-smoke.s
 mutates that guard away and requires the false clean verdict to appear. See
 `docs/BACKUP-EXCLUSION-PROPOSAL.md`.
 
+**The asset table is the ONLY authority for what is an Immich original.** A
+filesystem walk of `upload/` got both ends of the coverage fraction wrong at
+once: it counted the 13-byte `.immich` marker as an original *and* missed the 58
+originals under `encoded-video/`. Worse, because selection picks the
+median-sized file of each extension, the marker became the representative of
+extension "immich" and was reported as a restored original -- `match immich 13
+.immich` appeared in a production verification run. Selection and coverage are
+now pure functions of an INVENTORY built from `asset.originalPath`
+(`immich_original_inventory`), a path the table names but which is absent from
+disk is counted as **missing** rather than silently dropped, and both
+`verify-sample` and `sample-plan` **refuse** when the table cannot be read
+rather than falling back to the walk. Measured: 23,033 originals = 22,975 under
+`upload/` + 58 under `encoded-video/`, zero duplicates, zero nulls, zero
+elsewhere, zero missing on disk, 130.4 GiB.
+
+**The inventory must never be written inside the restore target.** `$scratch`
+is what restic restores into, so a file placed there is indistinguishable from
+restored content. It was briefly inside, and the corruption test caught it: the
+stub that damages "the first restored file" damaged the inventory instead, and
+the corruption went undetected.
+
+**ARCHIVE VALIDATED, DATABASE IMPORT RESTORE TESTED and FULL IMMICH RECOVERY
+VERIFIED are three different claims.** `verify-restore` checks gzip, size and
+footer -- that the FILE is intact. That says nothing about whether PostgreSQL
+can read it, and `dr-status` wrongly promoted it to `RESTORE TESTED`.
+`verify-db-restore` imports the restic-restored dump into a DISPOSABLE
+PostgreSQL and earns the second claim; the third requires a rebuilt Immich
+serving the library and has never been done. Rules that hold:
+
+- **The import runs under `ON_ERROR_STOP=1`.** Without it psql reports success
+  having skipped every statement it could not run. Measured against the real
+  dump: 20 s, exit 0, zero stderr, 23,033 assets into 61 tables, and a
+  deliberately truncated dump fails with the offending column named.
+- **The disposable instance must use the image production uses**, read from
+  `docker inspect`, never hardcoded: the dump declares
+  `CREATE EXTENSION vectors WITH SCHEMA vectors`, which only `pgvecto-rs`
+  provides, so a plain `postgres:14` would fail for a reason that has nothing to
+  do with the backup. If the image is absent locally it reports NOT ATTEMPTED
+  and **refuses to pull** -- what gets tested must be what is already here.
+- **Isolation is structural, not promised**: `--network none`, tmpfs PGDATA, no
+  published port, no bind mount, removed by a trap that also terminates on a
+  signal. The test asserts docker was really given those flags, not that the
+  report mentions them.
+- **A consistency key that was never emitted returns a sentinel that FAILS every
+  check.** `(( $(f missing) > 0 ))` with an empty substitution is a runtime
+  syntax error, so under `set -e` a renamed key would abort the verification
+  instead of failing it -- the metadata-key family again.
+
+`tests/db-import-verification-smoke.sh`; 1 mutant (dropping `ON_ERROR_STOP=1`
+must let a broken import pass), killed.
+
+**A test must not be ABLE to reach the host.** An un-stubbed
+`immich_db_original_paths` in `sample-verification-smoke` silently queried the
+LIVE production database and the plan reported its 23,033 assets from inside a
+fixture library. Redirecting roots is not enough when the code path leaves the
+filesystem: put a `docker` stub on `PATH` that exits non-zero, so reaching
+production FAILS instead of quietly succeeding.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

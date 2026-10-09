@@ -70,6 +70,9 @@ jobs:
       - name: DR status smoke test
         run: tests/dr-status-smoke.sh
 
+      - name: Database import verification smoke test
+        run: tests/db-import-verification-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 

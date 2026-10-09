@@ -91,6 +91,22 @@ mk_coverage() {  # $1 = sampled, $2 = population
 EOF
 }
 
+mk_dbimport() {  # $1 = assets imported
+  cat > "$VDIR/cloud-dbimport.env" <<EOF
+SCHEMA_VERSION=1
+TARGET=cloud
+RESULT=success
+VERIFIED_TS=2026-10-09T16:23:41-04:00
+LAST_SUCCESS_TS=2026-10-09T16:23:41-04:00
+LAST_SUCCESS_SNAPSHOT_ID=abc123de
+SNAPSHOT_ID=abc123de
+DUMP_BYTES=28066699
+PG_IMAGE=tensorchord/pgvecto-rs:pg14-v0.2.0
+ASSETS_IMPORTED=$1
+REASON=
+EOF
+}
+
 mk_dump_verification() {
   cat > "$VDIR/cloud.env" <<'EOF'
 SCHEMA_VERSION=2
@@ -159,23 +175,38 @@ grep -q '22964 never restore-tested' <<< "$out" || fail "the untested remainder 
 echo "  12 of 22976 stated, and 22964 reported as never restore-tested"
 
 # ---------------------------------------------------------------------------
-sect "the immich database is tracked separately from the originals"
+sect "ARCHIVE VALIDATED is not DATABASE IMPORT RESTORE TESTED"
+# The archive checks prove gzip, size and footer -- that the FILE is intact.
+# They say nothing about whether PostgreSQL can read it, so they must not
+# promote the level. This test previously required the opposite.
 out="$(run_dr)"
 grep -q 'immich database *BACKED UP' <<< "$out" \
   || fail "the database should still be only BACKED UP: $out"
-grep -q 'never been restored and revalidated' <<< "$out" \
-  || fail "did not say the dump was never restored: $out"
+grep -q 'NEVER imported' <<< "$out" \
+  || fail "did not say the dump was never imported: $out"
+
 mk_dump_verification
 out="$(run_dr)"
+grep -q 'immich database *BACKED UP' <<< "$out" \
+  || fail "archive validation wrongly PROMOTED the database: $out"
+grep -q 'archive validated' <<< "$out" || fail "archive validation not reported: $out"
+grep -q 'NEVER imported' <<< "$out" \
+  || fail "with only archive checks it must still say NEVER imported: $out"
+echo "  archive checks are reported and do NOT promote the level"
+
+mk_dbimport 23033
+out="$(run_dr)"
 grep -q 'immich database *RESTORE TESTED' <<< "$out" \
-  || fail "the dump verification did not promote the database: $out"
+  || fail "a successful import did not promote the database: $out"
+grep -q 'IMPORTED into a disposable PostgreSQL' <<< "$out" \
+  || fail "the import evidence is not cited: $out"
+grep -q '23033 asset' <<< "$out" || fail "the imported asset count is missing: $out"
 # Only once BOTH tiers are restore-tested does the overall verdict move.
 grep -q 'EXITCODE=0' <<< "$out" || fail "both tiers tested but verdict not 0: $out"
 grep -q 'WEAKEST TIER: RESTORE TESTED' <<< "$out" || fail "weakest tier wrong: $out"
+echo "  an actual import promotes it, cites the count, and moves the verdict"
 echo "  a sample proof for originals does not vouch for the database, or vice versa"
-echo "  and the verdict follows the weakest tier, not the strongest"
 
-# ---------------------------------------------------------------------------
 sect "nothing is ever FULL RECOVERY VERIFIED"
 out="$(run_dr)"
 grep -q 'Nothing above is FULL RECOVERY VERIFIED' <<< "$out" \

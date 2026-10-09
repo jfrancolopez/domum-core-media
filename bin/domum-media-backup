@@ -947,6 +947,74 @@ do_verify_restore() {
 # Recorded separately from the dump verification: they are different claims and
 # must never be conflated.
 
+# ---------------------------------------------------------------------------
+# The ORIGINAL inventory: the asset table, not a filesystem walk
+# ---------------------------------------------------------------------------
+
+# Every Immich original, as "<size>\t<host path>", written to $1.
+#
+# A filesystem walk of upload/ was the wrong source and got BOTH ends of the
+# coverage fraction wrong at once. Measured on this host:
+#
+#   asset table                         : 23,033 originals
+#   files under upload/                 : 22,976  (22,975 originals + 1 marker)
+#   originals under encoded-video/      :     58  (motion-photo parts)
+#
+# So the walk counted a 13-byte `.immich` marker as an original and MISSED 58
+# real ones -- and because selection picked the median-sized file of each
+# extension, the marker became the representative of extension "immich" and was
+# reported as a restored original: `match immich 13 .immich`.
+#
+# Prints "<originals> <missing_on_disk>" on stdout; returns non-zero when the
+# database cannot be read, so the caller says UNKNOWN rather than falling back
+# to a walk that is known to be wrong.
+immich_original_inventory() {  # $1 = output file
+  local out="${1:?immich_original_inventory: no output file}"
+  local paths want got
+  paths="$(immich_db_original_paths)" || return 1
+  [[ -n "$paths" ]] || return 1
+  want="$(printf '%s\n' "$paths" | grep -c . || true)"
+  # NUL-delimited: a path may legitimately contain spaces, and this is the
+  # inventory everything else is derived from.
+  printf '%s\n' "$paths" | sed '/^$/d' | tr '\n' '\0' \
+    | xargs -0 -r stat -c '%s	%n' 2>/dev/null > "$out" || true
+  got="$(grep -c . < "$out" || true)"
+  printf '%s %s\n' "$want" "$(( want - got ))"
+}
+
+# An inventory built by WALKING a directory.
+#
+# This is not the production source of truth and must not become one: walking
+# upload/ is precisely what counted a marker as an original and missed the 58
+# under encoded-video/. It exists so the selection algorithm can be tested as a
+# pure function of an inventory, without a database.
+inventory_from_dir() {  # $1 = directory, $2 = output file
+  find "$1" -type f -printf '%s\t%p\n' 2>/dev/null | sort -t"$(printf '\t')" -k2,2 > "$2"
+}
+
+# The originals an exclusion of glob metacharacters would make unsamplable.
+# restic --include takes a PATTERN, so such a name would select the wrong
+# objects or none, and "none" would then be reported as a mismatch against a
+# file that is perfectly fine.
+inventory_unsamplable() {  # $1 = inventory file
+  grep -cE '/[^/]*(\*|\?|\[|\]|\\)[^/]*$' "$1" 2>/dev/null || true
+}
+
+# Where the originals actually live, so the report can state it rather than
+# implying every original sits under upload/.
+# Prints "<count> <subtree>" lines, most populous first.
+inventory_by_location() {  # $1 = inventory file, $2 = library root
+  awk -F'\t' -v lib="$2" '
+      {
+        p = $2
+        sub("^" lib "/", "", p)
+        sub("/.*", "", p)
+        if (p == "") p = "(library root)"
+        c[p]++
+      }
+      END { for (k in c) printf "%d %s\n", c[k], k }' "$1" | sort -rn
+}
+
 SAMPLE_MAX_FILE_BYTES="${SAMPLE_MAX_FILE_BYTES:-268435456}"   # 256 MiB
 SAMPLE_MAX_TOTAL_BYTES="${SAMPLE_MAX_TOTAL_BYTES:-1073741824}" # 1 GiB
 SAMPLE_DEFAULT_COUNT="${SAMPLE_DEFAULT_COUNT:-12}"
@@ -977,11 +1045,10 @@ sample_manifest_file() {
 # 23k files.
 #
 # Prints: <total_files> <total_bytes> <oversize_files> <oversize_bytes>
-sample_coverage_stats() {  # $1 = originals dir
-  find "$1" -type f -printf '%s\n' 2>/dev/null \
-    | awk -v cap="$SAMPLE_MAX_FILE_BYTES" '
-        { n++; b += $1; if ($1 > cap) { on++; ob += $1 } }
-        END { printf "%d %d %d %d\n", n+0, b+0, on+0, ob+0 }'
+sample_coverage_stats() {  # $1 = inventory file
+  awk -F'\t' -v cap="$SAMPLE_MAX_FILE_BYTES" '
+      { n++; b += $1; if ($1 > cap) { on++; ob += $1 } }
+      END { printf "%d %d %d %d\n", n+0, b+0, on+0, ob+0 }' "$1"
 }
 
 # Human bytes, for the coverage lines only. Nothing parses these.
@@ -995,19 +1062,28 @@ sample_human_bytes() {  # $1 = bytes
 
 # One place that renders the coverage block, so the plan and the verification
 # cannot describe the population differently.
-sample_report_coverage() {  # $1 = originals dir, $2 = indent label width
+sample_report_coverage() {  # $1 = inventory file, $2 = library root, $3 = missing-on-disk
+  local inv="$1" lib="$2" missing="${3:-0}"
   local stats tf tb of ob glob
-  stats="$(sample_coverage_stats "$1")"
+  stats="$(sample_coverage_stats "$inv")"
   read -r tf tb of ob <<< "$stats"
-  echo "  population   : ${tf} file(s), $(sample_human_bytes "$tb") under $1"
+  echo "  originals    : ${tf} asset(s), $(sample_human_bytes "$tb") -- from the Immich asset table"
+  while read -r cnt sub; do
+    [[ -n "$cnt" ]] || continue
+    printf '                 %6d under %s/\n' "$cnt" "$sub"
+  done < <(inventory_by_location "$inv" "$lib")
+  if [[ "$missing" =~ ^[0-9]+$ ]] && (( missing > 0 )); then
+    echo "  MISSING      : ${missing} original(s) the asset table names are NOT on disk"
+    echo "                 These cannot be sampled and are not backed up either."
+  fi
   if [[ "$of" =~ ^[0-9]+$ ]] && (( of > 0 )); then
     echo "  NEVER sampled: ${of} file(s), $(sample_human_bytes "$ob") exceed the per-file"
     echo "                 cap of $(sample_human_bytes "$SAMPLE_MAX_FILE_BYTES"). These are the"
-    echo "                 largest originals -- raise SAMPLE_MAX_FILE_BYTES to cover them."
+    echo "                 largest originals -- see verify-large for a progressive proof."
   else
-    echo "  NEVER sampled: none by size -- every file is within the per-file cap"
+    echo "  NEVER sampled: none by size -- every original is within the per-file cap"
   fi
-  glob="$(sample_unsamplable_count "$1")"
+  glob="$(inventory_unsamplable "$inv")"
   if [[ "$glob" =~ ^[0-9]+$ ]] && (( glob > 0 )); then
     echo "  also excluded: ${glob} file(s) whose names contain glob metacharacters"
     echo "                 (restic --include is a pattern, so these cannot be sampled safely)"
@@ -1022,11 +1098,9 @@ sample_unsamplable_count() {
 # Deterministic and diverse: the median-sized file of each distinct extension,
 # then the smallest and largest that fit under the per-file cap, then every
 # k-th path to fill the quota. Sorted throughout so repeated runs agree.
-sample_select_paths() {
-  local root="$1" want="$2"
-  find "$root" -type f \
-    ! -name '*[*?]*' ! -name '*[][]*' ! -name '*\\*' \
-    -printf '%s\t%p\n' 2>/dev/null \
+sample_select_paths() {  # $1 = inventory file, $2 = how many
+  local inv="$1" want="$2"
+  grep -vE '/[^/]*(\*|\?|\[|\]|\\)[^/]*$' "$inv" \
     | awk -F'\t' -v cap="$SAMPLE_MAX_FILE_BYTES" '$1 > 0 && $1 <= cap' \
     | sort -t"$(printf '\t')" -k2,2 \
     | awk -F'\t' -v want="$want" '
@@ -1070,33 +1144,6 @@ sample_select_paths() {
         }'
 }
 
-# The Immich library root is not a directory of originals. It holds:
-#
-#   upload/         the ORIGINALS -- 22,856 files here
-#   thumbs/         generated thumbnails and previews -- 32,295
-#   encoded-video/  transcodes -- 9,029
-#   backups/        database dumps
-#   library/ profile/
-#
-# Sampling the whole tree meant "a deterministic sample of real Immich
-# originals" was mostly thumbnails, transcodes and a .sql.gz dump: derived data
-# that Immich regenerates, spending the sample budget on files whose loss costs
-# nothing and inflating the apparent type diversity while doing it.
-#
-# Falls back to the library root when there is no upload/ (a different layout),
-# and the caller says which was used -- a narrower claim stated plainly beats a
-# broader one that is not true.
-immich_originals_dir() {
-  local lib="$1"
-  if [[ -n "${IMMICH_ORIGINALS_DIR:-}" ]]; then
-    printf '%s' "$IMMICH_ORIGINALS_DIR"
-  elif [[ -d "$lib/upload" ]]; then
-    printf '%s' "$lib/upload"
-  else
-    printf '%s' "$lib"
-  fi
-}
-
 # What WOULD be sampled, without restoring anything.
 #
 # `verify-sample` needs root and a live repository, so until it runs there is no
@@ -1110,16 +1157,23 @@ do_sample_plan() {
   local want="${1:-$SAMPLE_DEFAULT_COUNT}"
   [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || die "Sample count must be a positive integer"
 
-  local lib originals
+  local lib inv counts n_orig n_missing
   lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
   [[ -d "$lib" ]] || die "Immich library not found at $lib"
-  originals="$(immich_originals_dir "$lib")"
-  [[ -d "$originals" ]] || die "Immich originals not found at $originals"
+  inv="$(mktemp)" || die "Cannot stage the originals inventory"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv'; exit 143" HUP INT TERM
+  counts="$(immich_original_inventory "$inv")" \
+    || die "Refusing: the Immich asset table could not be read, and it is the only
+authority for which files are originals. Walking upload/ instead counted a
+13-byte .immich marker as an original and missed the 58 originals that live
+under encoded-video/, so the fallback is not safe to use."
+  read -r n_orig n_missing <<< "$counts"
 
   local total=0 n=0 size path ext
-  echo "[domum-media-backup] Sample plan for $originals"
-  [[ "$originals" == "$lib" ]] \
-    && echo "  NOTE: no upload/ subtree; sampling the whole library, which includes derived files."
+  echo "[domum-media-backup] Sample plan over $n_orig original(s) in $lib"
   echo
   printf '  %-10s %14s  %s\n' "TYPE" "BYTES" "PATH"
   while IFS=$'\t' read -r size path; do
@@ -1127,18 +1181,18 @@ do_sample_plan() {
     (( total + size > SAMPLE_MAX_TOTAL_BYTES )) && continue
     ext="${path##*/}"
     if [[ "$ext" == *.* ]]; then ext="${ext##*.}"; ext="${ext,,}"; else ext="none"; fi
-    printf '  %-10s %14s  %s\n' "$ext" "$size" "${path#"$originals"/}"
+    printf '  %-10s %14s  %s\n' "$ext" "$size" "${path#"$lib"/}"
     total=$(( total + size )); n=$(( n + 1 ))
-  done < <(sample_select_paths "$originals" "$want")
+  done < <(sample_select_paths "$inv" "$want")
 
-  (( n > 0 )) || die "No sample candidates found under $originals within the size caps"
+  (( n > 0 )) || die "No sample candidates found in $lib within the size caps"
 
   echo
   echo "  files        : $n"
   echo "  total bytes  : $total"
   echo "  per-file cap : $SAMPLE_MAX_FILE_BYTES"
   echo "  total cap    : $SAMPLE_MAX_TOTAL_BYTES"
-  sample_report_coverage "$originals"
+  sample_report_coverage "$inv" "$lib" "$n_missing"
   echo
   echo "  This is a PLAN. Nothing was restored, nothing was contacted, and no"
   echo "  evidence was recorded. Run verify-sample <target> to actually verify."
@@ -1150,13 +1204,12 @@ do_verify_sample() {
   backup_target_enabled "$target" || die "Backup target is not enabled: $target"
   [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || die "Sample count must be a positive integer"
 
-  local lib originals
+  local lib
   lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
   [[ -d "$lib" ]] || die "Immich library not found at $lib"
-  originals="$(immich_originals_dir "$lib")"
-  [[ -d "$originals" ]] || die "Immich originals not found at $originals"
 
   local vdir scratch manifest snapshot_id total=0
+  local inv counts n_orig n_missing
   vdir="$(restore_verification_dir)"
   mkdir -p "$vdir"
   case "$vdir" in
@@ -1164,14 +1217,26 @@ do_verify_sample() {
       die "Refusing: the scratch location $vdir is inside a live data root." ;;
   esac
   scratch="$(mktemp -d "$vdir/sample.XXXXXX")" || die "Cannot create a scratch directory"
+  # The inventory must live OUTSIDE $scratch: $scratch is the restore TARGET,
+  # so anything written there becomes indistinguishable from restored content.
+  # It was briefly inside, and the corruption test caught it -- the stub that
+  # damages "the first restored file" damaged the inventory instead.
+  inv="$(mktemp "$vdir/.originals.XXXXXX")" || die "Cannot stage the originals inventory"
   # shellcheck disable=SC2064
-  trap "rm -rf -- '$scratch'" EXIT
+  trap "rm -rf -- '$scratch'; rm -f -- '$inv'" EXIT
   # shellcheck disable=SC2064
-  trap "rm -rf -- '$scratch'; exit 143" HUP INT TERM
+  trap "rm -rf -- '$scratch'; rm -f -- '$inv'; exit 143" HUP INT TERM
 
   snapshot_id="$(restic_for_target "$target" snapshots --latest 1 --json 2>/dev/null \
     | jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' 2>/dev/null || true)"
   [[ -n "$snapshot_id" ]] || die "Could not determine the latest snapshot for $target"
+
+  counts="$(immich_original_inventory "$inv")" \
+    || die "Refusing: the Immich asset table could not be read, and it is the only
+authority for which files are originals. A filesystem walk is not an acceptable
+substitute -- it counted a 13-byte .immich marker as a restored original and
+missed the 58 originals under encoded-video/."
+  read -r n_orig n_missing <<< "$counts"
 
   local -a sample_paths=() sample_sizes=()
   local size path
@@ -1179,9 +1244,9 @@ do_verify_sample() {
     [[ -n "$path" ]] || continue
     (( total + size > SAMPLE_MAX_TOTAL_BYTES )) && continue
     sample_paths+=("$path"); sample_sizes+=("$size"); total=$(( total + size ))
-  done < <(sample_select_paths "$originals" "$want")
+  done < <(sample_select_paths "$inv" "$want")
 
-  (( ${#sample_paths[@]} > 0 )) || die "No sample candidates found under $originals within the size caps"
+  (( ${#sample_paths[@]} > 0 )) || die "No sample candidates found in $lib within the size caps"
   log "sample verification: $target snapshot $snapshot_id, ${#sample_paths[@]} file(s), $total bytes"
 
   local -a include_args=()
@@ -1210,7 +1275,7 @@ do_verify_sample() {
       '{target:$t,snapshot_id:$s,path:$p,media_type:$e,size_bytes:$b,
         source_sha256:($sh|select(length>0)),restored_sha256:($dh|select(length>0)),
         result:$v,verified_at:$ts}' >> "$tmp"
-    printf '  %-9s %-6s %12s  %s\n' "$verdict" "$ext" "$size" "${path#"$originals"/}"
+    printf '  %-9s %-6s %12s  %s\n' "$verdict" "$ext" "$size" "${path#"$lib"/}"
   done
   chmod 0600 "$tmp"; mv -f "$tmp" "$manifest"
 
@@ -1218,24 +1283,34 @@ do_verify_sample() {
   echo "[domum-media-backup] Sample verification for $target"
   echo "  snapshot : $snapshot_id"
   echo "  sampled  : ${#sample_paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
-  echo "  sampled  : from $originals"
+  echo "  sampled  : from $lib (asset table)"
   echo "  manifest : $manifest"
-  sample_report_coverage "$originals"
+  sample_report_coverage "$inv" "$lib" "$n_missing"
   # Recorded beside the manifest, so the report can state the population rather
   # than only what was sampled. A separate file, not a record in the JSONL: the
   # report aggregates that with `jq -s` over per-file records, and a
   # differently-shaped row there would skew the match counts.
   local cov_file cov_stats c_tf c_tb c_of c_ob
   cov_file="$(sample_coverage_file "$target")"
-  cov_stats="$(sample_coverage_stats "$originals")"
+  cov_stats="$(sample_coverage_stats "$inv")"
   read -r c_tf c_tb c_of c_ob <<< "$cov_stats"
-  if jq -cn --arg t "$target" --arg o "$originals" --arg ts "$(date -Iseconds)" \
+  # `source` is recorded so a reader can tell WHICH population a stored proof
+  # was measured against. A denominator with no stated provenance is how the
+  # filesystem-walk figure passed for an original count for as long as it did.
+  local cov_loc
+  cov_loc="$(inventory_by_location "$inv" "$lib" \
+    | jq -Rn '[inputs | split(" ") | {(.[1]): (.[0]|tonumber)}] | add // {}' 2>/dev/null || echo '{}')"
+  if jq -cn --arg t "$target" --arg o "$lib" --arg ts "$(date -Iseconds)" \
+       --arg src "immich-asset-table" \
        --argjson tf "${c_tf:-0}" --argjson tb "${c_tb:-0}" \
        --argjson of "${c_of:-0}" --argjson ob "${c_ob:-0}" \
+       --argjson miss "${n_missing:-0}" \
+       --argjson byloc "${cov_loc:-\{\}}" \
        --argjson cap "$SAMPLE_MAX_FILE_BYTES" --argjson tcap "$SAMPLE_MAX_TOTAL_BYTES" \
        --argjson sampled "${#sample_paths[@]}" \
-       '{target:$t,originals:$o,recorded_at:$ts,population_files:$tf,
+       '{target:$t,originals:$o,source:$src,recorded_at:$ts,population_files:$tf,
          population_bytes:$tb,oversize_files:$of,oversize_bytes:$ob,
+         missing_on_disk:$miss,by_location:$byloc,
          per_file_cap_bytes:$cap,total_cap_bytes:$tcap,sampled_files:$sampled}' \
        > "$cov_file.tmp" 2>/dev/null; then
     chmod 0600 "$cov_file.tmp"; mv -f "$cov_file.tmp" "$cov_file"
@@ -1679,6 +1754,25 @@ dr_last_restore_verification() {  # $1 = target -> "ts snapshot_id" or empty
   )
 }
 
+# The database IMPORT proof for a target, if it passed.
+#
+# Separate from dr_last_restore_verification on purpose. That one records the
+# ARCHIVE checks -- gzip, size, footer -- which say nothing about whether
+# PostgreSQL can read the file. Treating the two as one claim is how
+# "RESTORE TESTED" got attached to a proof that had never run an import.
+dr_last_dbimport() {  # $1 = target -> "ts snapshot assets" or empty
+  local target="$1" file
+  file="$(dbimport_evidence_file "$target")"
+  [[ -f "$file" ]] || return 1
+  (
+    unset LAST_SUCCESS_TS LAST_SUCCESS_SNAPSHOT_ID ASSETS_IMPORTED
+    # shellcheck disable=SC1090
+    . "$file" >/dev/null 2>&1 || exit 1
+    [[ -n "${LAST_SUCCESS_TS:-}" ]] || exit 1
+    printf '%s %s %s' "$LAST_SUCCESS_TS" "${LAST_SUCCESS_SNAPSHOT_ID:-unknown}" "${ASSETS_IMPORTED:-0}"
+  )
+}
+
 # The sample-restore proof for a target, WITH its denominator.
 #
 # A sample proof without a population is not reportable as RESTORE TESTED: that
@@ -1762,12 +1856,20 @@ do_dr_status() {
       lvl=CONFIGURED; ev="dump is staged into the backup set; no successful run recorded"
     else
       lvl="BACKED UP"; ev="dump covered by snapshot $run_snap"
-      local vok
+      local vok dbok
+      # The archive checks are reported, but they do NOT promote the level:
+      # gzip, size and footer prove the FILE is intact, not that PostgreSQL can
+      # read it. Only an actual import earns RESTORE TESTED.
       if vok="$(dr_last_restore_verification "$target")"; then
-        lvl="RESTORE TESTED"
-        ev="dump restored to scratch and revalidated ${vok%% *} (snapshot ${vok##* })"
+        ev="archive validated ${vok%% *} (gzip, size, footer)"
       else
-        ev="$ev; the dump has never been restored and revalidated"
+        ev="$ev; the archive has never been validated"
+      fi
+      if dbok="$(dr_last_dbimport "$target")"; then
+        lvl="RESTORE TESTED"
+        ev="$ev; IMPORTED into a disposable PostgreSQL ${dbok%% *}, $(awk "{print \$3}" <<< "$dbok") asset(s), consistent"
+      else
+        ev="$ev; NEVER imported -- archive checks do not prove PostgreSQL can read it"
       fi
     fi
     dr_row "immich database" "$lvl" "$ev"
@@ -1787,6 +1889,294 @@ do_dr_status() {
     3) echo "WEAKEST TIER: RESTORE TESTED -- a stated fraction has been proven restorable." ; return 0 ;;
     *) echo "WEAKEST TIER: FULL RECOVERY VERIFIED." ; return 0 ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Database IMPORT verification: proving PostgreSQL can actually read the dump
+# ---------------------------------------------------------------------------
+
+# The three claims, which are not the same claim and must never be conflated:
+#
+#   ARCHIVE VALIDATED             the restored file is a well-formed gzip of the
+#                                 expected size with an intact footer. This says
+#                                 NOTHING about whether PostgreSQL can read it.
+#   DATABASE IMPORT RESTORE TESTED  a disposable PostgreSQL of the production
+#                                 version imported it with ON_ERROR_STOP=1, the
+#                                 expected tables exist, and the data is
+#                                 internally consistent.
+#   FULL IMMICH RECOVERY VERIFIED  a rebuilt Immich served the restored library.
+#                                 Not attempted by this command.
+#
+# `verify-restore` earns only the first. This command earns the second.
+
+# The image a disposable instance must use.
+#
+# Read from the running production container rather than hardcoded: the dump
+# declares `CREATE EXTENSION vectors WITH SCHEMA vectors`, which only the
+# pgvecto-rs image provides, so a plain `postgres:14` would fail the import for
+# a reason that has nothing to do with the backup. Measured: that image
+# preloads vectors.so by default, so no extra configuration is needed.
+dbimport_postgres_image() {
+  local img
+  img="$(docker inspect immich_postgres --format '{{.Config.Image}}' 2>/dev/null || true)"
+  printf '%s' "${IMMICH_PG_IMAGE:-$img}"
+}
+
+dbimport_evidence_file() {
+  printf '%s/%s-dbimport.env' "$(restore_verification_dir)" "$1"
+}
+
+# The checks run against the RESTORED copy. Internal consistency only: nothing
+# here depends on production being reachable, because a disaster recovery proof
+# that only works while the original is healthy proves nothing.
+#
+# Prints "<name>=<value>" lines.
+dbimport_consistency_sql() {
+  cat <<'SQL'
+select 'tables='||count(*) from information_schema.tables
+  where table_schema='public' and table_type='BASE TABLE'
+union all select 'assets='||count(*) from asset
+union all select 'asset_files='||count(*) from asset_file
+union all select 'exif_rows='||count(*) from asset_exif
+union all select 'extensions='||count(*) from pg_extension
+union all select 'originals_upload='||count(*) from asset
+  where "originalPath" like '%/upload/upload/%'
+union all select 'originals_encoded_video='||count(*) from asset
+  where "originalPath" like '%/upload/encoded-video/%'
+union all select 'originals_elsewhere='||count(*) from asset
+  where "originalPath" not like '%/upload/upload/%'
+    and "originalPath" not like '%/upload/encoded-video/%'
+union all select 'null_original_path='||count(*) from asset
+  where coalesce("originalPath",'')=''
+union all select 'duplicate_original_paths='||count(*) from (
+  select "originalPath" from asset group by 1 having count(*)>1) d
+union all select 'orphan_asset_files='||count(*) from asset_file f
+  left join asset a on a.id=f."assetId" where a.id is null
+union all select 'orphan_exif='||count(*) from asset_exif e
+  left join asset a on a.id=e."assetId" where a.id is null
+union all select 'assets_without_exif='||count(*) from asset a
+  left join asset_exif e on e."assetId"=a.id where e."assetId" is null
+union all select 'null_checksums='||count(*) from asset where checksum is null
+SQL
+}
+
+# One fact out of the consistency output.
+#
+# A key the query never emitted returns the sentinel -1 rather than the empty
+# string: `(( $(f missing) > 0 ))` with an empty substitution is a runtime
+# syntax error, so under `set -e` a renamed check would ABORT the verification
+# instead of failing it -- the metadata-key defect family again, where a key
+# read but never written is silently empty.
+dbimport_fact() {  # $1 = facts blob, $2 = key
+  local v
+  v="$(sed -nE "s/^$2=(.*)\$/\1/p" <<< "$1" | head -1)"
+  [[ "$v" =~ ^-?[0-9]+$ ]] || v=-1
+  printf '%s' "$v"
+}
+
+# Import the restored dump into a disposable PostgreSQL and verify it.
+#
+# Isolation is structural, not promised: the container runs with
+# `--network none` so it cannot reach the production database even in
+# principle, its PGDATA is a tmpfs that cannot outlive it, it publishes no
+# port, and it is removed by a trap that also terminates on a signal. No
+# production path is mounted into it.
+#
+# $1 = target. Exit 0 verified, 1 a check failed, 2 not attemptable.
+do_verify_db_restore() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "Usage: domum-media-backup verify-db-restore <target>"
+  backup_target_enabled "$target" || die "Backup target is not enabled: $target"
+  cmd_exists gzip || die "gzip is required"
+  cmd_exists docker || die "docker is required to run a disposable PostgreSQL"
+
+  local image
+  image="$(dbimport_postgres_image)"
+  if [[ -z "$image" ]]; then
+    echo "DATABASE IMPORT: NOT ATTEMPTED"
+    echo "  Could not determine the PostgreSQL image. The dump requires the"
+    echo "  'vectors' extension, so the disposable instance must use the same"
+    echo "  image production uses; set IMMICH_PG_IMAGE to name it explicitly."
+    return 2
+  fi
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo "DATABASE IMPORT: NOT ATTEMPTED"
+    echo "  The image $image is not present locally. Refusing to pull during a"
+    echo "  verification run: what gets tested must be what is already here."
+    return 2
+  fi
+
+  local vdir scratch
+  vdir="$(restore_verification_dir)"
+  mkdir -p "$vdir"
+  case "$vdir" in
+    "${DOMUM_DATA_ROOT%/}"/*|"${DOMUM_MEDIA_ROOT%/}"/*|"${DOMUM_DATA_ROOT%/}"|"${DOMUM_MEDIA_ROOT%/}")
+      die "Refusing to verify: the scratch location $vdir is inside a live data root." ;;
+  esac
+  scratch="$(mktemp -d "$vdir/dbimport.XXXXXX")" || die "Cannot create a scratch directory"
+
+  local cname="domum-dbimport-$$-$(date +%s)"
+  # One trap for both the scratch tree and the container, and the signal form
+  # must TERMINATE: a cleanup-only trap would let execution fall through into
+  # verification against a database that has just been destroyed.
+  # shellcheck disable=SC2064
+  trap "docker rm -f '$cname' >/dev/null 2>&1; rm -rf -- '$scratch'" EXIT
+  # shellcheck disable=SC2064
+  trap "docker rm -f '$cname' >/dev/null 2>&1; rm -rf -- '$scratch'; exit 143" HUP INT TERM
+
+  local snapshot_id artifact rel
+  snapshot_id="$(restic_for_target "$target" snapshots --latest 1 --json 2>/dev/null \
+    | jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' 2>/dev/null || true)"
+  [[ -n "$snapshot_id" ]] || die "Could not determine the latest snapshot for $target"
+
+  rel="$DOMUM_DATA_ROOT/immich/backup-staging/immich-postgres.dump.sql.gz"
+  log "database import verification: $target snapshot $snapshot_id -> $cname (isolated)"
+  if ! restic_for_target "$target" restore latest --target "$scratch" --include "$rel" \
+       >/dev/null 2>&1; then
+    die "Could not restore the dump from $target"
+  fi
+  artifact="$scratch$rel"
+  [[ -s "$artifact" ]] || die "The restored dump is missing or empty at $artifact"
+
+  local dump_bytes
+  dump_bytes="$(stat -c %s "$artifact")"
+
+  echo "[domum-media-backup] Database import verification for $target"
+  echo "  snapshot      : $snapshot_id"
+  echo "  dump          : $dump_bytes bytes (restored from the repository)"
+  echo "  image         : $image"
+  echo "  isolation     : --network none, tmpfs PGDATA, no published port, no bind mount"
+
+  if ! docker run -d --name "$cname" \
+        --network none \
+        -e POSTGRES_PASSWORD="dbimport-verification-$RANDOM" \
+        --tmpfs /var/lib/postgresql/data:rw,size=4g,mode=0700 \
+        "$image" >/dev/null 2>&1; then
+    echo "  result        : NOT ATTEMPTED -- the disposable instance did not start"
+    return 2
+  fi
+
+  local ready=0 i
+  for i in $(seq 1 60); do
+    if docker exec "$cname" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if (( ready == 0 )); then
+    echo "  result        : NOT ATTEMPTED -- the disposable instance never became ready"
+    return 2
+  fi
+
+  if ! docker exec "$cname" psql -U postgres -q -c 'create database immich' >/dev/null 2>&1; then
+    echo "  result        : FAILED -- could not create the target database"
+    return 1
+  fi
+
+  # ON_ERROR_STOP=1 is the point: without it psql reports success having skipped
+  # every statement it could not run, which is exactly the false pass this
+  # command exists to rule out.
+  local err_file rc=0
+  err_file="$scratch/import.err"
+  if ! gzip -dc "$artifact" \
+       | docker exec -i "$cname" psql -U postgres -d immich -q -v ON_ERROR_STOP=1 \
+         >/dev/null 2>"$err_file"; then
+    echo "  import        : FAILED"
+    echo "  first errors  :"
+    head -5 "$err_file" 2>/dev/null | sed 's/^/    /'
+    record_dbimport_result "$target" failure "$snapshot_id" "$dump_bytes" "$image" "" \
+      "psql exited non-zero under ON_ERROR_STOP=1"
+    return 1
+  fi
+  local err_lines
+  err_lines="$(grep -c . "$err_file" 2>/dev/null || true)"
+  echo "  import        : COMPLETED under ON_ERROR_STOP=1 (${err_lines:-0} stderr line(s))"
+
+  local facts
+  facts="$(dbimport_consistency_sql \
+    | docker exec -i "$cname" psql -U postgres -d immich -At 2>/dev/null || true)"
+  [[ -n "$facts" ]] || { echo "  result        : FAILED -- the restored database answered nothing"; return 1; }
+
+  local k v assets=0 tables=0
+  echo "  verified      :"
+  while IFS='=' read -r k v; do
+    [[ -n "$k" ]] || continue
+    printf '    %-26s %s\n' "$k" "$v"
+    case "$k" in assets) assets="$v" ;; tables) tables="$v" ;; esac
+  done <<< "$facts"
+
+  # What must be true, stated as checks rather than left to the reader. A
+  # sentinel of -1 (the key was not emitted at all) fails every one of these,
+  # which is the intended direction: a check that cannot find its input is not
+  # a check that passed.
+  local problem=""
+  (( $(dbimport_fact "$facts" assets) > 0 ))                    || problem="the restored database has no assets"
+  (( $(dbimport_fact "$facts" tables) > 0 ))                    || problem="no tables were created"
+  (( $(dbimport_fact "$facts" orphan_asset_files) == 0 ))       || problem="orphaned asset_file rows"
+  (( $(dbimport_fact "$facts" orphan_exif) == 0 ))              || problem="orphaned exif rows"
+  (( $(dbimport_fact "$facts" assets_without_exif) == 0 ))      || problem="assets with no exif row"
+  (( $(dbimport_fact "$facts" null_original_path) == 0 ))       || problem="assets with no originalPath"
+  (( $(dbimport_fact "$facts" duplicate_original_paths) == 0 )) || problem="two assets share an originalPath"
+  (( $(dbimport_fact "$facts" originals_elsewhere) == 0 ))      || problem="originals outside upload/ and encoded-video/"
+  (( $(dbimport_fact "$facts" null_checksums) == 0 ))           || problem="assets with no checksum"
+  (( $(dbimport_fact "$facts" extensions) > 0 ))                || problem="no extensions were restored"
+
+  if [[ -n "$problem" ]]; then
+    echo "  result        : FAILED -- $problem"
+    record_dbimport_result "$target" failure "$snapshot_id" "$dump_bytes" "$image" "$assets" "$problem"
+    rc=1
+  else
+    echo "  result        : DATABASE IMPORT RESTORE TESTED"
+    echo "                  $assets asset(s) imported into $tables table(s), internally consistent."
+    record_dbimport_result "$target" success "$snapshot_id" "$dump_bytes" "$image" "$assets" ""
+  fi
+
+  echo
+  echo "  This proves PostgreSQL can READ the backup and that the restored rows"
+  echo "  are self-consistent. It does NOT prove a rebuilt Immich can serve the"
+  echo "  library: that is FULL IMMICH RECOVERY VERIFIED and has not been done."
+  echo "  The disposable instance and the restored dump are now removed."
+  return "$rc"
+}
+
+record_dbimport_result() {
+  local target="$1" result="$2" snap="$3" bytes="$4" image="$5" assets="$6" reason="${7:-}"
+  local dir file tmp now prev_ok_ts="" prev_ok_snap=""
+  dir="$(restore_verification_dir)"
+  mkdir -p "$dir"
+  file="$(dbimport_evidence_file "$target")"
+  now="$(date -Iseconds)"
+  # A later failure must never erase when the import last genuinely succeeded.
+  if [[ -f "$file" ]]; then
+    eval "$(
+      unset RESULT VERIFIED_TS SNAPSHOT_ID LAST_SUCCESS_TS LAST_SUCCESS_SNAPSHOT_ID
+      # shellcheck disable=SC1090
+      . "$file" >/dev/null 2>&1 || true
+      if [[ "${RESULT:-}" == "success" ]]; then
+        printf 'prev_ok_ts=%q\nprev_ok_snap=%q\n' "${VERIFIED_TS:-}" "${SNAPSHOT_ID:-}"
+      else
+        printf 'prev_ok_ts=%q\nprev_ok_snap=%q\n' "${LAST_SUCCESS_TS:-}" "${LAST_SUCCESS_SNAPSHOT_ID:-}"
+      fi
+    )"
+  fi
+  local ok_ts ok_snap
+  if [[ "$result" == "success" ]]; then ok_ts="$now"; ok_snap="$snap"
+  else ok_ts="$prev_ok_ts"; ok_snap="$prev_ok_snap"; fi
+
+  tmp="$(mktemp "$dir/.${target}-dbimport.env.XXXXXX")" || return 1
+  {
+    printf 'SCHEMA_VERSION=1\n'
+    printf 'TARGET=%s\n' "$target"
+    printf 'RESULT=%s\n' "$result"
+    printf 'VERIFIED_TS=%s\n' "$now"
+    printf 'LAST_SUCCESS_TS=%s\n' "$ok_ts"
+    printf 'LAST_SUCCESS_SNAPSHOT_ID=%s\n' "$ok_snap"
+    printf 'SNAPSHOT_ID=%s\n' "$snap"
+    printf 'DUMP_BYTES=%s\n' "$bytes"
+    printf 'PG_IMAGE=%s\n' "$image"
+    printf 'ASSETS_IMPORTED=%s\n' "${assets:-0}"
+    printf 'REASON=%s\n' "$reason"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$file"
 }
 
 main() {
@@ -1813,6 +2203,7 @@ main() {
     verify-sample)        shift; do_verify_sample "${1:-}" "${2:-}" ;;
     sample-plan)          shift; do_sample_plan "${1:-}" ;;
     exclusion-audit)      shift; do_exclusion_audit "${1:-}" ;;
+    verify-db-restore)    shift; do_verify_db_restore "${1:-}" ;;
     dr-status)            do_dr_status ;;
     -h|--help)
       cat <<EOF
@@ -1855,6 +2246,15 @@ Usage:
                                             reviewed-but-unapplied patterns.
                                             Exit 0 clean, 1 an original is
                                             matched, 2 not answerable
+  domum-media-backup verify-db-restore <target>
+                                            Import the Restic-restored Immich
+                                            dump into a DISPOSABLE PostgreSQL
+                                            (--network none, tmpfs PGDATA) and
+                                            verify tables, counts and
+                                            referential consistency. Proves
+                                            PostgreSQL can READ the backup,
+                                            which the archive checks do not.
+                                            Touches no production database.
   domum-media-backup dr-status              What is actually PROVEN about
                                             recovery, per tier and per target,
                                             on the five levels UNKNOWN /
