@@ -919,6 +919,38 @@ Cockpit, GPU work, Btrfs migration, application upgrades, historical repository
 cleanup, and large observability stacks are later work unless explicitly
 reprioritized.
 
+**A NAS is a tier decision, not a capacity decision, and the protected tier
+never moves onto one.** Measured 2026-10-09: `/srv/data` is 24% used (715 GiB
+free), `/` is 14% used (371 GiB free), and `/srv/media` is ~976 MiB — so space
+is not the constraint. NFS and SMB have no subvolumes, snapshots or reflinks, so
+moving any migrated service's state to a NAS would silently undo the migration:
+`domum_is_subvolume` returns false and per-service protection reverts to
+DEGRADED. `/srv/data` and `/srv/snapshots` stay on local Btrfs. Immich originals
+stay local — they are the one large irreplaceable dataset, and if they ever
+outgrow 931 GiB the answer is a bigger local Btrfs device, not a network
+filesystem.
+
+Two further rules follow, both instances of defect families already recorded
+here:
+
+- **restic does not check that a path is mounted.** If a backup root were a
+  network mount and the NAS were absent at 02:31, restic would walk an EMPTY
+  directory and report `snapshot … saved`; current runs add only 10–60 MiB, so a
+  near-empty run is not visibly anomalous. Same shape as the
+  `--one-file-system` hazard. Any backup root that can be a network mount must
+  be asserted mounted and non-empty, and the run must **refuse**, not warn. That
+  precondition does not exist yet and is the first thing to build.
+- **Every NAS path bound into a container needs an explicit, scoped
+  `RequiresMountsFor=`, and its fstab line never gets `nofail`** — containers are
+  `restart: unless-stopped`, so Docker starts them at boot without compose and
+  would create the bind sources on the OS disk. This deliberately couples
+  Docker to the NAS, which is why the mount belongs at a NEW path
+  (`/srv/nas/media`) added as an extra read-only source rather than by moving
+  `/srv/media`: a NAS outage must not stop four working media services.
+
+See `docs/NAS-INTEGRATION-ARCHITECTURE.md`. Planning only — no mount is
+configured and no path is moved.
+
 ---
 
 ## 15. Known open safety defects
