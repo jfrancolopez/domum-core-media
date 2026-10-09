@@ -286,6 +286,36 @@ the function against fixtures with controlled inputs and assert the ANSWER. And
 `backup_last_success_epoch` already existed -- one implementation of a check, as
 with the topology invariant.
 
+**A deployment script must not assert an absolute per-service production
+state.** The 5394e453 deployment aborted at its own stage 7 with
+
+```
+ABORT: storage protection calibre-web reports 'protected', expected 'unprotected'
+```
+
+after it had already fast-forwarded the checkout, installed every file and
+removed the old wrapper. The mutations were complete and correct; only the
+verification was stale. calibre-web had been migrated that morning — by the
+previous step of the same session — and the generated script still carried
+`"calibre-web:unprotected"` from the deployment before it.
+
+This is the stale-topology-invariant failure again, in the one place still
+outside CI: deployment scripts are generated into `/home/jfranco` and no audit
+reads them. Operator wrappers were moved into `operator/` for exactly this
+reason; the generator has the same problem and the same fix is not yet applied.
+
+What a deployment may verify about protection: that the state word is one of the
+known values, that the exit status is 0 only for `protected`, and that the
+services the deployment itself claims to block are blocked. What it may not do
+is pin which service is in which state — that is live state the deployment does
+not control, and it changed within a day twice running (`plex`, then
+`calibre-web`).
+
+Related, and the reason this one got through: I had edited the explanatory
+*note* about calibre-web and left the actual check in the loop above it. When a
+fact appears twice in a script, changing one is worse than changing neither,
+because the remaining copy now has a comment vouching for it.
+
 **Strip comments before asserting that code does NOT contain something.** Three
 assertions in one section flagged their own explanatory comments: a test for
 "does not invoke restic", one for "does not digit-strip the marker", and the
