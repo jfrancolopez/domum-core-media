@@ -523,10 +523,15 @@ restic_backup_to() {
   trap "rm -f -- '$runlog'" EXIT
   # shellcheck disable=SC2064
   trap "rm -f -- '$runlog'; exit 143" HUP INT TERM
+  # Read from backup_exclude_patterns so the audit and the backup cannot
+  # disagree about what is excluded.
+  local -a excl=() ; local pat
+  while IFS= read -r pat; do
+    [[ -n "$pat" ]] && excl+=(--exclude "$pat")
+  done < <(backup_exclude_patterns)
   restic_for_target "$target" backup \
     --tag "$(date +%Y-%m-%d)" \
-    --exclude "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp" \
-    --exclude "${DOMUM_MEDIA_ROOT}/.cache/*" \
+    "${excl[@]}" \
     "${paths[@]}" 2>&1 | tee -a "$LOG_FILE" "$runlog" >&2
   rc="${PIPESTATUS[0]}"
   BACKUP_LAST_SNAPSHOT_ID="$(sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p' "$runlog" | tail -1)"
@@ -1402,6 +1407,201 @@ EOF
   log "Repository adopted. Metadata saved to $meta_file"
 }
 
+# ---------------------------------------------------------------------------
+# Backup exclusion patterns, and whether they can be trusted
+# ---------------------------------------------------------------------------
+
+# The exclusion patterns actually handed to restic.
+#
+# They used to be written inline in the restic invocation, where nothing could
+# read them: a proposal to stop backing up regenerable data had no way to be
+# checked against what is really in effect, and "the backup excludes X" was a
+# claim about source code rather than about behaviour. One source, read by both
+# the backup and the audit, so the two cannot disagree.
+backup_exclude_patterns() {
+  printf '%s\n' "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp"
+  printf '%s\n' "${DOMUM_MEDIA_ROOT}/.cache/*"
+}
+
+# Patterns that are NOT in effect: a reviewable proposal, kept beside the
+# active set so the audit can evaluate it against live data before anyone
+# edits the backup. Nothing in the backup path reads this function.
+#
+# Immich's library holds 130.2 GiB of originals and 82.4 GiB of regenerable
+# derivatives, so excluding the derivatives is worth doing -- but only once it
+# is proven the patterns cannot reach an original. See
+# docs/BACKUP-EXCLUSION-PROPOSAL.md.
+backup_proposed_exclude_patterns() {
+  local lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  printf '%s\n' "$lib/thumbs/**"
+  printf '%s\n' "$lib/encoded-video/**/*[0-9a-f].mp4"
+}
+
+# Does one path match one restic exclude pattern?
+#
+# Conservative by construction. Restic's "**" matches zero or more path
+# components, while bash's "*" inside [[ ]] crosses "/" but a literal "**/"
+# still demands one separator -- so the zero-component case is tested as a
+# separate collapsed variant. A pattern may therefore match here that restic
+# would not: this check can over-report, never miss. That is the only safe
+# direction for a check whose job is to find an original that would silently
+# stop being backed up.
+path_matches_exclude() {  # $1 = path, $2 = pattern
+  local path="$1" pat="$2" collapsed
+  # shellcheck disable=SC2053
+  [[ "$path" == $pat ]] && return 0
+  collapsed="${pat//\*\*\//}"
+  if [[ "$collapsed" != "$pat" ]]; then
+    # shellcheck disable=SC2053
+    [[ "$path" == $collapsed ]] && return 0
+  fi
+  return 1
+}
+
+# Where the container sees the Immich library, so database paths can be
+# translated to host paths. Read from the running container rather than
+# assumed: the destination is Immich's to choose, and a wrong prefix would
+# make every original look unmatched, i.e. would make the audit pass
+# vacuously.
+immich_container_library_prefix() {
+  local lib dest
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  dest="$(docker inspect immich_server \
+    --format "{{range .Mounts}}{{if eq .Source \"$lib\"}}{{.Destination}}{{end}}{{end}}" \
+    2>/dev/null || true)"
+  printf '%s' "${dest:-/usr/src/app/upload}"
+}
+
+# Every path Immich considers an ORIGINAL, as host paths.
+#
+# The database is the only authority for this. A filesystem walk of upload/
+# cannot answer it: measured on this host, 58 assets keep their original under
+# encoded-video/ (motion-photo parts, named "<uuid>-MP.mp4"), so a proposal
+# reasoned from directory names alone would have dropped 58 irreplaceable
+# files and reported success. Returns non-zero when the database cannot be
+# read, so the caller can say UNKNOWN instead of guessing.
+immich_db_original_paths() {
+  local pg_cid pg_user pg_db prefix lib rows tbl
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  pg_user="${IMMICH_DB_USERNAME:-postgres}"
+  pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
+  pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null | head -1 || true)"
+  [[ -n "$pg_cid" ]] || return 1
+  prefix="$(immich_container_library_prefix)"
+  # The table was renamed between Immich versions; try both rather than pin one.
+  for tbl in asset assets; do
+    rows="$(docker exec -i "$pg_cid" psql -U "$pg_user" -d "$pg_db" -At \
+              -c "select \"originalPath\" from $tbl where \"originalPath\" is not null" \
+              2>/dev/null || true)"
+    if [[ -n "$rows" ]]; then
+      printf '%s\n' "$rows" | sed "s|^${prefix}|${lib}|"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Would any exclusion pattern stop an Immich original from being backed up?
+#
+# Read-only: it contacts no repository, writes nothing, and changes no
+# exclusion. It exists because the obvious version of the derivative-exclusion
+# proposal was wrong in the dangerous direction, and the only thing that
+# revealed it was comparing the patterns against the live asset table.
+#
+# Exit 0 clean, 1 an original is matched, 2 the question could not be answered.
+do_exclusion_audit() {
+  local mode="${1:-}" pat path
+  local -a patterns=() labels=()
+  local lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+
+  case "$mode" in
+    ""|--active)   : ;;
+    --proposed)    : ;;
+    *) die "Usage: domum-media-backup exclusion-audit [--proposed]" ;;
+  esac
+
+  echo "BACKUP EXCLUSION AUDIT"
+  echo
+  echo "active exclusions (in effect for every backup):"
+  while IFS= read -r pat; do
+    [[ -n "$pat" ]] || continue
+    patterns+=("$pat"); labels+=("active")
+    echo "  $pat"
+  done < <(backup_exclude_patterns)
+
+  if [[ "$mode" == "--proposed" ]]; then
+    echo
+    echo "proposed exclusions (NOT in effect; reviewed, not applied):"
+    while IFS= read -r pat; do
+      [[ -n "$pat" ]] || continue
+      patterns+=("$pat"); labels+=("proposed")
+      echo "  $pat"
+    done < <(backup_proposed_exclude_patterns)
+  fi
+
+  echo
+  local originals rc=0 total=0 hits=0 i
+  if ! originals="$(immich_db_original_paths)"; then
+    echo "originals          : UNKNOWN -- the Immich database could not be read"
+    echo
+    echo "VERDICT: UNKNOWN. The audit cannot tell whether these patterns match an"
+    echo "         original, because the asset table is the only authority for"
+    echo "         which files are originals. Do not treat this as a pass."
+    return 2
+  fi
+
+  local n_orig n_under
+  n_orig="$(printf '%s\n' "$originals" | grep -c . || true)"
+  n_under="$(printf '%s\n' "$originals" | grep -c "^${lib}/" || true)"
+  echo "originals          : $n_orig (from the Immich asset table)"
+  echo "library root       : $lib"
+  echo "under library root : $n_under"
+  echo
+
+  # A failed container-to-host translation would leave every path shaped like
+  # the container's view, matching no host pattern, and the audit would report
+  # a clean pass having compared nothing. Refuse to answer instead: the one
+  # thing this check must never do is pass vacuously.
+  if (( n_under == 0 )); then
+    echo "VERDICT: UNKNOWN -- not one original resolved under the library root, so"
+    echo "         the database paths were not translated to host paths and no"
+    echo "         pattern could have matched. Do not treat this as a pass."
+    return 2
+  fi
+
+  local -a offenders=()
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    total=$((total + 1))
+    for i in "${!patterns[@]}"; do
+      if path_matches_exclude "$path" "${patterns[$i]}"; then
+        hits=$((hits + 1))
+        offenders+=("${labels[$i]}  ${patterns[$i]}  ->  $path")
+        break
+      fi
+    done
+  done <<< "$originals"
+
+  if (( hits > 0 )); then
+    echo "MATCHED ORIGINALS  : $hits of $total"
+    echo
+    echo "These files are originals and an exclusion pattern matches them. Backing"
+    echo "them up would stop, and nothing else holds them:"
+    printf '  %s\n' "${offenders[@]:0:20}"
+    (( hits > 20 )) && echo "  ... and $((hits - 20)) more"
+    echo
+    echo "VERDICT: FAIL -- an exclusion pattern reaches irreplaceable data."
+    rc=1
+  else
+    echo "MATCHED ORIGINALS  : 0 of $total"
+    echo
+    echo "VERDICT: no Immich original is matched by any audited pattern."
+    [[ "$mode" == "--proposed" ]] && echo "         The proposal is safe against the library as it is right now."
+    rc=0
+  fi
+  return "$rc"
+}
+
 main() {
   need_root
   load_cfg
@@ -1425,6 +1625,7 @@ main() {
     verify-restore)       shift; do_verify_restore "${1:-}" ;;
     verify-sample)        shift; do_verify_sample "${1:-}" "${2:-}" ;;
     sample-plan)          shift; do_sample_plan "${1:-}" ;;
+    exclusion-audit)      shift; do_exclusion_audit "${1:-}" ;;
     -h|--help)
       cat <<EOF
 domum-media-backup — restic wrapper
@@ -1457,6 +1658,15 @@ Usage:
                                             would pick. Read-only: restores
                                             nothing, contacts nothing, records
                                             nothing
+  domum-media-backup exclusion-audit [--proposed]
+                                            Check every backup exclusion pattern
+                                            against the Immich asset table and
+                                            report whether any ORIGINAL would
+                                            stop being backed up. Read-only.
+                                            With --proposed, also audits the
+                                            reviewed-but-unapplied patterns.
+                                            Exit 0 clean, 1 an original is
+                                            matched, 2 not answerable
 EOF
       ;;
     *)

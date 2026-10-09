@@ -64,6 +64,9 @@ jobs:
       - name: Sample verification smoke test
         run: tests/sample-verification-smoke.sh
 
+      - name: Backup exclusion audit smoke test
+        run: tests/backup-exclusion-audit-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 
