@@ -109,6 +109,91 @@ assets (13,893 image, 9,140 video), 0 trashed, 23,033 distinct original paths.
 
 ---
 
+## 4b. Original-asset inventory, reconciled (2026-10-09)
+
+The database is the only authority for what counts as an original. Reconciled
+completely, with nothing assumed:
+
+| Bucket | Assets |
+|---|---:|
+| originals under `upload/` | 22,975 |
+| originals under `encoded-video/` (motion-photo parts) | 58 |
+| originals under `thumbs/`, `library/`, `profile/`, `backups/` | 0 |
+| originals anywhere else, or outside the library | 0 |
+| **total `asset` rows** | **23,033** |
+
+```
+distinct originalPath values : 23,033   (so no two assets share a path)
+null or empty originalPath   :      0
+soft-deleted assets          :      0
+paths NOT present on disk    :      0
+total bytes on disk          : 139,989,935,700  (130.4 GiB)
+over the 256 MiB sample cap  : 17 files, 7.9 GiB
+```
+
+So the earlier figure of 22,976 was wrong in two directions at once: it
+**included** one 13-byte `.immich` marker and **excluded** the 58 motion-photo
+originals. The marker was not merely counted — because selection picks the
+median-sized file of each extension, it became the representative of extension
+"immich" and was reported as a restored original:
+
+```
+match     immich           13  .immich
+```
+
+Coverage is now computed from `asset.originalPath`. The first consequence is
+visible immediately: a `-MP.mp4` motion-photo original is now sampleable, and
+one was selected on the first run — the first time any of those 58 files has
+ever been restore-tested.
+
+---
+
+## 4c. Database import: what the archive checks never proved
+
+`verify-restore` checks gzip, size and footer. Those prove the **file** is
+intact and say nothing about whether PostgreSQL can read it.
+
+`verify-db-restore` imports the restic-restored dump into a disposable
+PostgreSQL. Measured against the real production dump (28,066,699 bytes):
+
+```
+image      : tensorchord/pgvecto-rs:pg14-v0.2.0   (production's own image)
+isolation  : --network none, tmpfs PGDATA, no port, no bind mount
+import     : 20 s, exit 0, ZERO stderr, under ON_ERROR_STOP=1
+tables     : 61            extensions : 7  (incl. vectors 0.2.0)
+assets     : 23,033        asset_file : 41,450        exif rows : 23,033
+orphans    : 0 asset_file, 0 exif, 0 album_asset, 0 face
+assets without exif : 0    null originalPath : 0    duplicate paths : 0
+originals  : 22,975 upload/ + 58 encoded-video/ + 0 elsewhere
+checksums  : 23,033 non-null (22,282 distinct)
+```
+
+Every count matches production exactly, and the path reconciliation holds
+inside the restored copy.
+
+The image matters: the dump declares `CREATE EXTENSION vectors WITH SCHEMA
+vectors`, which only the pgvecto-rs image provides. A plain `postgres:14` would
+fail for a reason that has nothing to do with the backup, so the image is read
+from `docker inspect immich_postgres` rather than hardcoded, and an absent image
+reports NOT ATTEMPTED rather than pulling during a verification run.
+
+A deliberately truncated dump fails, naming the column it died on — so the
+check is not vacuous.
+
+### The three claims, kept apart
+
+| Claim | Means | Status |
+|---|---|---|
+| ARCHIVE VALIDATED | gzip, size and footer of the restored file | **YES**, 2026-10-09 |
+| DATABASE IMPORT RESTORE TESTED | a real PostgreSQL imported it strictly and the rows are self-consistent | **YES**, rehearsed against the real dump |
+| FULL IMMICH RECOVERY VERIFIED | a rebuilt Immich served the restored library | **NO** — never attempted |
+
+`dr-status` previously promoted the first to `RESTORE TESTED`. It no longer
+does: archive checks are reported and the level stays `BACKED UP` until an
+import has actually happened.
+
+---
+
 ## 5. The exact missing piece
 
 Priority 1 asked whether family photo and video recovery from Hetzner is
@@ -137,13 +222,96 @@ demonstrated**, which is a different and currently unresolved thing.
 
 ---
 
+## 5b. The large originals, proven progressively
+
+17 originals exceed the 256 MiB per-file sample cap: **15 `.mov` and 2 `.mp4`,
+from 274 MB to 1.38 GB, 7.9 GiB in total.** They are the home videos — the
+least replaceable files in the library and the least represented by a sample of
+photos.
+
+Raising the cap is the wrong fix: it would fetch 7.9 GiB from Hetzner on every
+run to move a reported percentage. `verify-large` accumulates coverage instead:
+
+| Mechanism | Effect |
+|---|---|
+| smallest unproven file of each container format first | a run covers a new format before a second copy of a proven one |
+| `LARGE_MAX_RUN_BYTES` (default 1 GiB) | caps one run, names itself when it defers, always allows one file so it cannot deadlock |
+| durable history (`<target>-large-verified.jsonl`, 0600) | a proven file is never fetched again |
+| `--revalidate` | the only way to re-prove something |
+| `--plan` | states the exact byte cost and contacts nothing |
+
+A default run against the real library is **2 files, 524.4 MiB** — one `.mov`
+and one `.mp4` — against the 2.2 GiB an unbounded "verify 3" would have cost.
+Nine runs at that rate would cover the whole set.
+
+A mismatch is recorded as `MISMATCH` and is **not** counted as proven
+afterwards, so a corrupted large original cannot quietly become part of the
+coverage figure.
+
+---
+
+## 5c. What goes off-site, and what must not
+
+Hetzner should hold the irreplaceable things and nothing whose recovery plan is
+"download it again". `dr-status` now states the scope rather than leaving it to
+be inferred:
+
+```
+BACKUP SCOPE (what goes off-site)
+  included                           /srv/data
+  excluded                           /srv/data/immich/backup-staging/*.tmp
+  excluded                           /srv/media/.cache/*
+  replaceable media tier             not in the backup set (correct: /srv/media is reacquirable)
+  image archives                     N in /srv/data/backups/images (in the backup set)
+```
+
+| Should be off-site | Status |
+|---|---|
+| family originals (23,033 / 130.4 GiB) | **in** |
+| Immich PostgreSQL dump | **in** |
+| application state on the protected tier | **in** |
+| small databases (traefik `acme.json`, uptime-kuma `kuma.db`) | in, via the recovery pack |
+| recovery metadata and image archives | **in** (`/srv/data/backups/images`) |
+
+| Should NOT be off-site | Status |
+|---|---|
+| films, television | none exist on this host yet |
+| music (975 MiB), books (496 KiB) | **out** — `/srv/media` is not under the include root |
+| regenerable thumbnails (5.4 GiB) | **in** — the proposal would remove them |
+| transcodes (77.1 GiB) | **in** — the proposal would remove them |
+| caches | **out** — `/srv/media/.cache/*` excluded |
+
+So the distinction is already correct for the replaceable *media* tier, and the
+remaining 82.5 GiB of regenerable Immich derivatives is the one deliberate
+overpayment — gated, measured, and not yet applied.
+
+### How history is preserved when an exclusion takes effect
+
+A restic exclusion affects **new snapshots only**. Existing snapshots keep their
+own file lists and the data they reference: restic is content-addressed, so a
+blob stays in the repository while any snapshot still references it. Switching
+`BACKUP_EXCLUDE_IMMICH_DERIVATIVES` on would therefore:
+
+- leave every existing snapshot complete and restorable, derivatives included;
+- stop *adding* derivative blobs from the next run onward;
+- free nothing until retention eventually forgets those older snapshots **and**
+  a `prune` runs.
+
+That is why the saving is gradual rather than immediate, and why **no snapshot
+is pruned as part of applying an exclusion.** Old snapshots are the fallback if
+the exclusion ever turns out to be wrong.
+
+---
+
 ## 6. What one root run would settle
 
 ```
 sudo domum-media-backup dr-status
 sudo domum-media-backup exclusion-audit --proposed
 sudo domum-media-backup verify-restore cloud
+sudo domum-media-backup verify-db-restore cloud
 sudo domum-media-backup verify-sample cloud 12
+sudo domum-media-backup verify-large cloud
 sudo domum-media-backup dr-status
 ```
 
@@ -153,8 +321,13 @@ sudo domum-media-backup dr-status
   that the proposed patterns reach no original.
 - `verify-restore` restores the Immich dump into an isolated scratch directory
   (asserted to be outside every live data root) and revalidates it.
+- `verify-db-restore` imports the restored dump into a disposable PostgreSQL,
+  which is the only thing that proves PostgreSQL can read it.
 - `verify-sample` restores a deterministic, diverse sample of real originals
-  and compares them byte-for-byte, now recording the population.
+  and compares them byte-for-byte, now recording the population from the asset
+  table.
+- `verify-large` proves two of the 17 over-cap home videos (524 MiB) and
+  records them, so later runs continue rather than repeat.
 - `dr-status` again, to show what the run actually earned.
 
 All five are read-only with respect to production: they restore into scratch,

@@ -18,6 +18,19 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 command -v jq >/dev/null 2>&1 || fail "jq is required for this test"
 
+# Make the host unreachable. Any code path that tries to read the real Immich
+# database must FAIL here rather than quietly succeed: an earlier revision of
+# this suite reached production and reported its 23,033 assets from inside a
+# fixture library.
+mkdir -p "$TMP_DIR/bin"
+cat > "$TMP_DIR/bin/docker" <<'NODOCKER'
+#!/usr/bin/env bash
+echo "docker is deliberately unavailable in this test" >&2
+exit 127
+NODOCKER
+chmod +x "$TMP_DIR/bin/docker"
+export PATH="$TMP_DIR/bin:$PATH"
+
 LIB="$TMP_DIR/library"
 mkdir -p "$LIB/a" "$LIB/b"
 # Diverse types and sizes, plus one file deliberately over the per-file cap.
@@ -36,6 +49,12 @@ mk b/huge.mp4  40000     # over the per-file cap below
 cat > "$TMP_DIR/stubs.sh" <<'STUBS'
 backup_target_enabled() { return 0; }
 log() { :; }
+# Stands in for the Immich asset table. It lists the fixture's media files and
+# deliberately does NOT list the .immich marker, because the asset table does
+# not list markers -- which is exactly why the marker can no longer be sampled.
+immich_db_original_paths() {
+  find "$IMMICH_LIBRARY_DIR" -type f ! -name '.immich' 2>/dev/null | sort
+}
 restic_for_target() {
   shift
   case "$1" in
@@ -74,6 +93,10 @@ SAMPLE_MAX_FILE_BYTES=10000
 SAMPLE_MAX_TOTAL_BYTES=1000000
 source '$REPO_ROOT/bin/domum-media-backup'
 source '$TMP_DIR/stubs.sh'
+# Selection and coverage are pure functions of an INVENTORY file. Production
+# builds it from the Immich asset table; tests build it by walking, which is
+# what inventory_from_dir exists for.
+_inv() { local f; f=\"\$(mktemp)\"; inventory_from_dir \"\$1\" \"\$f\"; printf '%s' \"\$f\"; }
 $1
 "
 }
@@ -81,9 +104,9 @@ $1
 # ---------------------------------------------------------------------------
 # 1. Selection is deterministic and diverse, and honours the per-file cap.
 # ---------------------------------------------------------------------------
-sel1="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 7')" \
+sel1="$(harness 'sample_select_paths "$(_inv "$IMMICH_LIBRARY_DIR")" 7')" \
   || fail "sample_select_paths failed"
-sel2="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 7')"
+sel2="$(harness 'sample_select_paths "$(_inv "$IMMICH_LIBRARY_DIR")" 7')"
 [[ "$sel1" == "$sel2" ]] || fail "selection is not deterministic"
 
 grep -q 'huge.mp4' <<< "$sel1" && fail "a file above the per-file cap was selected: $sel1"
@@ -174,7 +197,28 @@ for i in 1 2 3 4 5 6 7 8; do head -c 900 /dev/urandom > "$LIB2/thumbs/bb/thumb$i
 head -c 900 /dev/urandom > "$LIB2/encoded-video/cc/transcode.mp4"
 head -c 900 /dev/urandom > "$LIB2/backups/dump.sql.gz"
 
-sel="$(bash -c "
+# The asset table decides what is an original -- not the directory a file
+# sits in. That is the whole point: a motion-photo original lives UNDER
+# encoded-video/ and must be sampleable, while a transcode sitting beside it
+# must never be. A walk of upload/ got both of those wrong at once.
+LIB2_MP="$LIB2/encoded-video/aa/bb/676850ba-6d31-43a1-9a03-b7710f607bcc-MP.mp4"
+mkdir -p "$(dirname "$LIB2_MP")"
+head -c 700 /dev/urandom > "$LIB2_MP"
+
+cat > "$TMP_DIR/dbstub.sh" <<STUB
+# Stands in for the asset table: upload/ originals plus one motion-photo
+# original under encoded-video/. Nothing generated is listed, because the
+# asset table does not list generated files.
+immich_db_original_paths() {
+  printf '%s\n' \\
+    '$LIB2/upload/a/one.heic' \\
+    '$LIB2/upload/a/two.mov' \\
+    '$LIB2_MP'
+}
+STUB
+
+run2() {
+  bash -c "
 set -uo pipefail
 DOMUM_STATE_ROOT='$TMP_DIR/state'
 DOMUM_DATA_ROOT='$TMP_DIR/data'
@@ -183,28 +227,51 @@ IMMICH_LIBRARY_DIR='$LIB2'
 SAMPLE_MAX_FILE_BYTES=100000
 SAMPLE_MAX_TOTAL_BYTES=10000000
 source '$REPO_ROOT/bin/domum-media-backup'
-sample_select_paths \"\$(immich_originals_dir '$LIB2')\" 8")"
+source '$TMP_DIR/dbstub.sh'
+$1
+"
+}
 
-[[ -n "$sel" ]] || fail "nothing was selected from the originals subtree"
-grep -q '/upload/' <<< "$sel" || fail "the sample did not come from upload/: $sel"
+mkdir -p "$LIB2/upload/a"
+head -c 500 /dev/urandom > "$LIB2/upload/a/one.heic"
+head -c 600 /dev/urandom > "$LIB2/upload/a/two.mov"
+
+inv_counts="$(run2 'inv=$(mktemp); immich_original_inventory "$inv"; cat "$inv"')" \
+  || fail "building the inventory from the asset table failed"
+[[ "$(head -1 <<< "$inv_counts")" == "3 0" ]] \
+  || fail "expected 3 originals and 0 missing, got: $(head -1 <<< "$inv_counts")"
+
+sel="$(run2 'inv=$(mktemp); immich_original_inventory "$inv" >/dev/null; sample_select_paths "$inv" 8')"
+[[ -n "$sel" ]] || fail "nothing was selected from the asset table"
+grep -q '/upload/' <<< "$sel" || fail "the sample did not include upload/ originals: $sel"
+grep -q -- '-MP.mp4' <<< "$sel" \
+  || fail "the motion-photo ORIGINAL under encoded-video/ was not sampleable: $sel"
 grep -q '/thumbs/' <<< "$sel" && fail "a generated thumbnail was sampled as an original: $sel"
-grep -q '/encoded-video/' <<< "$sel" && fail "a transcode was sampled as an original: $sel"
 grep -q '/backups/' <<< "$sel" && fail "a database dump was sampled as an original: $sel"
+grep -qE '/encoded-video/.*[0-9a-f]\.mp4' <<< "$sel" \
+  && fail "a transcode was sampled as an original: $sel"
+grep -q '\.immich' <<< "$sel" && fail "an .immich marker was sampled as an original: $sel"
 
-# And the resolver must fall back to the whole library when there is no upload/,
-# rather than failing -- a narrower claim stated plainly beats a broken command.
-LIB3="$TMP_DIR/library3"; mkdir -p "$LIB3/photos"
-head -c 100 /dev/urandom > "$LIB3/photos/a.heic"
-got="$(bash -c "
-set -uo pipefail
-source '$REPO_ROOT/bin/domum-media-backup'
-immich_originals_dir '$LIB3'")"
-[[ "$got" == "$LIB3" ]] || fail "with no upload/ the resolver must fall back to the library root, got $got"
-got="$(bash -c "
-set -uo pipefail
-source '$REPO_ROOT/bin/domum-media-backup'
-immich_originals_dir '$LIB2'")"
-[[ "$got" == "$LIB2/upload" ]] || fail "with an upload/ subtree the resolver must use it, got $got"
+# A path the asset table names but that is NOT on disk must be counted as
+# missing, not silently dropped: it is an original with no backup.
+cat > "$TMP_DIR/dbstub.sh" <<STUB
+immich_db_original_paths() {
+  printf '%s\n' '$LIB2/upload/a/one.heic' '$LIB2/upload/a/GONE.heic'
+}
+STUB
+miss="$(run2 'inv=$(mktemp); immich_original_inventory "$inv"')"
+[[ "$miss" == "2 1" ]] || fail "a missing original was not counted: got '$miss'"
+
+# And with no asset table at all it must REFUSE, not fall back to a walk.
+cat > "$TMP_DIR/dbstub.sh" <<'STUB'
+immich_db_original_paths() { return 1; }
+STUB
+out="$(run2 'do_sample_plan 4' 2>&1)"; rc=$?
+[[ "$rc" -ne 0 ]] || fail "with no asset table the plan must refuse, it exited 0: $out"
+grep -q 'asset table could not be read' <<< "$out" \
+  || fail "the refusal does not name the cause: $out"
+grep -q 'marker' <<< "$out" \
+  || fail "the refusal does not say why a walk is not an acceptable substitute: $out"
 
 # The plan command itself must sample originals, and must say plainly that it
 # is a plan. Exercising only sample_select_paths left do_sample_plan free to
@@ -213,22 +280,34 @@ immich_originals_dir '$LIB2'")"
 # Clear any manifest an earlier assertion left behind, or "a plan records
 # nothing" would be checking someone else's file.
 rm -f "$TMP_DIR/state/restore-verification/cloud-sample.jsonl"
-plan_out="$(bash -c "
-set -uo pipefail
-DOMUM_STATE_ROOT='$TMP_DIR/state'
-DOMUM_DATA_ROOT='$TMP_DIR/data'
-DOMUM_MEDIA_ROOT='$TMP_DIR/mediaroot'
-IMMICH_LIBRARY_DIR='$LIB2'
-SAMPLE_MAX_FILE_BYTES=100000
-SAMPLE_MAX_TOTAL_BYTES=10000000
-source '$REPO_ROOT/bin/domum-media-backup'
-do_sample_plan 8" 2>&1)" || fail "sample-plan failed: $plan_out"
+# Restore the LIB2 asset-table stub: the section above deliberately broke it to
+# prove the plan REFUSES without one.
+cat > "$TMP_DIR/dbstub.sh" <<STUB
+immich_db_original_paths() {
+  printf '%s\n' \\
+    '$LIB2/upload/a/one.heic' \\
+    '$LIB2/upload/a/two.mov' \\
+    '$LIB2_MP'
+}
+STUB
+plan_out="$(run2 'do_sample_plan 8' 2>&1)" || fail "sample-plan failed: $plan_out"
 
-grep -q 'Sample plan for .*/upload' <<< "$plan_out" \
-  || fail "sample-plan did not report that it planned over upload/: $plan_out"
+# The plan states its population AND where those originals live, so a reader
+# can see that encoded-video/ contributes originals rather than assuming every
+# original sits under upload/.
+grep -q 'Sample plan over 3 original(s)' <<< "$plan_out" \
+  || fail "sample-plan did not state its population: $plan_out"
+grep -qE '2 under upload/' <<< "$plan_out" \
+  || fail "sample-plan did not break the population down by location: $plan_out"
+grep -qE '1 under encoded-video/' <<< "$plan_out" \
+  || fail "sample-plan hid the encoded-video original: $plan_out"
+grep -q 'from the Immich asset table' <<< "$plan_out" \
+  || fail "sample-plan does not say where its population came from: $plan_out"
+# Generated files are absent because the asset table never named them.
 grep -q 'thumbs/' <<< "$plan_out" && fail "sample-plan listed a generated thumbnail: $plan_out"
-grep -q 'encoded-video/' <<< "$plan_out" && fail "sample-plan listed a transcode: $plan_out"
 grep -q 'backups/' <<< "$plan_out" && fail "sample-plan listed a database dump: $plan_out"
+grep -qE '/encoded-video/.*[0-9a-f]\.mp4' <<< "$plan_out" \
+  && fail "sample-plan listed a transcode: $plan_out"
 
 # A plan is not evidence and must never read as one.
 grep -qi 'This is a PLAN' <<< "$plan_out" || fail "sample-plan did not say it is a plan: $plan_out"
@@ -249,7 +328,7 @@ grep -qi 'Nothing was restored' <<< "$plan_out" || fail "sample-plan did not say
 # ---------------------------------------------------------------------------
 echo "== coverage: the population and the never-sampled set are counted =="
 # The fixture has 9 files; huge.mp4 (40000 b) is the only one over the 10000 cap.
-cov="$(harness 'sample_coverage_stats "$IMMICH_LIBRARY_DIR"')" \
+cov="$(harness 'sample_coverage_stats "$(_inv "$IMMICH_LIBRARY_DIR")"')" \
   || fail "sample_coverage_stats failed"
 read -r c_tf c_tb c_of c_ob <<< "$cov"
 [ "$c_tf" = "9" ] || fail "population is $c_tf file(s), expected 9: [$cov]"
@@ -262,7 +341,7 @@ echo "  9 file(s) / $exp_tb b; 1 oversize / 40000 b"
 echo "== coverage: the oversize file is really unreachable by selection =="
 # Not merely counted as excluded -- it must never appear in a selection, even
 # when the quota exceeds the number of eligible files.
-sel="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 99')"
+sel="$(harness 'sample_select_paths "$(_inv "$IMMICH_LIBRARY_DIR")" 99')"
 grep -q 'huge.mp4' <<< "$sel" \
   && fail "the oversize file was selected despite the per-file cap"
 [ "$(grep -c . <<< "$sel")" = "8" ] \
@@ -270,18 +349,20 @@ grep -q 'huge.mp4' <<< "$sel" \
 echo "  selection returns 8 of 9; huge.mp4 is never reachable"
 
 echo "== coverage: the report block NAMES the gap, and says so in bytes =="
-out="$(harness 'sample_report_coverage "$IMMICH_LIBRARY_DIR"' 2>&1)" \
+out="$(harness 'sample_report_coverage "$(_inv "$IMMICH_LIBRARY_DIR")" "$IMMICH_LIBRARY_DIR" 0' 2>&1)" \
   || fail "sample_report_coverage failed: $out"
-grep -q 'population   : 9 file(s)' <<< "$out" || fail "no population line: $out"
+grep -q 'originals    : 9 asset(s)' <<< "$out" || fail "no population line: $out"
+grep -q 'from the Immich asset table' <<< "$out" \
+  || fail "the population does not state its provenance: $out"
 grep -q 'NEVER sampled: 1 file(s)' <<< "$out" || fail "the gap is not stated: $out"
 grep -q 'exceed the per-file' <<< "$out" || fail "the reason is not stated: $out"
-grep -q 'raise SAMPLE_MAX_FILE_BYTES' <<< "$out" \
+grep -q 'verify-large' <<< "$out" \
   || fail "it does not say how to close the gap: $out"
 echo "  population, never-sampled count, bytes and the remedy all stated"
 
 echo "== coverage: 'none by size' when every file fits =="
 # The reassuring answer must be reachable too, or the line is just noise.
-out="$(harness 'SAMPLE_MAX_FILE_BYTES=100000; sample_report_coverage "$IMMICH_LIBRARY_DIR"' 2>&1)"
+out="$(harness 'SAMPLE_MAX_FILE_BYTES=100000; sample_report_coverage "$(_inv "$IMMICH_LIBRARY_DIR")" "$IMMICH_LIBRARY_DIR" 0' 2>&1)"
 grep -q 'NEVER sampled: none by size' <<< "$out" \
   || fail "with a cap above every file it did not say the gap is empty: $out"
 grep -q 'NEVER sampled: 1 file' <<< "$out" \
@@ -336,7 +417,7 @@ SAMPLE_MAX_FILE_BYTES=10000
 SAMPLE_MAX_TOTAL_BYTES=1000000
 source '$mut/domum-media-backup'
 source '$TMP_DIR/stubs.sh'
-sample_report_coverage \"\$IMMICH_LIBRARY_DIR\"
+sample_report_coverage \"\$(_inv \"\$IMMICH_LIBRARY_DIR\")\" \"\$IMMICH_LIBRARY_DIR\" 0
 " 2>&1)"
 grep -q 'NEVER sampled: none by size' <<< "$out" \
   || fail "removing the tally did NOT change the statement, so the assertions above

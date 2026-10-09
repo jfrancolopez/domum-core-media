@@ -702,6 +702,128 @@ clean `0 matched` having compared nothing. `tests/backup-exclusion-audit-smoke.s
 mutates that guard away and requires the false clean verdict to appear. See
 `docs/BACKUP-EXCLUSION-PROPOSAL.md`.
 
+**The asset table is the ONLY authority for what is an Immich original.** A
+filesystem walk of `upload/` got both ends of the coverage fraction wrong at
+once: it counted the 13-byte `.immich` marker as an original *and* missed the 58
+originals under `encoded-video/`. Worse, because selection picks the
+median-sized file of each extension, the marker became the representative of
+extension "immich" and was reported as a restored original -- `match immich 13
+.immich` appeared in a production verification run. Selection and coverage are
+now pure functions of an INVENTORY built from `asset.originalPath`
+(`immich_original_inventory`), a path the table names but which is absent from
+disk is counted as **missing** rather than silently dropped, and both
+`verify-sample` and `sample-plan` **refuse** when the table cannot be read
+rather than falling back to the walk. Measured: 23,033 originals = 22,975 under
+`upload/` + 58 under `encoded-video/`, zero duplicates, zero nulls, zero
+elsewhere, zero missing on disk, 130.4 GiB.
+
+**The inventory must never be written inside the restore target.** `$scratch`
+is what restic restores into, so a file placed there is indistinguishable from
+restored content. It was briefly inside, and the corruption test caught it: the
+stub that damages "the first restored file" damaged the inventory instead, and
+the corruption went undetected.
+
+**ARCHIVE VALIDATED, DATABASE IMPORT RESTORE TESTED and FULL IMMICH RECOVERY
+VERIFIED are three different claims.** `verify-restore` checks gzip, size and
+footer -- that the FILE is intact. That says nothing about whether PostgreSQL
+can read it, and `dr-status` wrongly promoted it to `RESTORE TESTED`.
+`verify-db-restore` imports the restic-restored dump into a DISPOSABLE
+PostgreSQL and earns the second claim; the third requires a rebuilt Immich
+serving the library and has never been done. Rules that hold:
+
+- **The import runs under `ON_ERROR_STOP=1`.** Without it psql reports success
+  having skipped every statement it could not run. Measured against the real
+  dump: 20 s, exit 0, zero stderr, 23,033 assets into 61 tables, and a
+  deliberately truncated dump fails with the offending column named.
+- **The disposable instance must use the image production uses**, read from
+  `docker inspect`, never hardcoded: the dump declares
+  `CREATE EXTENSION vectors WITH SCHEMA vectors`, which only `pgvecto-rs`
+  provides, so a plain `postgres:14` would fail for a reason that has nothing to
+  do with the backup. If the image is absent locally it reports NOT ATTEMPTED
+  and **refuses to pull** -- what gets tested must be what is already here.
+- **Isolation is structural, not promised**: `--network none`, tmpfs PGDATA, no
+  published port, no bind mount, removed by a trap that also terminates on a
+  signal. The test asserts docker was really given those flags, not that the
+  report mentions them.
+- **A consistency key that was never emitted returns a sentinel that FAILS every
+  check.** `(( $(f missing) > 0 ))` with an empty substitution is a runtime
+  syntax error, so under `set -e` a renamed key would abort the verification
+  instead of failing it -- the metadata-key family again.
+
+`tests/db-import-verification-smoke.sh`; 1 mutant (dropping `ON_ERROR_STOP=1`
+must let a broken import pass), killed.
+
+**A test must not be ABLE to reach the host.** An un-stubbed
+`immich_db_original_paths` in `sample-verification-smoke` silently queried the
+LIVE production database and the plan reported its 23,033 assets from inside a
+fixture library. Redirecting roots is not enough when the code path leaves the
+filesystem: put a `docker` stub on `PATH` that exits non-zero, so reaching
+production FAILS instead of quietly succeeding.
+
+**The exclusion check matches PATHS from the asset table, never a stat of
+them.** Whether a file is currently on disk is a different question: a path the
+table names is an original, and a pattern that matches it is wrong even while
+the file is absent. Making the match depend on an inventory built by `stat`
+meant the audit compared nothing and reported `0 matched` for a library whose
+files had not been created -- the vacuity hole again, found by CI, now pinned by
+a regression assertion. The inventory with sizes is for SAMPLING; matching needs
+only paths.
+
+**The large originals are proven progressively, never in bulk.** Measured: 17
+originals exceed the 256 MiB sample cap -- 15 `.mov` and 2 `.mp4`, 274 MB to
+1.38 GB, 7.9 GiB in total, i.e. the home videos. Raising the cap would fetch
+7.9 GiB from Hetzner on every run to move a reported percentage, so
+`verify-large` accumulates instead: smallest unproven file of each container
+format first, `LARGE_MAX_RUN_BYTES` (1 GiB) capping a run while always allowing
+one file so it cannot deadlock, a durable 0600 history so a proven file is never
+fetched twice, `--revalidate` as the only way to re-prove, and `--plan` stating
+the byte cost without contacting anything. A default run is **2 files, 524 MiB**.
+A `MISMATCH` is recorded and **not** counted as proven, so a corrupted large
+original cannot quietly join the coverage figure.
+
+Two defects there, both found by running the code rather than reading it, both
+of families already recorded in this file:
+
+- the history filter was `grep -vxF -f <paths>` against `<size>\t<path>` lines,
+  which can **never** match on a whole line -- the `docker images -q` short-id
+  defect exactly. Every proven file was re-selected and re-downloaded while the
+  report claimed they were already proven;
+- replacing it with the `NR==FNR` idiom broke the **empty** case: for the first
+  line of the second input `NR==FNR==1`, so that line is mistaken for a history
+  entry. With no history the candidate set silently emptied and the command
+  announced "every large original is proven" having verified none. Read the
+  other file with `getline` instead.
+
+**"Not in the backup set" and "the include set was never read" are different
+claims.** `dr_path_configured` reported the former for the latter. It now has a
+third state and the report says UNKNOWN -- the same conflation the five levels
+exist to prevent, in the one place that decides whether anything is covered at
+all.
+
+**An exclusion affects NEW snapshots only, and applying one must never prune.**
+restic is content-addressed: existing snapshots keep their file lists and the
+blobs they reference, so switching the derivative exclusion on would leave every
+existing snapshot complete and restorable, stop adding derivative blobs from the
+next run, and free nothing until retention forgets those snapshots **and** a
+prune runs. The saving is therefore gradual by design, and the old snapshots are
+the fallback if the exclusion turns out to be wrong. Never prune to realise a
+saving sooner.
+
+**`dr-status` states the backup SCOPE, so the irreplaceable/reacquirable split
+is checked rather than assumed.** Measured: `/srv/media` (975 MiB of music,
+496 KiB of books) is **not** under the include root, so the replaceable tier is
+correctly absent from Hetzner, and `/srv/media/.cache/*` is excluded. The one
+deliberate overpayment is the 82.5 GiB of regenerable Immich derivatives, which
+is gated and unapplied. A reacquirable tier found INSIDE the include set is
+reported as a finding.
+
+**When editing a file programmatically, assert the anchor matched.** A
+replacement whose anchor text did not exist silently did nothing, so a test's
+database stub was never installed into the harness and the suite reported
+"the asset table could not be read" from inside a fixture that had one. A
+no-op edit is indistinguishable from a successful one unless the count is
+checked.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a
@@ -765,8 +887,19 @@ Read it rather than relying on remembered commands. It currently expects:
 
 Notes:
 
-- `shellcheck` is **not installed on this host**; CI installs it. Do not report
-  a shellcheck pass that did not run.
+- `shellcheck` is not installed as a host package, but it **can be run here**
+  through the image that is now pulled locally, with exactly the flags CI uses:
+
+  ```
+  docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:stable \
+    --severity=warning bin/domum-media bin/domum-media-backup \
+    bin/domum-media-report install.sh operator/*.sh
+  ```
+
+  Run it before pushing. Two CI failures were spent on findings it reports in
+  seconds -- `SC2178`/`SC2128` from reusing the name of an array in the same
+  file as a string local, and `SC2155` from `local x="$(...)"`. Still do not
+  report a shellcheck pass that did not run.
 - **The workflow enumerates every test by name — there is no glob.** A new suite
   is not enforced until a step is added, and seven were not: they passed locally
   and were reported as "CI green" while CI had never run them. `tests/ci-coverage-audit.sh`

@@ -70,6 +70,15 @@ jobs:
       - name: DR status smoke test
         run: tests/dr-status-smoke.sh
 
+      - name: Database import verification smoke test
+        run: tests/db-import-verification-smoke.sh
+
+      - name: Exclusion invariant smoke test
+        run: tests/exclusion-invariant-smoke.sh
+
+      - name: Large original verification smoke test
+        run: tests/large-verification-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 
