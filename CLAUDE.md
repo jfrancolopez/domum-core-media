@@ -47,8 +47,9 @@ directories, dry runs, or an isolated scratch restore location.
 
 ## 3. Btrfs truth
 
-**Four services are migrated and protected: `jellyfin` (2026-09-25), `kavita`
-(2026-09-29), `navidrome` (2026-09-29) and `plex` (2026-10-06).** Each is a real
+**FIVE services are migrated and protected: `jellyfin` (2026-09-25), `kavita`
+(2026-09-29), `navidrome` (2026-09-29), `plex` (2026-10-06) and `calibre-web`
+(2026-10-09).** Each is a real
 Btrfs subvolume with a verified read-only proof snapshot and retained
 `.premigration`. Plex is the one with symlinks (7, one absolute into the
 container's `/config` namespace) and the weakest application pairing
@@ -57,8 +58,26 @@ dangling and survives only because a container references it). Its migration
 deliberately did **not** deploy its staged image, which was the point of doing
 it. `docs/PLEX-MIGRATION-RESULT.md` holds the evidence.
 
-**Still ordinary directories: `calibre-web` and `immich`** — so their upgrades
-remain correctly blocked, and `calibre-web` still has a staged image waiting.
+**Still an ordinary directory: `immich`** — so its upgrade remains correctly
+blocked. It is deliberately last and needs its own reviewed phase.
+
+**`calibre-web` was migrated 2026-10-09** (inode 256, `st_dev` 55 vs the
+parent's 45; proof snapshot `calibre-web-20261009-131921-post-migration`,
+`ro=true`; `.premigration` retained at 264 KB). It was the easiest of the five,
+as measured beforehand: 6 files, 255,729 bytes, `journal_mode DELETE` so no WAL
+to quiesce, and no symlinks. Its staged 0.6.27 image was reported and
+deliberately **not** deployed; the image was unchanged across the restart.
+
+Two per-service declarations were exercised in production for the first time
+there, and both worked: `service_sqlite_binary calibre-web` turned
+`unsupported: not checked` into `sqlite: 2 checked, 0 not checked` (its image
+ships sqlite3 3.45.1, and there is none on the host), and
+`service_ready_log_pattern calibre-web` produced
+`LOGGED READY since the restart: "port [tcp/*] succeeded!"`. Readiness is still
+all that proves — calibre-web has no container healthcheck.
+
+Its upgrade to 0.6.27-ls399 is now possible through the gated per-service path,
+and has not been performed.
 
 **`jellyfin` was the first, on 2026-09-25.** `/srv/data/jellyfin` is
 a real Btrfs subvolume (inode 256, `st_dev` 51 vs the parent's 45) with a verified

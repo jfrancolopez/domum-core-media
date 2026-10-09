@@ -38,7 +38,7 @@ CONTAINERS="traefik tailscale uptime-kuma jellyfin plex navidrome calibre-web ka
 # The fixture. $ENV/img-<svc> is the image a container currently runs; the
 # stub rewrites it only on `compose up -d`, which is what reconciling means.
 # --------------------------------------------------------------------------
-setup() {  # $1.. = options: no-subvol, no-staged, archive-fails, snapshot-fails
+setup() {  # $1.. = options: no-subvol, unprotected-cw, no-staged, archive-fails, snapshot-fails
   rm -rf "${TMP_DIR:?}/f"
   ENV_DIR="$TMP_DIR/f"
   mkdir -p "$ENV_DIR"/{data,snapshots,state,log,media,bin,st}
@@ -46,7 +46,11 @@ setup() {  # $1.. = options: no-subvol, no-staged, archive-fails, snapshot-fails
   local opts=" $* "
 
   # Four migrated subvolumes; calibre-web deliberately an ordinary directory.
-  [[ "$opts" == *" no-subvol "* ]] || for s in plex jellyfin kavita navidrome; do
+  # calibre-web joined the migrated set on 2026-10-09; the fixture tracks
+  # production. `unprotected-cw` models the state before that, which is what
+  # section 7 needs in order to exercise the refusal at all.
+  [[ "$opts" == *" no-subvol "* ]] || for s in plex jellyfin kavita navidrome calibre-web; do
+    [[ "$s" == "calibre-web" && "$opts" == *" unprotected-cw "* ]] && continue
     touch "$ENV_DIR/data/$s/.is-subvol"
   done
   # Plausible application state so quiescence has something to look at.
@@ -56,7 +60,8 @@ setup() {  # $1.. = options: no-subvol, no-staged, archive-fails, snapshot-fails
   # snapshot, which is what makes its protection state `protected` rather than
   # `snapshottable`. Without these the wrapper correctly refused, because a
   # subvolume with no snapshot has never actually been snapshotted.
-  [[ "$opts" == *" no-subvol "* ]] || for svc in plex jellyfin kavita navidrome; do
+  [[ "$opts" == *" no-subvol "* ]] || for svc in plex jellyfin kavita navidrome calibre-web; do
+    [[ "$svc" == "calibre-web" && "$opts" == *" unprotected-cw "* ]] && continue
     snap="$ENV_DIR/snapshots/$svc-20261006-120000-post-migration"
     mkdir -p "$snap"
     touch "$snap/.is-subvol" "$snap/.ro"
@@ -494,8 +499,10 @@ grep -q 'Known:' "$ENV_DIR/err" || fail "the refusal does not list the known ser
 echo "  refused, nothing stopped, nothing recreated, scope never widened"
 
 echo "== 7. unprotected state refuses BEFORE the stop =="
-# calibre-web is an ordinary directory in the fixture, as in production.
-setup
+# calibre-web WAS the production example of this, until it was migrated on
+# 2026-10-09. The refusal still has to work, so the fixture models the state it
+# was in rather than pretending production has not moved.
+setup unprotected-cw
 rc="$(run_cli updates apply --service calibre-web)"
 [ "$rc" != "0" ] || fail "upgrading a service with unprotected state exited 0"
 grep -q 'not a Btrfs subvolume' "$ENV_DIR/err" \
@@ -694,7 +701,7 @@ echo "  both refused; nothing touched"
 # ===========================================================================
 # REHEARSAL: the actual operator wrapper, against the same fixture.
 #
-# operator/domum-media-upgrade-plex.sh is the one command the operator runs. It
+# operator/domum-media-upgrade-service.sh is the one command the operator runs. It
 # is rehearsed here rather than only reviewed, because every previous wrapper
 # defect was found by running it in production.
 #
@@ -702,7 +709,7 @@ echo "  both refused; nothing touched"
 # the production paths.
 # ===========================================================================
 
-WRAPPER="$REPO_ROOT/operator/domum-media-upgrade-plex.sh"
+WRAPPER="$REPO_ROOT/operator/domum-media-upgrade-service.sh"
 
 # A shim that looks like the installed binary but carries the fixture's
 # environment. The wrapper invokes the CLI as a COMMAND, so this is the only way
@@ -753,7 +760,7 @@ wrapper_env() {
   printf 'DOMUM_DATA_ROOT_OVERRIDE=%s\n' "$ENV_DIR/data"
   printf 'DOMUM_SNAPSHOT_ROOT_OVERRIDE=%s\n' "$ENV_DIR/snapshots"
   printf 'DOMUM_STATE_ROOT_OVERRIDE=%s\n' "$ENV_DIR/state"
-  printf 'DOMUM_EXPECT_INODE=%s\n' "$(stat -c %i "$ENV_DIR/data/plex")"
+  printf 'DOMUM_EXPECT_INODE=%s\n' "$(stat -c %i "$ENV_DIR/data/${DOMUM_SVC:-plex}")"
 }
 
 # The wrapper requires root, and CI is not root. Rather than make that check
@@ -769,7 +776,7 @@ run_wrapper() {  # $@ = wrapper args; honours a pre-set DOMUM_EXPECT_CONTAINERS
   local n_expect="${DOMUM_EXPECT_CONTAINERS:-$(printf '%s\n' $CONTAINERS | wc -w)}"
   "${AS_ROOT[@]}" env $(wrapper_env) "DOMUM_EXPECT_CONTAINERS=$n_expect" \
       "PATH=$ENV_DIR/bin:$PATH" "HOME=$ENV_DIR" \
-    bash "$WRAPPER" "$@" >"$ENV_DIR/wout" 2>"$ENV_DIR/werr"
+    bash "$WRAPPER" "${DOMUM_SVC:-plex}" "$@" >"$ENV_DIR/wout" 2>"$ENV_DIR/werr"
   echo $?
 }
 wout() { cat "$ENV_DIR/wout" "$ENV_DIR/werr"; }
@@ -896,6 +903,37 @@ That timer is the automatic deployment path and must stay disabled."
 grep -q 'no longer disabled' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
 echo "  both refused"
 
+echo "== 30c. the wrapper drives a service OTHER than plex =="
+# The whole point of making the service a positional argument. It used to be
+# ${DOMUM_SVC:-plex} on a file called -upgrade-plex.sh, which is how the wrong
+# service gets upgraded at 2am.
+#
+# This also caught a real bug: SVC_PATH was derived at the top of the script,
+# before the argument loop, so with the service positional it became
+# "$DATA_ROOT/" and stage 4 checked the inode of the DATA ROOT itself.
+setup; make_installed_cli
+rc="$(DOMUM_SVC=calibre-web run_wrapper --preflight-only)"
+[ "$rc" = "0" ] || { wout; fail "the preflight failed for calibre-web (rc=$rc)"; }
+grep -q "/data/calibre-web is a subvolume" "$ENV_DIR/wout" \
+  || { wout; fail "it did not check calibre-web's OWN path; SVC_PATH may be derived
+before the argument loop again"; }
+grep -q 'plex' "$ENV_DIR/wout" \
+  && fail "the calibre-web preflight mentions plex; the service is not fully threaded through"
+echo "  calibre-web preflight passes, and checks its own path"
+
+# And the full run upgrades calibre-web ONLY.
+setup; make_installed_cli
+rc="$(DOMUM_SVC=calibre-web run_wrapper)"
+[ "$rc" = "0" ] || { wout; fail "the full calibre-web run failed (rc=$rc)"; }
+[ "$(img calibre-web)" = "$CW_NEW" ] \
+  || fail "calibre-web is not on its staged image: $(img calibre-web)"
+[ "$(img plex)" = "$PLEX_OLD" ] \
+  || fail "PLEX moved during a calibre-web upgrade. The service argument is not
+scoping the operation."
+grep -q 'CALIBRE_WEB UPGRADED' "$ENV_DIR/wout" \
+  || { wout; fail "the final report does not name the service it upgraded"; }
+echo "  calibre-web upgraded; plex untouched; the report names the service"
+
 echo "== 31. the wrapper's scope proof is INDEPENDENT of the CLI's =="
 # Blind the CLI's own before/after comparison and let another service move. The
 # wrapper must still catch it -- otherwise "asserted twice by two
@@ -905,9 +943,9 @@ mutate_cli 's|\[\[ "$others_before" == "$others_after" \]\]|[[ 1 == 1 ]]|'
 touch "$ENV_DIR/st/stray"
 rc="$(run_wrapper)"
 [ "$rc" != "0" ] \
-  || fail "a NON-PLEX container changed and the wrapper reported success. Its scope
+  || fail "another container changed and the wrapper reported success. Its scope
 proof is not independent of the CLI's -- blinding the CLI blinded both."
-grep -q 'a NON-PLEX container changed' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
+grep -q 'another container changed' "$ENV_DIR/werr" || { wout; fail "wrong refusal"; }
 echo "  caught by the wrapper even with the CLI's own check blinded"
 
 fi

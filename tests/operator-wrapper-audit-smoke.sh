@@ -8,7 +8,7 @@ set -uo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUDIT="$REPO_ROOT/tests/operator-wrapper-audit.py"
-WRAPPER="$REPO_ROOT/operator/domum-media-upgrade-plex.sh"
+WRAPPER="$REPO_ROOT/operator/domum-media-upgrade-service.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR:?}"' EXIT
 
@@ -18,7 +18,7 @@ echo "  clean"
 
 echo "== 2. the wrapper is syntactically valid and refuses without root =="
 bash -n "$WRAPPER" || fail "the wrapper does not parse"
-out="$(bash "$WRAPPER" --preflight-only 2>&1)"; rc=$?
+out="$(bash "$WRAPPER" plex --preflight-only 2>&1)"; rc=$?
 if [ "$(id -u)" -ne 0 ]; then
   [ "$rc" -ne 0 ] || fail "the wrapper ran as a non-root user"
   grep -q 'must run as root' <<< "$out" || fail "wrong refusal: $out"
@@ -26,9 +26,13 @@ if [ "$(id -u)" -ne 0 ]; then
 else
   echo "  parses (running as root, so the root refusal was not exercised)"
 fi
-bash "$WRAPPER" --nonsense >/dev/null 2>&1
+bash "$WRAPPER" plex --nonsense >/dev/null 2>&1
 [ $? -eq 2 ] || fail "an unknown option did not exit 2"
-echo "  an unknown option exits 2"
+# And no service at all is a usage error, checked BEFORE root -- argument
+# validation should not need privilege.
+bash "$WRAPPER" >/dev/null 2>&1
+[ $? -eq 2 ] || fail "no service argument did not exit 2"
+echo "  an unknown option exits 2; a missing service exits 2 before the root check"
 
 run_against() {  # $1 = file content -> audit exit code
   rm -rf "$TMP_DIR/r"; mkdir -p "$TMP_DIR/r/operator" "$TMP_DIR/r/tests" "$TMP_DIR/r/bin"
