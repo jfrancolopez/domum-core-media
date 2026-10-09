@@ -1598,15 +1598,20 @@ immich_db_original_paths() {
 # nothing matched, 1 when something did, and 2 when the question could not be
 # answered -- which callers must treat as "not safe", never as "safe".
 originals_matched_by_patterns() {  # $@ = patterns
-  local inv rc=0 path pat lib n_under
+  local rc=0 path pat lib n_under paths
   lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
-  inv="$(mktemp)" || return 2
-  if ! immich_original_inventory "$inv" >/dev/null; then rm -f "$inv"; return 2; fi
-  # The same vacuity guard the audit uses: untranslated paths match no host
-  # pattern, so "nothing matched" would be meaningless.
-  n_under="$(cut -f2 "$inv" | grep -c "^${lib}/" || true)"
-  if [[ "${n_under:-0}" -eq 0 ]]; then rm -f "$inv"; return 2; fi
-  while IFS=$'\t' read -r _ path; do
+  # Matched on the PATHS the asset table names, deliberately NOT on a stat of
+  # them. Whether a file is currently on disk is a different question: a path
+  # the table names is an original, and an exclusion that matches it is wrong
+  # even while the file is missing. Requiring existence here made the audit
+  # report "clean" for a library whose files had not been created yet.
+  paths="$(immich_db_original_paths)" || return 2
+  [[ -n "$paths" ]] || return 2
+  # Untranslated paths match no host pattern, so "nothing matched" would be
+  # meaningless rather than reassuring.
+  n_under="$(grep -c "^${lib}/" <<< "$paths" || true)"
+  [[ "${n_under:-0}" -gt 0 ]] || return 2
+  while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     for pat in "$@"; do
       [[ -n "$pat" ]] || continue
@@ -1615,8 +1620,7 @@ originals_matched_by_patterns() {  # $@ = patterns
         rc=1
       fi
     done
-  done < "$inv"
-  rm -f "$inv"
+  done <<< "$paths"
   return "$rc"
 }
 
@@ -1948,6 +1952,52 @@ dr_immich_summary() {  # $1 = target, $2 = library root
     "$([[ "${BACKUP_EXCLUDE_IMMICH_DERIVATIVES:-0}" == "1" ]] && echo yes || echo "no (BACKUP_EXCLUDE_IMMICH_DERIVATIVES=0)")"
 }
 
+# What the off-site repository is SUPPOSED to hold, checked against what the
+# configuration actually says.
+#
+# The distinction this protects is irreplaceable vs reacquirable. Hetzner should
+# hold the family originals, the Immich database dump, application state, small
+# databases, recovery metadata and image archives. It should NOT hold films,
+# television, music, books, thumbnails, transcodes or caches -- paying to store
+# data whose recovery plan is "download it again".
+#
+# Reported rather than asserted: the include set is configuration, and a claim
+# about it that was never read is worthless.
+dr_backup_scope() {  # $1 = library root
+  local lib="$1" root pat
+  echo "  BACKUP SCOPE (what goes off-site)"
+  if [[ -z "${BACKUP_INCLUDE_PATHS:-}" ]]; then
+    printf '    %-34s %s\n' "include paths" "UNKNOWN -- BACKUP_INCLUDE_PATHS is not set"
+    return 0
+  fi
+  for root in ${BACKUP_INCLUDE_PATHS:-}; do
+    printf '    %-34s %s\n' "included" "$root"
+  done
+  while IFS= read -r pat; do
+    [[ -n "$pat" ]] || continue
+    printf '    %-34s %s\n' "excluded" "$pat"
+  done < <(backup_exclude_patterns 2>/dev/null)
+
+  # The replaceable tier must not be paid for off-site. State it either way.
+  local media_in=1
+  for root in ${BACKUP_INCLUDE_PATHS:-}; do
+    case "${DOMUM_MEDIA_ROOT%/}" in
+      "${root%/}"|"${root%/}"/*) media_in=0 ;;
+    esac
+  done
+  if (( media_in == 0 )); then
+    printf '    %-34s %s\n' "replaceable media tier" \
+      "IN the backup set ($DOMUM_MEDIA_ROOT) -- reacquirable data is being stored off-site"
+  else
+    printf '    %-34s %s\n' "replaceable media tier" \
+      "not in the backup set (correct: $DOMUM_MEDIA_ROOT is reacquirable)"
+  fi
+  local arch="$DOMUM_DATA_ROOT/backups/images" arch_n
+  arch_n="$(find "$arch" -maxdepth 1 -name '*.tar' 2>/dev/null | grep -c . || true)"
+  printf '    %-34s %s\n' "image archives" \
+    "${arch_n:-0} in $arch$(dr_path_configured "$arch" && printf '%s' " (in the backup set)" || printf '%s' " (NOT in the backup set)")"
+}
+
 # The risks that remain, named rather than left for the reader to infer.
 dr_remaining_risks() {  # $1 = target, $2 = library root
   local target="$1" lib="$2" n=0
@@ -2065,6 +2115,8 @@ do_dr_status() {
     dr_row "immich database" "$lvl" "$ev"
     rank="$(dr_level_rank "$lvl")"; (( rank < worst )) && worst="$rank"
 
+    echo
+    dr_backup_scope "$lib"
     echo
     dr_immich_summary "$target" "$lib"
     echo

@@ -130,6 +130,19 @@ grep -q 'EXITCODE=0' <<< "$out" || fail "derivative exclusion should be clean: $
 echo "  excluding a derivative is not a finding"
 
 # ---------------------------------------------------------------------------
+sect "a path the table names but which is NOT on disk is still checked"
+# Matching must be about PATHS, not presence. Making it depend on a stat of the
+# file made the audit report a clean pass for a library whose files had not been
+# created -- it compared nothing and said "0 matched". CI caught it.
+rm -f "$LIB/encoded-video/cc/dd/676850ba-6d31-43a1-9a03-b7710f607bcc-MP.mp4"
+out="$(run_audit 'backup_proposed_exclude_patterns() {
+  printf "%s\n" "$LIB_T/encoded-video/**"
+}' --proposed)"
+grep -q 'EXITCODE=1' <<< "$out" \
+  || fail "an absent-but-named original was not checked: $out"
+grep -q '676850ba' <<< "$out" || fail "the absent original was not named: $out"
+echo "  an original the table names is checked whether or not the file exists"
+
 sect "an unreadable database reports UNKNOWN, not a pass"
 out="$(STUB_PG_DOWN=1 run_audit '' --proposed)"
 grep -q 'EXITCODE=2' <<< "$out" || fail "db down did not exit 2: $out"

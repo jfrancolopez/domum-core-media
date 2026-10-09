@@ -760,6 +760,70 @@ fixture library. Redirecting roots is not enough when the code path leaves the
 filesystem: put a `docker` stub on `PATH` that exits non-zero, so reaching
 production FAILS instead of quietly succeeding.
 
+**The exclusion check matches PATHS from the asset table, never a stat of
+them.** Whether a file is currently on disk is a different question: a path the
+table names is an original, and a pattern that matches it is wrong even while
+the file is absent. Making the match depend on an inventory built by `stat`
+meant the audit compared nothing and reported `0 matched` for a library whose
+files had not been created -- the vacuity hole again, found by CI, now pinned by
+a regression assertion. The inventory with sizes is for SAMPLING; matching needs
+only paths.
+
+**The large originals are proven progressively, never in bulk.** Measured: 17
+originals exceed the 256 MiB sample cap -- 15 `.mov` and 2 `.mp4`, 274 MB to
+1.38 GB, 7.9 GiB in total, i.e. the home videos. Raising the cap would fetch
+7.9 GiB from Hetzner on every run to move a reported percentage, so
+`verify-large` accumulates instead: smallest unproven file of each container
+format first, `LARGE_MAX_RUN_BYTES` (1 GiB) capping a run while always allowing
+one file so it cannot deadlock, a durable 0600 history so a proven file is never
+fetched twice, `--revalidate` as the only way to re-prove, and `--plan` stating
+the byte cost without contacting anything. A default run is **2 files, 524 MiB**.
+A `MISMATCH` is recorded and **not** counted as proven, so a corrupted large
+original cannot quietly join the coverage figure.
+
+Two defects there, both found by running the code rather than reading it, both
+of families already recorded in this file:
+
+- the history filter was `grep -vxF -f <paths>` against `<size>\t<path>` lines,
+  which can **never** match on a whole line -- the `docker images -q` short-id
+  defect exactly. Every proven file was re-selected and re-downloaded while the
+  report claimed they were already proven;
+- replacing it with the `NR==FNR` idiom broke the **empty** case: for the first
+  line of the second input `NR==FNR==1`, so that line is mistaken for a history
+  entry. With no history the candidate set silently emptied and the command
+  announced "every large original is proven" having verified none. Read the
+  other file with `getline` instead.
+
+**"Not in the backup set" and "the include set was never read" are different
+claims.** `dr_path_configured` reported the former for the latter. It now has a
+third state and the report says UNKNOWN -- the same conflation the five levels
+exist to prevent, in the one place that decides whether anything is covered at
+all.
+
+**An exclusion affects NEW snapshots only, and applying one must never prune.**
+restic is content-addressed: existing snapshots keep their file lists and the
+blobs they reference, so switching the derivative exclusion on would leave every
+existing snapshot complete and restorable, stop adding derivative blobs from the
+next run, and free nothing until retention forgets those snapshots **and** a
+prune runs. The saving is therefore gradual by design, and the old snapshots are
+the fallback if the exclusion turns out to be wrong. Never prune to realise a
+saving sooner.
+
+**`dr-status` states the backup SCOPE, so the irreplaceable/reacquirable split
+is checked rather than assumed.** Measured: `/srv/media` (975 MiB of music,
+496 KiB of books) is **not** under the include root, so the replaceable tier is
+correctly absent from Hetzner, and `/srv/media/.cache/*` is excluded. The one
+deliberate overpayment is the 82.5 GiB of regenerable Immich derivatives, which
+is gated and unapplied. A reacquirable tier found INSIDE the include set is
+reported as a finding.
+
+**When editing a file programmatically, assert the anchor matched.** A
+replacement whose anchor text did not exist silently did nothing, so a test's
+database stub was never installed into the harness and the suite reported
+"the asset table could not be read" from inside a fixture that had one. A
+no-op edit is indistinguishable from a successful one unless the count is
+checked.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

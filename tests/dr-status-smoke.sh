@@ -42,10 +42,35 @@ export BACKUP_INCLUDE_PATHS="$DATA"
 export BACKUP_TARGETS="cloud"
 mkdir -p "$SECRETS_DIR"
 
+# The summary blocks read the asset table. Stub it, and keep the host
+# unreachable so an un-stubbed path cannot silently query production.
+mkdir -p "$TMP_DIR/bin"
+cat > "$TMP_DIR/bin/docker" <<'NODOCKER'
+#!/usr/bin/env bash
+echo "docker is deliberately unavailable in this test" >&2
+exit 127
+NODOCKER
+chmod +x "$TMP_DIR/bin/docker"
+export PATH="$TMP_DIR/bin:$PATH"
+mkdir -p "$LIB/upload/aa" "$LIB/encoded-video/bb" "$LIB/thumbs/cc"
+head -c 400 /dev/urandom > "$LIB/upload/aa/one.heic"
+head -c 500 /dev/urandom > "$LIB/upload/aa/two.mov"
+head -c 600 /dev/urandom > "$LIB/encoded-video/bb/three-MP.mp4"
+head -c 900 /dev/urandom > "$LIB/encoded-video/bb/0000000000000000000000000000000a.mp4"
+head -c 300 /dev/urandom > "$LIB/thumbs/cc/t_thumbnail.webp"
+cat > "$TMP_DIR/dbstub.sh" <<STUB
+immich_db_original_paths() {
+  printf '%s\n' '$LIB/upload/aa/one.heic' '$LIB/upload/aa/two.mov' \
+                 '$LIB/encoded-video/bb/three-MP.mp4'
+}
+STUB
+
 run_dr() {
   (
     # shellcheck disable=SC1090
     source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
     set +e
     die() { echo "DIE: $*"; exit 9; }
     do_dr_status 2>&1
@@ -225,6 +250,64 @@ nas_rows="$(sed -n '/^target: nas/,/^$/p' <<< "$out" | grep -cE '^  immich ' || 
 echo "  the disabled target is named and claims nothing"
 
 # ---------------------------------------------------------------------------
+sect "the scope block states what goes off-site, in both directions"
+out="$(run_dr)"
+grep -q 'BACKUP SCOPE' <<< "$out" || fail "no scope block: $out"
+grep -qE 'included +'"$DATA" <<< "$out" || fail "the include root is not stated: $out"
+grep -q 'replaceable media tier' <<< "$out" || fail "the media tier is not addressed: $out"
+grep -q 'not in the backup set' <<< "$out" \
+  || fail "the media tier is outside the include set and that was not stated: $out"
+echo "  include roots, exclusions and the replaceable tier are all named"
+
+sect "an UNSET include path is UNKNOWN, not 'not backed up'"
+# A claim about configuration that was never read is worthless, and saying
+# "NOT in the backup set" for it is the same conflation this report prevents.
+out="$(BACKUP_INCLUDE_PATHS= run_dr)"
+grep -q 'BACKUP_INCLUDE_PATHS is not set' <<< "$out" \
+  || fail "an unset include set was not reported as UNKNOWN: $out"
+no_row_claims "$out" "BACKED UP" && fail "it claimed BACKED UP with no include set"
+echo "  unset configuration reports UNKNOWN and claims no level"
+
+sect "the media tier being INSIDE the include set is reported as a finding"
+out="$(BACKUP_INCLUDE_PATHS="$DATA $TMP_DIR/media" run_dr)"
+grep -q 'IN the backup set' <<< "$out" \
+  || fail "a reacquirable tier inside the backup set was not flagged: $out"
+echo "  reacquirable data stored off-site is called out"
+
+sect "the summary counts originals by LOCATION and names what is untested"
+out="$(run_dr)"
+grep -qE 'originals \(asset table\) +3' <<< "$out" || fail "wrong original count: $out"
+grep -qE 'under upload/ +2' <<< "$out" || fail "upload/ count missing: $out"
+grep -qE 'under encoded-video/ +1' <<< "$out" \
+  || fail "the encoded-video original is not counted: $out"
+grep -q 'NEVER restore-tested' <<< "$out" || fail "the untested count is missing: $out"
+echo "  3 originals: 2 upload/, 1 encoded-video/, and the untested count is stated"
+
+sect "the regenerable block separates derivatives from the originals beside them"
+grep -q 'REGENERABLE DATA' <<< "$out" || fail "no regenerable block: $out"
+grep -q 'of which ORIGINALS (kept)' <<< "$out" \
+  || fail "it does not distinguish the originals inside encoded-video/: $out"
+grep -q 'potential saving if excluded' <<< "$out" || fail "no saving figure: $out"
+grep -q 'BACKUP_EXCLUDE_IMMICH_DERIVATIVES=0' <<< "$out" \
+  || fail "it does not say the exclusion is unapplied: $out"
+echo "  derivatives, the originals among them, the saving, and that it is not applied"
+
+sect "remaining risks are numbered and name the command that would clear them"
+grep -q 'REMAINING RISKS' <<< "$out" || fail "no risk block: $out"
+grep -q 'verify-large' <<< "$out" || fail "the large-file risk does not name its remedy: $out"
+grep -q 'FULL RECOVERY VERIFIED' <<< "$out" || fail "the standing risk is missing: $out"
+# By this point the fixture HAS import evidence, so that risk is correctly
+# absent -- a risk list that keeps naming a resolved risk is noise. Prove both
+# directions by taking the evidence away.
+grep -q 'verify-db-restore' <<< "$out" \
+  && fail "the import risk is still listed although an import is recorded: $out"
+mv "$VDIR/cloud-dbimport.env" "$TMP_DIR/dbimport.saved"
+noimp="$(run_dr)"
+grep -q 'verify-db-restore' <<< "$noimp" \
+  || fail "with no import recorded the risk must be listed: $noimp"
+mv "$TMP_DIR/dbimport.saved" "$VDIR/cloud-dbimport.env"
+echo "  each risk names its remedy, and a resolved risk stops being listed"
+
 sect "mutation: ignoring the coverage file must produce an undenominated claim"
 # The coverage requirement is enforced twice -- the file must exist AND carry
 # both fields -- so the mutation has to remove both to reproduce the pre-fix

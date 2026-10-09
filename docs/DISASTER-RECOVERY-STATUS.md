@@ -222,13 +222,96 @@ demonstrated**, which is a different and currently unresolved thing.
 
 ---
 
+## 5b. The large originals, proven progressively
+
+17 originals exceed the 256 MiB per-file sample cap: **15 `.mov` and 2 `.mp4`,
+from 274 MB to 1.38 GB, 7.9 GiB in total.** They are the home videos — the
+least replaceable files in the library and the least represented by a sample of
+photos.
+
+Raising the cap is the wrong fix: it would fetch 7.9 GiB from Hetzner on every
+run to move a reported percentage. `verify-large` accumulates coverage instead:
+
+| Mechanism | Effect |
+|---|---|
+| smallest unproven file of each container format first | a run covers a new format before a second copy of a proven one |
+| `LARGE_MAX_RUN_BYTES` (default 1 GiB) | caps one run, names itself when it defers, always allows one file so it cannot deadlock |
+| durable history (`<target>-large-verified.jsonl`, 0600) | a proven file is never fetched again |
+| `--revalidate` | the only way to re-prove something |
+| `--plan` | states the exact byte cost and contacts nothing |
+
+A default run against the real library is **2 files, 524.4 MiB** — one `.mov`
+and one `.mp4` — against the 2.2 GiB an unbounded "verify 3" would have cost.
+Nine runs at that rate would cover the whole set.
+
+A mismatch is recorded as `MISMATCH` and is **not** counted as proven
+afterwards, so a corrupted large original cannot quietly become part of the
+coverage figure.
+
+---
+
+## 5c. What goes off-site, and what must not
+
+Hetzner should hold the irreplaceable things and nothing whose recovery plan is
+"download it again". `dr-status` now states the scope rather than leaving it to
+be inferred:
+
+```
+BACKUP SCOPE (what goes off-site)
+  included                           /srv/data
+  excluded                           /srv/data/immich/backup-staging/*.tmp
+  excluded                           /srv/media/.cache/*
+  replaceable media tier             not in the backup set (correct: /srv/media is reacquirable)
+  image archives                     N in /srv/data/backups/images (in the backup set)
+```
+
+| Should be off-site | Status |
+|---|---|
+| family originals (23,033 / 130.4 GiB) | **in** |
+| Immich PostgreSQL dump | **in** |
+| application state on the protected tier | **in** |
+| small databases (traefik `acme.json`, uptime-kuma `kuma.db`) | in, via the recovery pack |
+| recovery metadata and image archives | **in** (`/srv/data/backups/images`) |
+
+| Should NOT be off-site | Status |
+|---|---|
+| films, television | none exist on this host yet |
+| music (975 MiB), books (496 KiB) | **out** — `/srv/media` is not under the include root |
+| regenerable thumbnails (5.4 GiB) | **in** — the proposal would remove them |
+| transcodes (77.1 GiB) | **in** — the proposal would remove them |
+| caches | **out** — `/srv/media/.cache/*` excluded |
+
+So the distinction is already correct for the replaceable *media* tier, and the
+remaining 82.5 GiB of regenerable Immich derivatives is the one deliberate
+overpayment — gated, measured, and not yet applied.
+
+### How history is preserved when an exclusion takes effect
+
+A restic exclusion affects **new snapshots only**. Existing snapshots keep their
+own file lists and the data they reference: restic is content-addressed, so a
+blob stays in the repository while any snapshot still references it. Switching
+`BACKUP_EXCLUDE_IMMICH_DERIVATIVES` on would therefore:
+
+- leave every existing snapshot complete and restorable, derivatives included;
+- stop *adding* derivative blobs from the next run onward;
+- free nothing until retention eventually forgets those older snapshots **and**
+  a `prune` runs.
+
+That is why the saving is gradual rather than immediate, and why **no snapshot
+is pruned as part of applying an exclusion.** Old snapshots are the fallback if
+the exclusion ever turns out to be wrong.
+
+---
+
 ## 6. What one root run would settle
 
 ```
 sudo domum-media-backup dr-status
 sudo domum-media-backup exclusion-audit --proposed
 sudo domum-media-backup verify-restore cloud
+sudo domum-media-backup verify-db-restore cloud
 sudo domum-media-backup verify-sample cloud 12
+sudo domum-media-backup verify-large cloud
 sudo domum-media-backup dr-status
 ```
 
@@ -238,8 +321,13 @@ sudo domum-media-backup dr-status
   that the proposed patterns reach no original.
 - `verify-restore` restores the Immich dump into an isolated scratch directory
   (asserted to be outside every live data root) and revalidates it.
+- `verify-db-restore` imports the restored dump into a disposable PostgreSQL,
+  which is the only thing that proves PostgreSQL can read it.
 - `verify-sample` restores a deterministic, diverse sample of real originals
-  and compares them byte-for-byte, now recording the population.
+  and compares them byte-for-byte, now recording the population from the asset
+  table.
+- `verify-large` proves two of the 17 over-cap home videos (524 MiB) and
+  records them, so later runs continue rather than repeat.
 - `dr-status` again, to show what the run actually earned.
 
 All five are read-only with respect to production: they restore into scratch,
