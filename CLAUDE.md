@@ -668,6 +668,54 @@ Do not:
 
 Scratch restore testing must stay isolated from production paths.
 
+**`encoded-video/` is NOT purely derivative, and the obvious exclusion would
+have destroyed data.** The Immich library is 130.2 GiB of originals and 82.4 GiB
+of regenerable derivatives, so "exclude `thumbs/` and `encoded-video/`" looks
+free. Measured against the live asset table: **58 assets keep their
+`originalPath` under `encoded-video/`** — motion-photo parts, each named
+`<uuid>-MP.mp4`, 218.9 MiB, with no derivative rows of their own. Excluding the
+subtree would have removed the only backed-up copy of all 58 and reported
+success. A filesystem walk of `upload/` cannot find them; **only the database
+can**. `thumbs/` genuinely is 100% derivative (16,211 preview + 16,211 thumbnail
++ 1 marker = the 32,423 files on disk, exactly). Never reason about what is
+regenerable from directory names.
+
+**Never use a restic `!` re-include to protect data.** restic 0.18.0 supports
+them, and measured in a scratch repository they are **order dependent and fail
+silently in the dangerous direction**: with the re-include written first, zero
+`.mp4` files were kept — including the originals — and restic printed
+`snapshot … saved` with no warning. Prefer a pattern that cannot match the
+protected files at all; the derivative/original split is carried by a character
+class (`*[0-9a-f].mp4` matches the 9,028 derivatives and none of the 58
+`-MP.mp4` originals), which has no ordering semantics. Verified by duplicating
+and reversing the pattern list.
+
+**Exclusion patterns are read from `backup_exclude_patterns`, and
+`exclusion-audit` checks them against the live asset table.** They used to be
+written inline in the restic invocation where nothing could read them, so "the
+backup excludes X" was a claim about source text. The audit is conservative by
+construction (restic's `**` matches zero or more components, so the collapsed
+variant is tested too — it can over-report, never miss) and **refuses to pass
+vacuously**: if the container-to-host prefix translation fails, every path keeps
+its container shape, matches no host pattern, and a naive version reports a
+clean `0 matched` having compared nothing. `tests/backup-exclusion-audit-smoke.sh`
+mutates that guard away and requires the false clean verdict to appear. See
+`docs/BACKUP-EXCLUSION-PROPOSAL.md`.
+
+**Recovery is reported on five levels, and the weakest tier governs.**
+`UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
+(`domum-media-backup dr-status`). They are deliberately not collapsible into a
+boolean, because every reporting defect here was the weaker claim stated in the
+stronger claim's words. `RESTORE TESTED` requires a **stated denominator**: a
+sample proof whose population was never measured is reported as `BACKED UP`
+with the reason named, not promoted — a manifest saying "12 sampled, 12 matched"
+was true and uninformative while 17 originals (7.9 GiB) sat above the per-file
+sampling cap and could never be selected. **Nothing on this host is
+`FULL RECOVERY VERIFIED`**, and the report says so in its own words until a
+whole tier has been restored and the owning application has confirmed it. Never
+promote a tier because another tier was proven. See
+`docs/DISASTER-RECOVERY-STATUS.md`.
+
 ---
 
 ## 8. Git and development workflow
