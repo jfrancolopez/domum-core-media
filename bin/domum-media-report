@@ -613,7 +613,21 @@ report_asset_sample_verification() {
     return 0
   fi
 
-  jq -s --arg target "$newest_target"      --argjson at "$(report_iso_from_epoch "$newest_epoch")"      --argjson age "$(report_age_seconds "$newest_epoch")"      '(map(select(.result == "match")) | length) as $ok
+  # The POPULATION the sample was drawn from, recorded beside the manifest.
+  #
+  # Without it, "12 sampled, 12 matched" is a coverage claim that cannot be
+  # falsified: measured on this host the per-file cap leaves 17 of 22,976
+  # originals (7.9 GiB) permanently outside the sample, and they are the
+  # largest videos -- exactly what a sample of small photos least represents.
+  local cov_file cov
+  cov_file="${newest_file%-sample.jsonl}-coverage.json"
+  if [[ -r "$cov_file" ]]; then
+    cov="$(jq -c '{population_files,population_bytes,oversize_files,oversize_bytes,
+                   per_file_cap_bytes,recorded_at}' "$cov_file" 2>/dev/null || true)"
+  fi
+  [[ -n "${cov:-}" ]] || cov='null'
+
+  jq -s --arg target "$newest_target"      --argjson at "$(report_iso_from_epoch "$newest_epoch")"      --argjson age "$(report_age_seconds "$newest_epoch")"      --argjson coverage "$cov"      '(map(select(.result == "match")) | length) as $ok
       | (map(select(.result != "match")) | length) as $bad
       | {state: (if length == 0 then "unknown" elif $bad > 0 then "failed" else "sampled" end),
          target: $target,
@@ -625,12 +639,25 @@ report_asset_sample_verification() {
          media_types: (map(.media_type) | unique),
          last_sampled_at: $at,
          age_seconds: $age,
+         coverage: $coverage,
+         # What the sample provably does NOT cover. null when no coverage
+         # artefact was recorded -- which is itself worth seeing, because it
+         # means the population was never measured.
+         unsampled_files: (if $coverage == null then null
+                           else ($coverage.population_files - length) end),
+         oversize_files: (if $coverage == null then null else $coverage.oversize_files end),
+         oversize_bytes: (if $coverage == null then null else $coverage.oversize_bytes end),
          reason: (if $bad > 0
                   then ($bad|tostring) + " sampled file(s) did not match the live originals"
                   elif length == 0 then "the sample manifest is empty"
+                  elif $coverage == null
+                  then "the sampled objects matched, but the population was never measured, so the coverage of this proof is unknown"
+                  elif ($coverage.oversize_files // 0) > 0
+                  then ($coverage.oversize_files|tostring) + " original(s) exceed the per-file sampling cap and have never been restore-tested"
                   else null end)}' "$newest_file" 2>/dev/null     || jq -cn '{state:"unknown",target:null,snapshot_id:null,sampled_files:null,
                 matched:null,mismatched:null,sampled_bytes:null,media_types:null,
-                last_sampled_at:null,age_seconds:null,
+                last_sampled_at:null,age_seconds:null,coverage:null,
+                unsampled_files:null,oversize_files:null,oversize_bytes:null,
                 reason:"the sample manifest is not interpretable"}'
 }
 
@@ -967,7 +994,12 @@ report_render_text() {
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
     (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)+(if .last_run.paths==null then "" else "; scope: "+((.last_run.paths|length)|tostring)+" path(s)" end)),
-    "  Sampled originals:    " + .backups.asset_sample.state + (if .backups.asset_sample.state=="sampled" then " ("+(.backups.asset_sample.sampled_files|tostring)+" file(s), "+((.backups.asset_sample.media_types // [])|join("/"))+", "+(.backups.asset_sample.age_seconds|age)+" ago; a sample, not the whole library)" else " ("+(.backups.asset_sample.reason // "no detail")+")" end),
+    "  Sampled originals:    " + .backups.asset_sample.state + (if .backups.asset_sample.state=="sampled" then " ("+(.backups.asset_sample.sampled_files|tostring)+" of "+((.backups.asset_sample.coverage.population_files // "?")|tostring)+" file(s), "+((.backups.asset_sample.media_types // [])|join("/"))+", "+(.backups.asset_sample.age_seconds|age)+" ago)" else " ("+(.backups.asset_sample.reason // "no detail")+")" end),
+    (if (.backups.asset_sample.oversize_files // 0) > 0
+     then "    NEVER sampled:      " + (.backups.asset_sample.oversize_files|tostring) + " original(s) exceed the per-file cap of " + (((.backups.asset_sample.coverage.per_file_cap_bytes // 0) / 1048576 | floor)|tostring) + " MiB and have never been restore-tested"
+     elif .backups.asset_sample.state == "sampled" and .backups.asset_sample.coverage == null
+     then "    NEVER sampled:      unknown -- the population was never measured, so the coverage of this proof cannot be stated"
+     else empty end),
     "  Restore verification: " + .backups.restore_verification.state + (if .backups.restore_verification.state=="verified" then " ("+(.backups.restore_verification.target // "?")+", "+(.backups.restore_verification.age_seconds|age)+" ago, checks: "+(.backups.restore_verification.checks // "?")+")" else " ("+(.backups.restore_verification.reason // "no detail")+")"+(if .backups.restore_verification.last_verified_at==null then "" else "; last passed "+(.backups.restore_verification.age_seconds|age)+" ago" end) end),
     "  Recovery pack: " + .recovery_pack.state + "; age=" + (.recovery_pack.age_seconds|age),
     "",

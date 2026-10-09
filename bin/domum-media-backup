@@ -946,6 +946,10 @@ SAMPLE_MAX_FILE_BYTES="${SAMPLE_MAX_FILE_BYTES:-268435456}"   # 256 MiB
 SAMPLE_MAX_TOTAL_BYTES="${SAMPLE_MAX_TOTAL_BYTES:-1073741824}" # 1 GiB
 SAMPLE_DEFAULT_COUNT="${SAMPLE_DEFAULT_COUNT:-12}"
 
+sample_coverage_file() {
+  printf '%s/%s-coverage.json' "$(restore_verification_dir)" "$1"
+}
+
 sample_manifest_file() {
   printf '%s/%s-sample.jsonl' "$(restore_verification_dir)" "$1"
 }
@@ -955,6 +959,56 @@ sample_manifest_file() {
 # or none, which would then be reported as a mismatch against a file that is
 # actually fine. Such paths are excluded from sampling and counted, so the
 # blind spot is visible rather than silent.
+# What the sample CANNOT cover, in numbers.
+#
+# sample_unsamplable_count below counts only names containing glob
+# metacharacters. The per-file cap excludes files too, and nothing said so:
+# measured on this host, SAMPLE_MAX_FILE_BYTES=256 MiB leaves 17 of 22,976
+# originals outside the sample -- 7.9 GiB, and they are the largest videos,
+# precisely the files a sample of small photos is least representative of.
+#
+# "12 sampled, 12 matched" with no statement of the population is a coverage
+# claim that cannot be falsified. One `find` pass, so it stays cheap over
+# 23k files.
+#
+# Prints: <total_files> <total_bytes> <oversize_files> <oversize_bytes>
+sample_coverage_stats() {  # $1 = originals dir
+  find "$1" -type f -printf '%s\n' 2>/dev/null \
+    | awk -v cap="$SAMPLE_MAX_FILE_BYTES" '
+        { n++; b += $1; if ($1 > cap) { on++; ob += $1 } }
+        END { printf "%d %d %d %d\n", n+0, b+0, on+0, ob+0 }'
+}
+
+# Human bytes, for the coverage lines only. Nothing parses these.
+sample_human_bytes() {  # $1 = bytes
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B KiB MiB GiB TiB", u, " "); i=1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i]
+  }'
+}
+
+# One place that renders the coverage block, so the plan and the verification
+# cannot describe the population differently.
+sample_report_coverage() {  # $1 = originals dir, $2 = indent label width
+  local stats tf tb of ob glob
+  stats="$(sample_coverage_stats "$1")"
+  read -r tf tb of ob <<< "$stats"
+  echo "  population   : ${tf} file(s), $(sample_human_bytes "$tb") under $1"
+  if [[ "$of" =~ ^[0-9]+$ ]] && (( of > 0 )); then
+    echo "  NEVER sampled: ${of} file(s), $(sample_human_bytes "$ob") exceed the per-file"
+    echo "                 cap of $(sample_human_bytes "$SAMPLE_MAX_FILE_BYTES"). These are the"
+    echo "                 largest originals -- raise SAMPLE_MAX_FILE_BYTES to cover them."
+  else
+    echo "  NEVER sampled: none by size -- every file is within the per-file cap"
+  fi
+  glob="$(sample_unsamplable_count "$1")"
+  if [[ "$glob" =~ ^[0-9]+$ ]] && (( glob > 0 )); then
+    echo "  also excluded: ${glob} file(s) whose names contain glob metacharacters"
+    echo "                 (restic --include is a pattern, so these cannot be sampled safely)"
+  fi
+}
+
 sample_unsamplable_count() {
   find "$1" -type f \( -name '*[*?]*' -o -name '*[][]*' -o -name '*\\*' \) \
     -printf '.\n' 2>/dev/null | wc -l
@@ -1074,15 +1128,12 @@ do_sample_plan() {
 
   (( n > 0 )) || die "No sample candidates found under $originals within the size caps"
 
-  local unsamplable; unsamplable="$(sample_unsamplable_count "$originals")"
   echo
   echo "  files        : $n"
   echo "  total bytes  : $total"
   echo "  per-file cap : $SAMPLE_MAX_FILE_BYTES"
   echo "  total cap    : $SAMPLE_MAX_TOTAL_BYTES"
-  if [[ "$unsamplable" =~ ^[0-9]+$ ]] && (( unsamplable > 0 )); then
-    echo "  excluded     : $unsamplable file(s) whose names contain glob metacharacters"
-  fi
+  sample_report_coverage "$originals"
   echo
   echo "  This is a PLAN. Nothing was restored, nothing was contacted, and no"
   echo "  evidence was recorded. Run verify-sample <target> to actually verify."
@@ -1164,10 +1215,29 @@ do_verify_sample() {
   echo "  sampled  : ${#sample_paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
   echo "  sampled  : from $originals"
   echo "  manifest : $manifest"
-  local unsamplable; unsamplable="$(sample_unsamplable_count "$originals")"
-  if [[ "$unsamplable" =~ ^[0-9]+$ ]] && (( unsamplable > 0 )); then
-    echo "  excluded : $unsamplable file(s) whose names contain glob metacharacters"
-    echo "             (restic --include is a pattern, so these cannot be sampled safely)"
+  sample_report_coverage "$originals"
+  # Recorded beside the manifest, so the report can state the population rather
+  # than only what was sampled. A separate file, not a record in the JSONL: the
+  # report aggregates that with `jq -s` over per-file records, and a
+  # differently-shaped row there would skew the match counts.
+  local cov_file cov_stats c_tf c_tb c_of c_ob
+  cov_file="$(sample_coverage_file "$target")"
+  cov_stats="$(sample_coverage_stats "$originals")"
+  read -r c_tf c_tb c_of c_ob <<< "$cov_stats"
+  if jq -cn --arg t "$target" --arg o "$originals" --arg ts "$(date -Iseconds)" \
+       --argjson tf "${c_tf:-0}" --argjson tb "${c_tb:-0}" \
+       --argjson of "${c_of:-0}" --argjson ob "${c_ob:-0}" \
+       --argjson cap "$SAMPLE_MAX_FILE_BYTES" --argjson tcap "$SAMPLE_MAX_TOTAL_BYTES" \
+       --argjson sampled "${#sample_paths[@]}" \
+       '{target:$t,originals:$o,recorded_at:$ts,population_files:$tf,
+         population_bytes:$tb,oversize_files:$of,oversize_bytes:$ob,
+         per_file_cap_bytes:$cap,total_cap_bytes:$tcap,sampled_files:$sampled}' \
+       > "$cov_file.tmp" 2>/dev/null; then
+    chmod 0600 "$cov_file.tmp"; mv -f "$cov_file.tmp" "$cov_file"
+    echo "  coverage : $cov_file"
+  else
+    rm -f -- "$cov_file.tmp"
+    echo "  coverage : NOT RECORDED -- could not write $cov_file"
   fi
   echo "  NOTE: this proves the SAMPLED objects only. It does not prove the whole"
   echo "        library, nor that a rebuilt Immich can serve it."
