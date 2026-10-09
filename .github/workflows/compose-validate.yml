@@ -73,6 +73,9 @@ jobs:
       - name: Database import verification smoke test
         run: tests/db-import-verification-smoke.sh
 
+      - name: Exclusion invariant smoke test
+        run: tests/exclusion-invariant-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 
