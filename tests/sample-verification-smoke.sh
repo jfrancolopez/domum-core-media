@@ -236,4 +236,111 @@ grep -qi 'Nothing was restored' <<< "$plan_out" || fail "sample-plan did not say
 [[ ! -f "$TMP_DIR/state/restore-verification/cloud-sample.jsonl" ]] \
   || fail "sample-plan wrote a manifest; a plan must record no evidence"
 
+# ---------------------------------------------------------------------------
+# COVERAGE: what the sample provably does NOT reach.
+#
+# The cap is not a detail. Measured on this host, SAMPLE_MAX_FILE_BYTES=256 MiB
+# leaves 17 of 22,976 Immich originals outside the sample -- 7.9 GiB, and they
+# are the largest videos, exactly what a sample of small photos least
+# represents. Before this, the plan and the verification printed the caps but
+# never said how many files fell outside, and the recorded evidence carried no
+# population at all: "12 sampled, 12 matched" was a coverage claim that could
+# not be falsified.
+# ---------------------------------------------------------------------------
+echo "== coverage: the population and the never-sampled set are counted =="
+# The fixture has 9 files; huge.mp4 (40000 b) is the only one over the 10000 cap.
+cov="$(harness 'sample_coverage_stats "$IMMICH_LIBRARY_DIR"')" \
+  || fail "sample_coverage_stats failed"
+read -r c_tf c_tb c_of c_ob <<< "$cov"
+[ "$c_tf" = "9" ] || fail "population is $c_tf file(s), expected 9: [$cov]"
+[ "$c_of" = "1" ] || fail "oversize is $c_of file(s), expected 1 (huge.mp4): [$cov]"
+[ "$c_ob" = "40000" ] || fail "oversize bytes is $c_ob, expected 40000: [$cov]"
+exp_tb=$(( 1000+2000+3000+9000+1500+7000+120+500+40000 ))
+[ "$c_tb" = "$exp_tb" ] || fail "population bytes is $c_tb, expected $exp_tb"
+echo "  9 file(s) / $exp_tb b; 1 oversize / 40000 b"
+
+echo "== coverage: the oversize file is really unreachable by selection =="
+# Not merely counted as excluded -- it must never appear in a selection, even
+# when the quota exceeds the number of eligible files.
+sel="$(harness 'sample_select_paths "$IMMICH_LIBRARY_DIR" 99')"
+grep -q 'huge.mp4' <<< "$sel" \
+  && fail "the oversize file was selected despite the per-file cap"
+[ "$(grep -c . <<< "$sel")" = "8" ] \
+  || fail "expected all 8 eligible files when the quota exceeds them, got $(grep -c . <<< "$sel")"
+echo "  selection returns 8 of 9; huge.mp4 is never reachable"
+
+echo "== coverage: the report block NAMES the gap, and says so in bytes =="
+out="$(harness 'sample_report_coverage "$IMMICH_LIBRARY_DIR"' 2>&1)" \
+  || fail "sample_report_coverage failed: $out"
+grep -q 'population   : 9 file(s)' <<< "$out" || fail "no population line: $out"
+grep -q 'NEVER sampled: 1 file(s)' <<< "$out" || fail "the gap is not stated: $out"
+grep -q 'exceed the per-file' <<< "$out" || fail "the reason is not stated: $out"
+grep -q 'raise SAMPLE_MAX_FILE_BYTES' <<< "$out" \
+  || fail "it does not say how to close the gap: $out"
+echo "  population, never-sampled count, bytes and the remedy all stated"
+
+echo "== coverage: 'none by size' when every file fits =="
+# The reassuring answer must be reachable too, or the line is just noise.
+out="$(harness 'SAMPLE_MAX_FILE_BYTES=100000; sample_report_coverage "$IMMICH_LIBRARY_DIR"' 2>&1)"
+grep -q 'NEVER sampled: none by size' <<< "$out" \
+  || fail "with a cap above every file it did not say the gap is empty: $out"
+grep -q 'NEVER sampled: 1 file' <<< "$out" \
+  && fail "it still reported an oversize file with a cap above every file"
+echo "  states explicitly that nothing is excluded by size"
+
+echo "== coverage: verify-sample RECORDS the population beside the manifest =="
+out="$(harness 'do_verify_sample cloud 4' 2>&1)" || fail "verify-sample failed: $out"
+cf="$TMP_DIR/state/restore-verification/cloud-coverage.json"
+[ -r "$cf" ] || fail "no coverage artefact was written at $cf"
+[ "$(stat -c %a "$cf")" = "600" ] || fail "the coverage artefact is mode $(stat -c %a "$cf"), not 600"
+jq -e '.population_files == 9 and .oversize_files == 1 and .oversize_bytes == 40000
+       and .per_file_cap_bytes == 10000 and .sampled_files == 4' "$cf" >/dev/null \
+  || fail "the recorded coverage is wrong: $(cat "$cf")"
+grep -q 'coverage : ' <<< "$out" || fail "verify-sample did not name the coverage artefact"
+grep -q 'NEVER sampled: 1 file(s)' <<< "$out" \
+  || fail "verify-sample did not state the gap: $out"
+echo "  recorded 9/1/40000 at mode 600, and named in the output"
+
+echo "== coverage: the report turns it into an unmissable statement =="
+# The report must not be able to say "sampled, all matched" without also saying
+# what was out of reach.
+rep="$(jq -s --argjson coverage "$(jq -c '{population_files,population_bytes,oversize_files,oversize_bytes,per_file_cap_bytes,recorded_at}' "$cf")" \
+  '(map(select(.result == "match")) | length) as $ok
+   | {sampled_files: length, matched: $ok, coverage: $coverage,
+      unsampled_files: ($coverage.population_files - length),
+      oversize_files: $coverage.oversize_files,
+      reason: (if ($coverage.oversize_files // 0) > 0
+               then ($coverage.oversize_files|tostring) + " original(s) exceed the per-file sampling cap and have never been restore-tested"
+               else null end)}' \
+  "$TMP_DIR/state/restore-verification/cloud-sample.jsonl")"
+jq -e '.unsampled_files == 5 and .oversize_files == 1' <<< "$rep" >/dev/null \
+  || fail "the report arithmetic is wrong: $rep"
+jq -e '.reason | test("never been restore-tested")' <<< "$rep" >/dev/null \
+  || fail "the report does not state that the oversize originals are untested: $rep"
+echo "  4 sampled of 9; 5 unsampled; 1 never restore-testable -- all stated"
+
+echo "== mutation: dropping the oversize tally must break the statement =="
+mut="$TMP_DIR/mut"; rm -rf "$mut"; mkdir -p "$mut"
+cp "$REPO_ROOT/bin/domum-media-backup" "$mut/domum-media-backup"
+# Stop counting files above the cap. The population stays right; the gap vanishes.
+sed -i 's/if ($1 > cap) { on++; ob += $1 }/if (0) { on++; ob += $1 }/' "$mut/domum-media-backup"
+cmp -s "$REPO_ROOT/bin/domum-media-backup" "$mut/domum-media-backup" \
+  && fail "the oversize tally is no longer written as matched"
+out="$(bash -c "
+set -uo pipefail
+DOMUM_STATE_ROOT='$TMP_DIR/state2'
+DOMUM_DATA_ROOT='$TMP_DIR/data'
+DOMUM_MEDIA_ROOT='$TMP_DIR/mediaroot'
+IMMICH_LIBRARY_DIR='$LIB'
+SAMPLE_MAX_FILE_BYTES=10000
+SAMPLE_MAX_TOTAL_BYTES=1000000
+source '$mut/domum-media-backup'
+source '$TMP_DIR/stubs.sh'
+sample_report_coverage \"\$IMMICH_LIBRARY_DIR\"
+" 2>&1)"
+grep -q 'NEVER sampled: none by size' <<< "$out" \
+  || fail "removing the tally did NOT change the statement, so the assertions above
+prove nothing about where the count comes from: $out"
+echo "  without the tally it claims nothing is excluded -- the count is load-bearing"
+
 echo "PASS: sample-verification-smoke"
