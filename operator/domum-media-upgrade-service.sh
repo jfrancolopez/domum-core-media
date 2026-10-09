@@ -48,11 +48,16 @@ set -u
 # environment gives exactly the production values.
 REPO="${DOMUM_REPO:-/opt/domum-core-media}"
 CLI="${DOMUM_CLI:-/usr/local/bin/domum-media}"
-SVC="${DOMUM_SVC:-plex}"
+# The service is a positional argument, not a baked-in default.
+#
+# It was `${DOMUM_SVC:-plex}` while Plex was the only migrated service with a
+# staged image. Calibre-Web is now protected too, and driving this through an
+# environment variable on a file called `-upgrade-plex.sh` is the kind of
+# mismatch that gets the wrong service upgraded at 2am.
+SVC=""
 DATA_ROOT="${DOMUM_DATA_ROOT_OVERRIDE:-/srv/data}"
 SNAPSHOT_ROOT="${DOMUM_SNAPSHOT_ROOT_OVERRIDE:-/srv/snapshots}"
 STATE_ROOT="${DOMUM_STATE_ROOT_OVERRIDE:-/var/lib/domum-media}"
-SVC_PATH="$DATA_ROOT/$SVC"
 EXPECT_CONTAINERS="${DOMUM_EXPECT_CONTAINERS:-11}"
 PREFLIGHT_ONLY=0
 EXPECT_REVISION=""
@@ -61,9 +66,16 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --expect-revision) EXPECT_REVISION="${2:-}"; shift 2 ;;
-    *) printf 'usage: %s [--preflight-only] [--expect-revision <sha>]\n' "$0" >&2; exit 2 ;;
+    -*) printf 'usage: %s <service> [--preflight-only] [--expect-revision <sha>]\n' "$0" >&2; exit 2 ;;
+    *) SVC="$1"; shift ;;
   esac
 done
+[ -n "$SVC" ] || { printf 'usage: %s <service> [--preflight-only] [--expect-revision <sha>]\n' "$0" >&2; exit 2; }
+
+# Derived AFTER parsing: with the service positional, computing this at the top
+# built "$DATA_ROOT/" from an empty $SVC, and stage 4 then checked the inode of
+# the data root itself.
+SVC_PATH="$DATA_ROOT/$SVC"
 
 abort() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 note()  { printf '  %s\n' "$*"; }
@@ -134,7 +146,7 @@ done
 Deploy a revision that does before upgrading."
 note "all $(printf '%s' "$NEEDED_CAPS" | wc -w) required capabilities supported"
 
-head2 "3. Plex, and the two images"
+head2 "3. the service, and the two images"
 docker inspect "$SVC" >/dev/null 2>&1 || abort "$SVC is not present"
 OLD_CID="$(docker inspect -f '{{.Id}}' "$SVC")"
 OLD_IMG="$(docker inspect -f '{{.Image}}' "$SVC")"
@@ -247,7 +259,7 @@ identities > "$AFTER"
 CHANGED="$(diff <(grep -v "^$SVC " "$BEFORE") <(grep -v "^$SVC " "$AFTER") || true)"
 if [ -n "$CHANGED" ]; then
   printf '%s\n' "$CHANGED" >&2
-  abort "a NON-PLEX container changed. This was supposed to be a $SVC-only upgrade."
+  abort "another container changed. This was supposed to be a $SVC-only upgrade."
 fi
 note "the other $(( N_BEFORE - 1 )) containers are unchanged (id and image)"
 
@@ -312,7 +324,7 @@ note "0 failed units; image refresh still disabled"
 
 printf '\n'
 if [ "$RC" -eq 0 ]; then
-  printf 'PLEX UPGRADED and independently verified.\n'
+  printf '%s UPGRADED and independently verified.\n' "$(printf '%s' "$SVC" | tr 'a-z-' 'A-Z_')"
   printf '  %s -> %s\n' "${OLD_IMG:0:19}" "${NEW_IMG:0:19}"
   printf '  rollback: sudo %s rollback-upgrade %s %s\n' "$CLI" "$SVC" "$POINT"
   exit 0

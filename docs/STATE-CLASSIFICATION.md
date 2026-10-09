@@ -406,3 +406,66 @@ sudo domum-media storage verify-volume-dumps <point>
 
 Wiring the orchestration is the next step, and it deserves its own pass: that is
 the part that deploys.
+
+---
+
+## Calibre-Web: migrated 2026-10-09, as decided
+
+The decision recorded above was carried out. It went exactly as the measurements
+predicted, which is the useful part: the prediction was made from the state, not
+from analogy with Plex.
+
+```
+before  /srv/data/calibre-web  inode 4375, ordinary directory, 6 files, 255,492 b
+after   inode 256, st_dev 55 (parent /srv/data is 45)
+proof   calibre-web-20261009-131921-post-migration   ro=true
+kept    /srv/data/calibre-web.premigration            264 KB, inode 4375
+elapsed 1m 1s end to end, including the operator's own verification stages
+```
+
+**The integrity claim held, and was re-derived independently afterwards:**
+`.premigration` == proof snapshot, `ab4ddead8c0cc992…` on both sides.
+
+**The staged image was reported and not deployed.** `migrate[preflight]` named
+`6cf7dab48a4a -> d5ad2aaf36f8` and said why it was safe to proceed — the restart
+uses `compose start`, which resolves no image reference — and stage 8 confirmed
+`image unchanged across the restart`. calibre-web is still on 0.6.26-ls386.
+
+### Two declarations earned their place here
+
+Both were added when the decision was taken, and this migration is the first
+time either ran outside a test:
+
+| declaration | without it | with it |
+|---|---|---|
+| `service_sqlite_binary calibre-web` → `/usr/bin/sqlite3` | `unsupported: not checked` — honest, because there is no sqlite3 on the host at all | `sqlite config/app.db: ok`, `sqlite config/gdrive.db: ok`, `2 checked, 0 not checked` |
+| `service_ready_log_pattern calibre-web` → `port [tcp/*] succeeded!` | the migration could only report that the container was running | `LOGGED READY since the restart` |
+
+The second is still the weaker kind of readiness, and the report says so:
+calibre-web has no container healthcheck, so `running` plus a listener is all
+that is proven. The wrapper repeats that twice and tells the operator to exercise
+the application themselves.
+
+### Live-tree divergence
+
+```
+since the proof snapshot: 1 expected-churn, 0 pruned, 0 changed, 0 added, 0 lost
+```
+
+One churn record, and nothing lost — a log file, which is exactly the category
+the classification exists to separate from a real loss. The rule that "missing is
+a hard failure" was false and only Plex showed it; calibre-web adds a clean case
+on the other side.
+
+### What this unblocks
+
+`updates apply --service calibre-web` is now available, because its state is
+`protected`. The waiting upgrade is 0.6.26-ls386 → 0.6.27-ls399
+(`d5ad2aaf36f8`), and it has **not** been performed.
+
+### Remaining
+
+`immich` is the only service still on an ordinary directory. It is deliberately
+last: its state is a live PostgreSQL cluster plus the photo library, both under
+`/srv/data/immich`, and `CLAUDE.md` §7 governs it. It needs its own reviewed
+phase, not this wrapper.

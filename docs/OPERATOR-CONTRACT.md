@@ -114,9 +114,30 @@ candidate.
 `tests/cleanup-images-json-smoke.sh` asserts that structurally *and* by comparing
 both outputs over one fixture, and kills a mutant that inverts the JSON flag.
 
+## One wrapper, any service
+
+`operator/domum-media-upgrade-service.sh` takes the service as a **positional
+argument**. It was `${DOMUM_SVC:-plex}` on a file named `-upgrade-plex.sh` while
+Plex was the only migrated service with a staged image; Calibre-Web joined it on
+2026-10-09, and driving a second service through an environment variable on a
+file named after the first is how the wrong service gets upgraded at 2am.
+
+Generalising it exposed a real defect that only a rehearsal finds: `SVC_PATH` was
+derived at the top of the script, **before** the argument loop, so with the
+service positional it became `"$DATA_ROOT/"` and stage 4 checked the inode of the
+data root itself. The fixture reported it as
+
+```
+ABORT: /tmp/.../f/data/ is not a Btrfs subvolume (inode 424656, expected 424663)
+```
+
+Section 30c now drives the wrapper for `calibre-web` end to end and asserts it
+checks its *own* path, upgrades only itself, leaves Plex untouched, and names the
+service it upgraded.
+
 ## Rehearsal, not review
 
-`operator/domum-media-upgrade-plex.sh` is rehearsed in
+`operator/domum-media-upgrade-service.sh` is rehearsed in
 `tests/service-upgrade-integration-smoke.sh` against a production-shaped fixture:
 Plex on `58f13a1df833` with `7f9a1d574958` staged, four protected subvolumes with
 their retained post-migration proof snapshots, eleven containers, Calibre-Web an
