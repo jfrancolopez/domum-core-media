@@ -67,6 +67,9 @@ jobs:
       - name: Backup exclusion audit smoke test
         run: tests/backup-exclusion-audit-smoke.sh
 
+      - name: DR status smoke test
+        run: tests/dr-status-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 
