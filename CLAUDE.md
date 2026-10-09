@@ -823,8 +823,19 @@ Read it rather than relying on remembered commands. It currently expects:
 
 Notes:
 
-- `shellcheck` is **not installed on this host**; CI installs it. Do not report
-  a shellcheck pass that did not run.
+- `shellcheck` is not installed as a host package, but it **can be run here**
+  through the image that is now pulled locally, with exactly the flags CI uses:
+
+  ```
+  docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:stable \
+    --severity=warning bin/domum-media bin/domum-media-backup \
+    bin/domum-media-report install.sh operator/*.sh
+  ```
+
+  Run it before pushing. Two CI failures were spent on findings it reports in
+  seconds -- `SC2178`/`SC2128` from reusing the name of an array in the same
+  file as a string local, and `SC2155` from `local x="$(...)"`. Still do not
+  report a shellcheck pass that did not run.
 - **The workflow enumerates every test by name — there is no glob.** A new suite
   is not enforced until a step is added, and seven were not: they passed locally
   and were reported as "CI green" while CI had never run them. `tests/ci-coverage-audit.sh`

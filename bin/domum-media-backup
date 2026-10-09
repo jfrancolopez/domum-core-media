@@ -1063,7 +1063,7 @@ sample_human_bytes() {  # $1 = bytes
 # One place that renders the coverage block, so the plan and the verification
 # cannot describe the population differently.
 sample_report_coverage() {  # $1 = inventory file, $2 = library root, $3 = missing-on-disk
-  local inv="$1" lib="$2" missing="${3:-0}"
+  local inv="$1" lib="$2" absent="${3:-0}"
   local stats tf tb of ob glob
   stats="$(sample_coverage_stats "$inv")"
   read -r tf tb of ob <<< "$stats"
@@ -1072,8 +1072,8 @@ sample_report_coverage() {  # $1 = inventory file, $2 = library root, $3 = missi
     [[ -n "$cnt" ]] || continue
     printf '                 %6d under %s/\n' "$cnt" "$sub"
   done < <(inventory_by_location "$inv" "$lib")
-  if [[ "$missing" =~ ^[0-9]+$ ]] && (( missing > 0 )); then
-    echo "  MISSING      : ${missing} original(s) the asset table names are NOT on disk"
+  if [[ "$absent" =~ ^[0-9]+$ ]] && (( absent > 0 )); then
+    echo "  MISSING      : ${absent} original(s) the asset table names are NOT on disk"
     echo "                 These cannot be sampled and are not backed up either."
   fi
   if [[ "$of" =~ ^[0-9]+$ ]] && (( of > 0 )); then
@@ -1496,6 +1496,18 @@ EOF
 backup_exclude_patterns() {
   printf '%s\n' "$DOMUM_DATA_ROOT/immich/backup-staging/*.tmp"
   printf '%s\n' "${DOMUM_MEDIA_ROOT}/.cache/*"
+  # The Immich derivative exclusion is OFF by default and, even when switched
+  # on, is applied only if it can be PROVEN against the live asset table that
+  # no original matches. See exclusion_safe_to_apply.
+  if [[ "${BACKUP_EXCLUDE_IMMICH_DERIVATIVES:-0}" == "1" ]]; then
+    local -a proposed=()
+    local pat
+    while IFS= read -r pat; do [[ -n "$pat" ]] && proposed+=("$pat"); done \
+      < <(backup_proposed_exclude_patterns)
+    if (( ${#proposed[@]} > 0 )) && exclusion_safe_to_apply "${proposed[@]}"; then
+      printf '%s\n' "${proposed[@]}"
+    fi
+  fi
 }
 
 # Patterns that are NOT in effect: a reviewable proposal, kept beside the
@@ -1576,6 +1588,68 @@ immich_db_original_paths() {
   return 1
 }
 
+# Which originals would these patterns exclude?
+#
+# The one implementation of the question. The human audit and the runtime gate
+# both call it, so a report that says "safe" and a backup that excludes an
+# original cannot coexist.
+#
+# Prints one "<pattern>\t<original path>" line per offence. Returns 0 when
+# nothing matched, 1 when something did, and 2 when the question could not be
+# answered -- which callers must treat as "not safe", never as "safe".
+originals_matched_by_patterns() {  # $@ = patterns
+  local inv rc=0 path pat lib n_under
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  inv="$(mktemp)" || return 2
+  if ! immich_original_inventory "$inv" >/dev/null; then rm -f "$inv"; return 2; fi
+  # The same vacuity guard the audit uses: untranslated paths match no host
+  # pattern, so "nothing matched" would be meaningless.
+  n_under="$(cut -f2 "$inv" | grep -c "^${lib}/" || true)"
+  if [[ "${n_under:-0}" -eq 0 ]]; then rm -f "$inv"; return 2; fi
+  while IFS=$'\t' read -r _ path; do
+    [[ -n "$path" ]] || continue
+    for pat in "$@"; do
+      [[ -n "$pat" ]] || continue
+      if path_matches_exclude "$path" "$pat"; then
+        printf '%s\t%s\n' "$pat" "$path"
+        rc=1
+      fi
+    done
+  done < "$inv"
+  rm -f "$inv"
+  return "$rc"
+}
+
+# The permanent invariant: NO Immich original may be excluded from the off-site
+# backup.
+#
+# This is why the derivative exclusion is gated at RUN TIME rather than trusted
+# because an audit passed once. The patterns key off a naming convention --
+# a transcode is <uuid>.mp4, a motion-photo original is <uuid>-MP.mp4 -- and a
+# future Immich version is free to name a new kind of original anything it
+# likes, including something ending in a hex digit. The convention is evidence,
+# not a guarantee; the asset table is the guarantee.
+#
+# Failing toward MORE backup is safe: excluding less costs money, never data.
+# So when the invariant cannot be established the patterns are DROPPED and the
+# run says so, rather than the backup being refused. A refused backup would
+# turn a cost optimisation into an outage.
+exclusion_safe_to_apply() {  # $@ = patterns -> 0 safe, 1 unsafe/unknown
+  local offences rc
+  offences="$(originals_matched_by_patterns "$@")"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) warn "Exclusion REFUSED: these patterns would stop an Immich ORIGINAL being backed up."
+       printf '%s\n' "$offences" | head -10 | sed 's/^/  /' >&2
+       warn "The backup will proceed WITHOUT them. Nothing irreplaceable is dropped."
+       return 1 ;;
+    *) warn "Exclusion REFUSED: could not read the Immich asset table, so it cannot be"
+       warn "proven that no original would be excluded. Proceeding WITHOUT the"
+       warn "derivative exclusions -- backing up more is the safe direction."
+       return 1 ;;
+  esac
+}
+
 # Would any exclusion pattern stop an Immich original from being backed up?
 #
 # Read-only: it contacts no repository, writes nothing, and changes no
@@ -1606,7 +1680,11 @@ do_exclusion_audit() {
 
   if [[ "$mode" == "--proposed" ]]; then
     echo
-    echo "proposed exclusions (NOT in effect; reviewed, not applied):"
+    if [[ "${BACKUP_EXCLUDE_IMMICH_DERIVATIVES:-0}" == "1" ]]; then
+      echo "proposed exclusions (SWITCHED ON; applied only while this audit passes):"
+    else
+      echo "proposed exclusions (NOT in effect; BACKUP_EXCLUDE_IMMICH_DERIVATIVES=0):"
+    fi
     while IFS= read -r pat; do
       [[ -n "$pat" ]] || continue
       patterns+=("$pat"); labels+=("proposed")
@@ -1644,18 +1722,17 @@ do_exclusion_audit() {
     return 2
   fi
 
+  # One implementation of the question, shared with the runtime gate, so this
+  # report and the backup's behaviour cannot disagree.
   local -a offenders=()
-  while IFS= read -r path; do
-    [[ -n "$path" ]] || continue
-    total=$((total + 1))
-    for i in "${!patterns[@]}"; do
-      if path_matches_exclude "$path" "${patterns[$i]}"; then
-        hits=$((hits + 1))
-        offenders+=("${labels[$i]}  ${patterns[$i]}  ->  $path")
-        break
-      fi
-    done
-  done <<< "$originals"
+  local off_lines opat opath
+  total="$n_orig"
+  off_lines="$(originals_matched_by_patterns "${patterns[@]}")" || true
+  while IFS=$'\t' read -r opat opath; do
+    [[ -n "$opath" ]] || continue
+    hits=$((hits + 1))
+    offenders+=("$opat  ->  $opath")
+  done <<< "$off_lines"
 
   if (( hits > 0 )); then
     echo "MATCHED ORIGINALS  : $hits of $total"
@@ -2015,7 +2092,8 @@ do_verify_db_restore() {
   esac
   scratch="$(mktemp -d "$vdir/dbimport.XXXXXX")" || die "Cannot create a scratch directory"
 
-  local cname="domum-dbimport-$$-$(date +%s)"
+  local cname
+  cname="domum-dbimport-$$-$(date +%s)"
   # One trap for both the scratch tree and the container, and the signal form
   # must TERMINATE: a cleanup-only trap would let execution fall through into
   # verification against a database that has just been destroyed.
