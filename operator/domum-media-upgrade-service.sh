@@ -216,7 +216,7 @@ esac
 
 if [ "$PREFLIGHT_ONLY" = 1 ]; then
   printf '\nPREFLIGHT ONLY — every check above passed and nothing was changed.\n'
-  printf 'To upgrade:  sudo bash %s%s\n' "$0" \
+  printf 'To upgrade:  sudo bash %s %s%s\n' "$0" "$SVC" \
     "$([ -n "$EXPECT_REVISION" ] && printf ' --expect-revision %s' "$EXPECT_REVISION")"
   exit 0
 fi

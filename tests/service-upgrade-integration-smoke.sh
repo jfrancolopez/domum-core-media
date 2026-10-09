@@ -798,6 +798,13 @@ for want in "no tracked drift" "required capabilities supported" \
   grep -q "$want" "$ENV_DIR/wout" || { wout; fail "preflight did not report '$want'"; }
 done
 grep -q 'nothing was changed' "$ENV_DIR/wout" || fail "preflight did not say it changed nothing"
+# The closing line exists to be PASTED. It printed the script path with no
+# service once the service became positional, so pasting it gave the usage
+# error -- safe, and exactly the kind of friction that gets a wrapper edited
+# by hand at 2am.
+grep -qE "To upgrade:.*domum-media-upgrade-service\.sh +plex" "$ENV_DIR/wout" \
+  || fail "the preflight's 'To upgrade' line does not include the service, so it
+cannot be pasted: $(grep 'To upgrade' "$ENV_DIR/wout")"
 [ "$(img plex)" = "$PLEX_OLD" ] || fail "preflight changed plex's image"
 grep -qE '^RECREATED|^STOPPED' <<< "$(calls)" && fail "preflight stopped or recreated something"
 echo "  every preflight check passed; nothing stopped, nothing recreated"
