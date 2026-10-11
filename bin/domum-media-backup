@@ -2011,6 +2011,23 @@ dr_snapshot_coverage() {  # $1 = target -> "present originals missing snapshot" 
   printf '%s %s %s %s' "$present" "$orig" "${miss:-0}" "${snap:-unknown}"
 }
 
+# The Phase A rehearsal result, if it passed.
+#
+# A distinct claim from everything else: the application opened the recovered
+# database. It is NOT claim 4 -- nothing was served -- so it must never promote
+# a tier to FULL RECOVERY VERIFIED.
+dr_last_phase_a() {  # $1 = target -> "ts snapshot assets" or empty
+  local f; f="$(phasea_evidence_file "$1")"
+  [[ -f "$f" ]] || return 1
+  (
+    unset LAST_SUCCESS_TS LAST_SUCCESS_SNAPSHOT_ID ASSETS
+    # shellcheck disable=SC1090
+    . "$f" >/dev/null 2>&1 || exit 1
+    [[ -n "${LAST_SUCCESS_TS:-}" ]] || exit 1
+    printf '%s %s %s' "$LAST_SUCCESS_TS" "${LAST_SUCCESS_SNAPSHOT_ID:-unknown}" "${ASSETS:-0}"
+  )
+}
+
 # The sample-restore proof for a target, WITH its denominator.
 #
 # A sample proof without a population is not reportable as RESTORE TESTED: that
@@ -2123,6 +2140,17 @@ dr_immich_summary() {  # $1 = target, $2 = library root
     local never=$(( n_orig - samp - largeok ))
     (( never < 0 )) && never=0
     printf '    %-34s %s\n' "NEVER restore-tested" "$never"
+    # The application half, kept separate from the byte half. A started
+    # application proves the database is usable; it proves nothing about files.
+    local pa
+    if pa="$(dr_last_phase_a "$target")"; then
+      printf '    %-34s %s\n' "application startup (Phase A)" \
+        "VERIFIED ${pa%% *} -- $(awk '{print $3}' <<< "$pa") record(s), snapshot $(awk '{print $2}' <<< "$pa")"
+      printf '    %-34s %s\n' "" "(the app opened the database; no file was served)"
+    else
+      printf '    %-34s %s\n' "application startup (Phase A)" \
+        "NOT TESTED -- run immich-phase-a"
+    fi
     # The tier row above quotes the population RECORDED when the sample ran;
     # this block counts the library as it is NOW. They are different questions
     # and will diverge as photos are added, so say when they have rather than
@@ -2234,6 +2262,11 @@ dr_remaining_risks() {  # $1 = target, $2 = library root
       n=$((n+1)); echo "    $n. $scm original(s) are NOT in the snapshot that was reconciled."
       echo "       They exist locally but are not protected off-site."
     fi
+  fi
+  if ! dr_last_phase_a "$target" >/dev/null; then
+    n=$((n+1)); echo "    $n. No Immich has ever been started against a recovered database."
+    echo "       The dump imports, but nothing shows the APPLICATION accepts the"
+    echo "       schema. Run immich-phase-a; it restores ~28 MB, not the library."
   fi
   n=$((n+1)); echo "    $n. No tier is FULL RECOVERY VERIFIED: no run has restored a whole"
   echo "       tier and had Immich itself confirm it."
@@ -3122,6 +3155,407 @@ authority for which files are originals."
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Immich PHASE A: can a fresh application open a recovered database?
+# ---------------------------------------------------------------------------
+
+# This answers the one question the PostgreSQL import cannot. The import proves
+# PostgreSQL can READ the dump; it says nothing about whether Immich will mount
+# the schema, because Immich checks its own schema version and runs migrations
+# on startup. A database PostgreSQL accepts is not necessarily one Immich will
+# open.
+#
+# What Phase A establishes, and the name is deliberately narrow:
+#
+#   APPLICATION STARTUP VERIFIED  a fresh Immich of the production version
+#                                 started against the restored database,
+#                                 migrated it, and served its own API over the
+#                                 recovered users and asset records.
+#
+# What it does NOT establish: that the library can be served. The originals are
+# not restored here -- that is ~130 GiB and a separate, approved exercise. Never
+# report this as FULL RECOVERY VERIFIED.
+#
+# Isolation is structural rather than promised:
+#
+#   * images are pinned by ID, read from the RUNNING production containers. The
+#     tag is `:release`, which is mutable, and the running image's RepoDigest
+#     equals its image ID here -- so it is effectively identity,local and a tag
+#     could silently test a different application than production runs.
+#   * an INTERNAL docker network. Measured: container-to-container DNS works and
+#     the internet is unreachable (curl returns 000), so a disposable Immich
+#     cannot send mail, reach an integration, or ping for versions. That is the
+#     only honest way to satisfy "no external side effects" -- configuration
+#     lives in the restored database and may well have SMTP set up.
+#   * unique container and network names, refused on any collision.
+#   * tmpfs PGDATA and a scratch upload directory; no production path is mounted
+#     at all, read-only or otherwise.
+#   * no published port. The API is exercised from inside the container.
+#
+# Only the variables production itself sets are passed, plus a disposable
+# JWT_SECRET. Speculative "make it quieter" variables are NOT set: the first
+# rehearsal added IMMICH_TELEMETRY_INCLUDE=none and Immich refused to boot with
+# `Error: Invalid telemetry found: none`, because that variable is real and
+# validated. An unknown variable is ignored; a known one with a wrong value is
+# fatal. The internal network is what actually prevents egress, so nothing is
+# gained by guessing at feature switches -- and Phase A existing is how that
+# was found before it mattered.
+PHASEA_READY_TIMEOUT="${PHASEA_READY_TIMEOUT:-180}"
+PHASEA_PASSWORD="${PHASEA_PASSWORD:-phase-a-disposable-$$}"
+
+phasea_evidence_file() {
+  printf '%s/%s-phase-a.env' "$(restore_verification_dir)" "$1"
+}
+
+# The image a disposable copy must use: the ID the production container is
+# actually running, never the tag.
+phasea_pinned_image() {  # $1 = production container name
+  local id
+  id="$(docker inspect "$1" --format '{{.Image}}' 2>/dev/null || true)"
+  [[ -n "$id" ]] || return 1
+  docker image inspect "$id" >/dev/null 2>&1 || return 1
+  printf '%s' "$id"
+}
+
+# Refuse any name that already exists. A collision would mean operating on
+# something that is not ours, and the production stack is the thing most likely
+# to be on the other end of that mistake.
+phasea_name_free() {  # $1 = container name
+  docker ps -a --format '{{.Names}}' | grep -qxF "$1" && return 1
+  return 0
+}
+
+do_immich_phase_a() {
+  local target="${1:-}" a keep=0
+  shift || true
+  for a in "$@"; do
+    case "$a" in
+      --keep) keep=1 ;;
+      *) [[ -n "$a" ]] && die "Unknown argument: $a" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "Usage: domum-media-backup immich-phase-a <target> [--keep]"
+  backup_target_enabled "$target" || die "Backup target is not enabled: $target"
+  cmd_exists docker || die "docker is required"
+  cmd_exists jq || die "jq is required"
+
+  # ---- preflight: pin every image before anything is created ---------------
+  local img_pg img_redis img_server
+  img_pg="$(phasea_pinned_image immich_postgres)" \
+    || die "Cannot pin the PostgreSQL image: immich_postgres is not running, or its
+image is not present locally. Phase A must test the application version
+production actually runs, so it will not substitute a tag."
+  img_redis="$(phasea_pinned_image immich_redis)" \
+    || die "Cannot pin the Redis image from immich_redis."
+  img_server="$(phasea_pinned_image immich_server)" \
+    || die "Cannot pin the Immich server image from immich_server."
+
+  local stamp base net c_pg c_redis c_srv
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  base="domum-phasea-$$-$stamp"
+  net="${base}-net"; c_pg="${base}-pg"; c_redis="${base}-redis"; c_srv="${base}-server"
+  local n
+  for n in "$c_pg" "$c_redis" "$c_srv"; do
+    phasea_name_free "$n" || die "Refusing: a container named $n already exists."
+  done
+  docker network ls --format '{{.Name}}' | grep -qxF "$net" \
+    && die "Refusing: a network named $net already exists."
+
+  local vdir scratch
+  vdir="$(restore_verification_dir)"
+  mkdir -p "$vdir"
+  case "$vdir" in
+    "${DOMUM_DATA_ROOT%/}"/*|"${DOMUM_MEDIA_ROOT%/}"/*|"${DOMUM_DATA_ROOT%/}"|"${DOMUM_MEDIA_ROOT%/}")
+      die "Refusing: the scratch location $vdir is inside a live data root." ;;
+  esac
+  scratch="$(mktemp -d "$vdir/phasea.XXXXXX")" || die "Cannot create a scratch directory"
+  mkdir -p "$scratch/upload"
+
+  # One teardown for everything, and the signal form must TERMINATE: a
+  # cleanup-only trap would let execution fall through into assertions against
+  # containers that have just been destroyed.
+  # shellcheck disable=SC2064
+  trap "phasea_teardown '$c_srv' '$c_redis' '$c_pg' '$net' '$scratch' $keep" EXIT
+  # shellcheck disable=SC2064
+  trap "phasea_teardown '$c_srv' '$c_redis' '$c_pg' '$net' '$scratch' $keep; exit 143" HUP INT TERM
+
+  echo "[domum-media-backup] Immich Phase A rehearsal for $target"
+  echo "  server image      : ${img_server:0:19} (pinned from the running container)"
+  echo "  postgres image    : ${img_pg:0:19}"
+  echo "  redis image       : ${img_redis:0:19}"
+  echo "  network           : $net (INTERNAL -- no route off this host)"
+  echo "  upload location   : $scratch/upload (scratch; NO production path is mounted)"
+
+  # ---- the dump, from the repository ---------------------------------------
+  local snapshot_id rel artifact
+  snapshot_id="$(restic_for_target "$target" snapshots --latest 1 --json 2>/dev/null \
+    | jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' 2>/dev/null || true)"
+  [[ -n "$snapshot_id" ]] || die "Could not determine the latest snapshot for $target"
+  rel="$DOMUM_DATA_ROOT/immich/backup-staging/immich-postgres.dump.sql.gz"
+  log "immich phase A: $target snapshot $snapshot_id -> $base (isolated)"
+  restic_for_target "$target" restore latest --target "$scratch" --include "$rel" \
+    >/dev/null 2>&1 || die "Could not restore the dump from $target"
+  artifact="$scratch$rel"
+  [[ -s "$artifact" ]] || die "The restored dump is missing or empty"
+  echo "  snapshot          : $snapshot_id"
+  echo "  dump              : $(stat -c %s "$artifact") bytes"
+
+  # Immich verifies its own library scaffold before it will serve anything.
+  # Measured: with an empty upload directory the microservices worker dies with
+  #   Failed to read "<UPLOAD_LOCATION>/encoded-video/.immich"
+  # after reporting mountChecks for thumbs, upload, backups, library, profile
+  # and encoded-video. Those `.immich` files are Immich's OWN 13-byte integrity
+  # markers, which exist to detect a wrong or unmounted volume -- so they are
+  # real backed-up files, and Phase A RESTORES them from the snapshot rather
+  # than creating them. 78 bytes in total.
+  #
+  # This matters for honesty: nothing on the filesystem is fabricated to make
+  # the application look healthy. The library itself is still absent, and any
+  # attempt to serve an asset will fail -- which is reported, not hidden.
+  local lib marker sub restored_markers=0
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  local -a marker_args=()
+  for sub in upload thumbs encoded-video library profile backups; do
+    marker_args+=(--include "$lib/$sub/.immich")
+  done
+  restic_for_target "$target" restore latest --target "$scratch" "${marker_args[@]}" \
+    >/dev/null 2>&1 || true
+  for sub in upload thumbs encoded-video library profile backups; do
+    marker="$scratch$lib/$sub/.immich"
+    if [[ -f "$marker" ]]; then
+      mkdir -p "$scratch/upload/$sub"
+      cp -- "$marker" "$scratch/upload/$sub/.immich"
+      restored_markers=$(( restored_markers + 1 ))
+    fi
+  done
+  echo "  library scaffold  : $restored_markers of 6 .immich marker(s) restored from the snapshot"
+  if (( restored_markers < 6 )); then
+    echo "                      Immich checks all six and will refuse to start without"
+    echo "                      them. Missing markers mean the snapshot does not hold a"
+    echo "                      complete library scaffold, which is itself a finding."
+  fi
+
+  docker network create --internal "$net" >/dev/null 2>&1 \
+    || die "Could not create the isolated network"
+
+  # ---- disposable PostgreSQL ------------------------------------------------
+  local pgpass="phasea-$$-$RANDOM"
+  docker run -d --name "$c_pg" --network "$net" --network-alias database \
+    -e POSTGRES_PASSWORD="$pgpass" -e POSTGRES_DB=postgres \
+    --tmpfs /var/lib/postgresql/data:rw,size=6g,mode=0700 \
+    "$img_pg" >/dev/null 2>&1 || die "The disposable PostgreSQL did not start"
+  local i ready=0
+  for i in $(seq 1 60); do
+    docker exec "$c_pg" pg_isready -U postgres >/dev/null 2>&1 && { ready=1; break; }
+    sleep 1
+  done
+  (( ready == 1 )) || die "The disposable PostgreSQL never became ready"
+  docker exec "$c_pg" psql -U postgres -q -c 'create database immich' >/dev/null 2>&1 \
+    || die "Could not create the target database"
+  gzip -dc "$artifact" \
+    | docker exec -i "$c_pg" psql -U postgres -d immich -q -v ON_ERROR_STOP=1 \
+      >/dev/null 2>"$scratch/import.err" \
+    || { echo "  import            : FAILED"; head -5 "$scratch/import.err" | sed 's/^/    /'; return 1; }
+  echo "  import            : COMPLETED under ON_ERROR_STOP=1"
+
+  # Baseline BEFORE Immich touches it, so a migration that destroys data is
+  # visible as a change rather than assumed not to happen.
+  local before_assets before_users
+  before_assets="$(phasea_sql "$c_pg" 'select count(*) from asset')"
+  before_users="$(phasea_sql "$c_pg" 'select count(*) from "user"')"
+  echo "  restored records  : $before_assets asset(s), $before_users user(s) before startup"
+
+  # ---- disposable Redis ----------------------------------------------------
+  docker run -d --name "$c_redis" --network "$net" --network-alias redis \
+    "$img_redis" >/dev/null 2>&1 || die "The disposable Redis did not start"
+
+  # ---- disposable Immich server -------------------------------------------
+  # No production path is mounted. The upload location is scratch, so anything
+  # Immich generates lands there and dies with the scratch directory.
+  docker run -d --name "$c_srv" --network "$net" \
+    -e DB_HOSTNAME=database -e DB_USERNAME=postgres -e DB_PASSWORD="$pgpass" \
+    -e DB_DATABASE_NAME=immich \
+    -e REDIS_HOSTNAME=redis \
+    -e UPLOAD_LOCATION=/usr/src/app/upload \
+    -e JWT_SECRET="phase-a-disposable-secret-$$" \
+    -v "$scratch/upload:/usr/src/app/upload:rw" \
+    "$img_server" >/dev/null 2>&1 || die "The disposable Immich server did not start"
+
+  # ---- readiness -----------------------------------------------------------
+  local ver=""
+  for i in $(seq 1 "$PHASEA_READY_TIMEOUT"); do
+    ver="$(docker exec "$c_srv" curl -sf -m 3 http://127.0.0.1:2283/api/server/version 2>/dev/null || true)"
+    [[ -n "$ver" ]] && break
+    docker ps --format '{{.Names}}' | grep -qxF "$c_srv" \
+      || { echo "  startup           : FAILED -- the server container exited"; docker logs --tail 20 "$c_srv" 2>&1 | sed 's/^/    /'; return 1; }
+    sleep 1
+  done
+  if [[ -z "$ver" ]]; then
+    echo "  startup           : FAILED -- no API response within ${PHASEA_READY_TIMEOUT}s"
+    docker logs --tail 25 "$c_srv" 2>&1 | sed 's/^/    /'
+    return 1
+  fi
+  echo "  startup           : API answered -- version $(jq -r '[.major,.minor,.patch]|map(tostring)|join(".")' <<< "$ver" 2>/dev/null || echo "$ver")"
+
+  # ---- did it keep the recovered data? ------------------------------------
+  local after_assets after_users
+  after_assets="$(phasea_sql "$c_pg" 'select count(*) from asset')"
+  after_users="$(phasea_sql "$c_pg" 'select count(*) from "user"')"
+  echo "  after migrations  : $after_assets asset(s), $after_users user(s)"
+  if [[ "$after_assets" != "$before_assets" || "$after_users" != "$before_users" ]]; then
+    echo "  result            : FAILED -- startup CHANGED the recovered record counts"
+    echo "                      assets $before_assets -> $after_assets, users $before_users -> $after_users"
+    return 1
+  fi
+
+  # ---- the application layer ----------------------------------------------
+  # A known password is set on the admin user in the DISPOSABLE database only,
+  # using the database's own pgcrypto so no credential tooling or network is
+  # needed. Production is untouched: this database exists only inside this
+  # container's tmpfs. Without this there is no way to ask the application what
+  # it can see, and a DB query would only re-prove what the import already did.
+  local email token stats photos videos api_total
+  email="$(phasea_sql "$c_pg" 'select email from "user" where "isAdmin" order by "createdAt" limit 1')"
+  [[ -n "$email" ]] || { echo "  result            : FAILED -- no admin user in the recovered database"; return 1; }
+  phasea_sql "$c_pg" "create extension if not exists pgcrypto" >/dev/null
+  phasea_sql "$c_pg" "update \"user\" set password = crypt('$PHASEA_PASSWORD', gen_salt('bf',10)), \"shouldChangePassword\" = false where email = '$email'" >/dev/null
+  token="$(docker exec "$c_srv" curl -sf -m 10 -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$email\",\"password\":\"$PHASEA_PASSWORD\"}" \
+    http://127.0.0.1:2283/api/auth/login 2>/dev/null | jq -r '.accessToken // empty' 2>/dev/null || true)"
+  if [[ -z "$token" ]]; then
+    echo "  application layer : FAILED -- could not authenticate as the recovered admin user"
+    return 1
+  fi
+  echo "  application layer : authenticated as the recovered admin user"
+
+  stats="$(docker exec "$c_srv" curl -sf -m 20 \
+    -H "Authorization: Bearer $token" \
+    http://127.0.0.1:2283/api/server/statistics 2>/dev/null || true)"
+  photos="$(jq -r '.photos // empty' <<< "$stats" 2>/dev/null || true)"
+  videos="$(jq -r '.videos // empty' <<< "$stats" 2>/dev/null || true)"
+  if [[ -z "$photos" || -z "$videos" ]]; then
+    echo "  application layer : FAILED -- the API returned no asset statistics"
+    return 1
+  fi
+  api_total=$(( photos + videos ))
+  # The API reports TIMELINE-VISIBLE assets, not every row. Measured on this
+  # library: 13,893 timeline images + 1,712 timeline videos + 7,428 HIDDEN
+  # videos = 23,033. The hidden ones are the motion-photo components of live
+  # photos -- irreplaceable originals that are backed up but never shown in a
+  # timeline. Comparing the API total against every row therefore fails on a
+  # perfectly healthy recovery, which is what the first run of this check did.
+  local db_vis_img db_vis_vid db_hidden
+  db_vis_img="$(phasea_sql "$c_pg" "select count(*) from asset where type='IMAGE' and visibility='timeline'")"
+  db_vis_vid="$(phasea_sql "$c_pg" "select count(*) from asset where type='VIDEO' and visibility='timeline'")"
+  db_hidden="$(phasea_sql "$c_pg" "select count(*) from asset where visibility <> 'timeline'")"
+  echo "  API asset counts  : $photos photo(s) + $videos video(s) = $api_total visible"
+  if [[ -z "$db_vis_img" || -z "$db_vis_vid" ]]; then
+    # A schema without `visibility` cannot be compared this way. Say so rather
+    # than falling back to a comparison that is known to be wrong.
+    echo "  result            : INCONCLUSIVE -- this schema has no visibility column, so"
+    echo "                      the API total cannot be reconciled with the row count."
+    phasea_record "$target" inconclusive "$snapshot_id" "$img_server" "$after_assets" "$after_users" \
+      "no visibility column; API total not reconcilable"
+    return 1
+  fi
+  echo "  database (visible): $db_vis_img image(s) + $db_vis_vid video(s)"
+  echo "  database (hidden) : $db_hidden -- motion-photo components, backed up, not in a timeline"
+  if [[ "$photos" != "$db_vis_img" || "$videos" != "$db_vis_vid" ]]; then
+    echo "  result            : FAILED -- the application and the database disagree."
+    echo "                      API $photos/$videos vs database $db_vis_img/$db_vis_vid"
+    phasea_record "$target" failure "$snapshot_id" "$img_server" "$after_assets" "$after_users" \
+      "API/database asset counts disagree"
+    return 1
+  fi
+
+  # ---- record and report --------------------------------------------------
+  phasea_record "$target" success "$snapshot_id" "$img_server" "$after_assets" "$after_users" ""
+  echo
+  echo "  result            : APPLICATION STARTUP VERIFIED"
+  echo "                      A fresh Immich of the production image opened the"
+  echo "                      restored database, migrated it without changing the"
+  echo "                      recovered records, authenticated a recovered user,"
+  echo "                      and reported $api_total timeline assets through its own"
+  echo "                      API, matching the database exactly per media type."
+  echo "                      $db_hidden further originals are hidden motion-photo"
+  echo "                      components: backed up, but never shown in a timeline."
+  echo
+  echo "  This is NOT full recovery. No original was restored, so nothing proves"
+  echo "  the library can be SERVED. That needs ~130 GiB and separate approval."
+  return 0
+}
+
+# One SQL value out of the disposable database.
+phasea_sql() {  # $1 = container, $2 = query
+  docker exec "$1" psql -U postgres -d immich -At -c "$2" 2>/dev/null | head -1
+}
+
+# Remove everything this rehearsal created, and say what survived.
+#
+# A test that leaves containers behind has changed the host it was supposed to
+# leave alone, so the removal is asserted rather than assumed.
+phasea_teardown() {  # $1=srv $2=redis $3=pg $4=net $5=scratch $6=keep
+  local srv="$1" redis="$2" pg="$3" net="$4" scratch="$5" keep="${6:-0}"
+  if [[ "$keep" == "1" ]]; then
+    echo "  --keep: leaving $srv, $redis, $pg, $net and $scratch in place." >&2
+    return 0
+  fi
+  docker rm -f "$srv" "$redis" "$pg" >/dev/null 2>&1 || true
+  docker network rm "$net" >/dev/null 2>&1 || true
+  rm -rf -- "$scratch" 2>/dev/null || true
+  local leaked=""
+  local n
+  for n in "$srv" "$redis" "$pg"; do
+    docker ps -a --format '{{.Names}}' | grep -qxF "$n" && leaked="$leaked $n"
+  done
+  docker network ls --format '{{.Name}}' | grep -qxF "$net" && leaked="$leaked $net"
+  [[ -e "$scratch" ]] && leaked="$leaked $scratch"
+  if [[ -n "$leaked" ]]; then
+    echo "WARNING: Phase A could not remove:$leaked" >&2
+    return 1
+  fi
+  return 0
+}
+
+phasea_record() {
+  local target="$1" result="$2" snap="$3" image="$4" assets="$5" users="$6" reason="${7:-}"
+  local dir file tmp now prev_ok_ts="" prev_ok_snap=""
+  dir="$(restore_verification_dir)"; mkdir -p "$dir"
+  file="$(phasea_evidence_file "$target")"
+  now="$(date -Iseconds)"
+  if [[ -f "$file" ]]; then
+    eval "$(
+      unset RESULT VERIFIED_TS SNAPSHOT_ID LAST_SUCCESS_TS LAST_SUCCESS_SNAPSHOT_ID
+      # shellcheck disable=SC1090
+      . "$file" >/dev/null 2>&1 || true
+      if [[ "${RESULT:-}" == "success" ]]; then
+        printf 'prev_ok_ts=%q\nprev_ok_snap=%q\n' "${VERIFIED_TS:-}" "${SNAPSHOT_ID:-}"
+      else
+        printf 'prev_ok_ts=%q\nprev_ok_snap=%q\n' "${LAST_SUCCESS_TS:-}" "${LAST_SUCCESS_SNAPSHOT_ID:-}"
+      fi
+    )"
+  fi
+  local ok_ts ok_snap
+  if [[ "$result" == "success" ]]; then ok_ts="$now"; ok_snap="$snap"
+  else ok_ts="$prev_ok_ts"; ok_snap="$prev_ok_snap"; fi
+  tmp="$(mktemp "$dir/.${target}-phase-a.env.XXXXXX")" || return 1
+  {
+    printf 'SCHEMA_VERSION=1\n'
+    printf 'TARGET=%s\n' "$target"
+    printf 'RESULT=%s\n' "$result"
+    printf 'VERIFIED_TS=%s\n' "$now"
+    printf 'LAST_SUCCESS_TS=%s\n' "$ok_ts"
+    printf 'LAST_SUCCESS_SNAPSHOT_ID=%s\n' "$ok_snap"
+    printf 'SNAPSHOT_ID=%s\n' "$snap"
+    printf 'SERVER_IMAGE_ID=%s\n' "$image"
+    printf 'ASSETS=%s\n' "${assets:-0}"
+    printf 'USERS=%s\n' "${users:-0}"
+    printf 'REASON=%s\n' "$reason"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0600 "$tmp"; mv -f "$tmp" "$file"
+}
+
 main() {
   need_root
   load_cfg
@@ -3149,6 +3583,7 @@ main() {
     verify-db-restore)    shift; do_verify_db_restore "${1:-}" ;;
     verify-large)         shift; do_verify_large "$@" ;;
     verify-snapshot-coverage) shift; do_verify_snapshot_coverage "$@" ;;
+    immich-phase-a)       shift; do_immich_phase_a "$@" ;;
     dr-status)            do_dr_status ;;
     -h|--help)
       cat <<EOF
@@ -3223,6 +3658,17 @@ Usage:
                                             library cheaply. Exit 0 covered,
                                             1 an original is missing, 2 not
                                             answerable
+  domum-media-backup immich-phase-a <target> [--keep]
+                                            Start a FRESH, isolated Immich of
+                                            the production image against the
+                                            database restored from a snapshot,
+                                            and ask the application what it can
+                                            see. Internal network (no route off
+                                            the host), tmpfs database, scratch
+                                            upload dir, no production path
+                                            mounted, images pinned by ID.
+                                            Earns APPLICATION STARTUP VERIFIED
+                                            -- never full recovery
   domum-media-backup dr-status              What is actually PROVEN about
                                             recovery, per tier and per target,
                                             on the five levels UNKNOWN /

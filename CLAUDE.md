@@ -911,6 +911,56 @@ its effect before relying on it. In the same section a second assertion was
 checking for a notice emitted by a different, unmutated function -- so it was
 testing the wrong thing. Name the observable the mutation actually changes.
 
+**Immich OPENS the recovered database — proven, not argued.** Rehearsed
+2026-10-11 by `immich-phase-a`: a fresh Immich of the production image
+(pinned by ID) started against the restored dump and logged
+`Running migrations` → `Finished running migrations` → `Checking for schema
+drift` → `No schema drift detected`, then authenticated a recovered user and
+reported asset counts matching the database per media type. Record counts were
+identical before and after startup, so migrations altered nothing recovered.
+The claim is `APPLICATION STARTUP VERIFIED` and is deliberately narrow: no
+original was restored, so nothing shows the library can be SERVED. Never let it
+promote a tier to `FULL RECOVERY VERIFIED`.
+
+Three facts that rehearsal established, each of which would otherwise have been
+discovered during a real recovery:
+
+- **Recovery depends on a DEPRECATED extension.** Immich itself warns that
+  `pgvecto.rs` support "will be removed very soon" in favour of VectorChord.
+  Once Immich drops it, today's dump will no longer import into a current
+  Immich. The window in which an old backup restores into a contemporary
+  application is narrowing, and that is a recovery risk independent of whether
+  production is ever upgraded.
+- **Immich requires its library SCAFFOLD, not just the database.** With an empty
+  upload directory the microservices worker dies on
+  `Failed to read "<UPLOAD_LOCATION>/encoded-video/.immich"` after reporting
+  mountChecks for all six subtrees. Those `.immich` files are Immich's own
+  13-byte integrity markers and are real backed-up files, so Phase A RESTORES
+  all six from the snapshot (78 bytes). Nothing is fabricated to make the
+  application look healthy.
+- **7,428 of the 23,033 originals are HIDDEN motion-photo components.**
+  13,893 timeline images + 1,712 timeline videos + 7,428 hidden videos. The API
+  reports only the 15,605 timeline-visible assets and matches the database
+  exactly per media type, so a check comparing the API total against every row
+  FAILS on a perfectly healthy recovery -- which the first version of that
+  comparison did. The hidden ones are the video halves of live photos:
+  irreplaceable, backed up, never shown in a timeline.
+
+**A rehearsal's isolation is structural or it is nothing.** Phase A uses an
+**internal** docker network -- measured: container-to-container DNS works and
+`curl https://…` returns 000 -- which is the only honest way to guarantee no
+mail, integration or telemetry escapes, because that configuration lives in the
+restored database and may well be populated. It pins images by **ID** read from
+the running containers, never the mutable `:release` tag; uses tmpfs PGDATA; and
+mounts **no** production path, read-only or otherwise. Names are unique and
+refused if taken, and the teardown is asserted rather than assumed.
+
+**Pass only the environment variables production passes.** The first Phase A
+rehearsal added `IMMICH_TELEMETRY_INCLUDE=none` and Immich refused to boot with
+`Error: Invalid telemetry found: none`. An unknown variable is ignored; a known
+one with a wrong value is fatal. Isolation comes from the network, so there is
+nothing to gain by guessing at feature switches.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a
