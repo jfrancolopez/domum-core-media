@@ -127,6 +127,64 @@ attack "a webp original among thumbnails"          "thumbs/ee/ff/deadbeef-0000-1
 echo "  every planted original is detected and the exclusion is withheld"
 
 # ---------------------------------------------------------------------------
+sect "an original RELOCATED into a generated directory is caught"
+# Immich moves files (storage-template changes, library migrations). An asset
+# whose originalPath now sits under a generated subtree must be noticed even
+# though it was once somewhere safe.
+attack "an original relocated under thumbs/" \
+  "thumbs/ee/ff/relocated-11111111-2222-3333-4444-555555555555.heic"
+attack "an original relocated under encoded-video/" \
+  "encoded-video/cc/dd/relocated-0000000000000000000000000000000f.mp4"
+echo "  a relocated original is caught wherever the table says it now lives"
+
+sect "an unexpected EXTENSION inside a generated directory is caught"
+# The patterns reason about .mp4 and the thumbs subtree. A future Immich could
+# write an original with an extension nobody anticipated.
+attack "an avif original among thumbnails" "thumbs/ee/ff/future-asset.avif"
+attack "a jxl original among thumbnails"   "thumbs/ee/ff/future-asset.jxl"
+attack "an extensionless original"          "thumbs/ee/ff/no-extension-at-all"
+echo "  unanticipated extensions are caught because the TABLE decides, not the name"
+
+sect "a path containing .. is compared literally and cannot escape the check"
+# A traversal component must not let a path slip past the matcher by
+# normalising to somewhere the pattern does not cover.
+TRAV="$LIB/encoded-video/cc/../cc/dd/0000000000000000000000000000000b.mp4"
+mkdir -p "$(dirname "$TRAV")"
+head -c 64 /dev/urandom > "$TRAV"
+hits="$(probe "$BASE_ORIGINALS
+$TRAV" "originals_matched_by_patterns '$LIB/encoded-video/**/*[0-9a-f].mp4'")"
+applied="$(patterns_applied "$BASE_ORIGINALS
+$TRAV")"
+# Either the matcher catches it, or it does not -- but it must never be both
+# unmatched AND excluded. The safe outcome is that the exclusion is withheld
+# whenever the path cannot be shown to be a derivative.
+if grep -qF "$TRAV" <<< "$hits"; then
+  grep -q 'thumbs/\*\*' <<< "$applied" \
+    && fail "a traversal path matched an exclusion and the exclusion was applied anyway"
+  echo "  the traversal path is matched, so the exclusion is withheld"
+else
+  # Not matched by the glob: then it is not excluded either, so it stays backed
+  # up. That is the safe direction; assert restic would keep it.
+  path_matches_exclude "$TRAV" "$LIB/encoded-video/**/*[0-9a-f].mp4" \
+    && fail "the matcher disagrees with itself about the traversal path"
+  echo "  the traversal path is not matched, so it stays in the backup"
+fi
+rm -f "$TRAV"
+
+sect "the gate re-reads the table every time -- no stale inventory"
+# A cached inventory would let an exclusion stay applied after a new original
+# appeared in a generated directory. The gate must consult the table on each
+# call, so two calls with different tables must give different answers.
+VIC="$(mk "encoded-video/cc/dd/12345678-9abc-def0-1234-56789abcdef0.mp4" 128)"
+first="$(patterns_applied "$BASE_ORIGINALS")"
+grep -q 'thumbs/\*\*' <<< "$first" || fail "the clean case should apply the exclusion"
+second="$(patterns_applied "$BASE_ORIGINALS
+$VIC")"
+grep -q 'thumbs/\*\*' <<< "$second" \
+  && fail "the exclusion stayed applied after a new original appeared; the table is cached"
+echo "  the same process gives different answers for different tables"
+rm -f "$VIC"
+
 sect "case: the pattern must not silently depend on lowercase"
 # An uppercase .MP4 original under encoded-video does NOT match the lowercase
 # class, so it is NOT excluded -- which is the safe direction. Measured on the
