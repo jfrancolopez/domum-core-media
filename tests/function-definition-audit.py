@@ -49,6 +49,19 @@ CALL_PATTERNS = [
     re.compile(r"\$\((?!\()\s*([a-z_][a-z0-9_]{2,})(?=\s|\)|$)"),
 ]
 
+# The project's own logging vocabulary. These MUST be defined in every script
+# that calls them, and they are exempt from the underscore heuristic below.
+#
+# `warn` was called five times in bin/domum-media-backup, which defines only
+# `die` and `log`, so the exclusion gate's refusal lines printed
+# "warn: command not found" and the operator was told nothing about why an
+# exclusion had been withheld. The audit passed: the heuristic that keeps
+# false positives down -- only report words containing an underscore -- made a
+# one-word internal helper invisible. The gate was correct and unreadable,
+# which is the worse half to lose, because a refusal nobody can read trains
+# people to ignore refusals.
+PROJECT_HELPERS = {"warn", "die", "log"}
+
 SHELL_WORDS = {
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
     "case", "esac", "function", "select", "time", "in", "return", "break",
@@ -221,7 +234,9 @@ def main():
         for path, lineno, word, src in calls:
             if word in defined or word in SHELL_WORDS or word in ext:
                 continue
-            if "_" not in word or word in seen:
+            if word not in PROJECT_HELPERS and "_" not in word:
+                continue
+            if word in seen:
                 continue
             seen.add(word)
             problems.append((path.relative_to(ROOT), lineno, word, src))

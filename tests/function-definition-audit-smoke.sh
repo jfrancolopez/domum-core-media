@@ -129,6 +129,40 @@ done
   || fail "the audit reported $(( ${#BENIGN[@]} - quiet )) false positive(s); it will be disabled by whoever hits one"
 echo "  $quiet/${#BENIGN[@]} benign forms correctly ignored (arithmetic, awk, assignment, continuation, quoted heredoc)"
 
+echo "== 4b. a one-word project helper that is not defined is caught =="
+# The heuristic that keeps false positives down -- only report words containing
+# an underscore -- made `warn` invisible. bin/domum-media-backup called it five
+# times in the exclusion gate and defines only `die` and `log`, so the lines
+# explaining WHY an exclusion had been withheld printed "warn: command not
+# found" while the audit passed. PROJECT_HELPERS is exempt from the heuristic.
+rm -rf "$TMP_DIR/repo"
+mkdir -p "$TMP_DIR/repo/tests" "$TMP_DIR/repo/bin"
+cp "$REPO_ROOT"/bin/domum-media "$REPO_ROOT"/bin/domum-media-report \
+   "$REPO_ROOT"/bin/domum-media-backup "$TMP_DIR/repo/bin/"
+cp "$REPO_ROOT"/install.sh "$TMP_DIR/repo/"
+cp "$AUDIT" "$TMP_DIR/repo/tests/"
+# Remove the warn DEFINITION from the backup script, leaving its callers.
+sed -i '/^warn() { echo "WARNING/d' "$TMP_DIR/repo/bin/domum-media-backup"
+grep -q '^warn()' "$TMP_DIR/repo/bin/domum-media-backup" \
+  && fail "the warn definition was not removed; the mutation proves nothing"
+grep -q 'warn "Exclusion REFUSED' "$TMP_DIR/repo/bin/domum-media-backup" \
+  || fail "no warn CALLER remains, so there is nothing to catch"
+python3 "$TMP_DIR/repo/tests/function-definition-audit.py" >"$TMP_DIR/mut.log" 2>&1
+rc=$?
+[ "$rc" != "0" ] || fail "removing warn's definition was NOT caught:
+$(cat "$TMP_DIR/mut.log")"
+grep -q 'warn' "$TMP_DIR/mut.log" || fail "the report does not name warn"
+echo "  an undefined one-word helper is reported, not skipped by the heuristic"
+
+echo "== 4c. the underscore heuristic still applies to everything else =="
+# A one-word name that is NOT a project helper must stay exempt, or every
+# external command missing from this host's PATH becomes a false positive.
+rc="$(run_mutated 's/^  need_root$/  someunknownword/')"
+[ "$rc" = "0" ] || fail "a non-helper one-word call was reported, which would
+make the audit unusable across hosts with different PATHs:
+$(cat "$TMP_DIR/mut.log")"
+echo "  non-helper single words remain exempt"
+
 echo "== 5. the audit cannot pass vacuously =="
 # If its patterns stop matching, it must fail rather than report success.
 # Note: `CALL_PATTERNS = [] or [...]` does NOT empty the list -- `[] or X`
