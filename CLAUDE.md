@@ -824,6 +824,31 @@ database stub was never installed into the harness and the suite reported
 no-op edit is indistinguishable from a successful one unless the count is
 checked.
 
+**Two numbers in one report that must agree are ONE number, computed once.**
+The first production `dr-status` run printed `23021 never restore-tested` in the
+originals row and `23019` in the summary four lines below, because only the
+summary knew about the two large originals `verify-large` had just proved. Both
+now read `dr_large_proven_count`, and the test asserts the two figures are equal
+and mutates the shared count away to prove the assertion bites.
+
+**Read positional fields by INDEX, never by "the last one".** `dr_sample_proof`
+returned `sampled population unsampled` and its caller took the remainder with
+`${proof##* }`. Appending a fourth field silently redefined that expression, and
+the row claimed `0 never restore-tested` for a library with 22,964 untested
+originals. A trailing-field expression is a dependency on arity that nothing
+declares.
+
+**Every recorded claim cites the snapshot it is ABOUT.** In production the
+archive check was two days older than the import -- `476f8797` versus
+`05a6adb0` -- and the line showed neither snapshot, so two claims about
+different objects read as one. A proof of an earlier snapshot is still a proof
+and keeps its level, but it is now marked `[not the current snapshot]`.
+
+**A recorded denominator and the live one are different questions.** The tier
+row quotes the population recorded when the sample ran; the summary counts the
+library now. They diverge as photos are added, so a `population drift` line
+states both rather than leaving two numbers that look like they should match.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

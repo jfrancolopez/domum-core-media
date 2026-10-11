@@ -58,12 +58,17 @@ head -c 500 /dev/urandom > "$LIB/upload/aa/two.mov"
 head -c 600 /dev/urandom > "$LIB/encoded-video/bb/three-MP.mp4"
 head -c 900 /dev/urandom > "$LIB/encoded-video/bb/0000000000000000000000000000000a.mp4"
 head -c 300 /dev/urandom > "$LIB/thumbs/cc/t_thumbnail.webp"
-cat > "$TMP_DIR/dbstub.sh" <<STUB
-immich_db_original_paths() {
-  printf '%s\n' '$LIB/upload/aa/one.heic' '$LIB/upload/aa/two.mov' \
-                 '$LIB/encoded-video/bb/three-MP.mp4'
-}
-STUB
+# 20 originals: 19 under upload/ and the motion-photo one under
+# encoded-video/. Enough that "never restore-tested" is a real number rather
+# than clamping to zero, which would make the agreement assertion vacuous.
+for i in $(seq 4 20); do head -c 100 /dev/urandom > "$LIB/upload/aa/f$i.heic"; done
+{
+  printf 'immich_db_original_paths() {\n  printf '"'"'%%s\\n'"'"' \\\n'
+  printf "    '%s' \\\\\n" "$LIB/upload/aa/one.heic" "$LIB/upload/aa/two.mov"
+  for i in $(seq 4 20); do printf "    '%s' \\\\\n" "$LIB/upload/aa/f$i.heic"; done
+  printf "    '%s'\n}\n" "$LIB/encoded-video/bb/three-MP.mp4"
+} > "$TMP_DIR/dbstub.sh"
+bash -n "$TMP_DIR/dbstub.sh" || fail "the generated asset-table stub is not valid shell"
 
 run_dr() {
   (
@@ -114,6 +119,17 @@ mk_coverage() {  # $1 = sampled, $2 = population
  "oversize_bytes":500,"per_file_cap_bytes":268435456,
  "total_cap_bytes":1073741824,"sampled_files":$1}
 EOF
+}
+
+mk_large_history() {  # $1 = how many proven large originals
+  local i
+  : > "$VDIR/cloud-large-verified.jsonl"
+  for ((i=1; i<=$1; i++)); do
+    jq -cn --arg p "/big/video-$i.mov" \
+      '{target:"cloud",snapshot_id:"abc123de",path:$p,media_type:"mov",
+        size_bytes:300000000,result:"match",verified_at:"2026-10-11T08:25:58-04:00"}' \
+      >> "$VDIR/cloud-large-verified.jsonl"
+  done
 }
 
 mk_dbimport() {  # $1 = assets imported
@@ -232,6 +248,75 @@ grep -q 'WEAKEST TIER: RESTORE TESTED' <<< "$out" || fail "weakest tier wrong: $
 echo "  an actual import promotes it, cites the count, and moves the verdict"
 echo "  a sample proof for originals does not vouch for the database, or vice versa"
 
+sect "the tier row and the summary report the SAME untested count"
+# They did not. In production the row said "23021 never restore-tested" while
+# the summary four lines below said 23019, because only the summary knew about
+# the two large originals verify-large had just proved. Two numbers in one
+# report that must agree are one number.
+mk_large_history 2
+# The tier row quotes the RECORDED population and the summary counts the live
+# asset table, so the fixture must make them the same population for the two
+# untested figures to be comparable at all.
+mk_coverage 12 20
+out="$(run_dr)"
+row_un="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$out" | head -1)"
+sum_un="$(sed -nE 's/^ +NEVER restore-tested +([0-9]+)$/\1/p' <<< "$out" | head -1)"
+[[ -n "$row_un" ]] || fail "could not read the tier row's untested count: $out"
+[[ -n "$sum_un" ]] || fail "could not read the summary's untested count: $out"
+[[ "$row_un" == "$sum_un" ]] \
+  || fail "the two counts disagree: tier row $row_un vs summary $sum_un"
+echo "  both report $row_un, from one count"
+
+sect "the tier row cites BOTH numerators when large files are proven"
+grep -q 'sampled + 2 large' <<< "$out" \
+  || fail "the row does not show the sample and large contributions separately: $out"
+grep -qE 'immich originals +RESTORE TESTED +14 of 20' <<< "$out" \
+  || fail "the row does not total the two proofs: $out"
+echo "  14 of 20 = 12 sampled + 2 large, both numerators stated"
+
+sect "removing the large history moves BOTH figures together"
+rm -f "$VDIR/cloud-large-verified.jsonl"
+out="$(run_dr)"
+row_un="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$out" | head -1)"
+sum_un="$(sed -nE 's/^ +NEVER restore-tested +([0-9]+)$/\1/p' <<< "$out" | head -1)"
+[[ "$row_un" == "$sum_un" ]] || fail "they disagree with no large history: $row_un vs $sum_un"
+echo "  both still agree once the large proofs are gone"
+
+sect "a population that has GROWN since the proof is reported as drift"
+# The tier row quotes the recorded denominator and the summary the live one.
+# They diverge as photos are added, and that must be stated rather than left
+# looking like a contradiction.
+mk_coverage 12 22976
+out="$(run_dr)"
+grep -q 'population drift' <<< "$out" || fail "drift was not reported: $out"
+grep -q '20 now vs 22976 when last sampled' <<< "$out" \
+  || fail "the drift line does not give both populations: $out"
+grep -q 'the proof covers the older set' <<< "$out" \
+  || fail "the drift line does not say which set the proof covers: $out"
+mk_coverage 12 20
+out="$(run_dr)"
+grep -q 'population drift' <<< "$out" \
+  && fail "drift was reported although the populations match"
+echo "  drift is stated when it exists and silent when it does not"
+
+sect "each database claim cites the snapshot it is ABOUT"
+mk_dbimport 23033
+out="$(run_dr)"
+grep -q 'snapshot abc123de' <<< "$out" || fail "the import does not cite its snapshot: $out"
+grep -q 'not the current snapshot' <<< "$out" \
+  && fail "the evidence matches the current snapshot but was flagged as stale"
+# Now make the recorded proof refer to an OLDER snapshot than the current run.
+sed -i 's/^LAST_SUCCESS_SNAPSHOT_ID=.*/LAST_SUCCESS_SNAPSHOT_ID=0ldsnap1/' \
+  "$VDIR/cloud-dbimport.env"
+out="$(run_dr)"
+grep -q 'snapshot 0ldsnap1' <<< "$out" || fail "the older snapshot is not cited: $out"
+grep -q 'not the current snapshot' <<< "$out" \
+  || fail "a proof of an EARLIER snapshot was not flagged: $out"
+grep -q 'immich database *RESTORE TESTED' <<< "$out" \
+  || fail "an earlier-snapshot proof is still a proof and must keep the level: $out"
+echo "  the snapshot is cited, and a stale one is flagged without losing the level"
+mk_dbimport 23033
+
 sect "nothing is ever FULL RECOVERY VERIFIED"
 out="$(run_dr)"
 grep -q 'Nothing above is FULL RECOVERY VERIFIED' <<< "$out" \
@@ -276,8 +361,8 @@ echo "  reacquirable data stored off-site is called out"
 
 sect "the summary counts originals by LOCATION and names what is untested"
 out="$(run_dr)"
-grep -qE 'originals \(asset table\) +3' <<< "$out" || fail "wrong original count: $out"
-grep -qE 'under upload/ +2' <<< "$out" || fail "upload/ count missing: $out"
+grep -qE 'originals \(asset table\) +20' <<< "$out" || fail "wrong original count: $out"
+grep -qE 'under upload/ +19' <<< "$out" || fail "upload/ count missing: $out"
 grep -qE 'under encoded-video/ +1' <<< "$out" \
   || fail "the encoded-video original is not counted: $out"
 grep -q 'NEVER restore-tested' <<< "$out" || fail "the untested count is missing: $out"
@@ -308,6 +393,33 @@ grep -q 'verify-db-restore' <<< "$noimp" \
 mv "$TMP_DIR/dbimport.saved" "$VDIR/cloud-dbimport.env"
 echo "  each risk names its remedy, and a resolved risk stops being listed"
 
+sect "mutation: the tier row ignoring the large count must make the two disagree"
+# This is the production defect itself: the row counted only the sample, so it
+# said 23021 while the summary said 23019.
+mk_coverage 12 20
+mk_large_history 2
+MUT0="$TMP_DIR/mutant0"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUT0"
+python3 - "$MUT0" <<'PY2'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('  uns=$(( pop - sampled - large ))', '  uns=$(( pop - sampled ))', 1)
+open(p,'w').write(s)
+PY2
+m0="$(
+  source "$MUT0" >/dev/null 2>&1
+  # shellcheck disable=SC1090
+  source "$TMP_DIR/dbstub.sh"
+  set +e
+  die() { echo "DIE: $*"; exit 9; }
+  do_dr_status 2>&1
+)"
+m_row="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$m0" | head -1)"
+m_sum="$(sed -nE 's/^ +NEVER restore-tested +([0-9]+)$/\1/p' <<< "$m0" | head -1)"
+[[ "$m_row" != "$m_sum" ]] \
+  || fail "the mutant's figures still agree; the shared count is not load-bearing"
+echo "  without it the row says $m_row and the summary $m_sum -- the production defect"
+
 sect "mutation: ignoring the coverage file must produce an undenominated claim"
 # The coverage requirement is enforced twice -- the file must exist AND carry
 # both fields -- so the mutation has to remove both to reproduce the pre-fix
@@ -325,6 +437,9 @@ s=s.replace('  [[ -n "$sampled" && -n "$pop" ]] || return 1',
 open(p,'w').write(s)
 PY
 rm -f "$VDIR/cloud-coverage.json"
+# This section is about the missing DENOMINATOR, so clear the large history too:
+# otherwise the mutant reports "2 of 0" and the point is obscured.
+rm -f "$VDIR/cloud-large-verified.jsonl"
 mout="$(
   source "$MUT" >/dev/null 2>&1
   set +e
