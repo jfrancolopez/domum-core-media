@@ -849,6 +849,19 @@ row quotes the population recorded when the sample ran; the summary counts the
 library now. They diverge as photos are added, so a `population drift` line
 states both rather than leaving two numbers that look like they should match.
 
+**A deterministic sample proves the pipeline, not the library, and must
+ACCUMULATE.** Selection is deterministic so a run is reproducible -- and the
+measured consequence was that the 2026-10-09 and 2026-10-11 production runs
+sampled the **same 12 files**, holding coverage at 12 of 23,033 however often
+the command ran. `verify-sample` now skips already-proven originals and keeps a
+durable 0600 history, as `verify-large` does; `--revalidate` is the only way to
+re-prove. `dr-status` reports the CUMULATIVE count, because reporting the
+per-run figure would have hidden the cap. Stated honestly: 23,016 originals are
+reachable by sampling, so even at the 1 GiB per-run cap full coverage is ~130
+runs and ~130 GiB -- sampling will never prove the whole library, and
+`FULL RECOVERY VERIFIED` needs a disposable Immich serving a full restore
+instead.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

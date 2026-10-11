@@ -81,6 +81,13 @@ restic_for_target() {
 }
 STUBS
 
+# Selection skips already-proven originals, so any section that wants a fresh
+# selection must clear the durable history first. Sections testing accumulation
+# deliberately do not.
+reset_sample_history() {
+  rm -f "$TMP_DIR/state/restore-verification/cloud-sample-verified.jsonl"
+}
+
 harness() {
   # $1 = shell code evaluated after the real script and the stubs are loaded
   bash -c "
@@ -119,6 +126,7 @@ done
 # ---------------------------------------------------------------------------
 # 2. A faithful restore verifies, and the manifest carries the evidence.
 # ---------------------------------------------------------------------------
+reset_sample_history
 out="$(harness 'do_verify_sample cloud 7' 2>&1)" \
   || fail "verify-sample failed on an identical restore: $out"
 
@@ -157,6 +165,7 @@ jq -e 'select(.media_type | test("/"))' "$MANIFEST" >/dev/null \
 # 3. Corruption in the restored bytes MUST fail. If this passes, the whole
 #    command is decorative.
 # ---------------------------------------------------------------------------
+reset_sample_history
 out="$(harness 'RESTORE_CORRUPT=1; do_verify_sample cloud 7' 2>&1)"
 rc=$?
 (( rc != 0 )) || fail "a corrupted restore was reported as verified: $out"
@@ -166,6 +175,7 @@ grep -q 'MISMATCH' "$MANIFEST" || fail "the mismatch was not recorded in the man
 # ---------------------------------------------------------------------------
 # 4. The total-byte cap is enforced, not just the per-file cap.
 # ---------------------------------------------------------------------------
+reset_sample_history
 out="$(harness 'SAMPLE_MAX_TOTAL_BYTES=2600; do_verify_sample cloud 7' 2>&1)" \
   || fail "verify-sample failed under a tight total cap: $out"
 total="$(jq -s 'map(.size_bytes) | add' "$MANIFEST")"
@@ -174,6 +184,7 @@ total="$(jq -s 'map(.size_bytes) | add' "$MANIFEST")"
 # ---------------------------------------------------------------------------
 # 5. Scratch space may never live inside a live data root.
 # ---------------------------------------------------------------------------
+reset_sample_history
 out="$(harness 'DOMUM_STATE_ROOT="$DOMUM_DATA_ROOT/state"; do_verify_sample cloud 2' 2>&1)"
 rc=$?
 (( rc != 0 )) || fail "scratch inside the data root was permitted"
@@ -370,6 +381,10 @@ grep -q 'NEVER sampled: 1 file' <<< "$out" \
 echo "  states explicitly that nothing is excluded by size"
 
 echo "== coverage: verify-sample RECORDS the population beside the manifest =="
+# Earlier sections have already proven files, and selection now SKIPS those, so
+# clear the history first: this section is about the coverage artefact's
+# contents, not about accumulation.
+reset_sample_history
 out="$(harness 'do_verify_sample cloud 4' 2>&1)" || fail "verify-sample failed: $out"
 cf="$TMP_DIR/state/restore-verification/cloud-coverage.json"
 [ -r "$cf" ] || fail "no coverage artefact was written at $cf"
@@ -399,6 +414,95 @@ jq -e '.unsampled_files == 5 and .oversize_files == 1' <<< "$rep" >/dev/null \
 jq -e '.reason | test("never been restore-tested")' <<< "$rep" >/dev/null \
   || fail "the report does not state that the oversize originals are untested: $rep"
 echo "  4 sampled of 9; 5 unsampled; 1 never restore-testable -- all stated"
+
+echo "== accumulation: a second run picks DIFFERENT originals =="
+# Selection is deterministic by design, which is what makes a run reproducible.
+# Measured consequence in production: the 2026-10-09 and 2026-10-11 runs sampled
+# the SAME 12 files, so coverage of the main library was capped at 12 of 23,033
+# however often the command ran. Already-proven files are now skipped.
+reset_sample_history
+rm -f "$TMP_DIR/state/restore-verification/cloud-sample.jsonl"
+r1="$(harness 'do_verify_sample cloud 3' 2>&1)" || fail "run 1 failed: $r1"
+r2="$(harness 'do_verify_sample cloud 3' 2>&1)" || fail "run 2 failed: $r2"
+p1="$(grep -oE '[a-z0-9/_.-]+\.(heic|jpeg|jpg|mov|dng|png|mp4|none)$' <<< "$r1" | sort -u)"
+p2="$(grep -oE '[a-z0-9/_.-]+\.(heic|jpeg|jpg|mov|dng|png|mp4|none)$' <<< "$r2" | sort -u)"
+[[ -n "$p1" && -n "$p2" ]] || fail "could not extract sampled paths"
+overlap="$(comm -12 <(printf '%s\n' "$p1") <(printf '%s\n' "$p2") | grep -c . || true)"
+[[ "$overlap" -eq 0 ]] \
+  || fail "the second run re-proved $overlap already-proven file(s); coverage cannot grow"
+echo "  run 2 shares no file with run 1"
+
+echo "== accumulation: the cumulative figure grows and is reported =="
+grep -q 'cumulative: 3 of' <<< "$r1" || fail "run 1 did not report 3 cumulative: $r1"
+grep -q 'cumulative: 6 of' <<< "$r2" || fail "run 2 did not report 6 cumulative: $r2"
+HIST="$TMP_DIR/state/restore-verification/cloud-sample-verified.jsonl"
+[[ -f "$HIST" ]] || fail "no sample history was written"
+[[ "$(stat -c %a "$HIST")" == "600" ]] || fail "the sample history is not mode 0600"
+[[ "$(jq -s 'length' "$HIST")" == "6" ]] || fail "the history should hold 6 records"
+echo "  3 then 6, recorded in a 0600 history that selection reads next time"
+
+echo "== accumulation: once everything reachable is proven it says so =="
+harness 'do_verify_sample cloud 3' >/dev/null 2>&1
+out="$(harness 'do_verify_sample cloud 3' 2>&1)"
+grep -q 'nothing left to sample' <<< "$out" \
+  || fail "with everything proven it should say so: $out"
+grep -q 'verify-large' <<< "$out" \
+  || fail "it should point at verify-large for the over-cap files: $out"
+grep -q 'match' <<< "$out" && fail "it restored something with nothing left to do"
+echo "  no bytes are spent, and it names where the remaining gap lives"
+
+echo "== accumulation: --revalidate deliberately proves them again =="
+out="$(harness 'do_verify_sample cloud 3 --revalidate' 2>&1)"
+grep -q 'match' <<< "$out" || fail "--revalidate proved nothing: $out"
+rp="$(grep -oE '[a-z0-9/_.-]+\.(heic|jpeg|jpg|mov|dng|png|mp4|none)$' <<< "$out" | sort -u)"
+same="$(comm -12 <(printf '%s\n' "$p1") <(printf '%s\n' "$rp") | grep -c . || true)"
+[[ "$same" -gt 0 ]] || fail "--revalidate did not revisit the first run's files"
+echo "  the history is ignored only when explicitly asked"
+
+echo "== accumulation: the plan reflects what would ACTUALLY be picked =="
+out="$(harness 'do_sample_plan 3 cloud' 2>&1)"
+grep -q 'already proven' <<< "$out" || fail "the plan does not state the proven count: $out"
+echo "  the plan reads the same history selection does"
+
+echo "== mutation: ignoring the sample history must re-pick the same files =="
+MUTA="$TMP_DIR/mutant-acc"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTA"
+python3 - "$MUTA" <<'PY2'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('if (( reval == 1 )); then : > "$done_file"; else sample_verified_paths "$target" > "$done_file"; fi',
+            ': > "$done_file"', 1)
+open(p,'w').write(s)
+PY2
+rm -f "$HIST"
+m1="$(bash -c "
+set -uo pipefail
+DOMUM_STATE_ROOT='$TMP_DIR/state'
+DOMUM_DATA_ROOT='$TMP_DIR/data'
+DOMUM_MEDIA_ROOT='$TMP_DIR/mediaroot'
+IMMICH_LIBRARY_DIR='$LIB'
+SAMPLE_MAX_FILE_BYTES=10000
+SAMPLE_MAX_TOTAL_BYTES=1000000
+source '$MUTA'
+source '$TMP_DIR/stubs.sh'
+do_verify_sample cloud 3" 2>&1)"
+m2="$(bash -c "
+set -uo pipefail
+DOMUM_STATE_ROOT='$TMP_DIR/state'
+DOMUM_DATA_ROOT='$TMP_DIR/data'
+DOMUM_MEDIA_ROOT='$TMP_DIR/mediaroot'
+IMMICH_LIBRARY_DIR='$LIB'
+SAMPLE_MAX_FILE_BYTES=10000
+SAMPLE_MAX_TOTAL_BYTES=1000000
+source '$MUTA'
+source '$TMP_DIR/stubs.sh'
+do_verify_sample cloud 3" 2>&1)"
+q1="$(grep -oE '[a-z0-9/_.-]+\.(heic|jpeg|jpg|mov|dng|png|mp4|none)$' <<< "$m1" | sort -u)"
+q2="$(grep -oE '[a-z0-9/_.-]+\.(heic|jpeg|jpg|mov|dng|png|mp4|none)$' <<< "$m2" | sort -u)"
+mov="$(comm -12 <(printf '%s\n' "$q1") <(printf '%s\n' "$q2") | grep -c . || true)"
+[[ "$mov" -gt 0 ]] \
+  || fail "the mutant's two runs still differ; the history skip is not load-bearing"
+echo "  without the skip both runs prove the same files -- coverage frozen at 3"
 
 echo "== mutation: dropping the oversize tally must break the statement =="
 mut="$TMP_DIR/mut"; rm -rf "$mut"; mkdir -p "$mut"

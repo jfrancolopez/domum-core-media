@@ -1095,12 +1095,39 @@ sample_unsamplable_count() {
     -printf '.\n' 2>/dev/null | wc -l
 }
 
+# Paths already proven by an ordinary sample run, one per line.
+#
+# Selection is deterministic by design -- the same library always yields the
+# same picks, which is what makes a run reproducible. Measured consequence:
+# the 2026-10-09 and 2026-10-11 production runs sampled the SAME 12 files, so
+# coverage of the main library was permanently capped at 12 of 23,033 however
+# often the command ran. verify-large already solved this for the over-cap
+# files; ordinary originals get the same treatment.
+sample_verified_paths() {  # $1 = target
+  local f; f="$(sample_history_file "$1")"
+  [[ -f "$f" ]] || return 0
+  jq -r 'select(.result == "match") | .path' "$f" 2>/dev/null | sort -u || true
+}
+
+sample_history_file() {
+  printf '%s/%s-sample-verified.jsonl' "$(restore_verification_dir)" "$1"
+}
+
+sample_verified_count() {  # $1 = target
+  local n
+  n="$(sample_verified_paths "$1" 2>/dev/null | grep -c . || true)"
+  printf '%s' "${n:-0}"
+}
+
 # Deterministic and diverse: the median-sized file of each distinct extension,
 # then the smallest and largest that fit under the per-file cap, then every
 # k-th path to fill the quota. Sorted throughout so repeated runs agree.
-sample_select_paths() {  # $1 = inventory file, $2 = how many
-  local inv="$1" want="$2"
+sample_select_paths() {  # $1 = inventory file, $2 = how many, [$3 = proven list]
+  local inv="$1" want="$2" done_file="${3:-/dev/null}"
   grep -vE '/[^/]*(\*|\?|\[|\]|\\)[^/]*$' "$inv" \
+    | awk -F'\t' -v dfile="$done_file" '
+        BEGIN { while ((getline line < dfile) > 0) proven[line]=1 }
+        !($2 in proven)' \
     | awk -F'\t' -v cap="$SAMPLE_MAX_FILE_BYTES" '$1 > 0 && $1 <= cap' \
     | sort -t"$(printf '\t')" -k2,2 \
     | awk -F'\t' -v want="$want" '
@@ -1156,6 +1183,16 @@ sample_select_paths() {  # $1 = inventory file, $2 = how many
 do_sample_plan() {
   local want="${1:-$SAMPLE_DEFAULT_COUNT}"
   [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || die "Sample count must be a positive integer"
+  # The plan must reflect what would ACTUALLY be picked, which depends on what
+  # a target has already proven. Without a target named it uses the first
+  # enabled one; with none enabled it plans against an empty history and says
+  # so, rather than silently showing a selection no run would make.
+  local target_for_plan="${2:-}" t
+  if [[ -z "$target_for_plan" ]]; then
+    while read -r t; do
+      backup_target_enabled "$t" 2>/dev/null && { target_for_plan="$t"; break; }
+    done < <(backup_target_names)
+  fi
 
   local lib inv counts n_orig n_missing
   lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
@@ -1172,8 +1209,25 @@ authority for which files are originals. Walking upload/ instead counted a
 under encoded-video/, so the fallback is not safe to use."
   read -r n_orig n_missing <<< "$counts"
 
+  local plan_done
+  plan_done="$(mktemp)" || die "Cannot stage the sample history"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv' '$plan_done'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv' '$plan_done'; exit 143" HUP INT TERM
+  if [[ -n "$target_for_plan" ]]; then
+    sample_verified_paths "$target_for_plan" > "$plan_done" 2>/dev/null || : > "$plan_done"
+  else
+    : > "$plan_done"
+  fi
+
   local total=0 n=0 size path ext
   echo "[domum-media-backup] Sample plan over $n_orig original(s) in $lib"
+  if [[ -n "$target_for_plan" ]]; then
+    echo "  already proven: $(grep -c . < "$plan_done" || true) for target $target_for_plan"
+  else
+    echo "  already proven: UNKNOWN -- no enabled target, so no history was read"
+  fi
   echo
   printf '  %-10s %14s  %s\n' "TYPE" "BYTES" "PATH"
   while IFS=$'\t' read -r size path; do
@@ -1183,9 +1237,13 @@ under encoded-video/, so the fallback is not safe to use."
     if [[ "$ext" == *.* ]]; then ext="${ext##*.}"; ext="${ext,,}"; else ext="none"; fi
     printf '  %-10s %14s  %s\n' "$ext" "$size" "${path#"$lib"/}"
     total=$(( total + size )); n=$(( n + 1 ))
-  done < <(sample_select_paths "$inv" "$want")
+  done < <(sample_select_paths "$inv" "$want" "$plan_done")
 
-  (( n > 0 )) || die "No sample candidates found in $lib within the size caps"
+  if (( n == 0 )); then
+    echo "  nothing left to sample: every original within the size caps has been"
+    echo "  proven. Use --revalidate on verify-sample to prove them again."
+    return 0
+  fi
 
   echo
   echo "  files        : $n"
@@ -1199,8 +1257,17 @@ under encoded-video/, so the fallback is not safe to use."
 }
 
 do_verify_sample() {
-  local target="${1:-}" want="${2:-$SAMPLE_DEFAULT_COUNT}"
-  [[ -n "$target" ]] || die "Usage: domum-media-backup verify-sample <target> [count]"
+  local target="${1:-}" want="" reval=0 a
+  shift || true
+  for a in "$@"; do
+    case "$a" in
+      --revalidate) reval=1 ;;
+      ''|*[!0-9]*)  [[ -n "$a" ]] && die "Unknown argument: $a" ;;
+      *)            want="$a" ;;
+    esac
+  done
+  want="${want:-$SAMPLE_DEFAULT_COUNT}"
+  [[ -n "$target" ]] || die "Usage: domum-media-backup verify-sample <target> [count] [--revalidate]"
   backup_target_enabled "$target" || die "Backup target is not enabled: $target"
   [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || die "Sample count must be a positive integer"
 
@@ -1238,15 +1305,35 @@ substitute -- it counted a 13-byte .immich marker as a restored original and
 missed the 58 originals under encoded-video/."
   read -r n_orig n_missing <<< "$counts"
 
+  # Already-proven originals are skipped so repeated runs BROADEN coverage
+  # rather than re-proving the same deterministic twelve. --revalidate is the
+  # only way to prove them again.
+  local done_file already
+  done_file="$(mktemp "$vdir/.sample-done.XXXXXX")" || die "Cannot stage the sample history"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$scratch'; rm -f -- '$inv' '$done_file'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$scratch'; rm -f -- '$inv' '$done_file'; exit 143" HUP INT TERM
+  if (( reval == 1 )); then : > "$done_file"; else sample_verified_paths "$target" > "$done_file"; fi
+  already="$(grep -c . < "$done_file" || true)"
+
   local -a sample_paths=() sample_sizes=()
   local size path
   while IFS=$'\t' read -r size path; do
     [[ -n "$path" ]] || continue
     (( total + size > SAMPLE_MAX_TOTAL_BYTES )) && continue
     sample_paths+=("$path"); sample_sizes+=("$size"); total=$(( total + size ))
-  done < <(sample_select_paths "$inv" "$want")
+  done < <(sample_select_paths "$inv" "$want" "$done_file")
 
-  (( ${#sample_paths[@]} > 0 )) || die "No sample candidates found in $lib within the size caps"
+  if (( ${#sample_paths[@]} == 0 )); then
+    echo "[domum-media-backup] Sample verification for $target"
+    echo "  originals    : $n_orig (asset table)"
+    echo "  already proven: ${already:-0}"
+    echo "  nothing left to sample within the size caps. Every original that the"
+    echo "  caps can reach has been proven; use --revalidate to prove them again,"
+    echo "  or verify-large for the files above the per-file cap."
+    return 0
+  fi
   log "sample verification: $target snapshot $snapshot_id, ${#sample_paths[@]} file(s), $total bytes"
 
   local -a include_args=()
@@ -1279,12 +1366,23 @@ missed the 58 originals under encoded-video/."
   done
   chmod 0600 "$tmp"; mv -f "$tmp" "$manifest"
 
+  # The manifest is this RUN; the history is every run. Coverage accumulates in
+  # the history, which is what selection consults next time.
+  local hist htmp
+  hist="$(sample_history_file "$target")"
+  htmp="$(mktemp "${hist}.XXXXXX")" || die "Cannot stage the sample history"
+  [[ -f "$hist" ]] && cat "$hist" >> "$htmp"
+  cat "$manifest" >> "$htmp"
+  chmod 0600 "$htmp"; mv -f "$htmp" "$hist"
+
   echo
   echo "[domum-media-backup] Sample verification for $target"
   echo "  snapshot : $snapshot_id"
   echo "  sampled  : ${#sample_paths[@]} file(s), $total bytes, $ok matched, $bad mismatched"
   echo "  sampled  : from $lib (asset table)"
+  echo "  cumulative: $(sample_verified_count "$target") of $n_orig original(s) proven across all runs"
   echo "  manifest : $manifest"
+  echo "  history  : $(sample_history_file "$target")"
   sample_report_coverage "$inv" "$lib" "$n_missing"
   # Recorded beside the manifest, so the report can state the population rather
   # than only what was sampled. A separate file, not a record in the JSONL: the
@@ -1870,8 +1968,15 @@ dr_sample_proof() {  # $1 = target -> "sampled population unsampled" or empty
   man="$(sample_manifest_file "$target" 2>/dev/null)" || return 1
   cov="$(sample_coverage_file "$target" 2>/dev/null)" || return 1
   [[ -f "$man" && -f "$cov" ]] || return 1
-  sampled="$(jq -r '.sampled_files // empty' "$cov" 2>/dev/null || true)"
+  # The coverage artefact records the LAST RUN's sample count; the history
+  # records every run. Now that selection skips what is already proven, the
+  # cumulative figure is the honest numerator -- reporting the per-run one
+  # would hold coverage at 12 forever however many times the command ran.
   pop="$(jq -r '.population_files // empty' "$cov" 2>/dev/null || true)"
+  sampled="$(sample_verified_count "$target")"
+  if [[ "${sampled:-0}" -eq 0 ]]; then
+    sampled="$(jq -r '.sampled_files // empty' "$cov" 2>/dev/null || true)"
+  fi
   [[ -n "$sampled" && -n "$pop" ]] || return 1
   # The large-file history counts too. It did not, and the report contradicted
   # itself in production: the tier row said "23021 never restore-tested" while
@@ -1933,12 +2038,13 @@ dr_immich_summary() {  # $1 = target, $2 = library root
       *) printf '    %-34s %s\n' "backed up (in the backup set)" "UNKNOWN -- BACKUP_INCLUDE_PATHS unset" ;;
     esac
 
-    local samp=0 largeok=0
-    if [[ -f "$cov" ]]; then
+    local samp largeok=0
+    samp="$(sample_verified_count "$target")"
+    if [[ "${samp:-0}" -eq 0 && -f "$cov" ]]; then
       samp="$(jq -r '.sampled_files // 0' "$cov" 2>/dev/null || echo 0)"
     fi
     largeok="$(dr_large_proven_count "$target")"
-    printf '    %-34s %s\n' "restore-tested (sampled)" "$samp"
+    printf '    %-34s %s\n' "restore-tested (sampled, all runs)" "$samp"
     printf '    %-34s %s\n' "restore-tested (large files)" "$largeok of $of over the cap"
     local never=$(( n_orig - samp - largeok ))
     (( never < 0 )) && never=0
@@ -2734,8 +2840,8 @@ main() {
     verify)               shift; do_verify_target "${1:-}" ;;
     adopt-repo)           shift; do_adopt_repo "${1:-}" ;;
     verify-restore)       shift; do_verify_restore "${1:-}" ;;
-    verify-sample)        shift; do_verify_sample "${1:-}" "${2:-}" ;;
-    sample-plan)          shift; do_sample_plan "${1:-}" ;;
+    verify-sample)        shift; do_verify_sample "$@" ;;
+    sample-plan)          shift; do_sample_plan "${1:-}" "${2:-}" ;;
     exclusion-audit)      shift; do_exclusion_audit "${1:-}" ;;
     verify-db-restore)    shift; do_verify_db_restore "${1:-}" ;;
     verify-large)         shift; do_verify_large "$@" ;;
@@ -2764,11 +2870,16 @@ Usage:
                                             Restore the Immich dump into an
                                             isolated scratch dir, revalidate it,
                                             and record the result
-  domum-media-backup verify-sample <target> [count]
-                                            Restore a deterministic, diverse
-                                            sample of Immich originals and
-                                            compare them byte-for-byte
-  domum-media-backup sample-plan [count]    Show which originals verify-sample
+  domum-media-backup verify-sample <target> [count] [--revalidate]
+                                            Restore a diverse sample of Immich
+                                            originals and compare them
+                                            byte-for-byte. Already-proven files
+                                            are SKIPPED, so repeated runs widen
+                                            coverage instead of re-proving the
+                                            same twelve; --revalidate proves
+                                            them again
+  domum-media-backup sample-plan [count] [target]
+                                            Show which originals verify-sample
                                             would pick. Read-only: restores
                                             nothing, contacts nothing, records
                                             nothing
