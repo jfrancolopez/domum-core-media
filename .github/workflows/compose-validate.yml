@@ -82,6 +82,9 @@ jobs:
       - name: Repo hygiene smoke test
         run: tests/repo-hygiene-smoke.sh
 
+      - name: Snapshot coverage smoke test
+        run: tests/snapshot-coverage-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 

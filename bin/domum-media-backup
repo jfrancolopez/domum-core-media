@@ -1958,6 +1958,25 @@ dr_last_dbimport() {  # $1 = target -> "ts snapshot assets" or empty
   )
 }
 
+# The recorded snapshot-coverage proof: how many originals were OBSERVED in a
+# real snapshot, and which snapshot that was.
+#
+# Separate from the configuration question. "The library is under the backup
+# root and no exclusion matches it" is an argument; "this path is in snapshot
+# 05a6adb0" is an observation. The report must not present the first as the
+# second.
+dr_snapshot_coverage() {  # $1 = target -> "present originals missing snapshot" or empty
+  local f; f="$(snapshot_coverage_file "$1")"
+  [[ -f "$f" ]] || return 1
+  local present orig miss snap
+  present="$(jq -r '.in_snapshot // empty' "$f" 2>/dev/null || true)"
+  orig="$(jq -r '.originals // empty' "$f" 2>/dev/null || true)"
+  miss="$(jq -r '.missing_from_snapshot // empty' "$f" 2>/dev/null || true)"
+  snap="$(jq -r '.snapshot_id // empty' "$f" 2>/dev/null || true)"
+  [[ -n "$present" && -n "$orig" ]] || return 1
+  printf '%s %s %s %s' "$present" "$orig" "${miss:-0}" "${snap:-unknown}"
+}
+
 # The sample-restore proof for a target, WITH its denominator.
 #
 # A sample proof without a population is not reportable as RESTORE TESTED: that
@@ -2033,10 +2052,31 @@ dr_immich_summary() {  # $1 = target, $2 = library root
     local brc=0
     dr_path_configured "$lib" || brc=$?
     case "$brc" in
-      0) printf '    %-34s %s\n' "backed up (in the backup set)" "all $n_orig" ;;
-      1) printf '    %-34s %s\n' "backed up (in the backup set)" "NO -- not under any backup root" ;;
-      *) printf '    %-34s %s\n' "backed up (in the backup set)" "UNKNOWN -- BACKUP_INCLUDE_PATHS unset" ;;
+      0) printf '    %-34s %s\n' "in the backup set (config)" "all $n_orig" ;;
+      1) printf '    %-34s %s\n' "in the backup set (config)" "NO -- not under any backup root" ;;
+      *) printf '    %-34s %s\n' "in the backup set (config)" "UNKNOWN -- BACKUP_INCLUDE_PATHS unset" ;;
     esac
+    # Claim 2: OBSERVED in a snapshot, not inferred from configuration.
+    local sc
+    if sc="$(dr_snapshot_coverage "$target")"; then
+      local sc_present sc_orig sc_miss sc_snap
+      sc_present="$(awk '{print $1}' <<< "$sc")"; sc_orig="$(awk '{print $2}' <<< "$sc")"
+      sc_miss="$(awk '{print $3}' <<< "$sc")";    sc_snap="$(awk '{print $4}' <<< "$sc")"
+      if [[ "${sc_miss:-0}" -gt 0 ]]; then
+        printf '    %-34s %s\n' "IN a snapshot (observed)" \
+          "$sc_present of $sc_orig -- $sc_miss MISSING from snapshot $sc_snap"
+      else
+        printf '    %-34s %s\n' "IN a snapshot (observed)" \
+          "all $sc_present, snapshot $sc_snap"
+      fi
+      [[ "$sc_snap" == "$run_snap" ]] || \
+        printf '    %-34s %s\n' "" "[reconciled against an earlier snapshot]"
+      [[ "${sc_orig:-0}" == "$n_orig" ]] || \
+        printf '    %-34s %s\n' "" "[the library has $n_orig originals now vs $sc_orig when reconciled]"
+    else
+      printf '    %-34s %s\n' "IN a snapshot (observed)" \
+        "NOT CHECKED -- run verify-snapshot-coverage"
+    fi
 
     local samp largeok=0
     samp="$(sample_verified_count "$target")"
@@ -2149,6 +2189,17 @@ dr_remaining_risks() {  # $1 = target, $2 = library root
   if (( of > largeok )); then
     n=$((n+1)); echo "    $n. $(( of - largeok )) large original(s) have never been restore-tested."
     echo "       They are the home videos. Run verify-large to prove them a few at a time."
+  fi
+  if ! dr_snapshot_coverage "$target" >/dev/null; then
+    n=$((n+1)); echo "    $n. No original has been RECONCILED against a real snapshot. Coverage"
+    echo "       is inferred from configuration only. Run verify-snapshot-coverage;"
+    echo "       it reads snapshot metadata and downloads nothing."
+  else
+    local scm; scm="$(awk '{print $3}' <<< "$(dr_snapshot_coverage "$target")")"
+    if [[ "${scm:-0}" -gt 0 ]]; then
+      n=$((n+1)); echo "    $n. $scm original(s) are NOT in the snapshot that was reconciled."
+      echo "       They exist locally but are not protected off-site."
+    fi
   fi
   n=$((n+1)); echo "    $n. No tier is FULL RECOVERY VERIFIED: no run has restored a whole"
   echo "       tier and had Immich itself confirm it."
@@ -2819,6 +2870,167 @@ authority for which files are originals."
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Snapshot coverage: is every original actually IN the off-site snapshot?
+# ---------------------------------------------------------------------------
+
+# Four claims about an original, which are not the same claim:
+#
+#   1 LOCAL           the file the asset table names exists on this host
+#   2 IN SNAPSHOT     that path is present in an off-site restic snapshot
+#   3 RESTORE TESTED  it was restored from that snapshot and compared byte-wise
+#   4 APP USABLE      a recovered Immich served it
+#
+# Claim 2 was never checked. It was INFERRED from "the library is under the
+# backup root and no exclusion matches it", which is an argument about
+# configuration, not an observation of the repository. `restic ls` reads a
+# snapshot's tree metadata and downloads no file content, so claim 2 can be
+# established for all 23,033 originals cheaply -- which is why this does not
+# need a 130 GiB restore.
+
+snapshot_coverage_file() {
+  printf '%s/%s-snapshot-coverage.json' "$(restore_verification_dir)" "$1"
+}
+
+# Every path in a snapshot, one per line, absolute.
+#
+# `restic ls` prints a human header and then paths; the paths are the lines
+# starting with "/". Directories are listed too and are harmless here, because
+# we only ever ask whether a specific FILE path is present.
+snapshot_path_listing() {  # $1 = target, $2 = snapshot id, $3 = output file
+  restic_for_target "$1" ls "$2" 2>/dev/null | grep '^/' > "$3" || true
+  [[ -s "$3" ]] || return 1
+  return 0
+}
+
+# Reconcile the asset table against a real snapshot.
+#
+# Exit 0 every original is present, 1 at least one is MISSING, 2 the question
+# could not be answered. Fails closed: an empty or unobtainable listing is
+# never read as "nothing missing".
+do_verify_snapshot_coverage() {
+  local target="${1:-}" want_json=0 a
+  shift || true
+  for a in "$@"; do
+    case "$a" in
+      --json) want_json=1 ;;
+      *) [[ -n "$a" ]] && die "Unknown argument: $a" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "Usage: domum-media-backup verify-snapshot-coverage <target> [--json]"
+  backup_target_enabled "$target" || die "Backup target is not enabled: $target"
+
+  local lib vdir inv listing missing counts n_orig n_absent snapshot_id
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  vdir="$(restore_verification_dir)"
+  mkdir -p "$vdir"
+  inv="$(mktemp "$vdir/.cov-inv.XXXXXX")" || die "Cannot stage the inventory"
+  listing="$(mktemp "$vdir/.cov-ls.XXXXXX")" || die "Cannot stage the listing"
+  missing="$(mktemp "$vdir/.cov-missing.XXXXXX")" || die "Cannot stage the comparison"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv' '$listing' '$missing'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv' '$listing' '$missing'; exit 143" HUP INT TERM
+
+  counts="$(immich_original_inventory "$inv")" \
+    || die "Refusing: the Immich asset table could not be read, and it is the only
+authority for which files are originals."
+  read -r n_orig n_absent <<< "$counts"
+
+  snapshot_id="$(restic_for_target "$target" snapshots --latest 1 --json 2>/dev/null \
+    | jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' 2>/dev/null || true)"
+  if [[ -z "$snapshot_id" ]]; then
+    (( want_json == 1 )) && printf '{"target":"%s","result":"unknown","reason":"no snapshot"}\n' "$target"
+    echo "SNAPSHOT COVERAGE: UNKNOWN -- no snapshot could be identified for $target"
+    return 2
+  fi
+
+  if ! snapshot_path_listing "$target" "$snapshot_id" "$listing"; then
+    (( want_json == 1 )) && printf '{"target":"%s","snapshot_id":"%s","result":"unknown","reason":"listing failed"}\n' \
+      "$target" "$snapshot_id"
+    echo "SNAPSHOT COVERAGE: UNKNOWN -- the snapshot's file list could not be read."
+    echo "  Not treated as a pass: an unobtainable listing proves nothing."
+    return 2
+  fi
+
+  # Set comparison on sorted files: cheap over 23k vs 64k paths.
+  local sorted_inv sorted_ls n_listed n_missing n_present
+  sorted_inv="$(mktemp "$vdir/.cov-a.XXXXXX")"; sorted_ls="$(mktemp "$vdir/.cov-b.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$inv' '$listing' '$missing' '$sorted_inv' '$sorted_ls'" EXIT
+  cut -f2 "$inv" | LC_ALL=C sort -u > "$sorted_inv"
+  LC_ALL=C sort -u "$listing" > "$sorted_ls"
+  n_listed="$(grep -c . < "$sorted_ls" || true)"
+  LC_ALL=C comm -23 "$sorted_inv" "$sorted_ls" > "$missing"
+  n_missing="$(grep -c . < "$missing" || true)"
+  n_present=$(( n_orig - n_missing ))
+
+  # A listing that contains no library path at all means the comparison was
+  # against the wrong thing -- the vacuity guard, in the place where "0 missing"
+  # would otherwise be the most reassuring possible answer.
+  local n_lib_paths
+  n_lib_paths="$(grep -c "^${lib}/" "$sorted_ls" || true)"
+  if [[ "${n_lib_paths:-0}" -eq 0 ]]; then
+    (( want_json == 1 )) && printf '{"target":"%s","snapshot_id":"%s","result":"unknown","reason":"no library paths in listing"}\n' \
+      "$target" "$snapshot_id"
+    echo "SNAPSHOT COVERAGE: UNKNOWN -- the snapshot listing contains no path under"
+    echo "  $lib, so the comparison had nothing to match against. Not a pass."
+    return 2
+  fi
+
+  if (( want_json == 1 )); then
+    jq -cn --arg t "$target" --arg s "$snapshot_id" --arg lib "$lib" \
+      --argjson orig "$n_orig" --argjson present "$n_present" \
+      --argjson miss "$n_missing" --argjson listed "${n_listed:-0}" \
+      --arg res "$([[ "$n_missing" -eq 0 ]] && echo covered || echo incomplete)" \
+      '{target:$t,snapshot_id:$s,library:$lib,originals:$orig,
+        in_snapshot:$present,missing_from_snapshot:$miss,
+        snapshot_paths:$listed,result:$res}'
+  fi
+
+  echo "[domum-media-backup] Snapshot coverage for $target"
+  echo "  snapshot          : $snapshot_id"
+  echo "  originals         : $n_orig (from the Immich asset table)"
+  echo "  paths in snapshot : $n_listed"
+  echo "  IN the snapshot   : $n_present of $n_orig"
+  if (( n_absent > 0 )); then
+    echo "  absent on disk    : $n_absent original(s) the table names are not on this host"
+  fi
+
+  # Record the proof so dr-status can report claim 2 without re-listing.
+  local cov_file
+  cov_file="$(snapshot_coverage_file "$target")"
+  if jq -cn --arg t "$target" --arg s "$snapshot_id" --arg ts "$(date -Iseconds)" \
+       --argjson orig "$n_orig" --argjson present "$n_present" --argjson miss "$n_missing" \
+       --argjson listed "${n_listed:-0}" \
+       '{target:$t,snapshot_id:$s,recorded_at:$ts,originals:$orig,
+         in_snapshot:$present,missing_from_snapshot:$miss,snapshot_paths:$listed}' \
+       > "$cov_file.tmp" 2>/dev/null; then
+    chmod 0600 "$cov_file.tmp"; mv -f "$cov_file.tmp" "$cov_file"
+    echo "  evidence          : $cov_file"
+  else
+    rm -f "$cov_file.tmp"
+    echo "  evidence          : NOT RECORDED -- could not write $cov_file"
+  fi
+
+  if (( n_missing > 0 )); then
+    echo
+    echo "  MISSING FROM THE SNAPSHOT: $n_missing original(s)."
+    echo "  These exist in the asset table but their path is not in the snapshot,"
+    echo "  so they are NOT protected off-site:"
+    sed "s|^$lib/||" "$missing" | head -20 | sed 's/^/    /'
+    (( n_missing > 20 )) && echo "    ... and $(( n_missing - 20 )) more"
+    echo
+    echo "  result            : INCOMPLETE -- off-site coverage is not total."
+    return 1
+  fi
+
+  echo "  result            : every original the asset table names is present in"
+  echo "                      snapshot $snapshot_id. That is claim 2 of 4 --"
+  echo "                      PRESENT off-site, not yet restored or proven usable."
+  return 0
+}
+
 main() {
   need_root
   load_cfg
@@ -2845,6 +3057,7 @@ main() {
     exclusion-audit)      shift; do_exclusion_audit "${1:-}" ;;
     verify-db-restore)    shift; do_verify_db_restore "${1:-}" ;;
     verify-large)         shift; do_verify_large "$@" ;;
+    verify-snapshot-coverage) shift; do_verify_snapshot_coverage "$@" ;;
     dr-status)            do_dr_status ;;
     -h|--help)
       cat <<EOF
@@ -2909,6 +3122,16 @@ Usage:
                                             no file is downloaded twice. --plan
                                             shows the byte cost and fetches
                                             nothing. Default 2 files per run.
+  domum-media-backup verify-snapshot-coverage <target> [--json]
+                                            Reconcile EVERY originalPath in the
+                                            Immich asset table against the file
+                                            list of a real snapshot. Reads
+                                            snapshot metadata only -- downloads
+                                            no file content -- so it proves
+                                            off-site PRESENCE for the whole
+                                            library cheaply. Exit 0 covered,
+                                            1 an original is missing, 2 not
+                                            answerable
   domum-media-backup dr-status              What is actually PROVEN about
                                             recovery, per tier and per target,
                                             on the five levels UNKNOWN /
