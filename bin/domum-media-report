@@ -608,7 +608,10 @@ report_asset_sample_verification() {
   if [[ -z "$newest_file" ]]; then
     jq -cn --argjson age null       '{state:"unknown",target:null,snapshot_id:null,sampled_files:null,
         matched:null,mismatched:null,sampled_bytes:null,media_types:null,
-        last_sampled_at:null,age_seconds:$age,
+        last_sampled_at:null,age_seconds:$age,coverage:null,
+        proven_sampled:null,proven_large:null,proven_total:null,
+        snapshot_coverage:null,unsampled_files:null,oversize_files:null,
+        oversize_bytes:null,
         reason:"no sampled asset verification has been recorded on this host"}'
     return 0
   fi
@@ -627,7 +630,33 @@ report_asset_sample_verification() {
   fi
   [[ -n "${cov:-}" ]] || cov='null'
 
-  jq -s --arg target "$newest_target"      --argjson at "$(report_iso_from_epoch "$newest_epoch")"      --argjson age "$(report_age_seconds "$newest_epoch")"      --argjson coverage "$cov"      '(map(select(.result == "match")) | length) as $ok
+  # The manifest above is ONE RUN. Coverage accumulates in the durable
+  # histories, and `dr-status` reports those -- so a report showing only the
+  # per-run figure would drift away from dr-status as runs accumulate: the
+  # "two numbers that must agree" defect, at system level.
+  local hist_s hist_l n_sampled=0 n_large=0
+  hist_s="${newest_file%-sample.jsonl}-sample-verified.jsonl"
+  hist_l="${newest_file%-sample.jsonl}-large-verified.jsonl"
+  if [[ -r "$hist_s" ]]; then
+    n_sampled="$(jq -sr '[.[] | select(.result=="match") | .path] | unique | length' "$hist_s" 2>/dev/null || echo 0)"
+  fi
+  if [[ -r "$hist_l" ]]; then
+    n_large="$(jq -sr '[.[] | select(.result=="match") | .path] | unique | length' "$hist_l" 2>/dev/null || echo 0)"
+  fi
+  [[ "$n_sampled" =~ ^[0-9]+$ ]] || n_sampled=0
+  [[ "$n_large" =~ ^[0-9]+$ ]] || n_large=0
+
+  # Claim 2 of 4: OBSERVED in a real snapshot, as distinct from inferred from
+  # configuration. null when nothing has ever been reconciled, which is itself
+  # the thing worth seeing.
+  local sccov scfile
+  scfile="${newest_file%-sample.jsonl}-snapshot-coverage.json"
+  if [[ -r "$scfile" ]]; then
+    sccov="$(jq -c '{originals,in_snapshot,missing_from_snapshot,snapshot_id,recorded_at}' "$scfile" 2>/dev/null || true)"
+  fi
+  [[ -n "${sccov:-}" ]] || sccov='null'
+
+  jq -s --arg target "$newest_target"      --argjson at "$(report_iso_from_epoch "$newest_epoch")"      --argjson age "$(report_age_seconds "$newest_epoch")"      --argjson coverage "$cov" --argjson proven_sampled "$n_sampled" --argjson proven_large "$n_large" --argjson snapshot_coverage "$sccov"      '(map(select(.result == "match")) | length) as $ok
       | (map(select(.result != "match")) | length) as $bad
       | {state: (if length == 0 then "unknown" elif $bad > 0 then "failed" else "sampled" end),
          target: $target,
@@ -640,11 +669,15 @@ report_asset_sample_verification() {
          last_sampled_at: $at,
          age_seconds: $age,
          coverage: $coverage,
+         proven_sampled: $proven_sampled,
+         proven_large: $proven_large,
+         proven_total: ($proven_sampled + $proven_large),
+         snapshot_coverage: $snapshot_coverage,
          # What the sample provably does NOT cover. null when no coverage
          # artefact was recorded -- which is itself worth seeing, because it
          # means the population was never measured.
          unsampled_files: (if $coverage == null then null
-                           else ($coverage.population_files - length) end),
+                           else ($coverage.population_files - $proven_sampled - $proven_large) end),
          oversize_files: (if $coverage == null then null else $coverage.oversize_files end),
          oversize_bytes: (if $coverage == null then null else $coverage.oversize_bytes end),
          reason: (if $bad > 0
@@ -657,6 +690,8 @@ report_asset_sample_verification() {
                   else null end)}' "$newest_file" 2>/dev/null     || jq -cn '{state:"unknown",target:null,snapshot_id:null,sampled_files:null,
                 matched:null,mismatched:null,sampled_bytes:null,media_types:null,
                 last_sampled_at:null,age_seconds:null,coverage:null,
+                proven_sampled:null,proven_large:null,proven_total:null,
+                snapshot_coverage:null,
                 unsampled_files:null,oversize_files:null,oversize_bytes:null,
                 reason:"the sample manifest is not interpretable"}'
 }
@@ -957,6 +992,8 @@ report_generate_json() {
     # That is a data-integrity signal, not a scheduling nag.
     (.backups.asset_sample | select(.state == "failed") | {level:"critical",message:((.mismatched|tostring)+" sampled Immich original(s) did not restore to identical bytes"),action:"Run: domum-media-backup verify-sample <target> and inspect the sample manifest"}),
     (.backups.asset_sample | select(.state == "unknown") | {level:"info",message:"No sampled verification of the Immich originals has been recorded; only the database dump restore is proven",action:"Run: domum-media-backup verify-sample <target>"}),
+    (.backups.asset_sample | select(.snapshot_coverage == null) | {level:"info",message:"No Immich original has been reconciled against a real snapshot; off-site coverage is inferred from configuration only",action:"Run: domum-media-backup verify-snapshot-coverage <target> (reads snapshot metadata, downloads nothing)"}),
+    (.backups.asset_sample | select((.snapshot_coverage.missing_from_snapshot // 0) > 0) | {level:"critical",message:((.snapshot_coverage.missing_from_snapshot|tostring)+" Immich original(s) are NOT present in the reconciled snapshot and are therefore not protected off-site"),action:"Run: domum-media-backup verify-snapshot-coverage <target> and investigate the named paths"}),
     (.backups.asset_sample | select(.state == "sampled" and .age_seconds != null and .age_seconds > 7776000) | {level:"info",message:"The last sampled verification of the Immich originals is over 90 days old",action:"Run: domum-media-backup verify-sample <target>"}),
     (.backups.targets[] | select(.repository_identity.state == "missing") | {level:"warning",message:("Backup target "+.target+" has no pinned repository identity"),action:("Run: domum-media backup verify "+.target)}),
     (.backups.targets[] | select(.last_run.state == "failed") | {level:"critical",message:("Backup target "+.target+" last run FAILED"),action:("Inspect: journalctl -u domum-media-backup.service, then retry that target")}),
@@ -994,7 +1031,18 @@ report_render_text() {
     "  Check timer: " + .backups.check_timer.enabled + "/" + .backups.check_timer.active + "; service=" + .backups.check_timer.result,
     (.backups.latest_snapshots[] | "  "+.target+" latest snapshot: "+(if .snapshot==null then .state else (.snapshot.time // "available") end)),
     (.backups.targets[] | "  "+.target+" repository identity: "+.repository_identity.state+"; last run: "+.last_run.state+(if .last_run.age_seconds==null then "" else " ("+(.last_run.age_seconds|age)+" ago)" end)+(if .last_run.snapshot_id==null then "" else "; snapshot "+.last_run.snapshot_id end)+(if .last_run.paths==null then "" else "; scope: "+((.last_run.paths|length)|tostring)+" path(s)" end)),
-    "  Sampled originals:    " + .backups.asset_sample.state + (if .backups.asset_sample.state=="sampled" then " ("+(.backups.asset_sample.sampled_files|tostring)+" of "+((.backups.asset_sample.coverage.population_files // "?")|tostring)+" file(s), "+((.backups.asset_sample.media_types // [])|join("/"))+", "+(.backups.asset_sample.age_seconds|age)+" ago)" else " ("+(.backups.asset_sample.reason // "no detail")+")" end),
+    "  Sampled originals:    " + .backups.asset_sample.state + (if .backups.asset_sample.state=="sampled" then " ("+((.backups.asset_sample.proven_total // .backups.asset_sample.sampled_files)|tostring)+" of "+((.backups.asset_sample.coverage.population_files // "?")|tostring)+" original(s) proven across all runs; last run "+(.backups.asset_sample.sampled_files|tostring)+" file(s), "+((.backups.asset_sample.media_types // [])|join("/"))+", "+(.backups.asset_sample.age_seconds|age)+" ago)" else " ("+(.backups.asset_sample.reason // "no detail")+")" end),
+    (if (.backups.asset_sample.proven_large // 0) > 0
+     then "    large originals:    " + (.backups.asset_sample.proven_large|tostring) + " of the over-cap file(s) proven by verify-large"
+     else empty end),
+    # Claim 2 of 4, kept distinct from the configuration claim. "NOT CHECKED"
+    # is the honest answer until a snapshot has actually been reconciled.
+    (if .backups.asset_sample.snapshot_coverage == null
+     then "    in a snapshot:      NOT CHECKED -- run domum-media-backup verify-snapshot-coverage <target>"
+     elif (.backups.asset_sample.snapshot_coverage.missing_from_snapshot // 0) > 0
+     then "    in a snapshot:      " + (.backups.asset_sample.snapshot_coverage.in_snapshot|tostring) + " of " + (.backups.asset_sample.snapshot_coverage.originals|tostring) + " -- " + (.backups.asset_sample.snapshot_coverage.missing_from_snapshot|tostring) + " MISSING from snapshot " + (.backups.asset_sample.snapshot_coverage.snapshot_id // "?")
+     else "    in a snapshot:      all " + (.backups.asset_sample.snapshot_coverage.in_snapshot|tostring) + " present in snapshot " + (.backups.asset_sample.snapshot_coverage.snapshot_id // "?")
+     end),
     (if (.backups.asset_sample.oversize_files // 0) > 0
      then "    NEVER sampled:      " + (.backups.asset_sample.oversize_files|tostring) + " original(s) exceed the per-file cap of " + (((.backups.asset_sample.coverage.per_file_cap_bytes // 0) / 1048576 | floor)|tostring) + " MiB and have never been restore-tested"
      elif .backups.asset_sample.state == "sampled" and .backups.asset_sample.coverage == null

@@ -129,12 +129,19 @@ EOF
 }
 
 mk_large_history() {  # $1 = how many proven large originals
-  local i
+  # The files must REALLY exist with the recorded size: a proof is about the
+  # bytes that were there when it was taken, so large_verified_paths drops a
+  # record whose file is gone or has changed size. A fixture of invented paths
+  # would be invalidated on sight -- which is the correct behaviour, and makes
+  # it useless as a fixture for "these are proven".
+  local i dir="$TMP_DIR/bigfiles"
+  mkdir -p "$dir"
   : > "$VDIR/cloud-large-verified.jsonl"
   for ((i=1; i<=$1; i++)); do
-    jq -cn --arg p "/big/video-$i.mov" \
+    head -c $(( 300 + i )) /dev/zero > "$dir/video-$i.mov"
+    jq -cn --arg p "$dir/video-$i.mov" --argjson b "$(stat -c %s "$dir/video-$i.mov")" \
       '{target:"cloud",snapshot_id:"abc123de",path:$p,media_type:"mov",
-        size_bytes:300000000,result:"match",verified_at:"2026-10-11T08:25:58-04:00"}' \
+        size_bytes:$b,result:"match",verified_at:"2026-10-11T08:25:58-04:00"}' \
       >> "$VDIR/cloud-large-verified.jsonl"
   done
 }
