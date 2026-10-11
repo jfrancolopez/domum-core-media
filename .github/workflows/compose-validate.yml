@@ -85,6 +85,9 @@ jobs:
       - name: Snapshot coverage smoke test
         run: tests/snapshot-coverage-smoke.sh
 
+      - name: Immich Phase A smoke test
+        run: tests/immich-phase-a-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 

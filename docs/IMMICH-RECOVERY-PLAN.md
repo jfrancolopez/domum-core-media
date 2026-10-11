@@ -110,6 +110,99 @@ Phase C is the only thing that earns claim 4 outright.
 
 ---
 
+## 3b. Phase A RESULT — rehearsed 2026-10-11
+
+`immich-phase-a` is implemented and was rehearsed end to end against real
+production data. Only the repository fetch was stubbed; the pinned images, the
+internal network, the disposable containers, the strict import, the real Immich
+startup and the API queries all ran for real.
+
+```
+server image      : sha256:c15bff75068e (pinned from the running container)
+network           : INTERNAL -- no route off this host
+library scaffold  : 6 of 6 .immich marker(s) restored from the snapshot
+import            : COMPLETED under ON_ERROR_STOP=1
+restored records  : 23033 asset(s), 2 user(s) before startup
+startup           : API answered -- version 2.7.5
+after migrations  : 23033 asset(s), 2 user(s)
+application layer : authenticated as the recovered admin user
+API asset counts  : 13893 photo(s) + 1712 video(s) = 15605 visible
+database (visible): 13893 image(s) + 1712 video(s)
+database (hidden) : 7428 -- motion-photo components
+result            : APPLICATION STARTUP VERIFIED
+```
+
+Immich's own log settles the central question:
+
+```
+Running migrations -> Finished running migrations
+Checking for schema drift -> No schema drift detected
+```
+
+**Immich v2.7.5 opens the recovered database, accepts its schema, and serves its
+own API over the recovered users and asset records.** The record counts are
+identical before and after startup, so migrations did not alter what was
+recovered.
+
+### Three findings from the rehearsal
+
+**1. Recovery depends on a DEPRECATED PostgreSQL extension.** Immich printed:
+
+> DEPRECATION WARNING: The pgvecto.rs extension is deprecated and support for it
+> will be removed very soon. See .../upgrading#migrating-to-vectorchord in order
+> to switch to the VectorChord extension instead.
+
+This is a real, dated risk to *future* recovery: once Immich drops pgvecto.rs,
+today's dump will no longer import into a current Immich. Migrating production
+to VectorChord is a separate, approved project, but the recovery consequence
+belongs on the record now: **the longer this waits, the narrower the window in
+which an old backup can be restored into a contemporary application.**
+
+**2. Immich requires its library scaffold, not just the database.** With an
+empty upload directory the microservices worker dies:
+
+```
+mountChecks {thumbs, upload, backups, library, profile, encoded-video}
+Failed to read "<UPLOAD_LOCATION>/encoded-video/.immich"
+```
+
+Those `.immich` files are Immich's own 13-byte integrity markers, which exist to
+detect a wrong or unmounted volume. They are real backed-up files, so Phase A
+**restores all six from the snapshot** (78 bytes) rather than creating them.
+Nothing on the filesystem is fabricated to make the application look healthy.
+
+**3. 7,428 of the 23,033 originals are HIDDEN motion-photo components.**
+Measured: 13,893 timeline images + 1,712 timeline videos + 7,428 hidden videos.
+The API reports only the 15,605 timeline-visible assets, and matches the
+database exactly per media type. The hidden ones are the video halves of live
+photos — irreplaceable originals that are backed up but never shown in a
+timeline. A check comparing the API total against every row fails on a
+perfectly healthy recovery, which is what the first version of this comparison
+did.
+
+### What Phase A does not establish
+
+No original was restored, so **nothing here shows the library can be served.**
+`APPLICATION STARTUP VERIFIED` is deliberately narrow. Phase B (serve the
+already-verified subset) and Phase C (serve everything) remain.
+
+### Isolation, as actually enforced
+
+| Control | Mechanism |
+|---|---|
+| no external side effects | **internal** docker network — measured: container DNS works, `curl https://…` returns 000 |
+| right application version | images pinned by **ID** read from the running containers, never the `:release` tag |
+| no production database | a fresh container with tmpfs PGDATA |
+| no production files | only a scratch upload directory is mounted; no live root at all |
+| no name collisions | unique names, refused if taken, network refused if taken |
+| nothing left behind | one teardown in a trap that also fires on a signal, and the removal is **asserted** |
+
+The disposable admin password is set with the database's own `pgcrypto` inside
+the throwaway container, so no credential tooling or network access is needed
+and production credentials are never touched.
+
+---
+
 ## 4. Full-library restore: storage, time, bandwidth
 
 Derived from the observed 2026-10-11 run, which transferred 835,199,165 bytes

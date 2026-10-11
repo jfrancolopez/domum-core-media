@@ -121,6 +121,22 @@ mk_coverage() {  # $1 = sampled, $2 = population
 EOF
 }
 
+mk_phase_a() {  # $1 = assets
+  cat > "$VDIR/cloud-phase-a.env" <<EOF
+SCHEMA_VERSION=1
+TARGET=cloud
+RESULT=success
+VERIFIED_TS=2026-10-11T14:45:00-04:00
+LAST_SUCCESS_TS=2026-10-11T14:45:00-04:00
+LAST_SUCCESS_SNAPSHOT_ID=abc123de
+SNAPSHOT_ID=abc123de
+SERVER_IMAGE_ID=sha256:serverimgid0
+ASSETS=$1
+USERS=2
+REASON=
+EOF
+}
+
 mk_snapshot_coverage() {  # $1 = in_snapshot, $2 = originals, $3 = missing, $4 = snapshot
   cat > "$VDIR/cloud-snapshot-coverage.json" <<EOF
 {"target":"cloud","snapshot_id":"$4","recorded_at":"2026-10-11T10:00:00-04:00",
@@ -390,6 +406,33 @@ grep -q 'originals now vs 15 when reconciled' <<< "$out" \
   || fail "growth since the reconciliation is not reported: $out"
 echo "  20 now vs 15 when reconciled, stated plainly"
 mk_snapshot_coverage 20 20 0 abc123de
+
+sect "Phase A is reported as its own claim, and NOT TESTED until it runs"
+rm -f "$VDIR/cloud-phase-a.env"
+out="$(run_dr)"
+grep -qE 'application startup \(Phase A\) +NOT TESTED' <<< "$out" \
+  || fail "an untested Phase A must say NOT TESTED: $out"
+grep -q 'immich-phase-a' <<< "$out" || fail "it does not name the command: $out"
+grep -q 'ever been started against a recovered database' <<< "$out" \
+  || fail "the untested application is not raised as a risk: $out"
+grep -q 'not the library' <<< "$out" || fail "the risk does not state the cost: $out"
+echo "  NOT TESTED, named as a risk, with the remedy and its cost"
+
+sect "a passing Phase A is reported WITHOUT promoting any tier"
+mk_phase_a 23033
+out="$(run_dr)"
+grep -q 'application startup (Phase A)' <<< "$out" || fail "Phase A is not reported: $out"
+grep -q 'VERIFIED 2026-10-11' <<< "$out" || fail "the timestamp is not cited: $out"
+grep -q 'no file was served' <<< "$out" \
+  || fail "it does not say what Phase A did NOT prove: $out"
+grep -q 'ever been started against a recovered database' <<< "$out" \
+  && fail "the risk is still listed although Phase A passed"
+# The crucial one: it must not elevate the overall verdict.
+no_row_claims "$out" "FULL RECOVERY VERIFIED" \
+  && fail "a passing Phase A promoted a tier to FULL RECOVERY VERIFIED"
+grep -q 'Nothing above is FULL RECOVERY VERIFIED' <<< "$out" \
+  || fail "the standing caveat disappeared after Phase A passed: $out"
+echo "  reported, the risk clears, and no tier is promoted"
 
 sect "nothing is ever FULL RECOVERY VERIFIED"
 out="$(run_dr)"
