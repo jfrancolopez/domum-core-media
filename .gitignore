@@ -5,6 +5,17 @@
 !.env.example
 !config/ci.env
 
+# The REAL production config. It lives at
+# /opt/domum-core-media/config/domum-media.conf, is mode 0600 root-only, and
+# holds the production topology -- domains, backup endpoints, SFTP hosts -- plus
+# the paths of every secret file. `git add -A` in the production checkout would
+# have staged it, and it showed as permanently untracked there, which trains the
+# operator to ignore git status in production. Secret VALUES live in
+# /etc/domum-core-media/secrets and are referenced by *_FILE, so this is not a
+# secret store; it is still production configuration that must never be
+# committed. The .example stays tracked -- the installer copies it.
+config/domum-media.conf
+
 # Anything containing real secrets
 secrets/
 *.key

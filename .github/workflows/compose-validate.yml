@@ -79,6 +79,9 @@ jobs:
       - name: Large original verification smoke test
         run: tests/large-verification-smoke.sh
 
+      - name: Repo hygiene smoke test
+        run: tests/repo-hygiene-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 
