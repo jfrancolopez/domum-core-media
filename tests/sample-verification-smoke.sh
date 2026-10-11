@@ -521,11 +521,54 @@ SAMPLE_MAX_FILE_BYTES=10000
 SAMPLE_MAX_TOTAL_BYTES=1000000
 source '$mut/domum-media-backup'
 source '$TMP_DIR/stubs.sh'
+# _inv lives in the harness preamble, which this standalone bash -c does not
+# have. Without it the inventory path was EMPTY, and awk with an empty filename
+# reads stdin -- so this section blocked forever in the suite loop while
+# passing in two seconds standalone with stdin closed.
+_inv() { local f; f=\"\$(mktemp)\"; inventory_from_dir \"\$1\" \"\$f\"; printf '%s' \"\$f\"; }
 sample_report_coverage \"\$(_inv \"\$IMMICH_LIBRARY_DIR\")\" \"\$IMMICH_LIBRARY_DIR\" 0
 " 2>&1)"
 grep -q 'NEVER sampled: none by size' <<< "$out" \
   || fail "removing the tally did NOT change the statement, so the assertions above
 prove nothing about where the count comes from: $out"
 echo "  without the tally it claims nothing is excluded -- the count is load-bearing"
+
+echo "== an EMPTY inventory path refuses; it does not read stdin =="
+# awk with an empty filename argument reads STDIN rather than failing, so a
+# caller that lost its filename turned a measurement into a hang visible only
+# when stdin stays open. Driven here with stdin held open deliberately: if a
+# reader still read stdin this would time out.
+for fn in sample_coverage_stats inventory_unsamplable large_population; do
+  out="$( (sleep 10 | timeout 5 bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+set +e
+SAMPLE_MAX_FILE_BYTES=10000
+$fn '' ; echo \"rc=\$?\"
+") 2>&1 )"
+  grep -q 'rc=1' <<< "$out" || fail "$fn did not refuse an empty path (it may have read stdin): $out"
+  grep -q 'no file given' <<< "$out" || fail "$fn did not say why it refused: $out"
+done
+# And inventory_by_location, which prints nothing on refusal.
+out="$( (sleep 10 | timeout 5 bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+set +e
+inventory_by_location '' '/tmp/lib'; echo \"rc=\$?\"
+") 2>&1 )"
+grep -q 'rc=1' <<< "$out" || fail "inventory_by_location did not refuse an empty path: $out"
+echo "  all four readers refuse immediately instead of blocking on stdin"
+
+echo "== the coverage report says UNKNOWN rather than inventing a population =="
+out="$( (sleep 10 | timeout 5 bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+set +e
+sample_report_coverage '' '/tmp/lib' 0; echo \"rc=\$?\"
+") 2>&1 )"
+grep -q 'originals    : UNKNOWN' <<< "$out" || fail "it did not report UNKNOWN: $out"
+grep -q 'rc=1' <<< "$out" || fail "it did not signal failure: $out"
+grep -qE 'originals    : [0-9]' <<< "$out" && fail "it invented a population"
+echo "  UNKNOWN and non-zero, with no fabricated number"
 
 echo "PASS: sample-verification-smoke"
