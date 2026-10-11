@@ -191,6 +191,26 @@ unavailable", rather than "four media services fail to start".
 
 ---
 
+## 6b. Remaining mount-safety work, in order
+
+None of this is built. It is the work that must exist *before* a NAS path is
+mounted, listed so the sequence is not improvised later.
+
+| # | Work | Why it must come first |
+|---|---|---|
+| 1 | **A mounted-and-non-empty precondition for every backup root**, refusing rather than warning | restic walks paths; it does not check that one is mounted. An absent network mount would be backed up as an empty directory and reported `snapshot … saved`. Current runs add 10–60 MiB, so a near-empty run is not visibly anomalous. This is the `--one-file-system` hazard in another shape, and it is the single highest-priority item. |
+| 2 | **`RequiresMountsFor=` on `docker.service` for any NAS path bound into a container**, scoped to exactly that path | Containers are `restart: unless-stopped`, so the daemon starts them at boot without compose and would create the bind sources on the OS disk. This deliberately couples Docker to the NAS, which is why the scope matters more here than anywhere else. |
+| 3 | **No `nofail` on the NAS fstab line**, enforced by a test | `nofail` converts "refuse to start" into "start with the mount missing", which is the failure mode item 1 exists to prevent. |
+| 4 | **A topology assertion that the protected tier is still local Btrfs** | NFS and SMB have no subvolumes. Moving a migrated service's state onto one silently reverts its protection to DEGRADED, and `domum_is_subvolume` would simply start returning false. |
+| 5 | **Extend `dr-status` backup scope to name the NAS tier explicitly** | The report already states whether the replaceable tier is inside the backup set. A new tier must appear there by name, or "what goes off-site" stops being a complete answer. |
+| 6 | **Decide and record the NAS's own redundancy** | "Reacquirable" must be *true*. If the NAS ends up holding the only copy of anything irreplaceable it is a protected tier, and this architecture does not apply to it. |
+
+Items 1 and 3 are testable today without any NAS present, against a fixture
+mount that is deliberately absent. Items 2, 4 and 5 need the mount path decided
+but not mounted. Item 6 is a question for the operator, not code.
+
+---
+
 ## 7. Explicitly not decided here
 
 - No mount is configured and no fstab entry is proposed.

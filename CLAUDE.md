@@ -862,6 +862,55 @@ runs and ~130 GiB -- sampling will never prove the whole library, and
 `FULL RECOVERY VERIFIED` needs a disposable Immich serving a full restore
 instead.
 
+**Four claims about an original, none of which implies another.**
+`LOCAL` (the file the asset table names exists here) < `IN SNAPSHOT` (that path
+is in a real off-site snapshot) < `RESTORE TESTED` (restored and compared
+byte-wise) < `APP USABLE` (a recovered Immich served it). `dr-status` reported
+`backed up (in the backup set): all 23033`, which was claim 2 **inferred from
+configuration** -- the library is under the backup root and no exclusion
+matches it. That is an argument, not an observation, and it had never been
+checked for a single file. `verify-snapshot-coverage` reconciles every
+`originalPath` against a snapshot's own file list; `restic ls` reads tree
+metadata and downloads **no file content**, so claim 2 costs almost nothing and
+must never be confused with the ~130 GiB restore that claim 4 needs. The report
+now prints the configuration claim and the observed claim on separate lines and
+says `NOT CHECKED` until a reconciliation has happened.
+
+**A recorded proof is about the BYTES that were there when it was taken.** If a
+verified file is later replaced or truncated the proof says nothing about the
+new content, so the path drops out of the proven set, is reported rather than
+silently reducing a number the operator saw last week, and becomes selectable
+again. A vanished path is not proven either. Size is the discriminator and the
+limit is stated rather than overclaimed: it catches replacement and truncation,
+not a same-size edit. Re-hashing 6.5 GiB of home videos on every run to detect
+a change that has never happened would cost more than the verification it
+guards.
+
+**Commands that answer the same question must read the same evidence.**
+`domum-media report` read only the per-run sample manifest while `dr-status`
+read the cumulative histories, so once `verify-sample` began skipping
+already-proven originals the two would have drifted apart with every run -- the
+report frozen at "12 of 23033" while dr-status counted upward. Both now read
+the sample history, the large-file history and the snapshot-coverage proof.
+This is the "two numbers that must agree are one number" rule at system level,
+and it is the real risk in having several commands, not duplication.
+
+**A measurement pipeline that can silently drop a record is not a
+measurement.** Piping one `docker exec` into another lost a line: I counted 16
+over-cap originals totalling 7.56 GiB and briefly suspected a large original
+had vanished. Re-measuring via a file with an explicit in/out tally gave 17
+files, 7.90 GiB, 23,033 counted, 0 missing. The shipped
+`immich_original_inventory` already compares `want` against `got`, which is why
+only the throwaway pipeline was wrong -- write to a file and count both ends.
+
+**Assert that a mutation actually applied.** A mutation test "failed" against
+an unmutated binary: expressing the target line through two layers of script
+needed enough escaping to produce a SyntaxError, so the edit silently did
+nothing. Write the mutation script to a FILE with a quoted heredoc and assert
+its effect before relying on it. In the same section a second assertion was
+checking for a notice emitted by a different, unmutated function -- so it was
+testing the wrong thing. Name the observable the mutation actually changes.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a
