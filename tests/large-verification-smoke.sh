@@ -189,6 +189,99 @@ grep -q 'already proven   : 1 file(s)' <<< "$out" \
 echo "  exit 1, recorded as MISMATCH, and not counted as proven"
 
 # ---------------------------------------------------------------------------
+sect "the remaining cost is stated, so finishing the set is an informed decision"
+rm -f "$HIST"
+run '' 2 >/dev/null
+out="$(run '' 2 --plan)"
+grep -q 'still to prove' <<< "$out" || fail "the remaining total is not stated: $out"
+grep -q 'per-run budget' <<< "$out" || fail "the number of runs is not estimated: $out"
+rem="$(sed -nE 's/.*still to prove   : ([0-9]+) file\(s\).*/\1/p' <<< "$out" | head -1)"
+[[ "$rem" == "2" ]] || fail "expected 2 still to prove after proving 2 of 4, got '$rem'"
+echo "  2 proven, 2 still to prove, with the run count estimated"
+
+sect "a proof whose file CHANGED SIZE is invalidated and re-selected"
+# A recorded proof is about the bytes that were there when it was taken. If the
+# file has been replaced the old proof says nothing about the new content.
+victim="$(jq -r 'select(.result=="match") | .path' "$HIST" | head -1)"
+[[ -n "$victim" ]] || fail "no proven path to tamper with"
+orig_size="$(stat -c %s "$victim")"
+printf 'XXXX' >> "$victim"
+out="$(run '' 2 --plan)"
+grep -q 'proof INVALIDATED: 1 file' <<< "$out" \
+  || fail "a changed file was still counted as proven: $out"
+grep -q 'bytes now' <<< "$out" || fail "the invalidation does not show both sizes: $out"
+grep -qF "$(basename "$victim")" <<< "$out" || fail "the invalidated file is not named: $out"
+grep -q 'back in the unproven set' <<< "$out" || fail "the consequence is not stated: $out"
+# And it must actually be re-selectable, not merely reported.
+sel="$(run '' 4 --plan)"
+grep -qF "$(basename "$victim")" <<< "$sel" \
+  || fail "the invalidated file was not put back in the candidate set: $sel"
+truncate -s "$orig_size" "$victim"
+echo "  dropped from the proven set, named with both sizes, and re-selectable"
+
+sect "a proof whose file is GONE is invalidated too"
+# There is nothing left for the proof to be about.
+cp "$HIST" "$TMP_DIR/hist.bak"
+jq -c 'if .result=="match" then .path = "/nonexistent/vanished.mov" else . end' "$TMP_DIR/hist.bak" \
+  | head -1 > "$HIST"
+tail -n +2 "$TMP_DIR/hist.bak" >> "$HIST"
+out="$(run '' 2 --plan)"
+grep -q 'proof INVALIDATED' <<< "$out" || fail "a vanished file stayed proven: $out"
+grep -q 'gone' <<< "$out" || fail "it does not say the file is gone: $out"
+cp "$TMP_DIR/hist.bak" "$HIST"
+echo "  a vanished path is not proven either"
+
+sect "an UNCHANGED file keeps its proof -- invalidation is not indiscriminate"
+out="$(run '' 2 --plan)"
+grep -q 'proof INVALIDATED' <<< "$out" \
+  && fail "an unchanged library reported invalidations: $out"
+grep -q 'already proven   : 2 file' <<< "$out" \
+  || fail "unchanged proofs were not carried forward: $out"
+echo "  nothing is invalidated when nothing changed"
+
+sect "mutation: dropping the size comparison must keep a stale proof counted"
+MUTS="$TMP_DIR/mutant-stale"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTS"
+# The mutation script is written to a FILE with a quoted heredoc rather than
+# embedded inline: expressing this line through two layers of script needed
+# enough escaping that it produced a SyntaxError, the mutation silently did not
+# apply, and the test "failed" against an unmutated binary. A mutation that
+# cannot be shown to have applied proves nothing, so it is asserted below.
+cat > "$TMP_DIR/mutate.py" <<'MUTPY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+needle = '[[ -n "$now" && "$now" == "$recorded" ]] && '
+assert s.count(needle) == 1, "needle count: %d" % s.count(needle)
+s = s.replace(needle, "", 1)
+open(p, "w").write(s)
+MUTPY
+python3 "$TMP_DIR/mutate.py" "$MUTS" || fail "the mutation script failed"
+grep -q '"$now" == "$recorded"' "$MUTS" \
+  && fail "the size comparison is still present; the mutation proves nothing"
+printf 'XXXX' >> "$victim"
+mstale="$(
+  source "$MUTS" >/dev/null 2>&1
+  set +e
+  die() { echo "DIE: $*"; exit 9; }
+  log() { :; }
+  backup_target_enabled() { return 0; }
+  immich_db_original_paths() { cat "$TMP_DIR/originals.lst"; }
+  SAMPLE_MAX_FILE_BYTES="$CAP"
+  LARGE_MAX_RUN_BYTES="$BUDGET"
+  do_verify_large cloud 2 --plan 2>&1
+)"
+# The observable is the PROVEN COUNT. The invalidation notice comes from
+# large_invalidated_paths, a different function that was not mutated, so its
+# presence says nothing about this mutation either way -- asserting on it was
+# testing the wrong function.
+grep -q 'already proven   : 2 file' <<< "$mstale" \
+  || fail "the mutant did not keep the stale proof; the size check is not load-bearing"
+grep -q 'still to prove   : 2 file' <<< "$mstale" \
+  || fail "the mutant did not leave the stale file out of the unproven set: $mstale"
+truncate -s "$orig_size" "$victim"
+echo "  without the comparison a replaced file stays counted as proven"
+
 sect "mutation: ignoring the history must re-download a proven file"
 rm -f "$HIST"
 run '' 2 >/dev/null

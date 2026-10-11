@@ -200,6 +200,30 @@ unmeasured amount.
 
 ---
 
+## 6b. Reducing future backup size is NOT reclaiming storage
+
+These are different operations and only one of them is proposed.
+
+| | What happens |
+|---|---|
+| **Applying the exclusion** | From the next run onward, derivative blobs stop being *added*. Every existing snapshot keeps its own file list and the blobs it references, and stays completely restorable. **Nothing is freed.** |
+| **Reclaiming the space** | Requires `forget` to drop the snapshots that still reference those blobs, then `prune` to delete blobs nothing references. Both are destructive and both need explicit approval. |
+
+restic is content-addressed: a blob survives while any snapshot references it.
+So the saving arrives **gradually**, as retention forgets the older snapshots
+in the ordinary course, and only once a prune runs.
+
+That is a feature, not a delay. While the old snapshots exist they are the
+fallback if the exclusion turns out to be wrong — the derivatives are still
+recoverable from them. **Never prune to realise the saving sooner**, because
+that destroys the fallback at exactly the moment the new behaviour is least
+proven.
+
+The 82.5 GiB figure is therefore "data that will stop being added", not
+"disk space that will appear".
+
+---
+
 ## 7. Status of the claims in this document
 
 | Claim | Status |

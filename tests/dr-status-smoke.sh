@@ -121,13 +121,27 @@ mk_coverage() {  # $1 = sampled, $2 = population
 EOF
 }
 
+mk_snapshot_coverage() {  # $1 = in_snapshot, $2 = originals, $3 = missing, $4 = snapshot
+  cat > "$VDIR/cloud-snapshot-coverage.json" <<EOF
+{"target":"cloud","snapshot_id":"$4","recorded_at":"2026-10-11T10:00:00-04:00",
+ "originals":$2,"in_snapshot":$1,"missing_from_snapshot":$3,"snapshot_paths":64500}
+EOF
+}
+
 mk_large_history() {  # $1 = how many proven large originals
-  local i
+  # The files must REALLY exist with the recorded size: a proof is about the
+  # bytes that were there when it was taken, so large_verified_paths drops a
+  # record whose file is gone or has changed size. A fixture of invented paths
+  # would be invalidated on sight -- which is the correct behaviour, and makes
+  # it useless as a fixture for "these are proven".
+  local i dir="$TMP_DIR/bigfiles"
+  mkdir -p "$dir"
   : > "$VDIR/cloud-large-verified.jsonl"
   for ((i=1; i<=$1; i++)); do
-    jq -cn --arg p "/big/video-$i.mov" \
+    head -c $(( 300 + i )) /dev/zero > "$dir/video-$i.mov"
+    jq -cn --arg p "$dir/video-$i.mov" --argjson b "$(stat -c %s "$dir/video-$i.mov")" \
       '{target:"cloud",snapshot_id:"abc123de",path:$p,media_type:"mov",
-        size_bytes:300000000,result:"match",verified_at:"2026-10-11T08:25:58-04:00"}' \
+        size_bytes:$b,result:"match",verified_at:"2026-10-11T08:25:58-04:00"}' \
       >> "$VDIR/cloud-large-verified.jsonl"
   done
 }
@@ -316,6 +330,66 @@ grep -q 'immich database *RESTORE TESTED' <<< "$out" \
   || fail "an earlier-snapshot proof is still a proof and must keep the level: $out"
 echo "  the snapshot is cited, and a stale one is flagged without losing the level"
 mk_dbimport 23033
+
+sect "the CONFIG claim and the OBSERVED claim are reported separately"
+# "The library is under the backup root and no exclusion matches it" is an
+# argument about configuration. "This path is in snapshot X" is an observation.
+# Presenting the first as the second is what made off-site coverage look proven
+# when nothing had ever been reconciled.
+rm -f "$VDIR/cloud-snapshot-coverage.json"
+out="$(run_dr)"
+grep -qE 'in the backup set \(config\) +all 20' <<< "$out" \
+  || fail "the configuration claim is not reported: $out"
+grep -qE 'IN a snapshot \(observed\) +NOT CHECKED' <<< "$out" \
+  || fail "an unreconciled library must say NOT CHECKED: $out"
+grep -q 'verify-snapshot-coverage' <<< "$out" \
+  || fail "it does not name the command that would check it: $out"
+echo "  config says all 20; observed says NOT CHECKED, and names the remedy"
+
+sect "an unreconciled library is a named RISK"
+grep -q 'RECONCILED against a real snapshot' <<< "$out" \
+  || fail "the missing reconciliation is not listed as a risk: $out"
+grep -q 'downloads nothing' <<< "$out" \
+  || fail "the risk does not say the check is cheap: $out"
+echo "  listed as a risk, with the cost of clearing it stated"
+
+sect "recorded full coverage is reported as an observation"
+mk_snapshot_coverage 20 20 0 abc123de
+out="$(run_dr)"
+grep -qE 'IN a snapshot \(observed\) +all 20, snapshot abc123de' <<< "$out" \
+  || fail "full coverage is not reported with its snapshot: $out"
+grep -q 'RECONCILED against a real snapshot' <<< "$out" \
+  && fail "the risk is still listed although reconciliation happened"
+grep -q 'reconciled against an earlier snapshot' <<< "$out" \
+  && fail "the current snapshot was flagged as earlier"
+echo "  all 20 in abc123de, the risk clears, and it is not flagged stale"
+
+sect "a MISSING original is reported and becomes a risk"
+mk_snapshot_coverage 17 20 3 abc123de
+out="$(run_dr)"
+grep -q '3 MISSING from snapshot abc123de' <<< "$out" \
+  || fail "the missing originals are not reported: $out"
+grep -q '3 original(s) are NOT in the snapshot' <<< "$out" \
+  || fail "the gap is not raised as a risk: $out"
+grep -q 'not protected off-site' <<< "$out" \
+  || fail "the consequence is not stated: $out"
+echo "  3 missing, stated in the summary and raised as a risk"
+
+sect "a reconciliation against an EARLIER snapshot is flagged, not hidden"
+mk_snapshot_coverage 20 20 0 0ldsnap1
+out="$(run_dr)"
+grep -q 'snapshot 0ldsnap1' <<< "$out" || fail "the older snapshot is not cited: $out"
+grep -q 'reconciled against an earlier snapshot' <<< "$out" \
+  || fail "an older reconciliation was not flagged: $out"
+echo "  the older snapshot is named and flagged"
+
+sect "a library that has GROWN since reconciliation says so"
+mk_snapshot_coverage 15 15 0 abc123de
+out="$(run_dr)"
+grep -q 'originals now vs 15 when reconciled' <<< "$out" \
+  || fail "growth since the reconciliation is not reported: $out"
+echo "  20 now vs 15 when reconciled, stated plainly"
+mk_snapshot_coverage 20 20 0 abc123de
 
 sect "nothing is ever FULL RECOVERY VERIFIED"
 out="$(run_dr)"
