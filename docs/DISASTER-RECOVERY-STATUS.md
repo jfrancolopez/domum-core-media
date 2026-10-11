@@ -6,6 +6,51 @@ records what could not be determined without root.
 
 ---
 
+## 0. Production result, 2026-10-11
+
+Run on the host against the live Hetzner repository, snapshot `05a6adb0`. This
+is production evidence, not a rehearsal.
+
+```
+exclusion-audit --proposed : MATCHED ORIGINALS 0 of 23033
+verify-db-restore cloud    : DATABASE IMPORT RESTORE TESTED
+                             dump 28,067,272 B restored from the repository
+                             imported under ON_ERROR_STOP=1, 0 stderr lines
+                             61 tables, 7 extensions, 23,033 assets,
+                             41,450 asset_file rows, 0 orphans of any kind,
+                             22,975 upload/ + 58 encoded-video/ + 0 elsewhere
+verify-sample cloud 12     : 12 of 12 matched, 257,238,697 B
+                             including a -MP.mp4 motion-photo ORIGINAL
+verify-large cloud         : 2 of 17 proven, 524.4 MiB of 7.9 GiB
+dr-status                  : WEAKEST TIER: RESTORE TESTED
+```
+
+| Tier | Level |
+|---|---|
+| Immich originals | **RESTORE TESTED** — 14 of 23,033 proven (12 sampled + 2 large) |
+| Immich database | **RESTORE TESTED** — imported into a disposable PostgreSQL |
+| any tier | **NOT** FULL RECOVERY VERIFIED |
+
+So the headline question — *can the family photo library be recovered from
+Hetzner?* — now has a real partial answer: **yes for everything that has been
+tested, which is 14 originals and the entire database.** 23,019 originals remain
+untested, and that is stated by the tool rather than implied away.
+
+Two findings from that run, both fixed in the revision after it:
+
+- **The report contradicted itself.** The tier row said `23021 never
+  restore-tested` while the summary four lines below said `23019`, because only
+  the summary counted the two large originals `verify-large` had just proved.
+- **The archive claim was two days stale and did not say so.** `archive
+  validated 2026-10-09` referred to snapshot `476f8797` while the import
+  referred to `05a6adb0`, and neither snapshot was cited.
+
+Also confirmed by that run: `image archives : 2 in /srv/data/backups/images
+(in the backup set)` — the Plex and Calibre-Web archives are inside the off-site
+set, which an unprivileged check could not previously see.
+
+---
+
 ## 1. The five levels
 
 They are deliberately not collapsible into a boolean. "A backup exists" and

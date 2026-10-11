@@ -1866,15 +1866,32 @@ dr_last_dbimport() {  # $1 = target -> "ts snapshot assets" or empty
 # is the defect the coverage artefact was added to fix, and reading the manifest
 # alone would reintroduce it.
 dr_sample_proof() {  # $1 = target -> "sampled population unsampled" or empty
-  local target="$1" man cov sampled pop uns
+  local target="$1" man cov sampled pop uns large
   man="$(sample_manifest_file "$target" 2>/dev/null)" || return 1
   cov="$(sample_coverage_file "$target" 2>/dev/null)" || return 1
   [[ -f "$man" && -f "$cov" ]] || return 1
   sampled="$(jq -r '.sampled_files // empty' "$cov" 2>/dev/null || true)"
   pop="$(jq -r '.population_files // empty' "$cov" 2>/dev/null || true)"
   [[ -n "$sampled" && -n "$pop" ]] || return 1
-  uns=$(( pop - sampled ))
-  printf '%s %s %s' "$sampled" "$pop" "$uns"
+  # The large-file history counts too. It did not, and the report contradicted
+  # itself in production: the tier row said "23021 never restore-tested" while
+  # the summary four lines below said 23019, because only the summary knew
+  # about the two large originals verify-large had just proved. Two numbers in
+  # one report that must agree are one number, computed once.
+  large="$(dr_large_proven_count "$target")"
+  uns=$(( pop - sampled - large ))
+  (( uns < 0 )) && uns=0
+  printf '%s %s %s %s' "$sampled" "$pop" "$uns" "$large"
+}
+
+# How many large originals have been proven for this target.
+#
+# Separate from dr_sample_proof so the summary and the tier row read the same
+# figure; both call it rather than counting for themselves.
+dr_large_proven_count() {  # $1 = target
+  local n
+  n="$(large_verified_paths "$1" 2>/dev/null | grep -c . || true)"
+  printf '%s' "${n:-0}"
 }
 
 # One row of the report.
@@ -1890,9 +1907,8 @@ dr_row() {  # $1 = tier, $2 = level, $3 = evidence
 # because a missing line reads as "nothing to report".
 dr_immich_summary() {  # $1 = target, $2 = library root
   local target="$1" lib="$2"
-  local cov large_hist inv counts n_orig n_missing
+  local cov inv counts n_orig n_missing
   cov="$(sample_coverage_file "$target")"
-  large_hist="$(large_history_file "$target")"
 
   echo "  IMMICH ORIGINALS"
   inv="$(mktemp)" || return 0
@@ -1921,12 +1937,22 @@ dr_immich_summary() {  # $1 = target, $2 = library root
     if [[ -f "$cov" ]]; then
       samp="$(jq -r '.sampled_files // 0' "$cov" 2>/dev/null || echo 0)"
     fi
-    if [[ -f "$large_hist" ]]; then
-      largeok="$(large_verified_paths "$target" | grep -c . || true)"
-    fi
+    largeok="$(dr_large_proven_count "$target")"
     printf '    %-34s %s\n' "restore-tested (sampled)" "$samp"
     printf '    %-34s %s\n' "restore-tested (large files)" "$largeok of $of over the cap"
-    printf '    %-34s %s\n' "NEVER restore-tested" "$(( n_orig - samp - largeok ))"
+    local never=$(( n_orig - samp - largeok ))
+    (( never < 0 )) && never=0
+    printf '    %-34s %s\n' "NEVER restore-tested" "$never"
+    # The tier row above quotes the population RECORDED when the sample ran;
+    # this block counts the library as it is NOW. They are different questions
+    # and will diverge as photos are added, so say when they have rather than
+    # printing two numbers that look like they should match.
+    local rec_pop=""
+    [[ -f "$cov" ]] && rec_pop="$(jq -r '.population_files // empty' "$cov" 2>/dev/null || true)"
+    if [[ -n "$rec_pop" && "$rec_pop" != "$n_orig" ]]; then
+      printf '    %-34s %s\n' "population drift" \
+        "$n_orig now vs $rec_pop when last sampled -- the proof covers the older set"
+    fi
     printf '    %-34s %s\n' "largest unproven set" \
       "$(( of - largeok )) file(s) over $(sample_human_bytes "$SAMPLE_MAX_FILE_BYTES")"
   else
@@ -2001,9 +2027,8 @@ dr_backup_scope() {  # $1 = library root
 # The risks that remain, named rather than left for the reader to infer.
 dr_remaining_risks() {  # $1 = target, $2 = library root
   local target="$1" lib="$2" n=0
-  local cov large_hist
+  local cov
   cov="$(sample_coverage_file "$target")"
-  large_hist="$(large_history_file "$target")"
   echo "  REMAINING RISKS"
   if ! dr_last_dbimport "$target" >/dev/null; then
     n=$((n+1)); echo "    $n. The Immich dump has never been IMPORTED into a real PostgreSQL."
@@ -2012,9 +2037,9 @@ dr_remaining_risks() {  # $1 = target, $2 = library root
   if [[ ! -f "$cov" ]]; then
     n=$((n+1)); echo "    $n. No sample restore proof with a stated population exists."
   fi
-  local of=0 largeok=0
+  local of=0 largeok
   [[ -f "$cov" ]] && of="$(jq -r '.oversize_files // 0' "$cov" 2>/dev/null || echo 0)"
-  [[ -f "$large_hist" ]] && largeok="$(large_verified_paths "$target" | grep -c . || true)"
+  largeok="$(dr_large_proven_count "$target")"
   if (( of > largeok )); then
     n=$((n+1)); echo "    $n. $(( of - largeok )) large original(s) have never been restore-tested."
     echo "       They are the home videos. Run verify-large to prove them a few at a time."
@@ -2079,10 +2104,21 @@ do_dr_status() {
       lvl="BACKED UP"; ev="covered by snapshot $run_snap"
       local proof
       if proof="$(dr_sample_proof "$target")"; then
+        # Positional, so read every field by INDEX. Taking the remainder with
+        # ${proof##* } broke the moment a fourth field was appended: it silently
+        # returned the large count instead, and the row claimed "0 never
+        # restore-tested" for a library with 22,964 untested originals.
         local s p u
-        s="${proof%% *}"; u="${proof##* }"; p="$(awk '{print $2}' <<< "$proof")"
+        s="$(awk '{print $1}' <<< "$proof")"
+        p="$(awk '{print $2}' <<< "$proof")"
+        u="$(awk '{print $3}' <<< "$proof")"
         lvl="RESTORE TESTED"
-        ev="$s of $p original(s) restored and compared; $u never restore-tested"
+        local lg; lg="$(awk '{print $4}' <<< "$proof")"
+        if [[ "${lg:-0}" -gt 0 ]]; then
+          ev="$(( s + lg )) of $p original(s) proven ($s sampled + $lg large); $u never restore-tested"
+        else
+          ev="$s of $p original(s) restored and compared; $u never restore-tested"
+        fi
       else
         ev="$ev; NO sample restore proof with a stated population"
       fi
@@ -2100,14 +2136,24 @@ do_dr_status() {
       # The archive checks are reported, but they do NOT promote the level:
       # gzip, size and footer prove the FILE is intact, not that PostgreSQL can
       # read it. Only an actual import earns RESTORE TESTED.
+      # Each claim cites the snapshot it is ABOUT. In production the archive
+      # check was two days older than the import, and the line showed neither
+      # snapshot -- so two claims about different objects read as one. A proof
+      # of an earlier snapshot is still a proof, but the reader has to be able
+      # to see which one.
       if vok="$(dr_last_restore_verification "$target")"; then
-        ev="archive validated ${vok%% *} (gzip, size, footer)"
+        ev="archive validated ${vok%% *} (gzip, size, footer; snapshot ${vok##* })"
+        [[ "${vok##* }" == "$run_snap" ]] || ev="$ev [not the current snapshot]"
       else
         ev="$ev; the archive has never been validated"
       fi
       if dbok="$(dr_last_dbimport "$target")"; then
+        local db_snap db_assets
+        db_snap="$(awk '{print $2}' <<< "$dbok")"
+        db_assets="$(awk '{print $3}' <<< "$dbok")"
         lvl="RESTORE TESTED"
-        ev="$ev; IMPORTED into a disposable PostgreSQL ${dbok%% *}, $(awk "{print \$3}" <<< "$dbok") asset(s), consistent"
+        ev="$ev; IMPORTED into a disposable PostgreSQL ${dbok%% *}, $db_assets asset(s), consistent (snapshot $db_snap)"
+        [[ "$db_snap" == "$run_snap" ]] || ev="$ev [not the current snapshot]"
       else
         ev="$ev; NEVER imported -- archive checks do not prove PostgreSQL can read it"
       fi
