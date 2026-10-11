@@ -348,6 +348,55 @@ the exclusion ever turns out to be wrong.
 
 ---
 
+## 5d. Coverage accumulates — and what it still cannot reach
+
+Selection is deterministic, which is what makes a run reproducible. The measured
+consequence was that the 2026-10-09 and 2026-10-11 production runs sampled the
+**same 12 files**, so coverage of the main library was capped at 12 of 23,033
+however often the command ran.
+
+`verify-sample` now skips already-proven originals and keeps a durable history,
+exactly as `verify-large` does, so repeated runs widen coverage:
+
+```
+run 1 : 3 of 9 proven     run 3 : 9 of 9 proven
+run 2 : 6 of 9 proven     run 4 : nothing left to sample
+```
+
+`--revalidate` is the only way to prove the same files again.
+
+### The arithmetic of full coverage, stated plainly
+
+| | |
+|---|---:|
+| originals reachable by sampling | 23,016 (23,033 − 17 over the per-file cap) |
+| a default run | 12 files, ~260 MB |
+| runs needed at that rate | **~1,918** |
+| per-run total cap (`SAMPLE_MAX_TOTAL_BYTES`) | 1 GiB |
+| runs needed at 1 GiB each | **~130**, ~130 GiB transferred |
+
+So accumulation is a genuine improvement over a frozen 12, but **sampling will
+never prove the whole library** at any sensible cost. What sampling proves is
+that the *pipeline* works: that objects in the repository come back
+byte-identical, across every container format the library contains.
+
+### The route to FULL RECOVERY VERIFIED
+
+That level needs a different exercise, not more sampling:
+
+1. restore the whole Immich library (~130 GiB of originals) to isolated scratch;
+2. restore and import the database (already proven possible — §4c);
+3. stand up a **disposable** Immich against both and confirm it serves the
+   library;
+4. record the result.
+
+Step 3 is the only part never attempted. It is a day of work and roughly 130 GiB
+of transfer, and it is the single remaining thing between "every proof we have
+passes" and "recovery is demonstrated". Until it happens the report will keep
+saying `FULL RECOVERY VERIFIED` is unreached, which is correct.
+
+---
+
 ## 6. What one root run would settle
 
 ```
