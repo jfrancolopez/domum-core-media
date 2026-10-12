@@ -3665,16 +3665,28 @@ do_dr_offhost_audit() {
 
   # ---- 2. the recovery pack -----------------------------------------------
   echo "  2. THE RECOVERY PACK (the only designed route off this host)"
-  local pack_dir pack_state pack_age="" pack_ts=""
+  # The age is taken from the newest pack FILE, not from a recorded timestamp.
+  #
+  # The first version called recovery_pack_state_file, which is defined in
+  # bin/domum-media -- a different script that this one does not source. At run
+  # time that is "command not found", the `|| true` swallowed it, and the pack
+  # age was silently never reported. The function-definition audit caught it;
+  # nothing else would have, because the failure looked exactly like "no state
+  # file yet". Measuring the files removes the cross-script dependency and
+  # reports what EXISTS rather than what was once recorded.
+  local pack_dir pack_age="" pack_ts="" newest=""
   pack_dir="${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}"
-  pack_state="$(recovery_pack_state_file 2>/dev/null || true)"
-  if [[ -n "$pack_state" && -f "$pack_state" ]]; then
-    pack_ts="$(sed -nE "s/^(LAST_CREATED_TS|CREATED_TS|TIMESTAMP)=//p" "$pack_state" 2>/dev/null | head -1)"
-    if [[ -n "$pack_ts" ]]; then
+  if [[ -d "$pack_dir" ]]; then
+    newest="$(find "$pack_dir" -maxdepth 1 -type f -name '*.age' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | head -1 | cut -d' ' -f2- || true)"
+    if [[ -n "$newest" && -f "$newest" ]]; then
       local ep now
-      ep="$(date -d "$pack_ts" +%s 2>/dev/null || true)"
+      ep="$(stat -c %Y "$newest" 2>/dev/null || true)"
       now="$(date +%s)"
-      [[ -n "$ep" ]] && pack_age=$(( (now - ep) / 86400 ))
+      if [[ -n "$ep" ]]; then
+        pack_age=$(( (now - ep) / 86400 ))
+        pack_ts="$(date -d "@$ep" -Iseconds 2>/dev/null || true)"
+      fi
     fi
   fi
   local packs=0

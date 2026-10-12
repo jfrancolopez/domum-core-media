@@ -113,6 +113,17 @@ grep -qE 'off-host delivery +ENABLED' <<< "$out" || fail "enabled delivery not r
 grep -q 'NOT READY' <<< "$out" && fail "a healthy configuration was reported NOT READY"
 echo "  present credentials, delivery enabled, no blocking gap"
 
+sect "the pack AGE is reported, from the file that exists"
+# The first version read the age via recovery_pack_state_file, which lives in
+# bin/domum-media -- a script this one does not source. At run time that was
+# "command not found", swallowed by `|| true`, and the age silently vanished
+# while looking exactly like "no state file yet". The age now comes from the
+# newest pack FILE, so it reports what exists.
+grep -qE 'pack present +yes' <<< "$out" || fail "the pack was not detected: $out"
+grep -qE 'newest pack age +[0-9]+d' <<< "$out" \
+  || fail "the pack age was not reported from the file on disk: $out"
+echo "  age derived from the newest .age file, with no cross-script dependency"
+
 sect "delivery DISABLED is a blocking gap, with the consequence stated"
 o="$(run_audit 'RECOVERY_PACK_EMAIL_ENABLED=0')"
 grep -qE 'off-host delivery +DISABLED' <<< "$o" || fail "disabled delivery not reported: $o"
