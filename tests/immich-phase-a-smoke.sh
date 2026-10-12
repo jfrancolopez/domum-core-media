@@ -394,7 +394,7 @@ echo "  the image and the video its livePhotoVideoId names are both served"
 sect "ownership scope is stated, and other users are reported as untested"
 # Immich enforces per-user ownership: asking the admin's session for another
 # user's asset returns nothing. The first rehearsal selected a PNG owned by the
-# non-admin user and reported ERROR no-response, which looked like a serving
+# non-admin user and the fetch returned nothing, which looked like a serving
 # defect and was correct authorization.
 grep -q 'ownership scope : the authenticated user only' <<< "$pb" \
   || fail "the ownership scope is not stated: $pb"
@@ -414,7 +414,7 @@ echo "  served bytes differing from the original fails the run"
 sect "an empty response is a failure, not a pass"
 o="$(run_pa 'export STUB_ORIGINAL_EMPTY=1' --serve)"
 grep -q 'EXITCODE=1' <<< "$o" || fail "an empty response did not exit 1: $o"
-grep -q 'no-response' <<< "$o" || fail "the empty response is not reported: $o"
+grep -q 'NO-RESPONSE' <<< "$o" || fail "the empty response is not reported: $o"
 echo "  nothing returned is not treated as matching"
 
 sect "an original missing from the SNAPSHOT is reported, not skipped silently"

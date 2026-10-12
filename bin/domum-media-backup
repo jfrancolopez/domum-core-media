@@ -3200,7 +3200,7 @@ phaseb_selection_sql() {  # $1 = owner id to scope to
   # asking the admin's session for another user's asset returns nothing -- that
   # is correct authorization, not a recovery failure. The first rehearsal
   # selected a PNG belonging to the non-admin user and reported
-  # "ERROR no-response", which looked like a serving defect and was not.
+  # a failed fetch, which looked like a serving defect and was not.
   cat <<SQL
 with sized as (
   select a.id, a."originalPath", a.type, a.visibility,
@@ -3238,18 +3238,27 @@ phaseb_livephoto_video_sql() {  # $1 = image asset id
 
 # Fetch one asset through the API and compare with the restored file.
 #
-# Prints "<verdict> <detail>". The ORIGINAL endpoint is the only one whose
-# bytes are compared; a mismatch there is a failure, not a note.
+# Prints "<verdict> [detail]". That string is this function's RETURN VALUE --
+# the caller captures it -- so the verdict words are drawn from the same
+# vocabulary as the rest of the file (match / MISMATCH / NO-RESPONSE /
+# NO-LOCAL-FILE) and never from the LOGGING vocabulary. `ERROR no-response`
+# was the first form, and `tests/captured-stdout-purity-smoke.sh` rightly
+# rejected it: WARN and ERROR on a captured function's stdout are
+# indistinguishable from the log-line contamination that audit exists to catch,
+# and the prefix said nothing `no-response` did not already say.
+#
+# The ORIGINAL endpoint is the only one whose bytes are compared; a mismatch
+# there is a failure, not a note.
 phaseb_fetch_and_compare() {  # $1=container $2=token $3=asset id $4=local file
   local c="$1" tok="$2" id="$3" local_file="$4"
   local want got
   want="$(sha256sum "$local_file" 2>/dev/null | cut -d' ' -f1)"
-  [[ -n "$want" ]] || { printf 'ERROR no-local-file'; return 1; }
+  [[ -n "$want" ]] || { printf 'NO-LOCAL-FILE'; return 1; }
   got="$(docker exec "$c" sh -lc \
     "curl -sf -m 120 -H 'Authorization: Bearer $tok' \
       'http://127.0.0.1:2283/api/assets/$id/original' | sha256sum | cut -d' ' -f1" 2>/dev/null || true)"
   if [[ -z "$got" || "$got" == "$(printf '' | sha256sum | cut -d' ' -f1)" ]]; then
-    printf 'ERROR no-response'; return 1
+    printf 'NO-RESPONSE'; return 1
   fi
   if [[ "$got" == "$want" ]]; then printf 'match %s' "${want:0:12}"; return 0; fi
   printf 'MISMATCH local=%s served=%s' "${want:0:12}" "${got:0:12}"

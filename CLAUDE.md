@@ -981,7 +981,7 @@ Rules that came out of it:
 - **Immich enforces per-user ownership, and ignoring that looks like a bug.**
   The first rehearsal selected a PNG owned by the non-admin user while
   authenticating as the admin; Immich returned nothing and it read as
-  `ERROR no-response`, i.e. a serving defect. It was correct authorization.
+  a failed fetch, i.e. a serving defect. It was correct authorization.
   Selection is scoped to the authenticated user's `ownerId`.
 - **A multi-user library needs per-user verification.** Measured: 17,084 assets
   owned by the admin, 5,949 by the other user. Proving one user's assets serve
@@ -990,6 +990,16 @@ Rules that came out of it:
 - **The live-photo relationship is NOT 1:1.** Measured: 7,432 images carry a
   `livePhotoVideoId` pointing at 7,428 distinct hidden videos, so four videos
   are each shared by two images. Follow the column; never derive the pair.
+- **`WARN` and `ERROR` on a captured function's stdout are reserved, because
+  that stdout IS the return value.** The Phase B verdict shipped as
+  `ERROR no-response` and `tests/captured-stdout-purity-smoke.sh` rejected it in
+  CI -- correctly: the audit exists because `create_service_snapshot` once
+  logged a progress line into its own return value, and it cannot tell a verdict
+  word from contamination when the two share a vocabulary. The prefix also said
+  nothing `no-response` did not. Verdicts are drawn from this file's own
+  vocabulary -- `match` / `MISMATCH` / `NO-RESPONSE` / `NO-LOCAL-FILE` -- and the
+  log words stay on stderr. Do not widen the audit's `LOGLIKE` pattern to admit
+  a new caller.
 - **`ORDER BY`/`LIMIT` inside a `UNION` branch must be parenthesised**, or
   PostgreSQL applies them to the whole union and the statement is a syntax
   error. It was, and the tool reported only "no representative asset could be

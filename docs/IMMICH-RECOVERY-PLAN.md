@@ -247,7 +247,7 @@ question: **serving originals did not require the generated derivatives.**
 **1. Immich enforces per-user ownership, and the first run looked like a bug.**
 The selection picked a PNG owned by the non-admin user while authenticating as
 the admin; Immich returned nothing and the run reported
-`photo png  ERROR no-response`. That was correct authorization, not a serving
+`photo png  NO-RESPONSE`. That was correct authorization, not a serving
 defect. Selection is now scoped to the authenticated user's `ownerId`.
 
 **2. A multi-user library needs per-user verification.** Measured: **17,084
@@ -259,6 +259,15 @@ and names the untested count.
 `livePhotoVideoId`, pointing at 7,428 distinct hidden videos** — four videos are
 each shared by two images. The paired video must be followed through the column
 rather than derived, and a query assuming a one-to-one mapping would be wrong.
+
+**4. A captured function's stdout is its RETURN VALUE, so the logging
+vocabulary is reserved.** The verdict started as `ERROR no-response` and
+`tests/captured-stdout-purity-smoke.sh` — which exists because
+`create_service_snapshot` once logged a progress line into its own return value
+— rejected it. The audit cannot distinguish a verdict word from log-line
+contamination when the two share a vocabulary, and `ERROR` added nothing to
+`no-response`. The verdicts are now `match` / `MISMATCH` / `NO-RESPONSE` /
+`NO-LOCAL-FILE`, matching the rest of the file.
 
 ### What Phase B does not establish
 
