@@ -85,10 +85,26 @@ case "$1" in
     case "$1" in
       pg_isready) exit 0 ;;
       psql)
+        # Queries arrive two ways: via -c (in the arguments) and via STDIN
+        # (piped). The Phase B selection is piped, so matching only on "$*"
+        # could never see it -- the first version of this stub did exactly that
+        # and the selection silently returned nothing.
+        if [[ "$*" != *" -c "* && "$*" != *"ON_ERROR_STOP"* ]]; then
+          q="$(cat)"
+          case "$q" in
+            *"with sized as"*)
+              [[ -n "${STUB_SELECT_FAILS:-}" ]] && { echo "ERROR: syntax error at or near \"union\"" >&2; exit 1; }
+              cat "${STUB_SELECTION:?}"; exit 0 ;;
+            *livePhotoVideoId*) cat "${STUB_LP_VIDEO:?}"; exit 0 ;;
+          esac
+          exit 0
+        fi
         if [[ "$*" == *"create database"* ]]; then exit 0; fi
         if [[ "$*" == *"ON_ERROR_STOP=1"* ]]; then cat > /dev/null; [[ -n "${STUB_IMPORT_FAILS:-}" ]] && { echo "ERROR: boom" >&2; exit 3; }; exit 0; fi
         q="$*"
         case "$q" in
+          *'ownerId" <> '*) echo "${STUB_OTHER_ASSETS:-5949}"; exit 0 ;;
+          *"select id from \"user\" where email"*) echo "owner-0001"; exit 0 ;;
           *"count(*) from asset'"*|*"count(*) from asset\""*|*"count(*) from asset"*)
             case "$q" in
               *"type='IMAGE'"*) [[ -n "${STUB_NO_VISIBILITY:-}" ]] && exit 0; echo "$vis_img"; exit 0 ;;
@@ -108,7 +124,33 @@ case "$1" in
           *pgcrypto*|*"update \"user\""*) exit 0 ;;
         esac
         exit 0 ;;
+      sh)
+        # `docker exec <c> sh -lc "curl ... | sha256sum | cut ..."` -- the real
+        # fetch shape. Matching only a bare `curl` could never see it.
+        cmd="$*"
+        if [[ "$cmd" == *"/original"* ]]; then
+          [[ -n "${STUB_ORIGINAL_EMPTY:-}" ]] && exit 0
+          if [[ -n "${STUB_ORIGINAL_WRONG:-}" ]]; then
+            printf 'WRONGBYTES' | sha256sum | cut -d' ' -f1; exit 0
+          fi
+          sha256sum < "${STUB_SERVE_FILE:?}" | cut -d' ' -f1; exit 0
+        fi
+        if [[ "$cmd" == *"/thumbnail"* ]]; then
+          [[ -n "${STUB_NO_THUMB:-}" ]] && { printf '0'; exit 0; }
+          printf '4242'; exit 0
+        fi
+        exit 0 ;;
       curl)
+        if [[ "$*" == *"/original"* ]]; then
+          [[ -n "${STUB_ORIGINAL_EMPTY:-}" ]] && exit 0
+          if [[ -n "${STUB_ORIGINAL_WRONG:-}" ]]; then printf 'WRONGBYTES'; exit 0; fi
+          # Echo back exactly the fixture content, so a hash comparison can pass.
+          cat "${STUB_SERVE_FILE:?}"; exit 0
+        fi
+        if [[ "$*" == *"/thumbnail"* ]]; then
+          [[ -n "${STUB_NO_THUMB:-}" ]] && { printf '0'; exit 0; }
+          printf '4242'; exit 0
+        fi
         if [[ "$*" == *"api/server/version"* ]]; then
           [[ -n "${STUB_NO_API:-}" ]] && exit 1
           echo '{"major":2,"minor":7,"patch":5}'; exit 0
@@ -131,7 +173,22 @@ chmod +x "$TMP_DIR/bin/docker"
 export PATH="$TMP_DIR/bin:$PATH"
 export STUB_LOG="$TMP_DIR/docker.log" STUB_FACTS="$TMP_DIR/facts"
 
-run_pa() {  # $1 = setup
+# Phase B fixtures: one small file whose bytes the stub echoes back, so a hash
+# comparison is a real comparison.
+mkdir -p "$TMP_DIR/orig"
+printf 'this-is-a-real-original-photo\n' > "$TMP_DIR/orig/one.jpeg"
+export STUB_SERVE_FILE="$TMP_DIR/orig/one.jpeg"
+cat > "$TMP_DIR/selection" <<EOF
+photo jpeg|asset-0001|/usr/src/app/upload/upload/aa/bb/one.jpeg|30
+livephoto image|asset-0002|/usr/src/app/upload/upload/aa/bb/two.jpeg|30
+EOF
+cat > "$TMP_DIR/lpvideo" <<EOF
+livephoto video|asset-0003|/usr/src/app/upload/encoded-video/cc/dd/three-MP.mp4|30
+EOF
+export STUB_SELECTION="$TMP_DIR/selection" STUB_LP_VIDEO="$TMP_DIR/lpvideo"
+
+run_pa() {  # $1 = setup (may be empty), $2.. = args for do_immich_phase_a
+  local setup="${1:-}"; shift || true
   : > "$STUB_LOG"
   (
     # shellcheck disable=SC1090
@@ -154,6 +211,7 @@ run_pa() {  # $1 = setup
               case "$a" in
                 *dump.sql.gz) cp "$TMP_DIR/dump.sql.gz" "$t$a" ;;
                 *.immich)     [[ -n "${STUB_NO_MARKERS:-}" ]] || printf 'immich-marker' > "$t$a" ;;
+                *)            [[ -n "${STUB_NO_ORIGINALS:-}" ]] || cp "$TMP_DIR/orig/one.jpeg" "$t$a" ;;
               esac
             fi
             p2="$a"
@@ -161,8 +219,8 @@ run_pa() {  # $1 = setup
       esac
       return 0
     }
-    [[ -n "${1:-}" ]] && eval "$1"
-    do_immich_phase_a cloud 2>&1
+    [[ -n "$setup" ]] && eval "$setup"
+    do_immich_phase_a cloud "$@" 2>&1
     echo "EXITCODE=$?"
   )
 }
@@ -310,6 +368,142 @@ grep -q '^RESULT=failure' "$EV" || fail "the failure was not recorded"
 echo "  0600, the pinned image recorded, and the last success survives a failure"
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PHASE B -- serving recovered media
+# ---------------------------------------------------------------------------
+sect "Phase B serves originals and compares BYTES, earning the narrow claim"
+pb="$(run_pa '' --serve)"
+grep -q 'EXITCODE=0' <<< "$pb" || fail "the Phase B happy path did not exit 0: $pb"
+grep -q 'REPRESENTATIVE RECOVERY VERIFIED' <<< "$pb" || fail "the claim was not made: $pb"
+grep -qE 'REPRESENTATIVE RECOVERY VERIFIED \(3 of 23033\)' <<< "$pb" \
+  || fail "the claim does not state its denominator: $pb"
+grep -qE 'photo jpeg +match' <<< "$pb" || fail "the jpeg was not served and matched: $pb"
+grep -qE 'livephoto video +match' <<< "$pb" \
+  || fail "the hidden live-photo video component was not served: $pb"
+grep -q 'APPLICATION STARTUP VERIFIED' <<< "$pb" && fail "it used the Phase A claim instead"
+grep -q 'FULL RECOVERY VERIFIED' <<< "$pb" && fail "it used the words FULL RECOVERY VERIFIED"
+echo "  3 of 23033, byte-compared, including the live-photo video"
+
+sect "the live-photo RELATIONSHIP is followed, not assumed"
+# 7,432 images link to 7,428 distinct hidden videos on the real library, so the
+# relationship is not 1:1 and the video must be fetched via livePhotoVideoId.
+grep -qE 'livephoto image +match' <<< "$pb" || fail "the live-photo image was not served: $pb"
+grep -q 'livephoto video' <<< "$pb" || fail "the paired video was never selected: $pb"
+echo "  the image and the video its livePhotoVideoId names are both served"
+
+sect "ownership scope is stated, and other users are reported as untested"
+# Immich enforces per-user ownership: asking the admin's session for another
+# user's asset returns nothing. The first rehearsal selected a PNG owned by the
+# non-admin user and reported ERROR no-response, which looked like a serving
+# defect and was correct authorization.
+grep -q 'ownership scope : the authenticated user only' <<< "$pb" \
+  || fail "the ownership scope is not stated: $pb"
+grep -q '5949 asset(s) belong to OTHER user(s)' <<< "$pb" \
+  || fail "other users' untested assets are not reported: $pb"
+grep -q 'does not prove another' <<< "$pb" || fail "the limitation is not explained: $pb"
+grep -q 'only ONE user' <<< "$pb" || fail "the verdict does not repeat the limitation: $pb"
+echo "  one user tested, 5949 other assets named as untested"
+
+sect "a BYTE MISMATCH is a failure, not a note"
+o="$(run_pa 'export STUB_ORIGINAL_WRONG=1' --serve)"
+grep -q 'EXITCODE=1' <<< "$o" || fail "a mismatch did not exit 1: $o"
+grep -q 'MISMATCH' <<< "$o" || fail "the mismatch is not shown: $o"
+grep -q 'REPRESENTATIVE RECOVERY VERIFIED' <<< "$o" && fail "a mismatch still claimed the level"
+echo "  served bytes differing from the original fails the run"
+
+sect "an empty response is a failure, not a pass"
+o="$(run_pa 'export STUB_ORIGINAL_EMPTY=1' --serve)"
+grep -q 'EXITCODE=1' <<< "$o" || fail "an empty response did not exit 1: $o"
+grep -q 'no-response' <<< "$o" || fail "the empty response is not reported: $o"
+echo "  nothing returned is not treated as matching"
+
+sect "an original missing from the SNAPSHOT is reported, not skipped silently"
+o="$(run_pa 'export STUB_NO_ORIGINALS=1' --serve)"
+grep -q 'NOT RESTORED' <<< "$o" || fail "a missing original was not reported: $o"
+grep -q 'not in the snapshot' <<< "$o" || fail "the cause is not stated: $o"
+grep -q 'EXITCODE=1' <<< "$o" || fail "missing originals did not fail: $o"
+echo "  an original absent from the snapshot fails the run and says why"
+
+sect "the thumbnail is fetched but NEVER claimed to match an original"
+grep -q 'GENERATED, not compared to any original' <<< "$pb" \
+  || fail "the thumbnail distinction is not stated: $pb"
+# It must not appear among the hash comparisons.
+grep -qE 'thumbnail +match [0-9a-f]{12}' <<< "$pb" \
+  && fail "a generated thumbnail was hash-compared to an original"
+o="$(run_pa 'export STUB_NO_THUMB=1' --serve)"
+grep -q 'not a failure' <<< "$o" || fail "an absent thumbnail was treated as a failure: $o"
+grep -q 'EXITCODE=0' <<< "$o" || fail "an absent thumbnail failed the run: $o"
+echo "  reported as generated; its absence is explicitly not a failure"
+
+sect "the run is bounded by a byte budget"
+o="$(run_pa 'PHASEB_MAX_BYTES=10' --serve)"
+grep -q 'would exceed the' <<< "$o" || fail "the budget did not skip anything: $o"
+grep -q 'run budget' <<< "$o" || fail "the budget is not named: $o"
+echo "  oversized selections are skipped rather than silently downloaded"
+
+sect "a selection error is SURFACED, not reported as 'nothing to select'"
+# The first rehearsal hit a real SQL syntax error -- ORDER BY/LIMIT inside
+# UNION branches needs parentheses -- and the tool said only "no representative
+# asset could be selected". An unactionable FAIL trains the operator to ignore it.
+o="$(run_pa 'export STUB_SELECT_FAILS=1' --serve)"
+grep -q 'no representative asset could be selected' <<< "$o" || fail "no failure reported: $o"
+grep -q 'selection error' <<< "$o" || fail "the SQL error was swallowed: $o"
+grep -q 'syntax error' <<< "$o" || fail "the error text is not shown: $o"
+echo "  the database's own error is printed"
+
+sect "mutation: dropping the hash comparison must let wrong bytes pass"
+MUTB="$TMP_DIR/mutant-b"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTB"
+cat > "$TMP_DIR/mutate-b.py" <<'MUTPY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+needle = '  if [[ "$got" == "$want" ]]; then printf \'match %s\' "${want:0:12}"; return 0; fi'
+assert s.count(needle) == 1, "needle count: %d" % s.count(needle)
+s = s.replace(needle, '  printf \'match %s\' "${want:0:12}"; return 0', 1)
+open(p, "w").write(s)
+MUTPY
+python3 "$TMP_DIR/mutate-b.py" "$MUTB" || fail "the Phase B mutation script failed"
+grep -q 'if \[\[ "$got" == "$want" \]\]' "$MUTB" \
+  && fail "the comparison is still present; the mutation proves nothing"
+mbout="$(
+  source "$MUTB" >/dev/null 2>&1
+  set +e
+  die() { echo "DIE: $*"; exit 9; }
+  log() { :; }
+  backup_target_enabled() { return 0; }
+  PHASEA_READY_TIMEOUT=3
+  export STUB_ORIGINAL_WRONG=1
+  restic_for_target() {
+    shift
+    case "$1" in
+      snapshots) echo '[{"short_id":"snapA001"}]' ;;
+      restore)
+        local t="" prev="" p2=""
+        for a in "$@"; do [[ "$prev" == "--target" ]] && t="$a"; prev="$a"; done
+        for a in "$@"; do
+          if [[ "$p2" == "--include" ]]; then
+            mkdir -p "$t$(dirname "$a")"
+            case "$a" in
+              *dump.sql.gz) cp "$TMP_DIR/dump.sql.gz" "$t$a" ;;
+              *.immich)     printf 'immich-marker' > "$t$a" ;;
+              *)            cp "$TMP_DIR/orig/one.jpeg" "$t$a" ;;
+            esac
+          fi
+          p2="$a"
+        done ;;
+    esac
+    return 0
+  }
+  do_immich_phase_a cloud --serve 2>&1
+  echo "EXITCODE=$?"
+)"
+grep -q 'EXITCODE=0' <<< "$mbout" \
+  || fail "the mutant did not pass wrong bytes; the comparison is not load-bearing"
+grep -q 'REPRESENTATIVE RECOVERY VERIFIED' <<< "$mbout" \
+  || fail "the mutant did not produce the false claim: $mbout"
+echo "  without it, bytes that differ from the original are reported as matching"
+
 sect "mutation: dropping the before/after check must let a destructive migration pass"
 MUT="$TMP_DIR/mutant"
 cp "$REPO_ROOT/bin/domum-media-backup" "$MUT"

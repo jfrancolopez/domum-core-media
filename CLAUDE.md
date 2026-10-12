@@ -961,6 +961,52 @@ rehearsal added `IMMICH_TELEMETRY_INCLUDE=none` and Immich refused to boot with
 one with a wrong value is fatal. Isolation comes from the network, so there is
 nothing to gain by guessing at feature switches.
 
+**A recovered Immich SERVES recovered originals — proven 2026-10-12.**
+`immich-phase-b` restored 8 originals from the snapshot and the application
+returned all 8 with **bytes identical** to the restored files: jpeg, heic, png,
+raw, an ordinary video, a larger video, and a live-photo image together with its
+hidden motion-photo video. 41.0 MiB transferred, no leftovers, production
+untouched. The claim is `REPRESENTATIVE RECOVERY VERIFIED (8 of 23033)` and it
+states its own denominator, because 23,025 originals were never served and only
+one user was tested.
+
+Rules that came out of it:
+
+- **`/original` may be hash-compared; `/thumbnail` may not.** The first returns
+  the stored file, the second a GENERATED preview. The report fetches the
+  thumbnail to show the application works and never claims its bytes match an
+  original. No thumbnail came back at all, because derivatives were not
+  restored -- reported as explicitly not a failure, and useful evidence for the
+  exclusion question: serving originals did not need the derivatives.
+- **Immich enforces per-user ownership, and ignoring that looks like a bug.**
+  The first rehearsal selected a PNG owned by the non-admin user while
+  authenticating as the admin; Immich returned nothing and it read as
+  `ERROR no-response`, i.e. a serving defect. It was correct authorization.
+  Selection is scoped to the authenticated user's `ownerId`.
+- **A multi-user library needs per-user verification.** Measured: 17,084 assets
+  owned by the admin, 5,949 by the other user. Proving one user's assets serve
+  says nothing about the other's, so the ownership scope and the untested count
+  are printed.
+- **The live-photo relationship is NOT 1:1.** Measured: 7,432 images carry a
+  `livePhotoVideoId` pointing at 7,428 distinct hidden videos, so four videos
+  are each shared by two images. Follow the column; never derive the pair.
+- **`ORDER BY`/`LIMIT` inside a `UNION` branch must be parenthesised**, or
+  PostgreSQL applies them to the whole union and the statement is a syntax
+  error. It was, and the tool reported only "no representative asset could be
+  selected" because it sent stderr to /dev/null -- an unactionable FAIL. The
+  database's own error is now printed.
+
+**Off-host recovery is viable: measured 2026-10-12.** The audit, run as root,
+found all four repository credentials present, 37 encrypted recovery packs with
+the newest 0 days old, **off-host delivery ENABLED by email**, the pack
+correctly NOT inside the backup it would be needed to open, and all three
+application images obtainable from their registries. Verdict `UNPROVEN` rather
+than clean, because two items cannot be established from the host whose loss is
+assumed: the age PRIVATE key is held by the operator, and pgvecto.rs is
+deprecated so the set of Immich versions able to import today's dump shrinks
+over time. The whole chain rests on that age key -- 37 copies are equally
+useless without it.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

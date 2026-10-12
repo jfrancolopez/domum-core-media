@@ -203,6 +203,72 @@ and production credentials are never touched.
 
 ---
 
+## 3c. Phase B RESULT — rehearsed 2026-10-12
+
+`immich-phase-b` restores a small representative set of ORIGINALS from the
+snapshot and asks the recovered Immich for them through its own API, comparing
+the returned bytes by hash.
+
+```
+selected        : 8 asset(s), 41.0 MiB to restore
+ownership scope : the authenticated user only
+                  5949 asset(s) belong to OTHER user(s) and were not tested
+restored        : 8 of 8 original(s), 41.0 MiB
+photo jpeg         match 00a5580b3641
+photo heic         match f6cfdf63d4f2
+photo png          match e97e1a3e6298
+photo raw          match 59b92d971ff7
+video ordinary     match 7d75e232d405
+video larger       match 06900c4b5a28
+livephoto image    match 9c23bdbf6992
+livephoto video    match 2ca5c2fa13a1
+thumbnail        : none returned (derivatives were not restored; not a failure)
+result            : REPRESENTATIVE RECOVERY VERIFIED (8 of 23033)
+```
+
+**A fresh Immich served eight recovered originals with bytes identical to the
+restored files**, across every requested media type including the hidden
+motion-photo video component of a live photo. 41.0 MiB transferred; no leftover
+containers or networks; all eleven production containers untouched.
+
+### What is compared, and what is not
+
+| Endpoint | Treatment |
+|---|---|
+| `/api/assets/<id>/original` | returns the stored file; bytes **hash-compared** to the restored original |
+| `/api/assets/<id>/thumbnail` | **generated** preview; fetched to show the app works, never claimed to match an original |
+
+No thumbnail was returned because derivatives were not restored — reported
+explicitly as *not* a failure. That is also useful evidence for the exclusion
+question: **serving originals did not require the generated derivatives.**
+
+### Three findings from the rehearsal
+
+**1. Immich enforces per-user ownership, and the first run looked like a bug.**
+The selection picked a PNG owned by the non-admin user while authenticating as
+the admin; Immich returned nothing and the run reported
+`photo png  ERROR no-response`. That was correct authorization, not a serving
+defect. Selection is now scoped to the authenticated user's `ownerId`.
+
+**2. A multi-user library needs per-user verification.** Measured: **17,084
+assets owned by the admin, 5,949 by the other user.** Proving one user's assets
+serve says nothing about the other's, so the report states the ownership scope
+and names the untested count.
+
+**3. The live-photo relationship is not 1:1.** Measured: **7,432 images carry a
+`livePhotoVideoId`, pointing at 7,428 distinct hidden videos** — four videos are
+each shared by two images. The paired video must be followed through the column
+rather than derived, and a query assuming a one-to-one mapping would be wrong.
+
+### What Phase B does not establish
+
+**23,025 originals were never restored or served, and only one user was
+tested.** A subset proves the path from repository to application works for
+these media types; it cannot speak for the whole library. `FULL RECOVERY
+VERIFIED` still requires the full ~130 GiB exercise.
+
+---
+
 ## 4. Full-library restore: storage, time, bandwidth
 
 Derived from the observed 2026-10-11 run, which transferred 835,199,165 bytes
