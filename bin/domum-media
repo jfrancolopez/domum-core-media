@@ -779,6 +779,20 @@ restic-rest-server|ENABLE_RESTIC_REST_SERVER|RESTIC_REST_SERVER_IMAGE|RESTIC_RES
 EOF
 }
 
+# Exact whole-line membership in the managed service list.
+#
+# Capture first. `managed_image_specs | cut … | grep -qxF "$svc"` is the banned
+# shape: grep exits at the first match, the generator takes SIGPIPE and the
+# PIPELINE reports 141, so under `pipefail` a VALID service name reads as
+# unknown and all three callers `die` on correct input. It is intermittent,
+# which is what makes it worse. Three copies of that pipeline are now one
+# function.
+is_managed_service() {  # $1 = service name
+  local known
+  known="$(managed_image_specs | cut -d'|' -f1)"
+  grep -qxF -- "$1" <<< "$known"
+}
+
 service_lifecycle_specs() {
   cat <<'EOF'
 traefik|ENABLE_TRAEFIK|A|14|traefik|TRAEFIK_IMAGE|
@@ -1401,7 +1415,7 @@ render_traefik_dynamic() {
     # envsubst takes the literal '${VAR}' allowlist; we do not want shell expansion here.
     # shellcheck disable=SC2016
     rendered="$(envsubst '${TRAEFIK_DASHBOARD_HOST} ${DOMUM_DOMAIN}' < "$src")"
-    if [[ "$rendered" == *'{{'* ]] || printf '%s' "$rendered" | grep -qE '\$\{[A-Z_][A-Z0-9_]*\}'; then
+    if [[ "$rendered" == *'{{'* ]] || grep -qE '\$\{[A-Z_][A-Z0-9_]*\}' <<< "$rendered"; then
       die "Unresolved placeholder in $src after render — refusing to write $dst"
     fi
     printf '%s' "$rendered" > "$dst.partial"
@@ -4884,7 +4898,9 @@ uptime_kuma_dump() {
   local in_container="/tmp/kuma-recovery-$$.db"
 
   cmd_exists docker || return 1
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qFx -- "$container" || return 1
+  local running
+  running="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+  grep -qFx -- "$container" <<< "$running" || return 1
 
   docker exec "$container" sh -c \
     "rm -f '$in_container' && sqlite3 '$db' \".backup '$in_container'\"" >/dev/null 2>&1 || {
@@ -5250,7 +5266,9 @@ checkup_cmd() {
   if grep -qE '^(IMMICH_VERSION|JELLYFIN_VERSION|NAVIDROME_VERSION)=' "$CFG_FILE" 2>/dev/null; then
     checkup_add critical "Legacy image pin variables are still present in the config."
   fi
-  if ! enabled_backup_targets | grep -q .; then
+  local enabled_targets
+  enabled_targets="$(enabled_backup_targets || true)"
+  if [[ -z "${enabled_targets//[[:space:]]/}" ]]; then
     checkup_add critical "No backup targets are enabled."
   else
     checkup_add healthy "At least one backup target is enabled."
@@ -6040,7 +6058,7 @@ doctor_traefik() {
           [[ -n "$host" ]] || continue
           if ! cmd_exists jq; then
             state="unknown (jq not installed)"
-          elif [[ -n "$issued_hosts" ]] && printf '%s\n' "$issued_hosts" | grep -Fxq -- "$host"; then
+          elif [[ -n "$issued_hosts" ]] && grep -Fxq -- "$host" <<< "$issued_hosts"; then
             state="issued"
           else
             state="missing"
@@ -8321,7 +8339,7 @@ rollback_volume_upgrade() {  # $1 = service, $2 = recovery point
   local service="${1:-}" point="${2:-}"
   [[ -n "$service" && -n "$point" ]] \
     || die "Usage: domum-media rollback-volume-upgrade <service> <recovery-point>"
-  managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
+  is_managed_service "$service" \
     || die "Refusing: '$service' is not a service this command knows about"
 
   local meta kind want_img arch want_sha compose_svcs volumes
@@ -8429,7 +8447,7 @@ rollback_upgrade() {  # $1 = service, $2 = recovery point
   local service="${1:-}" point="${2:-}"
   [[ -n "$service" && -n "$point" ]] \
     || die "Usage: domum-media rollback-upgrade <service> <recovery-point>"
-  managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
+  is_managed_service "$service" \
     || die "Refusing: '$service' is not a service this command knows about"
 
   local meta path snap want_img arch want_sha compose_svcs
@@ -8668,7 +8686,7 @@ service_upgrade() {  # $1 = service, [--dry-run]
   [[ "${2:-}" == "--dry-run" ]] && dry=1
   [[ -n "$service" ]] || die "Usage: domum-media updates apply --service <service> [--dry-run]"
   # Fail CLOSED on an unknown name. A typo must never widen to every service.
-  managed_image_specs | cut -d'|' -f1 | grep -qxF "$service" \
+  is_managed_service "$service" \
     || die "Refusing: '$service' is not an upgradable service.
 Known: $(managed_image_specs | cut -d'|' -f1 | tr '\n' ' ')"
   # Refuse while the service is still RUNNING if its state cannot be snapshotted.
@@ -8801,7 +8819,9 @@ rollback instructions in $meta."
   cleanup_images_execute 1 0 || true
   # The CHECK reads the value-returning selector instead, and matches the whole
   # line rather than grepping prose.
-  if collect_cleanup_image_ids 2>/dev/null | grep -qxF "$old_id"; then
+  local cleanup_ids
+  cleanup_ids="$(collect_cleanup_image_ids 2>/dev/null || true)"
+  if grep -qxF -- "$old_id" <<< "$cleanup_ids"; then
     warn "THE OLD IMAGE IS A DELETION CANDIDATE: $old_id"
     warn "Its recovery point depends on it. Do NOT run cleanup --confirm."
     rc=1

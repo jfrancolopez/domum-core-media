@@ -41,17 +41,36 @@ $svc_branch"
 echo "  --service -> service_upgrade; fleet path unreachable from that branch"
 
 echo "== 2. an unknown service FAILS CLOSED, it does not widen =="
-grep -q "managed_image_specs | cut -d'|' -f1 | grep -qxF \"\$service\"" <<< "$up" \
-  || fail "service_upgrade does not validate the name against managed_image_specs"
-val_block="$(awk "/managed_image_specs \| cut -d'\\|' -f1 \| grep -qxF/,/^  assert_pre_upgrade_possible/" <<< "$up")"
+# EXECUTED, not read. This assertion used to grep service_upgrade for the
+# literal pipeline `managed_image_specs | cut -d'|' -f1 | grep -qxF "$service"`
+# and broke the moment that pipeline was replaced -- by a FIX, because
+# `cmd | grep -q` under pipefail reports 141 and would have made a VALID
+# service name read as unknown and die. A test that reads source text cannot
+# tell a fix from a regression, so this drives the checker instead.
+probe() {  # $1 = candidate name; echoes the exit status
+  bash -c 'source "$1" >/dev/null 2>&1; set +e; is_managed_service "$2"; echo $?' \
+    _ "$CLI" "$1"
+}
+for good in traefik plex calibre-web uptime-kuma restic-rest-server; do
+  [ "$(probe "$good")" = "0" ] \
+    || fail "'$good' is a managed service and was rejected. A check that refuses
+valid input aborts a correct upgrade -- the failure family this repository has
+already shipped three times."
+done
+for bad in plexx pl "" "plex " PLEX immich jellyfin-x; do
+  [ "$(probe "$bad")" != "0" ] \
+    || fail "'$bad' is not a managed service and was accepted. A typo must never
+widen to fleet-wide operation."
+done
+grep -q 'is_managed_service "$service"' <<< "$up" \
+  || fail "service_upgrade does not validate the name against the managed list"
+val_block="$(awk '/is_managed_service "\$service"/,/^  assert_pre_upgrade_possible/' <<< "$up")"
 grep -q 'die ' <<< "$val_block" \
   || fail "an unknown service name does not abort. A typo must never fall back to
 fleet-wide operation:
 $val_block"
-grep -q 'grep -qxF' <<< "$up" \
-  || fail "the name check is not an exact whole-line match, so a substring like
-'plex' could match another service's key"
-echo "  unknown name dies; exact whole-line match"
+echo "  5 valid names accepted, 7 invalid rejected (substring, case, trailing
+  space and empty among them); the unknown-name branch dies"
 
 echo "== 3. the scope proof is captured BEFORE and compared AFTER =="
 grep -q 'other_container_identities' <<< "$up" || fail "no scope capture at all"

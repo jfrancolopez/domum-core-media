@@ -343,9 +343,11 @@ quiesce_immich_postgres() {
 
       gzip -t "$dump_tmp" || exit 1
       (( $(stat -c %s "$dump_tmp") >= 1024 )) || exit 1
-      gzip -cd "$dump_tmp" \
-        | tail -n 20 \
-        | grep -Fqx -- '-- PostgreSQL database dump complete' \
+      # Capture first. `tail | grep -Fqx` reports 141 when grep exits on the
+      # footer before tail has finished writing, so a VALID dump is rejected
+      # and the backup fails -- intermittently, on good input.
+      dump_tail="$(gzip -cd "$dump_tmp" | tail -n 20)" || exit 1
+      grep -Fqx -- '-- PostgreSQL database dump complete' <<< "$dump_tail" \
         || exit 1
 
       sync -f "$dump_tmp" || exit 1
@@ -615,7 +617,7 @@ list_latest_snapshots() {
     out="$(restic_for_target "$target" snapshots --latest 1 2>&1)" || rc=$?
     if (( rc == 0 )); then
       printf '%s\n' "$out"
-    elif printf '%s' "$out" | grep -qiE 'repository does not exist|unable to open config|config file does not exist'; then
+    elif grep -qiE 'repository does not exist|unable to open config|config file does not exist' <<< "$out"; then
       echo "($target: repository not initialized — run: sudo domum-media backup init $target)"
     else
       echo "(failed to query snapshots for $target)"
@@ -921,8 +923,9 @@ do_verify_restore() {
   fi
   checks="$checks,size"
 
-  if ! gzip -dc "$artifact" 2>/dev/null | tail -5 \
-       | grep -Fqx -- '-- PostgreSQL database dump complete'; then
+  local artifact_tail
+  artifact_tail="$(gzip -dc "$artifact" 2>/dev/null | tail -5 || true)"
+  if ! grep -Fqx -- '-- PostgreSQL database dump complete' <<< "$artifact_tail"; then
     reason="restored dump is missing the PostgreSQL completion footer"
     record_restore_verification "$target" failure "$snapshot_id" "$rel" "$bytes" "$checks" "$reason" || true
     die "Restore verification FAILED for $target: $reason"
@@ -3221,7 +3224,13 @@ phasea_pinned_image() {  # $1 = production container name
 # something that is not ours, and the production stack is the thing most likely
 # to be on the other end of that mistake.
 phasea_name_free() {  # $1 = container name
-  docker ps -a --format '{{.Names}}' | grep -qxF "$1" && return 1
+  # Capture first. `docker ps | grep -qxF` would report 141 when grep exits on
+  # the first match before docker has finished writing, so a name that DOES
+  # exist reads as free -- and this is the guard that keeps the harness away
+  # from production containers.
+  local names
+  names="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
+  grep -qxF -- "$1" <<< "$names" && return 1
   return 0
 }
 
@@ -3258,7 +3267,9 @@ production actually runs, so it will not substitute a tag."
   for n in "$c_pg" "$c_redis" "$c_srv"; do
     phasea_name_free "$n" || die "Refusing: a container named $n already exists."
   done
-  docker network ls --format '{{.Name}}' | grep -qxF "$net" \
+  local existing_nets
+  existing_nets="$(docker network ls --format '{{.Name}}' 2>/dev/null || true)"
+  grep -qxF -- "$net" <<< "$existing_nets" \
     && die "Refusing: a network named $net already exists."
 
   local vdir scratch
@@ -3382,11 +3393,12 @@ production actually runs, so it will not substitute a tag."
     "$img_server" >/dev/null 2>&1 || die "The disposable Immich server did not start"
 
   # ---- readiness -----------------------------------------------------------
-  local ver=""
+  local ver="" running=""
   for i in $(seq 1 "$PHASEA_READY_TIMEOUT"); do
     ver="$(docker exec "$c_srv" curl -sf -m 3 http://127.0.0.1:2283/api/server/version 2>/dev/null || true)"
     [[ -n "$ver" ]] && break
-    docker ps --format '{{.Names}}' | grep -qxF "$c_srv" \
+    running="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+    grep -qxF -- "$c_srv" <<< "$running" \
       || { echo "  startup           : FAILED -- the server container exited"; docker logs --tail 20 "$c_srv" 2>&1 | sed 's/^/    /'; return 1; }
     sleep 1
   done
@@ -3504,12 +3516,13 @@ phasea_teardown() {  # $1=srv $2=redis $3=pg $4=net $5=scratch $6=keep
   docker rm -f "$srv" "$redis" "$pg" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   rm -rf -- "$scratch" 2>/dev/null || true
-  local leaked=""
-  local n
+  local leaked="" n names nets
+  names="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
+  nets="$(docker network ls --format '{{.Name}}' 2>/dev/null || true)"
   for n in "$srv" "$redis" "$pg"; do
-    docker ps -a --format '{{.Names}}' | grep -qxF "$n" && leaked="$leaked $n"
+    grep -qxF -- "$n" <<< "$names" && leaked="$leaked $n"
   done
-  docker network ls --format '{{.Name}}' | grep -qxF "$net" && leaked="$leaked $net"
+  grep -qxF -- "$net" <<< "$nets" && leaked="$leaked $net"
   [[ -e "$scratch" ]] && leaked="$leaked $scratch"
   if [[ -n "$leaked" ]]; then
     echo "WARNING: Phase A could not remove:$leaked" >&2

@@ -1004,6 +1004,41 @@ inspect → reproduce → develop → test → focused commit → push branch �
   (`out="$(cmd)"`), then `grep -q … <<< "$out"`. This silently inverted a test
   guard and was one pipe-buffer away from inverting the stop verification that
   the whole migration safety argument rests on.
+
+  **The rule was written down and then not enforced: ten more instances were
+  sitting in the tree.** `tests/pipefail-grep-audit.py` now fails on the shape,
+  in both CLIs, `install.sh` and `operator/*.sh`. The direction of failure
+  differed at every site, which is why none of them looked alike:
+
+  - `phasea_name_free` -- the guard that keeps the disposable Immich harness
+    away from PRODUCTION containers. A name that **does** exist would read as
+    free;
+  - the config render check -- an unresolved `${PLACEHOLDER}` would be written
+    to a live config instead of refused;
+  - the `cleanup images` warning "THE OLD IMAGE IS A DELETION CANDIDATE" would
+    be silently skipped, which is the protection the recovery point rests on;
+  - **three copies** of the managed-service gate -- `die` on a **valid**
+    service name, aborting a correct upgrade or rollback. Now one
+    `is_managed_service`;
+  - the PostgreSQL dump footer check, twice -- a **valid** dump rejected, so the
+    backup fails on good input;
+  - the operator wrapper's post-migration check -- abort a migration that had
+    completed perfectly, which is the failure that wrapper has already caused
+    three times in other forms.
+
+  Two of the ten were invisible to a line-at-a-time search because the pipeline
+  was **split across lines**, so the audit joins continuations; and `||` must
+  not read as a pipe, or the audit flags the very fix it prescribes. Both are
+  mutation-tested, because the leading-pipe shape is caught either way and
+  asserting the mutation against it would have passed vacuously.
+
+  **A text-grep test cannot tell a fix from a regression.**
+  `service-upgrade-smoke` section 2 asserted that `service_upgrade` contained
+  the literal pipeline `managed_image_specs | cut … | grep -qxF "$service"` --
+  so replacing it with the fix *failed the suite*. It now EXECUTES the checker:
+  5 valid names must be accepted (a check that refuses valid input is the
+  aborted-deployment family) and 7 invalid ones rejected, substring, case,
+  trailing-space and empty among them.
 - **Take the backup before the mutation, unconditionally.** When mutation-testing,
   `cp` the file on its own line — not chained after the command being tested. A
   short-circuited `&&` chain leaves the mutation applied and no way back.
