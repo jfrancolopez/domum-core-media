@@ -88,6 +88,9 @@ jobs:
       - name: Immich Phase A smoke test
         run: tests/immich-phase-a-smoke.sh
 
+      - name: Off-host recovery audit smoke test
+        run: tests/offhost-recovery-audit-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 

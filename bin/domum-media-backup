@@ -3556,6 +3556,245 @@ phasea_record() {
   chmod 0600 "$tmp"; mv -f "$tmp" "$file"
 }
 
+# ---------------------------------------------------------------------------
+# Off-host recovery audit: could a NEW machine rebuild from Hetzner?
+# ---------------------------------------------------------------------------
+
+# Every proof so far has run on the N100, using the N100's credentials, against
+# images already in the N100's docker store. None of that survives the machine.
+# This audit asks the only question that matters if the host is destroyed:
+#
+#   with Hetzner and nothing else, can a new Debian machine read the repository
+#   and rebuild the application?
+#
+# It reports, never fixes, and it is explicit about what it CANNOT determine
+# from the very host whose loss is being assumed -- an audit that scored itself
+# a pass from inside the thing it is testing would be worthless.
+offhost_audit_row() {  # $1 = item, $2 = verdict, $3 = detail
+  printf '  %-34s %-14s %s\n' "$1" "$2" "$3"
+}
+
+# The credential files required to READ the repository, by name only.
+#
+# Never their values. The audit's job is to establish that recovery material
+# exists and has an off-host route, not to handle it.
+offhost_required_secrets() {  # prints "<label>|<path>"
+  local t type
+  while IFS= read -r t; do
+    backup_target_enabled "$t" 2>/dev/null || continue
+    type="$(backup_target_value "$t" TYPE repository 2>/dev/null)"
+    printf '%s|%s\n' "restic password ($t)" "$(backup_target_password_file "$t")"
+    local envf; envf="$(backup_target_value "$t" ENV_FILE 2>/dev/null)"
+    [[ -n "$envf" ]] && printf '%s|%s\n' "repository endpoint ($t)" "$envf"
+    if [[ "$type" == "repository" && "$(backup_target_value "$t" REPOSITORY 2>/dev/null)" == sftp:* ]]; then
+      printf '%s|%s\n' "SFTP key ($t)" "$(backup_target_value "$t" SFTP_KEY_FILE 2>/dev/null)"
+      printf '%s|%s\n' "SFTP known_hosts ($t)" "$(backup_target_value "$t" SFTP_KNOWN_HOSTS_FILE 2>/dev/null)"
+    fi
+  done < <(backup_target_names)
+}
+
+# The images a rebuild needs, and whether each carries a REGISTRY-resolvable
+# reference.
+#
+# An image ID in the local store proves nothing after the host is gone, and the
+# ID is not even portable: measured on this host, the local Id of
+# immich-server equals the multi-arch INDEX digest, not the config digest, so
+# comparing Ids between machines is meaningless. The durable reference is the
+# RepoDigest -- the `name@sha256:...` form -- which is what a new machine can
+# pull.
+offhost_recovery_images() {  # prints "<role>|<container>"
+  printf '%s\n' "immich server|immich_server" \
+                "postgresql|immich_postgres" \
+                "redis|immich_redis"
+}
+
+offhost_image_digest() {  # $1 = container -> repo digest or empty
+  local id
+  id="$(docker inspect "$1" --format '{{.Image}}' 2>/dev/null || true)"
+  [[ -n "$id" ]] || return 1
+  docker image inspect "$id" --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' 2>/dev/null \
+    | grep -m1 '@sha256:' || return 1
+}
+
+# $1 = "--probe" to contact the registry (read-only, no pull)
+do_dr_offhost_audit() {
+  local probe=0 a want_json=0
+  for a in "$@"; do
+    case "$a" in
+      --probe) probe=1 ;;
+      --json)  want_json=1 ;;
+      *) [[ -n "$a" ]] && die "Usage: domum-media-backup dr-offhost-audit [--probe] [--json]" ;;
+    esac
+  done
+  local problems=0 unknowns=0
+
+  echo "OFF-HOST RECOVERY AUDIT"
+  echo
+  echo "Assumes this machine is gone: system disk and data disk both unavailable."
+  echo "Anything reachable only from here does not count."
+  echo
+
+  # ---- 1. credentials ------------------------------------------------------
+  echo "  1. CREDENTIALS NEEDED TO READ THE REPOSITORY"
+  local label path missing=0 total=0
+  while IFS='|' read -r label path; do
+    [[ -n "$path" ]] || continue
+    total=$(( total + 1 ))
+    # "absent" and "I cannot look" are different answers. Reporting the second
+    # as the first makes the audit cry wolf, and an audit that cries wolf gets
+    # ignored -- which is worse than not having one.
+    if [[ -f "$path" ]]; then
+      offhost_audit_row "$label" "present" "$(basename "$path")"
+    elif [[ ! -r "$(dirname "$path")" ]]; then
+      offhost_audit_row "$label" "UNREADABLE" "$(dirname "$path") needs root"
+      unknowns=$(( unknowns + 1 ))
+    else
+      offhost_audit_row "$label" "MISSING" "$path"
+      missing=$(( missing + 1 ))
+    fi
+  done < <(offhost_required_secrets)
+  if (( total == 0 )); then
+    offhost_audit_row "credential inventory" "UNKNOWN" "no enabled target, or config unreadable"
+    unknowns=$(( unknowns + 1 ))
+  elif (( missing > 0 )); then
+    problems=$(( problems + 1 ))
+  fi
+  echo "     Without these the repository cannot be opened at all, so they are the"
+  echo "     first thing a rebuild needs -- before any snapshot is useful."
+  echo
+
+  # ---- 2. the recovery pack -----------------------------------------------
+  echo "  2. THE RECOVERY PACK (the only designed route off this host)"
+  local pack_dir pack_state pack_age="" pack_ts=""
+  pack_dir="${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}"
+  pack_state="$(recovery_pack_state_file 2>/dev/null || true)"
+  if [[ -n "$pack_state" && -f "$pack_state" ]]; then
+    pack_ts="$(sed -nE "s/^(LAST_CREATED_TS|CREATED_TS|TIMESTAMP)=//p" "$pack_state" 2>/dev/null | head -1)"
+    if [[ -n "$pack_ts" ]]; then
+      local ep now
+      ep="$(date -d "$pack_ts" +%s 2>/dev/null || true)"
+      now="$(date +%s)"
+      [[ -n "$ep" ]] && pack_age=$(( (now - ep) / 86400 ))
+    fi
+  fi
+  local packs=0
+  [[ -d "$pack_dir" ]] && packs="$(find "$pack_dir" -maxdepth 1 -type f -name '*.age' 2>/dev/null | grep -c . || true)"
+  if [[ ! -d "$pack_dir" ]]; then
+    offhost_audit_row "pack present" "UNKNOWN" "$pack_dir not readable from here"
+    unknowns=$(( unknowns + 1 ))
+  elif [[ "${packs:-0}" -gt 0 ]]; then
+    offhost_audit_row "pack present" "yes" "${packs} encrypted pack(s) in $pack_dir"
+    [[ -n "$pack_age" ]] && offhost_audit_row "newest pack age" "${pack_age}d" "created $pack_ts"
+  else
+    offhost_audit_row "pack present" "NONE" "no encrypted pack in $pack_dir"
+    problems=$(( problems + 1 ))
+  fi
+
+  # The decisive question. A pack that never leaves is lost with the machine.
+  # Likewise: a configuration value that was never read is not a value of 0.
+  if [[ -n "${CFG_FILE:-}" && ! -r "${CFG_FILE:-/nonexistent}" ]]; then
+    offhost_audit_row "off-host delivery" "UNKNOWN" "$CFG_FILE needs root; nothing can be said"
+    unknowns=$(( unknowns + 1 ))
+  elif [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then
+    offhost_audit_row "off-host delivery" "ENABLED" "emailed to ${RECOVERY_PACK_EMAIL_TO:-\$DOMUM_EMAIL}"
+  else
+    offhost_audit_row "off-host delivery" "DISABLED" "RECOVERY_PACK_EMAIL_ENABLED is not 1"
+    echo "     The pack is written to this host and never sent anywhere. If both disks"
+    echo "     are lost it is lost with them, and with it the ability to open the"
+    echo "     repository. This is the single highest-consequence gap in the system."
+    problems=$(( problems + 1 ))
+  fi
+
+  # Storing the pack inside the backup would be circular: you would need the
+  # credentials in order to fetch the credentials.
+  local in_set=1 root
+  for root in ${BACKUP_INCLUDE_PATHS:-}; do
+    case "$pack_dir" in "${root%/}"|"${root%/}"/*) in_set=0 ;; esac
+  done
+  if (( in_set == 0 )); then
+    offhost_audit_row "pack inside the backup" "CIRCULAR" "the credentials would be inside the repository they open"
+    problems=$(( problems + 1 ))
+  else
+    offhost_audit_row "pack inside the backup" "no" "correct -- that would be circular"
+  fi
+
+  # The age PRIVATE key is deliberately not on this host, so its presence
+  # cannot be checked from here. Saying so is the honest answer.
+  offhost_audit_row "age private key" "UNPROVABLE" "held by the operator; not checkable from this host"
+  unknowns=$(( unknowns + 1 ))
+  echo "     The pack is encrypted to $(basename "${RECOVERY_PACK_AGE_PUBKEY_FILE:-recovery_pack_pubkey}")."
+  echo "     Without the matching PRIVATE key the pack cannot be opened, so that key"
+  echo "     must exist somewhere that is neither this machine nor the pack."
+  echo
+
+  # ---- 3. images -----------------------------------------------------------
+  echo "  3. APPLICATION IMAGES A REBUILD NEEDS"
+  local role cont dig
+  while IFS='|' read -r role cont; do
+    if dig="$(offhost_image_digest "$cont")"; then
+      if (( probe == 1 )); then
+        if timeout 60 docker manifest inspect "$dig" >/dev/null 2>&1; then
+          offhost_audit_row "$role" "obtainable" "${dig##*@}"
+        else
+          offhost_audit_row "$role" "NOT IN REGISTRY" "${dig##*@}"
+          problems=$(( problems + 1 ))
+        fi
+      else
+        offhost_audit_row "$role" "pinned" "${dig##*@} (--probe to contact the registry)"
+      fi
+    else
+      offhost_audit_row "$role" "NO DIGEST" "local only -- not obtainable after this host is gone"
+      problems=$(( problems + 1 ))
+    fi
+  done < <(offhost_recovery_images)
+  echo "     A local image ID proves nothing once the store is gone, and is not even"
+  echo "     portable: this host's immich-server Id equals the multi-arch INDEX"
+  echo "     digest rather than the config digest, so IDs cannot be compared between"
+  echo "     machines. The durable reference is the RepoDigest."
+  echo
+
+  # ---- 4. the version trap ------------------------------------------------
+  echo "  4. VERSION COMPATIBILITY OF THE RECOVERY POINT"
+  local pgext
+  pgext="$(docker exec immich_postgres psql -U "${IMMICH_DB_USERNAME:-postgres}" \
+    -d "${IMMICH_DB_DATABASE_NAME:-immich}" -At \
+    -c "select extname from pg_extension where extname in ('vectors','vchord')" 2>/dev/null | tr '\n' ' ' || true)"
+  if [[ "$pgext" == *vectors* ]]; then
+    offhost_audit_row "vector extension" "pgvecto.rs" "DEPRECATED by Immich -- see note"
+    echo "     Immich warns that pgvecto.rs support will be removed. The dump can only"
+    echo "     be imported by an Immich that still supports it, so the set of"
+    echo "     applications able to read today's backup SHRINKS over time. Pin the"
+    echo "     image digest in the recovery pack, or migrate to VectorChord."
+    unknowns=$(( unknowns + 1 ))
+  elif [[ -n "$pgext" ]]; then
+    offhost_audit_row "vector extension" "$pgext" "current"
+  else
+    offhost_audit_row "vector extension" "UNKNOWN" "could not query the live database"
+    unknowns=$(( unknowns + 1 ))
+  fi
+  echo
+
+  # ---- verdict -------------------------------------------------------------
+  echo "  VERDICT"
+  if (( problems > 0 )); then
+    echo "    NOT READY -- $problems blocking gap(s) above. A new machine could not"
+    echo "    rebuild from Hetzner today."
+  elif (( unknowns > 0 )); then
+    echo "    UNPROVEN -- no blocking gap was found, but $unknowns item(s) cannot be"
+    echo "    established from this host. That is not the same as ready."
+  else
+    echo "    No gap found that this host can detect."
+  fi
+  if (( want_json == 1 )); then
+    jq -cn --argjson p "$problems" --argjson u "$unknowns" \
+      --arg res "$(if (( problems > 0 )); then echo not_ready; elif (( unknowns > 0 )); then echo unproven; else echo clean; fi)" \
+      '{problems:$p,unknowns:$u,result:$res}'
+  fi
+  (( problems > 0 )) && return 1
+  (( unknowns > 0 )) && return 2
+  return 0
+}
+
 main() {
   need_root
   load_cfg
@@ -3584,6 +3823,7 @@ main() {
     verify-large)         shift; do_verify_large "$@" ;;
     verify-snapshot-coverage) shift; do_verify_snapshot_coverage "$@" ;;
     immich-phase-a)       shift; do_immich_phase_a "$@" ;;
+    dr-offhost-audit)     shift; do_dr_offhost_audit "$@" ;;
     dr-status)            do_dr_status ;;
     -h|--help)
       cat <<EOF
@@ -3669,6 +3909,16 @@ Usage:
                                             mounted, images pinned by ID.
                                             Earns APPLICATION STARTUP VERIFIED
                                             -- never full recovery
+  domum-media-backup dr-offhost-audit [--probe] [--json]
+                                            Could a NEW machine rebuild from
+                                            Hetzner if this one were destroyed?
+                                            Audits the credentials, the recovery
+                                            pack and its off-host route, the
+                                            obtainability of every image, and
+                                            the vector-extension version trap.
+                                            Reports only; never prints a secret.
+                                            Exit 0 clean, 1 a blocking gap,
+                                            2 not establishable from this host
   domum-media-backup dr-status              What is actually PROVEN about
                                             recovery, per tier and per target,
                                             on the five levels UNKNOWN /
