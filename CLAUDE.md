@@ -1003,6 +1003,44 @@ rehearsal added `IMMICH_TELEMETRY_INCLUDE=none` and Immich refused to boot with
 one with a wrong value is fatal. Isolation comes from the network, so there is
 nothing to gain by guessing at feature switches.
 
+**"Never restore-tested" is a claim about the library NOW, and it was computed
+against the recorded denominator.** Production, 2026-10-12: after 69 photos were
+added, the tier row said `23013 never restore-tested` and the summary four
+sections below said `23082`. Both were derived from the same proven count (20);
+the row subtracted it from the population RECORDED when the sample ran (23033)
+and the summary from the LIVE library (23102). The row's figure silently
+treated 69 brand-new originals as tested -- the weaker claim in the stronger
+claim's words. One `dr_never_restore_tested` now answers it, against the live
+count, and the proof's own FRACTION keeps the recorded population with both
+labelled. This is the second instance of this exact rule in this function; the
+first is recorded in `dr_sample_proof`'s comment.
+
+**A test that establishes the precondition for agreement cannot detect
+disagreement.** The suite already had a section called "the tier row and the
+summary report the SAME untested count", and it passed throughout. Its own
+comment explained why it could not work: *"the fixture must make them the same
+population for the two untested figures to be comparable at all"* -- it set
+recorded == live, the one case where the two cannot differ. A sibling section
+then asserted `22964 never restore-tested` with a recorded population of 22976
+and a live library of 20, i.e. it REQUIRED the defect. Both now drive the grown
+library, which is the only configuration in which the invariant has content.
+
+**One read of the asset table per report, passed as an argument -- never
+memoised in a global.** Every call site in `dr-status` is a command
+substitution, so a global assigned inside `$( )` is set in the subshell and the
+parent never sees it. The first version of this fix cached the inventory that
+way and the path came back EMPTY: the summary reported `20, 0 B` with no
+location breakdown, because `sample_coverage_stats ""` happily returns zeros.
+Two reads would also be two observations, and the whole defect here was two
+denominators wearing one label.
+
+**The risk block is what the operator acts on, so a drift note is not a risk.**
+The summary printed `[the library has 23102 originals now vs 23033 when
+reconciled]` -- honest, unactionable, and the REMAINING RISKS block said
+nothing, so 69 originals that had never been observed in ANY snapshot were
+invisible where it mattered. `dr_remaining_risks` now names them, says they are
+the newest photos, names `verify-snapshot-coverage` and says it downloads
+nothing -- a remedy that reads as expensive does not get run.
 **A recovered Immich SERVES recovered originals — proven 2026-10-12.**
 `immich-phase-b` restored 8 originals from the snapshot and the application
 returned all 8 with **bytes identical** to the restored files: jpeg, heic, png,
@@ -1058,6 +1096,7 @@ assumed: the age PRIVATE key is held by the operator, and pgvecto.rs is
 deprecated so the set of Immich versions able to import today's dump shrinks
 over time. The whole chain rests on that age key -- 37 copies are equally
 useless without it.
+||||||| parent of e64a33c (safety: two "never restore-tested" numbers, 69 apart)
 
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
