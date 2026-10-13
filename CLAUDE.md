@@ -1029,6 +1029,13 @@ occur there however long the list was. Driving it needs its own bash process:
 function invoked as part of a `&&`/`||` list -- which is exactly the condition
 being tested.
 
+**A broken pipe does not have one exit status, so do not assert on the
+number.** The mutation above exits **141** here (SIGPIPE kills `sed`) and **4**
+on the CI runner (GNU sed's "I/O error", because an ancestor ignores SIGPIPE so
+the write returns `EPIPE` instead of killing it) -- same mutant, same fixture.
+Pinning 141 made the assertion pass locally and fail in CI. The observable is
+that the verdict is LOST and the status is neither of the meaningful ones.
+
 **Size a SIGPIPE fixture deliberately.** The mutation that restores `| head -20`
 survives at 69 paths, because 69 short lines fit the 64 KiB pipe buffer and the
 writer finishes before `head` exits. It only dies reliably at ~3,000 paths. The
