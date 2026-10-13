@@ -464,11 +464,22 @@ PYH
 grep -q 'head -20' "$MUTH" || fail "the head mutation was not applied"
 
 mout="$(run_huge "$MUTH")"
+mrc="$(sed -nE 's/^EXITCODE=([0-9]+)$/\1/p' <<< "$mout" | tail -1)"
+# Assert the BEHAVIOUR, not the number. The broken pipe surfaces as 141 when
+# SIGPIPE kills sed, and as sed's own exit 4 ("I/O error") when an ancestor
+# ignores SIGPIPE so the write returns EPIPE instead. Measured: 141 here, 4 on
+# the CI runner, from the same mutant and the same fixture. Pinning 141 made
+# this assertion pass locally and fail in CI -- an exit code is not the
+# observable here; losing the verdict is.
 grep -q 'result            : INCOMPLETE' <<< "$mout" \
   && fail "the mutant kept its verdict; this mutation proves nothing"
-grep -q 'EXITCODE=141' <<< "$mout" \
-  || fail "the mutant should die with SIGPIPE (141): $(grep EXITCODE <<< "$mout")"
-echo "  killed: with | head -20 and 2999 missing it exits 141 and the verdict is gone"
+case "$mrc" in
+  1|3) fail "the mutant reached a meaningful verdict status ($mrc); it should have
+died in the pipeline: $mout" ;;
+  "")  fail "no exit status was captured from the mutant: $mout" ;;
+esac
+echo "  killed: with | head -20 and 2999 missing it dies in the pipeline (status"
+echo "  $mrc, neither 1 nor 3) and the verdict is gone"
 
 sect "the FIXED form survives the same 2999-path list"
 fout="$(run_huge "$REPO_ROOT/bin/domum-media-backup")"
