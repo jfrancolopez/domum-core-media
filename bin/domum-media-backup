@@ -2781,6 +2781,43 @@ large_population() {  # $1 = inventory file
 # Unverified first, and diverse by container format before size, so the second
 # run does not simply fetch the next-largest .mov again. Deterministic: the same
 # history and inventory always choose the same files.
+# How many more runs finishing the set would actually take.
+#
+# NOT `ceil(remaining_bytes / budget)`. A run is capped TWICE -- by
+# LARGE_DEFAULT_COUNT files (2) and by LARGE_MAX_RUN_BYTES (1 GiB) -- and it
+# cannot split a file, so neither cap is usually the binding one and the budget
+# is rarely filled. Measured in production 2026-10-12: with 13 files and 6.5 GiB
+# left the byte division said "about 7 more runs", and the run that followed
+# fetched 2 files and 614.5 MiB, 60% of the budget, because the FILE COUNT was
+# the binding cap, not the bytes. The division models neither cap.
+#
+# So the packing is simulated with both, in the order large_select yields and
+# with the rule the real run uses: offer the first `count` unproven files, take
+# the first unconditionally, then skip over anything that would overflow the
+# budget and keep looking. A file larger than the whole budget is still taken as
+# a run's first file, so this always makes progress and always terminates.
+#
+# It remains an estimate: large_select re-orders as files become proven, so the
+# count can move by one. It can no longer be wrong about which cap binds.
+large_run_estimate() {  # $1 = budget bytes, $2 = files per run; stdin = size<TAB>path
+  awk -F'\t' -v budget="$1" -v percount="$2" '
+    { size[++n] = $1 + 0 }
+    END {
+      if (n == 0) { print 0; exit }
+      left = n; runs = 0
+      while (left > 0) {
+        runs++; total = 0; offered = 0
+        for (i = 1; i <= n && offered < percount; i++) {
+          if (taken[i]) continue
+          offered++
+          if (total > 0 && total + size[i] > budget) continue
+          taken[i] = 1; total += size[i]; left--
+        }
+      }
+      print runs
+    }'
+}
+
 large_select() {  # $1 = inventory, $2 = already-verified list file, $3 = count
   local inv="$1" done_file="$2" want="$3"
   large_population "$inv" \
@@ -2885,9 +2922,13 @@ authority for which files are originals."
   rem_files=$(( pop_files - done_n ))
   rem_bytes=$(( pop_bytes - ${done_bytes:-0} ))
   if (( rem_files > 0 )); then
-    rem_runs=$(( (rem_bytes + LARGE_MAX_RUN_BYTES - 1) / LARGE_MAX_RUN_BYTES ))
+    # Simulated, not divided: a run cannot split a file. See large_run_estimate.
+    rem_runs="$(large_select "$inv" "$done_file" "$pop_files" \
+      | large_run_estimate "$LARGE_MAX_RUN_BYTES" "$LARGE_DEFAULT_COUNT")"
     echo "  still to prove   : $rem_files file(s), $(sample_human_bytes "$rem_bytes") -- about"
-    echo "                     $rem_runs more run(s) at the $(sample_human_bytes "$LARGE_MAX_RUN_BYTES") per-run budget"
+    echo "                     $rem_runs more run(s) at $LARGE_DEFAULT_COUNT file(s) and"
+    echo "                     $(sample_human_bytes "$LARGE_MAX_RUN_BYTES") per run -- whichever binds first; a run"
+    echo "                     cannot split a file, so the budget is rarely filled"
   fi
 
   if (( pop_files == 0 )); then

@@ -311,4 +311,65 @@ grep -q 'big_a.mov' <<< "$mout" \
   || fail "the mutant did not re-select an already-proven file: $mout"
 echo "  without the history it re-fetches what was already proven"
 
+echo "== the remaining-runs estimate models BOTH caps, not a byte division =="
+# Production, 2026-10-12: with 13 files and 6.5 GiB left the report said "about
+# 7 more run(s)" -- ceil(bytes/budget) -- and the run that followed fetched 2
+# files and 614.5 MiB, 60% of the budget. The FILE COUNT was the binding cap,
+# and the division modelled neither it nor the fact that a run cannot split a
+# file.
+est() {  # $1 = budget, $2 = files per run, rest = sizes
+  local budget="$1" count="$2"; shift 2
+  local b
+  for b in "$@"; do printf '%s\tp%s\n' "$b" "$b"; done \
+    | ( source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+        set +e; large_run_estimate "$budget" "$count" )
+}
+BUD=1073741824
+
+# The file count binding: eleven 280 MB files are 2.9 GiB, so the byte division
+# says 3. At 2 files a run it is 6 -- double.
+ELEVEN="293601280 293601280 293601280 293601280 293601280 293601280 293601280
+        293601280 293601280 293601280 293601280"
+# shellcheck disable=SC2086
+got="$(est $BUD 2 $ELEVEN)"
+[ "$got" = "6" ] || fail "eleven files at 2 per run must be 6 runs, got $got"
+echo "  count cap binds: 11 files, 2.9 GiB -> 6 runs, where bytes/budget says 3"
+
+# The byte budget binding: two 600 MB files cannot share a 1 GiB run even
+# though the file count would allow it.
+got="$(est $BUD 2 629145600 629145600)"
+[ "$got" = "2" ] || fail "two 600 MB files cannot share a 1 GiB run, got $got"
+echo "  budget cap binds: 2 files, 1.17 GiB -> 2 runs, not 1"
+
+# A file larger than the whole budget must still be taken, or the estimate never
+# terminates -- the same "always allow the first file" rule the real run uses so
+# it cannot deadlock.
+got="$(est $BUD 2 2147483648)"
+[ "$got" = "1" ] || fail "a file larger than the budget must still be one run, got $got"
+echo "  one over-budget file is still a run; the simulation cannot deadlock"
+
+[ "$(est $BUD 2)" = "0" ] || fail "an empty set must be 0 runs"
+echo "  an empty set is 0 runs"
+
+# The real remaining set, measured from the asset table 2026-10-12.
+REMAIN="341001575 369015865 371441059 390135019 396503166 461661604 462843817
+        595149165 607172210 964179088 1380730680"
+# shellcheck disable=SC2086
+got="$(est $BUD 2 $REMAIN)"
+[ "$got" = "7" ] || fail "the production remaining set must be 7 runs, got $got"
+echo "  production's 11 remaining (5.90 GiB) -> 7 runs; the division said 6"
+
+echo "== mutation: dropping the file-count cap must get that case wrong =="
+MUTE="$TMP_DIR/mut-estimate"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTE"
+sed -i 's/offered < percount/offered < 1000000/' "$MUTE"
+grep -q 'offered < 1000000' "$MUTE" || fail "the estimate mutation was not applied"
+# shellcheck disable=SC2086
+mgot="$(for b in $ELEVEN; do printf '%s\tp%s\n' "$b" "$b"; done \
+        | ( source "$MUTE" >/dev/null 2>&1; set +e
+            large_run_estimate $BUD 2 ))"
+[ "$mgot" != "6" ] \
+  || fail "ignoring the per-run file count still gave 6; the cap is not load-bearing"
+echo "  killed: without the count cap the same set reports $mgot, not 6"
+
 echo "PASS: large-verification-smoke"

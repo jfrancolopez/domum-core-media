@@ -794,6 +794,26 @@ of families already recorded in this file:
   announced "every large original is proven" having verified none. Read the
   other file with `getline` instead.
 
+**An estimate of remaining work must model the mechanism, not divide the
+bytes.** `verify-large` reported `13 file(s), 6.5 GiB -- about 7 more run(s) at
+the 1.0 GiB per-run budget`, which was `ceil(bytes/budget)`. Measured in
+production 2026-10-12, the very next run fetched **2 files and 614.5 MiB -- 60%
+of the budget** -- because a run is capped **twice**, by `LARGE_DEFAULT_COUNT`
+(2 files) and by `LARGE_MAX_RUN_BYTES` (1 GiB), and it cannot split a file. The
+division modelled neither cap: the binding one here was the file count. The
+estimate is now a SIMULATION of the real packing over `large_select`'s own
+order, and it says what binds. For the measured remaining set it gives 7 where
+the division gave 6; where the files are smaller it is twice out -- eleven
+280 MB files are 6 runs, not 3. The report also still calls it an estimate,
+because `large_select` re-orders as files become proven.
+
+**Verify which cap binds before reasoning about throughput.** I first explained
+the 614.5 MiB run as the byte budget failing to pack, and the fix I wrote
+simulated only the budget. It was the file count. A per-run limit that is not
+the one named in the message is exactly how a plausible wrong estimate survives.
+`tests/large-verification-smoke.sh` drives both caps and mutates the count cap
+away; without it the same set reports 4 runs instead of 6.
+
 **"Not in the backup set" and "the include set was never read" are different
 claims.** `dr_path_configured` reported the former for the latter. It now has a
 third state and the report says UNKNOWN -- the same conflation the five levels
