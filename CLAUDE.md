@@ -961,6 +961,69 @@ rehearsal added `IMMICH_TELEMETRY_INCLUDE=none` and Immich refused to boot with
 one with a wrong value is fatal. Isolation comes from the network, so there is
 nothing to gain by guessing at feature switches.
 
+**A safety report lost its own verdict exactly when the news was bad.**
+Production, 2026-10-12: `verify-snapshot-coverage` listed 20 missing originals
+and then stopped -- no `... and 49 more`, no `result : INCOMPLETE`, and it
+exited **141**. The cause was `sed … "$missing" | head -20 | sed …`: `head`
+closes its input after 20 lines, the first `sed` took SIGPIPE, the pipeline
+reported 141, and under `set -euo pipefail` the function DIED there. With 20 or
+fewer missing, `head` reads everything and nothing fails -- so the defect
+appeared only when the list was long, i.e. only when there was something to
+report. Reproduced against the real function before fixing. Slice with
+`sed -n '1,20{…;p}'`, which has no pipe.
+
+`tests/pipefail-grep-audit.py` now covers every consumer that STOPS EARLY:
+`grep -q`/`-m`, `sed Nq`, and `head` with no count, a count that is not 1, or a
+variable count -- six more sites, including two `diff | head -20` on migration
+mismatch paths. `| head -1` after a `sed -nE 's/^KEY=…/p'` is deliberately NOT
+flagged (about sixty of those): the producer emits at most a line or two, and an
+audit that cries wolf is one somebody switches off. That scope is stated in the
+audit rather than left implicit.
+
+**A test that relaxes production's shell options is not a test of production.**
+`snapshot-coverage-smoke`'s harness ran with `set +e`, so the abort could not
+occur there however long the list was. Driving it needs its own bash process:
+`( f ) || rc=$?` does not work, because bash suppresses errexit inside a
+function invoked as part of a `&&`/`||` list -- which is exactly the condition
+being tested.
+
+**Size a SIGPIPE fixture deliberately.** The mutation that restores `| head -20`
+survives at 69 paths, because 69 short lines fit the 64 KiB pipe buffer and the
+writer finishes before `head` exits. It only dies reliably at ~3,000 paths. The
+intermittency is the hazard, so the fixture has to exceed the buffer or the
+mutation proves nothing.
+
+**"Missing from the snapshot" conflated two different facts.** 69 originals were
+reported as "NOT protected off-site" with no further distinction. They were the
+69 photos uploaded at 20:05 -- a 02:42 snapshot cannot contain them. So the line
+would fire every day anything was added, while a genuinely dropped original
+would look identical. It is now split: `added AFTER the snapshot` (expected,
+exit **3**, `PENDING`, and still stated as unprotected right now) against
+`present BEFORE the snapshot` (a real gap, exit 1, `INCOMPLETE`). A split that
+cannot be computed says so and is never promoted to `PENDING`.
+
+**Recency of an Immich original comes from the asset table, never from mtime.**
+Measured: 69 assets had `createdAt` after the snapshot while only **27** files
+under `upload/` had a newer mtime -- an uploaded photo keeps a date from the file
+it came from. I reasoned from mtime first and was one step from reporting "42
+originals predate the backup and are genuinely missing", a false alarm about
+family photos, from the exact inference this file already forbids. The asset
+table settled it: exactly 69, created 20:05-20:06.
+
+**The snapshot comparison was built by `stat`, so it only covered originals
+present on disk.** `cut -f2 "$inv"` takes the inventory, which
+`immich_original_inventory` builds with `stat` -- a path the table names but
+which is absent never enters it. A fixture that created no files reported
+`IN the snapshot: 3000 of 3000`: full coverage, having compared nothing. This is
+the same hole already recorded for the exclusion audit, in a second command. The
+comparison now uses the table's PATHS, and an empty left-hand side returns
+UNKNOWN instead of a clean sweep.
+
+**The full missing list is durable evidence.** It existed only as 20 truncated
+terminal lines, so a finding could not be diagnosed without re-running the
+command. It is written to `<target>-snapshot-missing.txt` at 0600 and the report
+names it.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

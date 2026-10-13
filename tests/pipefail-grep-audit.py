@@ -31,11 +31,61 @@ ROOT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__
 TARGETS = ["bin/domum-media", "bin/domum-media-backup", "bin/domum-media-report",
            "install.sh"] + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "operator").glob("*.sh"))
 
-# A pipe into grep with a quiet flag. -q anywhere in the option cluster counts,
-# so -qxF, -Fxq and -qiE are all caught. `(?<!\|)` keeps `|| grep -q … <<< "$x"`
-# -- the CORRECT capture-first form reached through an or-list -- from matching;
-# without it this audit flags the very fix it exists to require.
-PIPE_TO_QUIET_GREP = re.compile(r"(?<!\|)\|(?!\|)\s*grep\s+(?:-[A-Za-z]*q[A-Za-z]*\s*)+")
+# A pipe into a consumer that STOPS EARLY. `grep -q` was the known one; the
+# same SIGPIPE mechanism applies to anything that closes its input before the
+# writer is finished:
+#
+#   grep -q / -m N   stop at the first (or Nth) match
+#   head -N          stop after N lines
+#   sed Nq / sed -n '1,Nq'  quit at a line number
+#
+# Found in production, 2026-10-12: `sed … "$missing" | head -20 | sed …` in
+# verify-snapshot-coverage. With MORE than 20 originals missing the first sed
+# took SIGPIPE, the pipeline reported 141, and under `set -e` the function died
+# right there -- losing the "... and N more" line AND its own
+# "result : INCOMPLETE" verdict, and exiting 141 instead of 1. It only bites
+# when the list is long, i.e. exactly when the finding matters.
+#
+# `(?<!\|)` keeps `|| grep -q … <<< "$x"` -- the CORRECT capture-first form
+# reached through an or-list -- from matching; without it this audit flags the
+# very fix it exists to require.
+# Scope, stated rather than hidden. Flagged:
+#
+#   | grep -q / -m N   stops at the first (or Nth) match
+#   | head             with NO count, or a count that is not 1, or a variable
+#                      count -- i.e. used to TRUNCATE a list expected to be
+#                      longer, which is the shape that bit us
+#   | sed Nq           quits at a line number
+#
+# NOT flagged: `| head -1` after a `sed -nE 's/^KEY=…/p'` on a metadata file,
+# of which there are about sixty here. The mechanism is the same, but the
+# producer emits at most a line or two, so there is nothing left to write when
+# head exits. Flagging them would make this audit noise, and an audit that
+# cries wolf is one somebody switches off. `sort | head -1` is safer still:
+# sort cannot emit anything until it has read all of its input.
+#
+# `(?<!\|)` keeps `|| grep -q … <<< "$x"` -- the CORRECT capture-first form
+# reached through an or-list -- from matching; without it this audit flags the
+# very fix it exists to require.
+_PIPE = r"(?<!\|)\|(?!\|)\s*"
+QUIET_GREP = re.compile(_PIPE + r"grep\s+(?:-[A-Za-z]*[qm][A-Za-z]*\s*)+")
+SED_QUIT = re.compile(_PIPE + r"sed\s+(?:-n\s+)?['\"]?[0-9]*q")
+# `head`, then whatever follows it on the line.
+HEAD = re.compile(_PIPE + r"head\b([^|]*)")
+# The one exempt form: a count of exactly 1.
+HEAD_ONE = re.compile(r"^\s*(?:-n\s*|-)?1\s*(?:$|[^0-9])")
+
+
+def offending(code):
+    """The matched text of the first banned pipeline on this line, or None."""
+    for rx in (QUIET_GREP, SED_QUIT):
+        m = rx.search(code)
+        if m:
+            return m.group(0).strip()
+    m = HEAD.search(code)
+    if m and not HEAD_ONE.match(m.group(1)):
+        return ("| head" + m.group(1)).strip()
+    return None
 
 bad = []
 scanned = 0
@@ -59,7 +109,8 @@ for rel in TARGETS:
         # comments that document each fix.
         code = re.sub(r"(^|\s)#.*$", "", subject)
         scanned += 1
-        if PIPE_TO_QUIET_GREP.search(code):
+        hit = offending(code)
+        if hit:
             bad.append((rel, i, ln.strip()[:100]))
 
 print("== scanned %d line(s) across %d file(s)" % (scanned, len([r for r in TARGETS if (ROOT / r).exists()])))
