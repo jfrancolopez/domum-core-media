@@ -1723,6 +1723,40 @@ immich_db_original_paths() {
   return 1
 }
 
+# Which originals were added to the library AFTER a given moment.
+#
+# The asset table is the authority, NOT the file's mtime. Measured 2026-10-12:
+# 69 assets had `createdAt` after the last snapshot while only 27 files under
+# upload/ had a NEWER mtime, because an uploaded photo keeps a date from the
+# file it came from. Reasoning from mtime would have reported 42 originals as
+# "present before the backup and genuinely missing" -- a false alarm about
+# family photos, from exactly the inference this file already forbids.
+immich_db_paths_created_after() {  # $1 = ISO-8601 timestamp -> host paths
+  local since="$1" pg_cid pg_user pg_db prefix lib rows tbl
+  [[ -n "$since" ]] || return 1
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  pg_user="${IMMICH_DB_USERNAME:-postgres}"
+  pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
+  pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null \
+    | head -1 || true)"
+  [[ -n "$pg_cid" ]] || return 1
+  prefix="$(immich_container_library_prefix)"
+  for tbl in asset assets; do
+    rows="$(docker exec -i "$pg_cid" psql -U "$pg_user" -d "$pg_db" -At \
+              -c "select \"originalPath\" from $tbl
+                  where \"originalPath\" is not null and \"createdAt\" > '$since'" \
+              2>/dev/null || true)"
+    # An EMPTY result is a legitimate answer here -- nothing added since -- so
+    # the table's existence is what distinguishes it from a failed query.
+    if docker exec -i "$pg_cid" psql -U "$pg_user" -d "$pg_db" -At \
+         -c "select 1 from $tbl limit 1" >/dev/null 2>&1; then
+      [[ -n "$rows" ]] && printf '%s\n' "$rows" | sed "s|^${prefix}|${lib}|"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Which originals would these patterns exclude?
 #
 # The one implementation of the question. The human audit and the runtime gate
@@ -1779,7 +1813,7 @@ exclusion_safe_to_apply() {  # $@ = patterns -> 0 safe, 1 unsafe/unknown
   case "$rc" in
     0) return 0 ;;
     1) warn "Exclusion REFUSED: these patterns would stop an Immich ORIGINAL being backed up."
-       printf '%s\n' "$offences" | head -10 | sed 's/^/  /' >&2
+       sed -n '1,10{s/^/  /;p}' <<< "$offences" >&2
        warn "The backup will proceed WITHOUT them. Nothing irreplaceable is dropped."
        return 1 ;;
     *) warn "Exclusion REFUSED: could not read the Immich asset table, so it cannot be"
@@ -2851,7 +2885,7 @@ large_select() {  # $1 = inventory, $2 = already-verified list file, $3 = count
           }
           for (i=1; i<=picked; i++) printf "%s\t%s\n", size[order[i]], path[order[i]]
         }' \
-    | head -n "$want"
+    | awk -v want="$want" 'NR <= want'
 }
 
 # Verify a few of the large originals, or say exactly what it would cost.
@@ -2916,7 +2950,7 @@ authority for which files are originals."
   inval="$(large_invalidated_paths "$target")"
   if [[ -n "$inval" ]]; then
     echo "  proof INVALIDATED: $(grep -c . <<< "$inval") file(s) changed since they were proven"
-    printf '%s\n' "$inval" | head -5 | sed "s|^$lib/|    |" | sed 's/\t/  -- /'
+    sed -n "1,5{s|^$lib/|    |;s/\t/  -- /;p}" <<< "$inval"
     echo "                     These are back in the unproven set."
   fi
   # What finishing the set would cost, so the decision is informed rather than
@@ -3113,8 +3147,14 @@ do_verify_snapshot_coverage() {
 authority for which files are originals."
   read -r n_orig n_absent <<< "$counts"
 
-  snapshot_id="$(restic_for_target "$target" snapshots --latest 1 --json 2>/dev/null \
-    | jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' 2>/dev/null || true)"
+  local snap_json snapshot_time=""
+  snap_json="$(restic_for_target "$target" snapshots --latest 1 --json 2>/dev/null || true)"
+  snapshot_id="$(jq -r 'if length == 0 then "" else (.[-1].short_id // .[-1].id[0:8]) end' \
+    <<< "$snap_json" 2>/dev/null || true)"
+  # The snapshot's own timestamp, so "missing" can be split into originals that
+  # did not EXIST when it was taken and originals that did.
+  snapshot_time="$(jq -r 'if length == 0 then "" else (.[-1].time // "") end' \
+    <<< "$snap_json" 2>/dev/null || true)"
   if [[ -z "$snapshot_id" ]]; then
     (( want_json == 1 )) && printf '{"target":"%s","result":"unknown","reason":"no snapshot"}\n' "$target"
     echo "SNAPSHOT COVERAGE: UNKNOWN -- no snapshot could be identified for $target"
@@ -3134,8 +3174,32 @@ authority for which files are originals."
   sorted_inv="$(mktemp "$vdir/.cov-a.XXXXXX")"; sorted_ls="$(mktemp "$vdir/.cov-b.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -f -- '$inv' '$listing' '$missing' '$sorted_inv' '$sorted_ls'" EXIT
-  cut -f2 "$inv" | LC_ALL=C sort -u > "$sorted_inv"
+  # The comparison set is the asset table's PATHS, not the stat-built inventory.
+  #
+  # `cut -f2 "$inv"` was wrong for the same reason it was wrong in the exclusion
+  # audit, which this file already records: the inventory is built by `stat`, so
+  # an original the table names but which is NOT on disk never enters it. With
+  # every original absent the set was empty, the comparison had nothing to do,
+  # and this reported "IN the snapshot: 3000 of 3000" -- full coverage, having
+  # compared nothing. Whether a file is on disk today is a DIFFERENT question
+  # from whether its path is in the snapshot.
+  local table_paths
+  table_paths="$(immich_db_original_paths)" \
+    || die "Refusing: the Immich asset table could not be read."
+  printf '%s\n' "$table_paths" | sed '/^$/d' | LC_ALL=C sort -u > "$sorted_inv"
   LC_ALL=C sort -u "$listing" > "$sorted_ls"
+  # Vacuity guard on the OTHER side of the comparison. The listing already has
+  # one; without this, an empty left-hand side is the most reassuring possible
+  # answer.
+  local n_compared
+  n_compared="$(grep -c . < "$sorted_inv" || true)"
+  if [[ "${n_compared:-0}" -eq 0 ]]; then
+    (( want_json == 1 )) && printf '{"target":"%s","snapshot_id":"%s","result":"unknown","reason":"no original paths to compare"}\n' \
+      "$target" "$snapshot_id"
+    echo "SNAPSHOT COVERAGE: UNKNOWN -- the asset table yielded no original paths,"
+    echo "  so the comparison had nothing on its own side. Not a pass."
+    return 2
+  fi
   n_listed="$(grep -c . < "$sorted_ls" || true)"
   LC_ALL=C comm -23 "$sorted_inv" "$sorted_ls" > "$missing"
   n_missing="$(grep -c . < "$missing" || true)"
@@ -3154,14 +3218,50 @@ authority for which files are originals."
     return 2
   fi
 
+  # Split "missing" by whether the original EXISTED when the snapshot was taken.
+  #
+  # Without this the report said only "they are NOT protected off-site", which
+  # is true and unactionable: 69 photos uploaded at 20:05 cannot be in a 02:42
+  # snapshot, so the line would fire every single day that anything was added
+  # and train the operator to ignore it -- while a genuinely dropped original
+  # would look identical. The two states are:
+  #
+  #   added AFTER the snapshot  -- expected; the next run covers them. They are
+  #                                still only on this host right now.
+  #   present BEFORE it         -- a real gap: the backup should have had them.
+  #
+  # Recency comes from the asset table, never from the file's mtime. See
+  # immich_db_paths_created_after.
+  local newer_f older_f recent_f n_newer=0 n_older=0 split_known=0
+  if (( n_missing > 0 )) && [[ -n "$snapshot_time" ]]; then
+    newer_f="$(mktemp "$vdir/.cov-new.XXXXXX")"
+    older_f="$(mktemp "$vdir/.cov-old.XXXXXX")"
+    recent_f="$(mktemp "$vdir/.cov-rec.XXXXXX")"
+    local recent=""
+    if recent="$(immich_db_paths_created_after "$snapshot_time")"; then
+      printf '%s\n' "$recent" | LC_ALL=C sort -u > "$recent_f"
+      LC_ALL=C comm -12 "$missing" "$recent_f" > "$newer_f"
+      LC_ALL=C comm -23 "$missing" "$recent_f" > "$older_f"
+      n_newer="$(grep -c . < "$newer_f" || true)"
+      n_older="$(grep -c . < "$older_f" || true)"
+      split_known=1
+    fi
+    rm -f -- "$recent_f"
+  fi
+
   if (( want_json == 1 )); then
     jq -cn --arg t "$target" --arg s "$snapshot_id" --arg lib "$lib" \
       --argjson orig "$n_orig" --argjson present "$n_present" \
       --argjson miss "$n_missing" --argjson listed "${n_listed:-0}" \
-      --arg res "$([[ "$n_missing" -eq 0 ]] && echo covered || echo incomplete)" \
+      --argjson newer "${n_newer:-0}" --argjson older "${n_older:-0}" \
+      --arg split "$([[ "${split_known:-0}" -eq 1 ]] && echo known || echo unknown)" \
+      --arg res "$([[ "$n_missing" -eq 0 ]] && echo covered \
+                   || { [[ "${split_known:-0}" -eq 1 && "${n_older:-0}" -eq 0 ]] \
+                        && echo pending || echo incomplete; })" \
       '{target:$t,snapshot_id:$s,library:$lib,originals:$orig,
         in_snapshot:$present,missing_from_snapshot:$miss,
-        snapshot_paths:$listed,result:$res}'
+        missing_added_after_snapshot:$newer,missing_present_before_snapshot:$older,
+        missing_split:$split,snapshot_paths:$listed,result:$res}'
   fi
 
   echo "[domum-media-backup] Snapshot coverage for $target"
@@ -3179,8 +3279,12 @@ authority for which files are originals."
   if jq -cn --arg t "$target" --arg s "$snapshot_id" --arg ts "$(date -Iseconds)" \
        --argjson orig "$n_orig" --argjson present "$n_present" --argjson miss "$n_missing" \
        --argjson listed "${n_listed:-0}" \
+       --argjson newer "${n_newer:-0}" --argjson older "${n_older:-0}" \
+       --arg split "$([[ "${split_known:-0}" -eq 1 ]] && echo known || echo unknown)" \
        '{target:$t,snapshot_id:$s,recorded_at:$ts,originals:$orig,
-         in_snapshot:$present,missing_from_snapshot:$miss,snapshot_paths:$listed}' \
+         in_snapshot:$present,missing_from_snapshot:$miss,
+         missing_added_after_snapshot:$newer,missing_present_before_snapshot:$older,
+         missing_split:$split,snapshot_paths:$listed}' \
        > "$cov_file.tmp" 2>/dev/null; then
     chmod 0600 "$cov_file.tmp"; mv -f "$cov_file.tmp" "$cov_file"
     echo "  evidence          : $cov_file"
@@ -3192,11 +3296,40 @@ authority for which files are originals."
   if (( n_missing > 0 )); then
     echo
     echo "  MISSING FROM THE SNAPSHOT: $n_missing original(s)."
+    if (( split_known == 1 )); then
+      echo "    added AFTER the snapshot    : $n_newer -- expected; the next run covers"
+      echo "                                  them, but they are only on THIS host now"
+      echo "    present BEFORE the snapshot : $n_older -- a real gap if above zero"
+    else
+      echo "    the snapshot's own time or the asset table could not be read, so these"
+      echo "    cannot be split into 'added since' and 'should have been there'."
+    fi
     echo "  These exist in the asset table but their path is not in the snapshot,"
     echo "  so they are NOT protected off-site:"
-    sed "s|^$lib/||" "$missing" | head -20 | sed 's/^/    /'
+    # One sed, no pipe. `sed … | head -20 | sed …` was the production defect:
+    # with MORE than 20 missing the first sed took SIGPIPE, the pipeline
+    # reported 141, and under set -e this function DIED here -- losing the
+    # "... and N more" line below, its own verdict, and returning 141 instead
+    # of 1. It only broke when the list was long, i.e. exactly when the
+    # finding mattered.
+    sed -n "1,20{s|^$lib/||;s|^|    |;p}" "$missing"
     (( n_missing > 20 )) && echo "    ... and $(( n_missing - 20 )) more"
+    # Durable evidence. The full list used to exist only as 20 truncated lines
+    # on a terminal, so a finding could not be diagnosed without re-running.
+    local miss_file="$vdir/${target}-snapshot-missing.txt"
+    if sed "s|^$lib/||" "$missing" > "$miss_file.tmp" 2>/dev/null; then
+      chmod 0600 "$miss_file.tmp"; mv -f "$miss_file.tmp" "$miss_file"
+      echo "  full list         : $miss_file"
+    else
+      rm -f "$miss_file.tmp"
+    fi
     echo
+    if (( split_known == 1 && n_older == 0 )); then
+      echo "  result            : PENDING -- every original that existed when snapshot"
+      echo "                      $snapshot_id was taken is present in it. The $n_newer"
+      echo "                      newer one(s) await the next backup run."
+      return 3
+    fi
     echo "  result            : INCOMPLETE -- off-site coverage is not total."
     return 1
   fi
@@ -3912,8 +4045,10 @@ offhost_image_digest() {  # $1 = container -> repo digest or empty
   local id
   id="$(docker inspect "$1" --format '{{.Image}}' 2>/dev/null || true)"
   [[ -n "$id" ]] || return 1
-  docker image inspect "$id" --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' 2>/dev/null \
-    | grep -m1 '@sha256:' || return 1
+  local digests
+  digests="$(docker image inspect "$id" \
+    --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' 2>/dev/null || true)"
+  grep -m1 '@sha256:' <<< "$digests" || return 1
 }
 
 # $1 = "--probe" to contact the registry (read-only, no pull)
