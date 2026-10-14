@@ -807,6 +807,14 @@ the division gave 6; where the files are smaller it is twice out -- eleven
 280 MB files are 6 runs, not 3. The report also still calls it an estimate,
 because `large_select` re-orders as files become proven.
 
+**"Over the budget" was false of the file.** Production, 2026-10-14: a 919.5
+MiB original was reported as `over the 1.0 GiB per-run budget`. It is
+comfortably under it -- it did not fit ALONGSIDE the 579.0 MiB file already
+selected. A file genuinely larger than the whole budget is always taken as a
+run's first file so the command cannot deadlock, which means it can never reach
+that line: the message described a case that cannot occur while misdescribing
+the one that did. The deferral is now attributed to the run's remaining room.
+
 **Verify which cap binds before reasoning about throughput.** I first explained
 the 614.5 MiB run as the byte budget failing to pack, and the fix I wrote
 simulated only the budget. It was the file count. A per-run limit that is not

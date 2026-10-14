@@ -2956,8 +2956,16 @@ authority for which files are originals."
 
   echo "  this run         : ${#paths[@]} file(s), $(sample_human_bytes "$total") to download"
   if (( deferred > 0 )); then
-    echo "  deferred         : $deferred file(s), $(sample_human_bytes "$deferred_bytes") -- over the"
-    echo "                     $(sample_human_bytes "$LARGE_MAX_RUN_BYTES") per-run budget. Raise LARGE_MAX_RUN_BYTES to include them."
+    # "over the budget" was false of the FILE. Production, 2026-10-14: a 919.5
+    # MiB original was reported as "over the 1.0 GiB per-run budget" -- it is
+    # comfortably under it. It was deferred because it did not fit ALONGSIDE
+    # this run's 579.0 MiB selection. A file genuinely larger than the whole
+    # budget is a different case, and is always taken as a run's first file
+    # rather than deferred, so it can never appear on this line.
+    echo "  deferred         : $deferred file(s), $(sample_human_bytes "$deferred_bytes") -- would not fit"
+    echo "                     alongside this run within the $(sample_human_bytes "$LARGE_MAX_RUN_BYTES") per-run budget"
+    echo "                     (they are not individually too large). Raise"
+    echo "                     LARGE_MAX_RUN_BYTES to take more in one run."
   fi
   local i ext
   for i in "${!paths[@]}"; do

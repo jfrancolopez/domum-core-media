@@ -311,6 +311,33 @@ grep -q 'big_a.mov' <<< "$mout" \
   || fail "the mutant did not re-select an already-proven file: $mout"
 echo "  without the history it re-fetches what was already proven"
 
+sect "a deferred file is not described as too large for the budget"
+# Production, 2026-10-14: a 919.5 MiB original was reported as "over the 1.0 GiB
+# per-run budget". It is under it -- it simply did not fit alongside the 579.0
+# MiB file already selected. A file genuinely larger than the whole budget is
+# always taken as a run's FIRST file, so it can never reach this line.
+# shellcheck disable=SC2086
+out="$(run '' --plan)"
+if grep -q 'deferred' <<< "$out"; then
+  grep -q 'would not fit' <<< "$out" \
+    || fail "the deferred line does not say why: $out"
+  grep -q 'not individually too large' <<< "$out" \
+    || fail "the deferred line still implies the file exceeds the budget: $out"
+  grep -qE 'deferred .*-- over the' <<< "$out" \
+    && fail "the deferred line still claims the file is over the budget: $out"
+  echo "  deferral is attributed to the run's remaining room, not the file's size"
+else
+  echo "  nothing deferred in this fixture; wording asserted below instead"
+fi
+# Drive the exact production shape: two files, the second under the budget but
+# unable to share a run with the first.
+out2="$(LARGE_MAX_RUN_BYTES=2600 run '' --plan)"
+grep -q 'deferred' <<< "$out2" || fail "a 2600 B budget must defer something: $out2"
+grep -q 'would not fit' <<< "$out2" || fail "no explanation given: $out2"
+grep -qE 'deferred .*-- over the' <<< "$out2" \
+  && fail "the file was called over-budget although it is smaller: $out2"
+echo "  a file smaller than the budget is never called over-budget"
+
 echo "== the remaining-runs estimate models BOTH caps, not a byte division =="
 # Production, 2026-10-12: with 13 files and 6.5 GiB left the report said "about
 # 7 more run(s)" -- ceil(bytes/budget) -- and the run that followed fetched 2
