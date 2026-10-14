@@ -1000,6 +1000,32 @@ invisible where it mattered. `dr_remaining_risks` now names them, says they are
 the newest photos, names `verify-snapshot-coverage` and says it downloads
 nothing -- a remedy that reads as expensive does not get run.
 
+**A stale coverage proof was reported in the present tense.** Production,
+2026-10-14: the reconciliation had been taken on `b18ea965`, and two backup
+runs later -- `8aae9af2` was current -- `dr-status` still said *"69 original(s)
+are NOT in the snapshot that was reconciled. They exist locally but are not
+protected off-site."* By then those 69 had almost certainly been collected by
+the intervening runs. The summary's `[reconciled against an earlier snapshot]`
+note did not say WHICH, that another had run since, or that the missing count
+was therefore not about now. A proof is about the snapshot it was taken on, and
+repeating its count in the present tense outlives its own evidence. When the
+proof's snapshot is not the latest successful run the risk now says the
+reconciliation is STALE, names both snapshots, states that the present position
+is UNKNOWN, and points at the free remedy; when it IS the current snapshot the
+plain "not protected off-site" claim stands. The distinction is tested in both
+directions, because a softer wording that never asserts anything is not an
+improvement.
+
+**`[[ … && false ]]` is TRUE: inside `[[ ]]` the bare word `false` is a
+non-empty STRING, not the command.** Measured. A mutation written that way
+applied textually, passed its own `grep` check, and changed nothing -- so the
+mutant still behaved correctly and the test "failed" against code that was
+right, which cost a long hunt through the wrong half of the problem.
+`[[ … ]] && false` does work, because there `false` is a command, and so does
+`if false; then`. Prefer mutating the comparison itself into something that
+cannot hold -- `"$a" != "$a"` -- which has no such ambiguity. "Assert that a
+mutation actually applied" is not enough; assert that it changed the ANSWER.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a

@@ -427,8 +427,8 @@ grep -qE 'IN a snapshot \(observed\) +all 20, snapshot abc123de' <<< "$out" \
   || fail "full coverage is not reported with its snapshot: $out"
 grep -q 'RECONCILED against a real snapshot' <<< "$out" \
   && fail "the risk is still listed although reconciliation happened"
-grep -q 'reconciled against an earlier snapshot' <<< "$out" \
-  && fail "the current snapshot was flagged as earlier"
+grep -q 'has run since' <<< "$out" \
+  && fail "the current snapshot was flagged as superseded"
 echo "  all 20 in abc123de, the risk clears, and it is not flagged stale"
 
 sect "a MISSING original is reported and becomes a risk"
@@ -436,18 +436,90 @@ mk_snapshot_coverage 17 20 3 abc123de
 out="$(run_dr)"
 grep -q '3 MISSING from snapshot abc123de' <<< "$out" \
   || fail "the missing originals are not reported: $out"
-grep -q '3 original(s) are NOT in the snapshot' <<< "$out" \
+grep -q '3 original(s) are NOT in snapshot abc123de, the current one' <<< "$out" \
   || fail "the gap is not raised as a risk: $out"
 grep -q 'not protected off-site' <<< "$out" \
   || fail "the consequence is not stated: $out"
 echo "  3 missing, stated in the summary and raised as a risk"
 
+sect "a STALE coverage proof is not a present-tense claim"
+# Production, 2026-10-14. The proof was taken on b18ea965 and reported 69
+# originals missing. Two backup runs later -- 8aae9af2 was current -- dr-status
+# still said "69 original(s) are NOT in the snapshot that was reconciled. They
+# exist locally but are not protected off-site." By then those 69 had almost
+# certainly been collected. A proof is about the snapshot it was taken on, and
+# repeating its count in the present tense outlives its own evidence.
+mk_snapshot_coverage 17 20 3 oldsnap1
+out="$(run_dr)"
+grep -q 'reconciliation is STALE' <<< "$out" \
+  || fail "a superseded proof is not reported as stale: $out"
+grep -q 'abc123de has run since' <<< "$out" \
+  || fail "the risk does not name the snapshot that superseded it: $out"
+grep -q 'off-site NOW is unknown' <<< "$out" \
+  || fail "the risk must say the present state is unknown: $out"
+grep -q 'not protected off-site' <<< "$out" \
+  && fail "a stale proof must NOT assert the originals are unprotected now: $out"
+grep -q 'is NOT current' <<< "$out" \
+  || fail "the summary does not qualify the stale missing count: $out"
+grep -q 'reconciled against oldsnap1; abc123de has run since' <<< "$out" \
+  || fail "the summary does not name both snapshots: $out"
+echo "  3 missing from oldsnap1 reported as stale and UNKNOWN, both snapshots named"
+
+sect "the same count IS asserted when the proof is about the current snapshot"
+# The distinction has to cut both ways, or it is just a softer wording that
+# never says anything.
+mk_snapshot_coverage 17 20 3 abc123de
+out="$(run_dr)"
+grep -q 'not protected off-site' <<< "$out" \
+  || fail "a current proof must still state the consequence plainly: $out"
+grep -q 'reconciliation is STALE' <<< "$out" \
+  && fail "the current snapshot was reported as stale: $out"
+grep -q 'is NOT current' <<< "$out" \
+  && fail "the summary qualified a proof that IS current: $out"
+echo "  on the current snapshot it is still a plain, present-tense gap"
+
+sect "mutation: ignoring the proof's snapshot brings the overclaim back"
+MUTST="$TMP_DIR/mut-stale"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTST"
+# Mutate the COMPARISON into a self-comparison, which is always false.
+#
+# NOT `&& false`: inside `[[ ]]` the bare word `false` is a non-empty STRING,
+# not the command, so `[[ -n "$x" && false ]]` is TRUE. That mutation applied
+# textually, passed its own grep, and changed nothing -- the mutant still
+# reported staleness and the test "failed" against code that was behaving
+# correctly. `[[ ... ]] && false` works, because there `false` is a command.
+sed -i 's/"\$sc_snap" != "\$cur_snap"/"$sc_snap" != "$sc_snap"/' "$MUTST"
+grep -q '"\$sc_snap" != "\$sc_snap"' "$MUTST" \
+  || fail "the staleness mutation was not applied"
+mk_snapshot_coverage 17 20 3 oldsnap1
+mout="$(
+  (
+    # shellcheck disable=SC1090
+    source "$MUTST" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    do_dr_status 2>&1
+  )
+)"
+grep -q 'not protected off-site' <<< "$mout" \
+  || fail "the mutant should assert the stale count in the present tense: $mout"
+grep -q 'reconciliation is STALE' <<< "$mout" \
+  && fail "the mutant still reported staleness; the comparison is not load-bearing"
+echo "  killed: without the comparison a two-run-old count is asserted as current"
+mk_snapshot_coverage 20 20 0 abc123de
+
 sect "a reconciliation against an EARLIER snapshot is flagged, not hidden"
 mk_snapshot_coverage 20 20 0 0ldsnap1
 out="$(run_dr)"
 grep -q 'snapshot 0ldsnap1' <<< "$out" || fail "the older snapshot is not cited: $out"
-grep -q 'reconciled against an earlier snapshot' <<< "$out" \
-  || fail "an older reconciliation was not flagged: $out"
+# The note now names BOTH snapshots: a proof is about the one it was taken on,
+# and "an earlier snapshot" did not say which, nor that another had run since.
+grep -q 'reconciled against 0ldsnap1; abc123de has run since' <<< "$out" \
+  || fail "an older reconciliation was not flagged with both snapshots: $out"
+grep -q 'is NOT current' <<< "$out" \
+  && fail "nothing was missing, so there is no stale count to qualify: $out"
 echo "  the older snapshot is named and flagged"
 
 sect "a library that has GROWN since reconciliation says so"

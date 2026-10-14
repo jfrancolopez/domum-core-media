@@ -2165,8 +2165,14 @@ dr_immich_summary() {  # $1 = target, $2 = library root, $3 = counts, $4 = inven
         printf '    %-34s %s\n' "IN a snapshot (observed)" \
           "all $sc_present, snapshot $sc_snap"
       fi
-      [[ "$sc_snap" == "$run_snap" ]] || \
-        printf '    %-34s %s\n' "" "[reconciled against an earlier snapshot]"
+      if [[ "$sc_snap" != "$run_snap" ]]; then
+        printf '    %-34s %s\n' "" "[reconciled against $sc_snap; $run_snap has run since]"
+        # A missing count from a superseded snapshot is not a statement about
+        # now. Saying only "an earlier snapshot" left the 69 reading as a live
+        # gap two runs after they were almost certainly backed up.
+        (( ${sc_miss:-0} > 0 )) && printf '    %-34s %s\n' "" \
+          "[so the $sc_miss MISSING above is NOT current -- re-run verify-snapshot-coverage]"
+      fi
       [[ "${sc_orig:-0}" == "$n_orig" ]] || \
         printf '    %-34s %s\n' "" "[the library has $n_orig originals now vs $sc_orig when reconciled]"
     else
@@ -2304,18 +2310,39 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
     echo "       is inferred from configuration only. Run verify-snapshot-coverage;"
     echo "       it reads snapshot metadata and downloads nothing."
   else
-    local scm; scm="$(awk '{print $3}' <<< "$(dr_snapshot_coverage "$target")")"
+    # One read of the proof, and the snapshot it is ABOUT.
+    local cov_row scm sc_snap sc_orig cur_snap=""
+    cov_row="$(dr_snapshot_coverage "$target")"
+    scm="$(awk '{print $3}' <<< "$cov_row")"
+    sc_orig="$(awk '{print $2}' <<< "$cov_row")"
+    sc_snap="$(awk '{print $4}' <<< "$cov_row")"
+    local cur
+    cur="$(dr_last_success_run "$target" || true)"
+    [[ -n "$cur" ]] && cur_snap="${cur##* }"
     if [[ "${scm:-0}" -gt 0 ]]; then
-      n=$((n+1)); echo "    $n. $scm original(s) are NOT in the snapshot that was reconciled."
-      echo "       They exist locally but are not protected off-site."
+      n=$((n+1))
+      if [[ -n "$cur_snap" && -n "$sc_snap" && "$sc_snap" != "unknown" \
+            && "$sc_snap" != "$cur_snap" ]]; then
+        # A proof is about the snapshot it was taken on. Reporting its count in
+        # the PRESENT tense outlived its own evidence: 69 originals missing from
+        # b18ea965 were still being called "not protected off-site" two backup
+        # runs later, by which time 8aae9af2 had almost certainly collected
+        # them. The honest state is UNKNOWN, and the remedy is free.
+        echo "    $n. $scm original(s) were missing from snapshot $sc_snap -- and that"
+        echo "       reconciliation is STALE: $cur_snap has run since. Whether those"
+        echo "       originals are off-site NOW is unknown; do not read the count as"
+        echo "       a present-tense gap. Re-run verify-snapshot-coverage; it reads"
+        echo "       snapshot metadata and downloads nothing."
+      else
+        echo "    $n. $scm original(s) are NOT in snapshot $sc_snap, the current one."
+        echo "       They exist locally but are not protected off-site."
+      fi
     fi
     # Originals added SINCE the reconciliation have never been observed in any
     # snapshot. The summary prints the drift as a bracketed note, which is
     # honest but not actionable and said nothing about what to do; a missing
     # risk line reads as "nothing to report". These are the NEWEST photos, the
     # ones least likely to exist anywhere else yet.
-    local sc_orig
-    sc_orig="$(awk '{print $2}' <<< "$(dr_snapshot_coverage "$target")")"
     if [[ -n "$live_pop" ]]; then
       local live_now="$live_pop"
       if [[ -n "$sc_orig" ]] && (( live_now > sc_orig )); then
@@ -2327,6 +2354,7 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
       fi
     fi
   fi
+
   if ! dr_last_phase_a "$target" >/dev/null; then
     n=$((n+1)); echo "    $n. No Immich has ever been started against a recovered database."
     echo "       The dump imports, but nothing shows the APPLICATION accepts the"
