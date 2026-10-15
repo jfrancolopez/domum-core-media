@@ -262,6 +262,17 @@ Its design follows the rules this file already records:
   the backup, not about installing a file, and conflating them would make a real
   finding look like a deployment problem.
 
+**A dry run must not speak in the indicative.** The deployment's dry run
+printed `fast-forward: 6551bd48 -> 3bb4e79c` before its own `--confirm` gate,
+which reads as though the checkout had already moved. It had not -- verified
+afterwards, the checkout was still at `6551bd4` and both installed binaries were
+untouched -- but the operator had to be told that, which is exactly backwards.
+It now says `WOULD fast-forward: … (not done yet)` unless `--confirm` was given,
+and the rehearsal asserts BOTH tenses: the dry run must not print the plain
+form, and a confirmed run must not hedge. A report that implies a mutation it
+did not make is the defect this repository keeps correcting, and a deployment
+script is the worst place to have it.
+
 **`--json` prints the machine-readable line and THEN the human report, so the
 JSON is the FIRST line beginning with `{`.** The deployment script first took
 `| tail -n 1`, which returns a line of prose; the rehearsal caught it with a
