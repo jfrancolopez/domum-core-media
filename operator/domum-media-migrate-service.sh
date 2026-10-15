@@ -378,7 +378,12 @@ note "live-tree classification: performed by the CLI (migration stage 10)"
 note "  a LOST file makes the CLI's migration report it; this script asserts on its exit status"
 
 head2 "6. application verification (separate from byte-level)"
-docker ps --format '{{.Names}}' | grep -qFx "$SVC" || abort "$SVC is not running after the migration"
+# Capture first: `docker ps | grep -qFx` reports 141 when grep exits before
+# docker finishes writing, so a RUNNING service reads as stopped and this
+# aborts a migration that completed perfectly -- the failure this wrapper has
+# already caused three times in other forms.
+RUNNING_NAMES="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+grep -qFx "$SVC" <<< "$RUNNING_NAMES" || abort "$SVC is not running after the migration"
 HEALTH_AFTER="$(docker inspect "$SVC" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || echo unknown)"
 note "docker health: before=$HEALTH_BEFORE after=$HEALTH_AFTER"
 [ "$HEALTH_AFTER" != "unhealthy" ] || abort "$SVC reports UNHEALTHY after the migration. Nothing was deleted."

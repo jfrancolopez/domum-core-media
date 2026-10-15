@@ -234,6 +234,16 @@ jobs:
       - name: Reconcile boundary audit
         run: python3 tests/reconcile-boundary-audit.py
 
+      # `cmd | grep -q` under pipefail reports 141 when grep exits at the first
+      # match, so A MATCH READS AS NO-MATCH. Ten instances were found at once,
+      # including the guard that keeps the disposable Immich harness away from
+      # production containers and the PostgreSQL dump footer check.
+      - name: Pipefail grep audit
+        run: python3 tests/pipefail-grep-audit.py
+
+      - name: Pipefail grep audit smoke test
+        run: tests/pipefail-grep-audit-smoke.sh
+
       # A runbook command that does not exist is discovered during a recovery.
       - name: Documented commands audit
         run: python3 tests/documented-commands-audit.py
