@@ -98,7 +98,17 @@ else
   git -C "$CHECKOUT" merge-base --is-ancestor "$BEFORE_REV" "$TARGET_REV" \
     || abort "the checkout is NOT an ancestor of $REMOTE/$BRANCH -- a
 fast-forward would be a rewrite. Investigate before deploying."
-  say "fast-forward: ${BEFORE_REV:0:12} -> ${TARGET_REV:0:12}"
+  # A dry run must not describe an action in the indicative. This said
+  # "fast-forward: X -> Y" before the --confirm gate, which reads as though the
+  # checkout had already moved -- it had not, and the operator had to be told
+  # so afterwards. A report that implies a mutation it did not make is the
+  # defect this project keeps correcting, and a deployment script is the worst
+  # place for it.
+  if [ "$CONFIRM" -eq 1 ]; then
+    say "fast-forward: ${BEFORE_REV:0:12} -> ${TARGET_REV:0:12}"
+  else
+    say "WOULD fast-forward: ${BEFORE_REV:0:12} -> ${TARGET_REV:0:12} (not done yet)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

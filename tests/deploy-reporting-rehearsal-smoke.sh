@@ -85,6 +85,12 @@ out="$(run)"
 rc=$?
 (( rc == 0 )) || fail "the dry run did not exit 0: $out"
 grep -q 'DRY RUN' <<< "$out" || fail "it does not say it was a dry run: $out"
+# A dry run must not describe the fast-forward in the indicative. It did, and
+# the operator reasonably read it as "the checkout moved" when nothing had.
+grep -q 'WOULD fast-forward' <<< "$out" \
+  || fail "the dry run does not mark the fast-forward as hypothetical: $out"
+grep -qE '^  fast-forward: ' <<< "$out" \
+  && fail "the dry run claims a completed fast-forward: $out"
 grep -qE 'bin/domum-media-backup .* INSTALL' <<< "$out" \
   || fail "the changed file is not named: $out"
 grep -qE 'bin/domum-media-report .* unchanged' <<< "$out" \
@@ -122,7 +128,10 @@ echo "  refuses when a fast-forward would be a rewrite"
 sect "--confirm installs ONLY what differs, and verifies it"
 out="$(run --confirm)"
 rc=$?
-grep -q 'fast-forward' <<< "$out" || fail "it did not fast-forward: $out"
+grep -qE '^  fast-forward: ' <<< "$out" \
+  || fail "the confirming run must state the fast-forward plainly: $out"
+grep -q 'WOULD fast-forward' <<< "$out" \
+  && fail "a confirmed run must not hedge: $out"
 grep -q "installed $BIN/domum-media-backup" <<< "$out" \
   || fail "the changed binary was not installed: $out"
 grep -q "installed $LIB/domum-media-report" <<< "$out" \
