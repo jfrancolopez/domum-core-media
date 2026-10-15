@@ -885,10 +885,24 @@ the command ran. `verify-sample` now skips already-proven originals and keeps a
 durable 0600 history, as `verify-large` does; `--revalidate` is the only way to
 re-prove. `dr-status` reports the CUMULATIVE count, because reporting the
 per-run figure would have hidden the cap. Stated honestly: 23,016 originals are
-reachable by sampling, so even at the 1 GiB per-run cap full coverage is ~130
-runs and ~130 GiB -- sampling will never prove the whole library, and
+reachable by sampling, and sampling will never prove the whole library --
 `FULL RECOVERY VERIFIED` needs a disposable Immich serving a full restore
 instead.
+
+Quote the figure for the cap that BINDS. This rule used to say "even at the
+1 GiB per-run cap full coverage is ~130 runs and ~130 GiB", which is the
+estimate for a configuration nobody runs: `SAMPLE_DEFAULT_COUNT` is **12**, and
+a default run transfers ~260 MB, so the COUNT binds and full coverage is
+**~1,900 runs**, not ~130. The ~130 figure needs the count raised to ~190 so
+the byte budget binds. `docs/DISASTER-RECOVERY-STATUS.md` states both rates and
+always did; only this summary quoted the favourable one -- the same mistake as
+the `verify-large` estimate, made in prose instead of in code.
+
+Measured 2026-10-15, and a reminder that the sample is NOT random: the
+selection deliberately includes the largest original under the per-file cap,
+which is 249.1 MiB, so one such file dominates a 12-file run. Dividing the mean
+size (5.46 MiB) by the budget gives ~65 MB per run and is wrong for this
+selection.
 
 **Four claims about an original, none of which implies another.**
 `LOCAL` (the file the asset table names exists here) < `IN SNAPSHOT` (that path
