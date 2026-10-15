@@ -794,6 +794,34 @@ of families already recorded in this file:
   announced "every large original is proven" having verified none. Read the
   other file with `getline` instead.
 
+**An estimate of remaining work must model the mechanism, not divide the
+bytes.** `verify-large` reported `13 file(s), 6.5 GiB -- about 7 more run(s) at
+the 1.0 GiB per-run budget`, which was `ceil(bytes/budget)`. Measured in
+production 2026-10-12, the very next run fetched **2 files and 614.5 MiB -- 60%
+of the budget** -- because a run is capped **twice**, by `LARGE_DEFAULT_COUNT`
+(2 files) and by `LARGE_MAX_RUN_BYTES` (1 GiB), and it cannot split a file. The
+division modelled neither cap: the binding one here was the file count. The
+estimate is now a SIMULATION of the real packing over `large_select`'s own
+order, and it says what binds. For the measured remaining set it gives 7 where
+the division gave 6; where the files are smaller it is twice out -- eleven
+280 MB files are 6 runs, not 3. The report also still calls it an estimate,
+because `large_select` re-orders as files become proven.
+
+**"Over the budget" was false of the file.** Production, 2026-10-14: a 919.5
+MiB original was reported as `over the 1.0 GiB per-run budget`. It is
+comfortably under it -- it did not fit ALONGSIDE the 579.0 MiB file already
+selected. A file genuinely larger than the whole budget is always taken as a
+run's first file so the command cannot deadlock, which means it can never reach
+that line: the message described a case that cannot occur while misdescribing
+the one that did. The deferral is now attributed to the run's remaining room.
+
+**Verify which cap binds before reasoning about throughput.** I first explained
+the 614.5 MiB run as the byte budget failing to pack, and the fix I wrote
+simulated only the budget. It was the file count. A per-run limit that is not
+the one named in the message is exactly how a plausible wrong estimate survives.
+`tests/large-verification-smoke.sh` drives both caps and mutates the count cap
+away; without it the same set reports 4 runs instead of 6.
+
 **"Not in the backup set" and "the include set was never read" are different
 claims.** `dr_path_configured` reported the former for the latter. It now has a
 third state and the report says UNKNOWN -- the same conflation the five levels
@@ -857,10 +885,24 @@ the command ran. `verify-sample` now skips already-proven originals and keeps a
 durable 0600 history, as `verify-large` does; `--revalidate` is the only way to
 re-prove. `dr-status` reports the CUMULATIVE count, because reporting the
 per-run figure would have hidden the cap. Stated honestly: 23,016 originals are
-reachable by sampling, so even at the 1 GiB per-run cap full coverage is ~130
-runs and ~130 GiB -- sampling will never prove the whole library, and
+reachable by sampling, and sampling will never prove the whole library --
 `FULL RECOVERY VERIFIED` needs a disposable Immich serving a full restore
 instead.
+
+Quote the figure for the cap that BINDS. This rule used to say "even at the
+1 GiB per-run cap full coverage is ~130 runs and ~130 GiB", which is the
+estimate for a configuration nobody runs: `SAMPLE_DEFAULT_COUNT` is **12**, and
+a default run transfers ~260 MB, so the COUNT binds and full coverage is
+**~1,900 runs**, not ~130. The ~130 figure needs the count raised to ~190 so
+the byte budget binds. `docs/DISASTER-RECOVERY-STATUS.md` states both rates and
+always did; only this summary quoted the favourable one -- the same mistake as
+the `verify-large` estimate, made in prose instead of in code.
+
+Measured 2026-10-15, and a reminder that the sample is NOT random: the
+selection deliberately includes the largest original under the per-file cap,
+which is 249.1 MiB, so one such file dominates a 12-file run. Dividing the mean
+size (5.46 MiB) by the budget gives ~65 MB per run and is wrong for this
+selection.
 
 **Four claims about an original, none of which implies another.**
 `LOCAL` (the file the asset table names exists here) < `IN SNAPSHOT` (that path
