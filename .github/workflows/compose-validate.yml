@@ -244,6 +244,12 @@ jobs:
       - name: Pipefail grep audit smoke test
         run: tests/pipefail-grep-audit-smoke.sh
 
+      # A wrapper that has only been READ has not been tested. This rehearses
+      # the reporting deployment against a fake production tree, as uid 0 via
+      # `unshare -r`, with the real checks unmodified.
+      - name: Deploy reporting rehearsal
+        run: tests/deploy-reporting-rehearsal-smoke.sh
+
       # A runbook command that does not exist is discovered during a recovery.
       - name: Documented commands audit
         run: python3 tests/documented-commands-audit.py
