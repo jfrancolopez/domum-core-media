@@ -242,8 +242,15 @@ grep -q 'EXITCODE=1' <<< "$out" \
   || fail "promoting one tier changed the overall verdict: $out"
 grep -q 'WEAKEST TIER: BACKED UP' <<< "$out" || fail "the weakest tier is misreported: $out"
 grep -q '12 of 22976 original' <<< "$out" || fail "the denominator is missing: $out"
-grep -q '22964 never restore-tested' <<< "$out" || fail "the untested remainder is missing: $out"
-echo "  12 of 22976 stated, and 22964 reported as never restore-tested"
+# This asserted "22964 never restore-tested" -- 22976 recorded minus 12 proven
+# -- and so REQUIRED the defect production showed on 2026-10-12: the recorded
+# population as the denominator for a claim about the library NOW. The fixture's
+# live library has 20 originals, so 8 of them have never been tested. Before
+# adapting a test to a change, ask which of the two is wrong; here it was the
+# test.
+grep -q '8 of 20 never restore-tested' <<< "$out" \
+  || fail "the untested remainder must count the LIVE library: $out"
+echo "  the fraction cites the recorded 22976; the remainder is 8 of the live 20"
 
 # ---------------------------------------------------------------------------
 sect "ARCHIVE VALIDATED is not DATABASE IMPORT RESTORE TESTED"
@@ -279,37 +286,81 @@ echo "  an actual import promotes it, cites the count, and moves the verdict"
 echo "  a sample proof for originals does not vouch for the database, or vice versa"
 
 sect "the tier row and the summary report the SAME untested count"
-# They did not. In production the row said "23021 never restore-tested" while
-# the summary four lines below said 23019, because only the summary knew about
-# the two large originals verify-large had just proved. Two numbers in one
-# report that must agree are one number.
+# They did not, twice. In 2026-10-09 the row said "23021 never restore-tested"
+# while the summary said 23019, because only the summary knew about two large
+# originals. In 2026-10-12 the row said 23013 and the summary 23082 -- 69 apart
+# -- because the row subtracted the proven count from the population RECORDED
+# when the sample ran while the summary subtracted it from the LIVE library.
+#
+# The previous version of this very section could not catch the second one: its
+# own comment said "the fixture must make them the same population for the two
+# untested figures to be comparable at all", and it set recorded == live. An
+# assertion that first establishes the precondition for agreement cannot detect
+# disagreement. So both cases are driven here.
+row_un() { sed -nE 's/.*immich originals.*; ([0-9]+) of [0-9]+ never restore-tested.*/\1/p' <<< "$1" | head -1; }
+sum_un() { sed -nE 's/^ +NEVER restore-tested +([0-9]+) of [0-9]+$/\1/p' <<< "$1" | head -1; }
+row_den() { sed -nE 's/.*immich originals.*; [0-9]+ of ([0-9]+) never restore-tested.*/\1/p' <<< "$1" | head -1; }
+
 mk_large_history 2
-# The tier row quotes the RECORDED population and the summary counts the live
-# asset table, so the fixture must make them the same population for the two
-# untested figures to be comparable at all.
-mk_coverage 12 20
+mk_coverage 12 20          # recorded == live: the case the old fixture allowed
 out="$(run_dr)"
-row_un="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$out" | head -1)"
-sum_un="$(sed -nE 's/^ +NEVER restore-tested +([0-9]+)$/\1/p' <<< "$out" | head -1)"
-[[ -n "$row_un" ]] || fail "could not read the tier row's untested count: $out"
-[[ -n "$sum_un" ]] || fail "could not read the summary's untested count: $out"
-[[ "$row_un" == "$sum_un" ]] \
-  || fail "the two counts disagree: tier row $row_un vs summary $sum_un"
-echo "  both report $row_un, from one count"
+r="$(row_un "$out")"; u="$(sum_un "$out")"
+[[ -n "$r" ]] || fail "could not read the tier row's untested count: $out"
+[[ -n "$u" ]] || fail "could not read the summary's untested count: $out"
+[[ "$r" == "$u" ]] || fail "the two counts disagree: tier row $r vs summary $u"
+[[ "$r" == "6" ]] || fail "20 originals less 12 sampled and 2 large is 6, got $r"
+echo "  equal populations: both report $r, from one count"
+
+mk_coverage 12 15          # the library has GROWN since the proof: production's case
+out="$(run_dr)"
+r="$(row_un "$out")"; u="$(sum_un "$out")"
+[[ "$r" == "$u" ]] \
+  || fail "they disagree once the library has grown: tier row $r vs summary $u"
+[[ "$r" == "6" ]] \
+  || fail "never-restore-tested must count the LIVE library (20 - 14 = 6), got $r"
+[[ "$(row_den "$out")" == "20" ]] \
+  || fail "the tier row must state the LIVE denominator, got $(row_den "$out")"
+grep -q 'of the 15 present when sampled' <<< "$out" \
+  || fail "the proof's own fraction must still quote the recorded population: $out"
+echo "  grown library: both report $r of 20, and the fraction still cites 15"
+
+sect "mutation: the recorded denominator must bring the contradiction back"
+MUTD="$TMP_DIR/mut-dr"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTD"
+sed -i 's/^          nevtxt="\$nev of \$dr_live_pop never restore-tested"$/          nevtxt="$u never restore-tested"/' "$MUTD"
+grep -q 'nevtxt="\$u never restore-tested"' "$MUTD" \
+  || fail "the dr-status mutation was not applied"
+mout="$(
+  (
+    # shellcheck disable=SC1090
+    source "$MUTD" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    do_dr_status 2>&1
+  )
+)"
+mr="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$mout" | head -1)"
+[[ "$mr" == "1" ]] \
+  || fail "the mutant should subtract from the recorded 15 and report 1, got '$mr'"
+echo "  killed: the recorded denominator reports 1 where the live one reports 6"
+mk_coverage 12 20
 
 sect "the tier row cites BOTH numerators when large files are proven"
+out="$(run_dr)"
 grep -q 'sampled + 2 large' <<< "$out" \
   || fail "the row does not show the sample and large contributions separately: $out"
-grep -qE 'immich originals +RESTORE TESTED +14 of 20' <<< "$out" \
-  || fail "the row does not total the two proofs: $out"
-echo "  14 of 20 = 12 sampled + 2 large, both numerators stated"
+grep -qE 'immich originals +RESTORE TESTED +14 proven \(12 sampled \+ 2 large\) of the 20 present when sampled' <<< "$out" \
+  || fail "the row does not total the two proofs against the sampled population: $out"
+echo "  14 proven = 12 sampled + 2 large, both numerators stated"
 
 sect "removing the large history moves BOTH figures together"
 rm -f "$VDIR/cloud-large-verified.jsonl"
 out="$(run_dr)"
-row_un="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$out" | head -1)"
-sum_un="$(sed -nE 's/^ +NEVER restore-tested +([0-9]+)$/\1/p' <<< "$out" | head -1)"
-[[ "$row_un" == "$sum_un" ]] || fail "they disagree with no large history: $row_un vs $sum_un"
+r="$(row_un "$out")"; u="$(sum_un "$out")"
+[[ "$r" == "$u" ]] || fail "they disagree with no large history: $r vs $u"
+[[ "$r" == "8" ]] || fail "without the 2 large proofs it must be 8, got $r"
 echo "  both still agree once the large proofs are gone"
 
 sect "a population that has GROWN since the proof is reported as drift"
@@ -376,8 +427,8 @@ grep -qE 'IN a snapshot \(observed\) +all 20, snapshot abc123de' <<< "$out" \
   || fail "full coverage is not reported with its snapshot: $out"
 grep -q 'RECONCILED against a real snapshot' <<< "$out" \
   && fail "the risk is still listed although reconciliation happened"
-grep -q 'reconciled against an earlier snapshot' <<< "$out" \
-  && fail "the current snapshot was flagged as earlier"
+grep -q 'has run since' <<< "$out" \
+  && fail "the current snapshot was flagged as superseded"
 echo "  all 20 in abc123de, the risk clears, and it is not flagged stale"
 
 sect "a MISSING original is reported and becomes a risk"
@@ -385,18 +436,90 @@ mk_snapshot_coverage 17 20 3 abc123de
 out="$(run_dr)"
 grep -q '3 MISSING from snapshot abc123de' <<< "$out" \
   || fail "the missing originals are not reported: $out"
-grep -q '3 original(s) are NOT in the snapshot' <<< "$out" \
+grep -q '3 original(s) are NOT in snapshot abc123de, the current one' <<< "$out" \
   || fail "the gap is not raised as a risk: $out"
 grep -q 'not protected off-site' <<< "$out" \
   || fail "the consequence is not stated: $out"
 echo "  3 missing, stated in the summary and raised as a risk"
 
+sect "a STALE coverage proof is not a present-tense claim"
+# Production, 2026-10-14. The proof was taken on b18ea965 and reported 69
+# originals missing. Two backup runs later -- 8aae9af2 was current -- dr-status
+# still said "69 original(s) are NOT in the snapshot that was reconciled. They
+# exist locally but are not protected off-site." By then those 69 had almost
+# certainly been collected. A proof is about the snapshot it was taken on, and
+# repeating its count in the present tense outlives its own evidence.
+mk_snapshot_coverage 17 20 3 oldsnap1
+out="$(run_dr)"
+grep -q 'reconciliation is STALE' <<< "$out" \
+  || fail "a superseded proof is not reported as stale: $out"
+grep -q 'abc123de has run since' <<< "$out" \
+  || fail "the risk does not name the snapshot that superseded it: $out"
+grep -q 'off-site NOW is unknown' <<< "$out" \
+  || fail "the risk must say the present state is unknown: $out"
+grep -q 'not protected off-site' <<< "$out" \
+  && fail "a stale proof must NOT assert the originals are unprotected now: $out"
+grep -q 'is NOT current' <<< "$out" \
+  || fail "the summary does not qualify the stale missing count: $out"
+grep -q 'reconciled against oldsnap1; abc123de has run since' <<< "$out" \
+  || fail "the summary does not name both snapshots: $out"
+echo "  3 missing from oldsnap1 reported as stale and UNKNOWN, both snapshots named"
+
+sect "the same count IS asserted when the proof is about the current snapshot"
+# The distinction has to cut both ways, or it is just a softer wording that
+# never says anything.
+mk_snapshot_coverage 17 20 3 abc123de
+out="$(run_dr)"
+grep -q 'not protected off-site' <<< "$out" \
+  || fail "a current proof must still state the consequence plainly: $out"
+grep -q 'reconciliation is STALE' <<< "$out" \
+  && fail "the current snapshot was reported as stale: $out"
+grep -q 'is NOT current' <<< "$out" \
+  && fail "the summary qualified a proof that IS current: $out"
+echo "  on the current snapshot it is still a plain, present-tense gap"
+
+sect "mutation: ignoring the proof's snapshot brings the overclaim back"
+MUTST="$TMP_DIR/mut-stale"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTST"
+# Mutate the COMPARISON into a self-comparison, which is always false.
+#
+# NOT `&& false`: inside `[[ ]]` the bare word `false` is a non-empty STRING,
+# not the command, so `[[ -n "$x" && false ]]` is TRUE. That mutation applied
+# textually, passed its own grep, and changed nothing -- the mutant still
+# reported staleness and the test "failed" against code that was behaving
+# correctly. `[[ ... ]] && false` works, because there `false` is a command.
+sed -i 's/"\$sc_snap" != "\$cur_snap"/"$sc_snap" != "$sc_snap"/' "$MUTST"
+grep -q '"\$sc_snap" != "\$sc_snap"' "$MUTST" \
+  || fail "the staleness mutation was not applied"
+mk_snapshot_coverage 17 20 3 oldsnap1
+mout="$(
+  (
+    # shellcheck disable=SC1090
+    source "$MUTST" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    do_dr_status 2>&1
+  )
+)"
+grep -q 'not protected off-site' <<< "$mout" \
+  || fail "the mutant should assert the stale count in the present tense: $mout"
+grep -q 'reconciliation is STALE' <<< "$mout" \
+  && fail "the mutant still reported staleness; the comparison is not load-bearing"
+echo "  killed: without the comparison a two-run-old count is asserted as current"
+mk_snapshot_coverage 20 20 0 abc123de
+
 sect "a reconciliation against an EARLIER snapshot is flagged, not hidden"
 mk_snapshot_coverage 20 20 0 0ldsnap1
 out="$(run_dr)"
 grep -q 'snapshot 0ldsnap1' <<< "$out" || fail "the older snapshot is not cited: $out"
-grep -q 'reconciled against an earlier snapshot' <<< "$out" \
-  || fail "an older reconciliation was not flagged: $out"
+# The note now names BOTH snapshots: a proof is about the one it was taken on,
+# and "an earlier snapshot" did not say which, nor that another had run since.
+grep -q 'reconciled against 0ldsnap1; abc123de has run since' <<< "$out" \
+  || fail "an older reconciliation was not flagged with both snapshots: $out"
+grep -q 'is NOT current' <<< "$out" \
+  && fail "nothing was missing, so there is no stale count to qualify: $out"
 echo "  the older snapshot is named and flagged"
 
 sect "a library that has GROWN since reconciliation says so"
@@ -405,6 +528,57 @@ out="$(run_dr)"
 grep -q 'originals now vs 15 when reconciled' <<< "$out" \
   || fail "growth since the reconciliation is not reported: $out"
 echo "  20 now vs 15 when reconciled, stated plainly"
+mk_snapshot_coverage 20 20 0 abc123de
+
+sect "originals added since the reconciliation are a NAMED RISK"
+# The summary already printed "[the library has 23102 originals now vs 23033
+# when reconciled]" in production. That is honest but not actionable, and the
+# REMAINING RISKS block -- the part an operator acts on -- said nothing, so 69
+# originals that had never been observed in ANY snapshot were invisible there.
+# A missing risk line reads as "nothing to report", which is this function's
+# own stated reason for existing. They are also the NEWEST photos.
+mk_snapshot_coverage 15 15 0 abc123de
+out="$(run_dr)"
+grep -qE '5 original\(s\) have been added since the last' <<< "$out" \
+  || fail "the unreconciled additions are not named as a risk: $out"
+grep -q 'NEVER been observed in a snapshot' <<< "$out" \
+  || fail "the risk does not say what is unproven about them: $out"
+grep -q 'They are the newest photos' <<< "$out" \
+  || fail "the risk does not say which originals these are: $out"
+grep -q 're-run verify-snapshot-coverage\|Re-run verify-snapshot-coverage' <<< "$out" \
+  || fail "the risk does not name its remedy: $out"
+grep -q 'downloads nothing' <<< "$out" \
+  || fail "the remedy must say it costs no egress, or it reads as expensive: $out"
+echo "  5 unreconciled additions named, with the remedy and its cost"
+
+# And silent when the library has not grown -- a risk that is always listed is
+# noise, and this block is read by someone deciding what to do next.
+mk_snapshot_coverage 20 20 0 abc123de
+out="$(run_dr)"
+grep -q 'have been added since the last' <<< "$out" \
+  && fail "the risk was listed although the library has not grown: $out"
+echo "  silent when the reconciled population matches the live one"
+
+sect "mutation: dropping the growth comparison must hide those originals"
+MUTG="$TMP_DIR/mut-growth"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTG"
+sed -i 's/^      if \[\[ -n "\$sc_orig" \]\] \&\& (( live_now > sc_orig )); then$/      if [[ -n "$sc_orig" ]] \&\& false; then/' "$MUTG"
+grep -q 'sc_orig" \]\] && false; then' "$MUTG" || fail "the growth mutation was not applied"
+mk_snapshot_coverage 15 15 0 abc123de
+mg="$(
+  (
+    # shellcheck disable=SC1090
+    source "$MUTG" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    do_dr_status 2>&1
+  )
+)"
+grep -q 'have been added since the last' <<< "$mg" \
+  && fail "the risk still appeared without the comparison; it is not load-bearing"
+echo "  killed: without the comparison the 5 unreconciled originals go unmentioned"
 mk_snapshot_coverage 20 20 0 abc123de
 
 sect "Phase A is reported as its own claim, and NOT TESTED until it runs"
@@ -510,32 +684,39 @@ grep -q 'verify-db-restore' <<< "$noimp" \
 mv "$TMP_DIR/dbimport.saved" "$VDIR/cloud-dbimport.env"
 echo "  each risk names its remedy, and a resolved risk stops being listed"
 
-sect "mutation: the tier row ignoring the large count must make the two disagree"
-# This is the production defect itself: the row counted only the sample, so it
-# said 23021 while the summary said 23019.
+sect "mutation: the shared count ignoring large proofs must move BOTH figures"
+# The production defect of 2026-10-09 was the ROW counting only the sample while
+# the summary counted sample + large: 23021 against 23019. Both figures now come
+# from dr_never_restore_tested, so that particular divergence is no longer
+# EXPRESSIBLE -- which is the improvement, and also why the old form of this
+# mutation (breaking dr_sample_proof's `uns`) no longer changes anything
+# observable. The shared count is still load-bearing, and this proves it the way
+# that now applies: drop the large term and both figures must move together and
+# both must be wrong.
 mk_coverage 12 20
 mk_large_history 2
 MUT0="$TMP_DIR/mutant0"
 cp "$REPO_ROOT/bin/domum-media-backup" "$MUT0"
-python3 - "$MUT0" <<'PY2'
-import sys
-p=sys.argv[1]; s=open(p).read()
-s=s.replace('  uns=$(( pop - sampled - large ))', '  uns=$(( pop - sampled ))', 1)
-open(p,'w').write(s)
-PY2
+sed -i 's/^  never=\$(( live - \${samp:-0} - \${largeok:-0} ))$/  never=$(( live - ${samp:-0} ))/' "$MUT0"
+grep -q 'never=\$(( live - \${samp:-0} ))' "$MUT0" \
+  || fail "the shared-count mutation was not applied"
 m0="$(
-  source "$MUT0" >/dev/null 2>&1
-  # shellcheck disable=SC1090
-  source "$TMP_DIR/dbstub.sh"
-  set +e
-  die() { echo "DIE: $*"; exit 9; }
-  do_dr_status 2>&1
+  (
+    # shellcheck disable=SC1090
+    source "$MUT0" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    do_dr_status 2>&1
+  )
 )"
-m_row="$(sed -nE 's/.*immich originals.*; ([0-9]+) never restore-tested.*/\1/p' <<< "$m0" | head -1)"
-m_sum="$(sed -nE 's/^ +NEVER restore-tested +([0-9]+)$/\1/p' <<< "$m0" | head -1)"
-[[ "$m_row" != "$m_sum" ]] \
-  || fail "the mutant's figures still agree; the shared count is not load-bearing"
-echo "  without it the row says $m_row and the summary $m_sum -- the production defect"
+m_row="$(row_un "$m0")"; m_sum="$(sum_un "$m0")"
+[[ "$m_row" == "$m_sum" ]] \
+  || fail "the two figures diverged; they must come from ONE count: $m_row vs $m_sum"
+[[ "$m_row" == "8" ]] \
+  || fail "ignoring the 2 large proofs must report 8, not $m_row -- the mutation did nothing"
+echo "  without the large term both say $m_row instead of 6, still agreeing"
 
 sect "mutation: ignoring the coverage file must produce an undenominated claim"
 # The coverage requirement is enforced twice -- the file must exist AND carry

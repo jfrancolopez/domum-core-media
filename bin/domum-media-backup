@@ -2070,6 +2070,55 @@ dr_last_phase_a() {  # $1 = target -> "ts snapshot assets" or empty
 # A sample proof without a population is not reportable as RESTORE TESTED: that
 # is the defect the coverage artefact was added to fix, and reading the manifest
 # alone would reintroduce it.
+# One asset-table read per dr-status run, PASSED to every figure derived from
+# the live library rather than cached in a global.
+#
+# Without one shared read the report contradicted itself in production,
+# 2026-10-12: the tier row subtracted the proven count from the population
+# RECORDED when the sample ran (23033) while the summary subtracted it from the
+# live count (23102), so the phrase "never restore-tested" appeared twice, 69
+# apart. That is the "two numbers in one report that must agree are ONE number"
+# rule, whose previous instance is recorded in dr_sample_proof's own comment.
+#
+# It is passed as an argument and never memoised in a global, because every call
+# site here is a command substitution: a global assigned inside $( ) is set in
+# the subshell and the parent never sees it. The first version of this did
+# exactly that and the inventory path came back EMPTY, so the summary reported
+# 20 originals and 0 B with no location breakdown.
+
+# How many originals have been proven by SAMPLING, counted the same way
+# everywhere. Three call sites computed this with their own fallback.
+dr_sampled_count() {  # $1 = target
+  local target="$1" n cov
+  n="$(sample_verified_count "$target")"
+  if [[ "${n:-0}" -eq 0 ]] && cov="$(sample_coverage_file "$target" 2>/dev/null)" \
+     && [[ -f "$cov" ]]; then
+    n="$(jq -r '.sampled_files // 0' "$cov" 2>/dev/null || echo 0)"
+  fi
+  printf '%s' "${n:-0}"
+}
+
+# How many originals in the library NOW have never been restore-tested.
+#
+# The denominator is the LIVE library, deliberately, because "never
+# restore-tested" is a claim about what exists today: a photo added since the
+# sample ran has indeed never been tested. Subtracting from the recorded
+# population silently counted 69 newly added originals as tested -- the weaker
+# claim in the stronger claim's words, which is the defect family this whole
+# report exists to prevent.
+#
+# The proof's own FRACTION still quotes the recorded population, because that
+# is what was measured; the two are different questions and both are labelled.
+dr_never_restore_tested() {  # $1 = target, $2 = live population -> "never" or empty
+  local target="$1" live="$2" samp largeok never
+  [[ -n "$live" ]] || return 1
+  samp="$(dr_sampled_count "$target")"
+  largeok="$(dr_large_proven_count "$target")"
+  never=$(( live - ${samp:-0} - ${largeok:-0} ))
+  (( never < 0 )) && never=0
+  printf '%s' "$never"
+}
+
 dr_sample_proof() {  # $1 = target -> "sampled population unsampled" or empty
   local target="$1" man cov sampled pop uns large
   man="$(sample_manifest_file "$target" 2>/dev/null)" || return 1
@@ -2080,10 +2129,7 @@ dr_sample_proof() {  # $1 = target -> "sampled population unsampled" or empty
   # cumulative figure is the honest numerator -- reporting the per-run one
   # would hold coverage at 12 forever however many times the command ran.
   pop="$(jq -r '.population_files // empty' "$cov" 2>/dev/null || true)"
-  sampled="$(sample_verified_count "$target")"
-  if [[ "${sampled:-0}" -eq 0 ]]; then
-    sampled="$(jq -r '.sampled_files // empty' "$cov" 2>/dev/null || true)"
-  fi
+  sampled="$(dr_sampled_count "$target")"
   [[ -n "$sampled" && -n "$pop" ]] || return 1
   # The large-file history counts too. It did not, and the report contradicted
   # itself in production: the tier row said "23021 never restore-tested" while
@@ -2117,14 +2163,13 @@ dr_row() {  # $1 = tier, $2 = level, $3 = evidence
 # Every number here is either read from recorded evidence or measured locally.
 # Where a figure cannot be obtained it says UNKNOWN rather than being omitted,
 # because a missing line reads as "nothing to report".
-dr_immich_summary() {  # $1 = target, $2 = library root
-  local target="$1" lib="$2"
-  local cov inv counts n_orig n_missing
+dr_immich_summary() {  # $1 = target, $2 = library root, $3 = counts, $4 = inventory
+  local target="$1" lib="$2" counts="$3" inv="$4"
+  local cov n_orig n_missing
   cov="$(sample_coverage_file "$target")"
 
   echo "  IMMICH ORIGINALS"
-  inv="$(mktemp)" || return 0
-  if counts="$(immich_original_inventory "$inv")"; then
+  if [[ -n "$counts" && -s "$inv" ]]; then
     read -r n_orig n_missing <<< "$counts"
     local stats tf tb of ob
     stats="$(sample_coverage_stats "$inv")"
@@ -2157,8 +2202,14 @@ dr_immich_summary() {  # $1 = target, $2 = library root
         printf '    %-34s %s\n' "IN a snapshot (observed)" \
           "all $sc_present, snapshot $sc_snap"
       fi
-      [[ "$sc_snap" == "$run_snap" ]] || \
-        printf '    %-34s %s\n' "" "[reconciled against an earlier snapshot]"
+      if [[ "$sc_snap" != "$run_snap" ]]; then
+        printf '    %-34s %s\n' "" "[reconciled against $sc_snap; $run_snap has run since]"
+        # A missing count from a superseded snapshot is not a statement about
+        # now. Saying only "an earlier snapshot" left the 69 reading as a live
+        # gap two runs after they were almost certainly backed up.
+        (( ${sc_miss:-0} > 0 )) && printf '    %-34s %s\n' "" \
+          "[so the $sc_miss MISSING above is NOT current -- re-run verify-snapshot-coverage]"
+      fi
       [[ "${sc_orig:-0}" == "$n_orig" ]] || \
         printf '    %-34s %s\n' "" "[the library has $n_orig originals now vs $sc_orig when reconciled]"
     else
@@ -2167,16 +2218,19 @@ dr_immich_summary() {  # $1 = target, $2 = library root
     fi
 
     local samp largeok=0
-    samp="$(sample_verified_count "$target")"
-    if [[ "${samp:-0}" -eq 0 && -f "$cov" ]]; then
-      samp="$(jq -r '.sampled_files // 0' "$cov" 2>/dev/null || echo 0)"
-    fi
+    samp="$(dr_sampled_count "$target")"
     largeok="$(dr_large_proven_count "$target")"
     printf '    %-34s %s\n' "restore-tested (sampled, all runs)" "$samp"
     printf '    %-34s %s\n' "restore-tested (large files)" "$largeok of $of over the cap"
-    local never=$(( n_orig - samp - largeok ))
-    (( never < 0 )) && never=0
-    printf '    %-34s %s\n' "NEVER restore-tested" "$never"
+    # The SAME number the tier row prints, from the same function, against the
+    # same live denominator -- and the denominator is stated so the figure
+    # cannot be read against the wrong population.
+    local never
+    if never="$(dr_never_restore_tested "$target" "$n_orig")"; then
+      printf '    %-34s %s\n' "NEVER restore-tested" "$never of $n_orig"
+    else
+      printf '    %-34s %s\n' "NEVER restore-tested" "UNKNOWN"
+    fi
     # The application half, kept separate from the byte half. A started
     # application proves the database is usable; it proves nothing about files.
     local pa
@@ -2203,7 +2257,6 @@ dr_immich_summary() {  # $1 = target, $2 = library root
   else
     printf '    %-34s %s\n' "originals" "UNKNOWN -- the asset table could not be read"
   fi
-  rm -f "$inv"
 
   # What an exclusion would save, measured now rather than quoted from a doc.
   local th_b ev_all_b ev_d_b
@@ -2270,8 +2323,8 @@ dr_backup_scope() {  # $1 = library root
 }
 
 # The risks that remain, named rather than left for the reader to infer.
-dr_remaining_risks() {  # $1 = target, $2 = library root
-  local target="$1" lib="$2" n=0
+dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
+  local target="$1" lib="$2" live_pop="${3:-}" n=0
   local cov
   cov="$(sample_coverage_file "$target")"
   echo "  REMAINING RISKS"
@@ -2294,12 +2347,51 @@ dr_remaining_risks() {  # $1 = target, $2 = library root
     echo "       is inferred from configuration only. Run verify-snapshot-coverage;"
     echo "       it reads snapshot metadata and downloads nothing."
   else
-    local scm; scm="$(awk '{print $3}' <<< "$(dr_snapshot_coverage "$target")")"
+    # One read of the proof, and the snapshot it is ABOUT.
+    local cov_row scm sc_snap sc_orig cur_snap=""
+    cov_row="$(dr_snapshot_coverage "$target")"
+    scm="$(awk '{print $3}' <<< "$cov_row")"
+    sc_orig="$(awk '{print $2}' <<< "$cov_row")"
+    sc_snap="$(awk '{print $4}' <<< "$cov_row")"
+    local cur
+    cur="$(dr_last_success_run "$target" || true)"
+    [[ -n "$cur" ]] && cur_snap="${cur##* }"
     if [[ "${scm:-0}" -gt 0 ]]; then
-      n=$((n+1)); echo "    $n. $scm original(s) are NOT in the snapshot that was reconciled."
-      echo "       They exist locally but are not protected off-site."
+      n=$((n+1))
+      if [[ -n "$cur_snap" && -n "$sc_snap" && "$sc_snap" != "unknown" \
+            && "$sc_snap" != "$cur_snap" ]]; then
+        # A proof is about the snapshot it was taken on. Reporting its count in
+        # the PRESENT tense outlived its own evidence: 69 originals missing from
+        # b18ea965 were still being called "not protected off-site" two backup
+        # runs later, by which time 8aae9af2 had almost certainly collected
+        # them. The honest state is UNKNOWN, and the remedy is free.
+        echo "    $n. $scm original(s) were missing from snapshot $sc_snap -- and that"
+        echo "       reconciliation is STALE: $cur_snap has run since. Whether those"
+        echo "       originals are off-site NOW is unknown; do not read the count as"
+        echo "       a present-tense gap. Re-run verify-snapshot-coverage; it reads"
+        echo "       snapshot metadata and downloads nothing."
+      else
+        echo "    $n. $scm original(s) are NOT in snapshot $sc_snap, the current one."
+        echo "       They exist locally but are not protected off-site."
+      fi
+    fi
+    # Originals added SINCE the reconciliation have never been observed in any
+    # snapshot. The summary prints the drift as a bracketed note, which is
+    # honest but not actionable and said nothing about what to do; a missing
+    # risk line reads as "nothing to report". These are the NEWEST photos, the
+    # ones least likely to exist anywhere else yet.
+    if [[ -n "$live_pop" ]]; then
+      local live_now="$live_pop"
+      if [[ -n "$sc_orig" ]] && (( live_now > sc_orig )); then
+        n=$((n+1))
+        echo "    $n. $(( live_now - sc_orig )) original(s) have been added since the last"
+        echo "       snapshot reconciliation and have NEVER been observed in a snapshot."
+        echo "       They are the newest photos. Re-run verify-snapshot-coverage; it"
+        echo "       reads snapshot metadata and downloads nothing."
+      fi
     fi
   fi
+
   if ! dr_last_phase_a "$target" >/dev/null; then
     n=$((n+1)); echo "    $n. No Immich has ever been started against a recovered database."
     echo "       The dump imports, but nothing shows the APPLICATION accepts the"
@@ -2333,6 +2425,17 @@ do_dr_status() {
   echo "RESTORE TESTED < FULL RECOVERY VERIFIED. A level is claimed only where"
   echo "local evidence supports it; absence of evidence reports UNKNOWN."
   echo
+
+  # ONE read of the asset table for the whole report, passed to every figure
+  # derived from the live library. Two reads would be two observations, and the
+  # contradiction this fixes was two denominators wearing one label.
+  local dr_inv_file dr_inv_counts="" dr_live_pop=""
+  dr_inv_file="$(mktemp)" || dr_inv_file=""
+  if [[ -n "$dr_inv_file" ]] && dr_inv_counts="$(immich_original_inventory "$dr_inv_file")"; then
+    dr_live_pop="${dr_inv_counts%% *}"
+  else
+    dr_inv_counts=""
+  fi
 
   for target in $targets; do
     if ! backup_target_enabled "$target" 2>/dev/null; then
@@ -2375,10 +2478,20 @@ do_dr_status() {
         u="$(awk '{print $3}' <<< "$proof")"
         lvl="RESTORE TESTED"
         local lg; lg="$(awk '{print $4}' <<< "$proof")"
-        if [[ "${lg:-0}" -gt 0 ]]; then
-          ev="$(( s + lg )) of $p original(s) proven ($s sampled + $lg large); $u never restore-tested"
+        # The fraction quotes the population RECORDED when the sample ran; the
+        # "never restore-tested" figure is about the library NOW and is the one
+        # number the summary also prints. Mixing the two made the same phrase
+        # appear twice, 69 apart, after 69 photos were added.
+        local nev nevtxt
+        if nev="$(dr_never_restore_tested "$target" "$dr_live_pop")"; then
+          nevtxt="$nev of $dr_live_pop never restore-tested"
         else
-          ev="$s of $p original(s) restored and compared; $u never restore-tested"
+          nevtxt="$u never restore-tested (of the population when sampled; the live count is UNKNOWN)"
+        fi
+        if [[ "${lg:-0}" -gt 0 ]]; then
+          ev="$(( s + lg )) proven ($s sampled + $lg large) of the $p present when sampled; $nevtxt"
+        else
+          ev="$s of $p original(s) restored and compared when sampled; $nevtxt"
         fi
       else
         ev="$ev; NO sample restore proof with a stated population"
@@ -2425,9 +2538,9 @@ do_dr_status() {
     echo
     dr_backup_scope "$lib"
     echo
-    dr_immich_summary "$target" "$lib"
+    dr_immich_summary "$target" "$lib" "$dr_inv_counts" "$dr_inv_file"
     echo
-    dr_remaining_risks "$target" "$lib"
+    dr_remaining_risks "$target" "$lib" "$dr_live_pop"
     echo
   done
 
@@ -2435,6 +2548,9 @@ do_dr_status() {
   echo "whole tier and having the application that owns it confirm the result;"
   echo "no such run has been performed on this host."
   echo
+  # One read, one release. Held for the whole report so every live figure
+  # comes from the same observation of the asset table.
+  [[ -n "$dr_inv_file" ]] && rm -f "$dr_inv_file"
   case "$worst" in
     0) echo "WEAKEST TIER: UNKNOWN -- recovery is not demonstrated." ; return 2 ;;
     1) echo "WEAKEST TIER: CONFIGURED -- a backup is intended but not proven." ; return 2 ;;

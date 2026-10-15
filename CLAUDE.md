@@ -1003,6 +1003,44 @@ rehearsal added `IMMICH_TELEMETRY_INCLUDE=none` and Immich refused to boot with
 one with a wrong value is fatal. Isolation comes from the network, so there is
 nothing to gain by guessing at feature switches.
 
+**"Never restore-tested" is a claim about the library NOW, and it was computed
+against the recorded denominator.** Production, 2026-10-12: after 69 photos were
+added, the tier row said `23013 never restore-tested` and the summary four
+sections below said `23082`. Both were derived from the same proven count (20);
+the row subtracted it from the population RECORDED when the sample ran (23033)
+and the summary from the LIVE library (23102). The row's figure silently
+treated 69 brand-new originals as tested -- the weaker claim in the stronger
+claim's words. One `dr_never_restore_tested` now answers it, against the live
+count, and the proof's own FRACTION keeps the recorded population with both
+labelled. This is the second instance of this exact rule in this function; the
+first is recorded in `dr_sample_proof`'s comment.
+
+**A test that establishes the precondition for agreement cannot detect
+disagreement.** The suite already had a section called "the tier row and the
+summary report the SAME untested count", and it passed throughout. Its own
+comment explained why it could not work: *"the fixture must make them the same
+population for the two untested figures to be comparable at all"* -- it set
+recorded == live, the one case where the two cannot differ. A sibling section
+then asserted `22964 never restore-tested` with a recorded population of 22976
+and a live library of 20, i.e. it REQUIRED the defect. Both now drive the grown
+library, which is the only configuration in which the invariant has content.
+
+**One read of the asset table per report, passed as an argument -- never
+memoised in a global.** Every call site in `dr-status` is a command
+substitution, so a global assigned inside `$( )` is set in the subshell and the
+parent never sees it. The first version of this fix cached the inventory that
+way and the path came back EMPTY: the summary reported `20, 0 B` with no
+location breakdown, because `sample_coverage_stats ""` happily returns zeros.
+Two reads would also be two observations, and the whole defect here was two
+denominators wearing one label.
+
+**The risk block is what the operator acts on, so a drift note is not a risk.**
+The summary printed `[the library has 23102 originals now vs 23033 when
+reconciled]` -- honest, unactionable, and the REMAINING RISKS block said
+nothing, so 69 originals that had never been observed in ANY snapshot were
+invisible where it mattered. `dr_remaining_risks` now names them, says they are
+the newest photos, names `verify-snapshot-coverage` and says it downloads
+nothing -- a remedy that reads as expensive does not get run.
 **A safety report lost its own verdict exactly when the news was bad.**
 Production, 2026-10-12: `verify-snapshot-coverage` listed 20 missing originals
 and then stopped -- no `... and 49 more`, no `result : INCOMPLETE`, and it
@@ -1072,6 +1110,7 @@ UNKNOWN instead of a clean sweep.
 terminal lines, so a finding could not be diagnosed without re-running the
 command. It is written to `<target>-snapshot-missing.txt` at 0600 and the report
 names it.
+||||||| parent of 3ba6290 (safety: two "never restore-tested" numbers, 69 apart)
 **A recovered Immich SERVES recovered originals — proven 2026-10-12.**
 `immich-phase-b` restored 8 originals from the snapshot and the application
 returned all 8 with **bytes identical** to the restored files: jpeg, heic, png,
@@ -1127,7 +1166,35 @@ assumed: the age PRIVATE key is held by the operator, and pgvecto.rs is
 deprecated so the set of Immich versions able to import today's dump shrinks
 over time. The whole chain rests on that age key -- 37 copies are equally
 useless without it.
+||||||| parent of e64a33c (safety: two "never restore-tested" numbers, 69 apart)
 ||||||| parent of c6c0e5e (safety: the missing-originals report lost its own verdict)
+||||||| parent of 3ba6290 (safety: two "never restore-tested" numbers, 69 apart)
+
+**A stale coverage proof was reported in the present tense.** Production,
+2026-10-14: the reconciliation had been taken on `b18ea965`, and two backup
+runs later -- `8aae9af2` was current -- `dr-status` still said *"69 original(s)
+are NOT in the snapshot that was reconciled. They exist locally but are not
+protected off-site."* By then those 69 had almost certainly been collected by
+the intervening runs. The summary's `[reconciled against an earlier snapshot]`
+note did not say WHICH, that another had run since, or that the missing count
+was therefore not about now. A proof is about the snapshot it was taken on, and
+repeating its count in the present tense outlives its own evidence. When the
+proof's snapshot is not the latest successful run the risk now says the
+reconciliation is STALE, names both snapshots, states that the present position
+is UNKNOWN, and points at the free remedy; when it IS the current snapshot the
+plain "not protected off-site" claim stands. The distinction is tested in both
+directions, because a softer wording that never asserts anything is not an
+improvement.
+
+**`[[ … && false ]]` is TRUE: inside `[[ ]]` the bare word `false` is a
+non-empty STRING, not the command.** Measured. A mutation written that way
+applied textually, passed its own `grep` check, and changed nothing -- so the
+mutant still behaved correctly and the test "failed" against code that was
+right, which cost a long hunt through the wrong half of the problem.
+`[[ … ]] && false` does work, because there `false` is a command, and so does
+`if false; then`. Prefer mutating the comparison itself into something that
+cannot hold -- `"$a" != "$a"` -- which has no such ambiguity. "Assert that a
+mutation actually applied" is not enough; assert that it changed the ANSWER.
 
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
@@ -1207,6 +1274,21 @@ inspect → reproduce → develop → test → focused commit → push branch �
   5 valid names must be accepted (a check that refuses valid input is the
   aborted-deployment family) and 7 invalid ones rejected, substring, case,
   trailing-space and empty among them.
+- **Never `--delete-branch` a PR that another PR is based on.** GitHub CLOSES a
+  pull request whose base branch is deleted, and a closed PR cannot be reopened
+  once that base is gone -- `gh pr reopen` fails with "Could not open the pull
+  request". Merging #108 with `--delete-branch` closed the stacked #113 that way.
+  Nothing was lost (the branch and its commits survived), but recovering it
+  meant replaying the commits onto the squashed `main` and opening a new PR.
+  Merge the base WITHOUT deleting, retarget the child to `main`, land it, then
+  delete.
+- **A squash merge makes every stacked branch conflict.** The child's parent
+  commit no longer exists in `main`'s history, so a rebase or cherry-pick is
+  required even when no file content actually disagrees. With several PRs each
+  inserting a rule block at the SAME anchor in this file, every merge invalidates
+  the next, and the conflicts are adjacent insertions where **both sides must be
+  kept** -- resolving one by taking a side silently deletes a rule. Prefer
+  landing such a series in one branch, or expect one rebase per merge.
 - **Take the backup before the mutation, unconditionally.** When mutation-testing,
   `cp` the file on its own line — not chained after the command being tested. A
   short-circuited `&&` chain leaves the mutation applied and no way back.
