@@ -1196,6 +1196,64 @@ right, which cost a long hunt through the wrong half of the problem.
 cannot hold -- `"$a" != "$a"` -- which has no such ambiguity. "Assert that a
 mutation actually applied" is not enough; assert that it changed the ANSWER.
 
+**"Missing from the snapshot" was one word for four different situations.**
+Production, 2026-10-15: five HEIC originals were reported absent from snapshot
+`d0829433` with the words *"NOT protected off-site"* and `INCOMPLETE`. They were
+uploaded at **11:09:50 that morning**, 8h37m after the backup finished. A 02:32
+snapshot cannot contain photos ingested at 11:09, so that report fires every day
+anything is added -- and a genuinely skipped photo reads identically. Missing
+originals are now classified against the backup **WINDOW**:
+
+| class | meaning | verdict |
+|---|---|---|
+| `BACKUP GAP` | ingested at or before the window OPENED | exit 1, escalated, path list written |
+| `PENDING` | ingested at or after the window CLOSED | exit 3, stated, not a defect |
+| `UNKNOWN` | ingested DURING the window, or no window | exit 2, neither excused nor blamed |
+| covered | not missing | exit 0 |
+
+**A snapshot is not an instant.** restic records when the run STARTED; the run
+record holds when it FINISHED. A file ingested between the two may or may not
+have been walked, so it is `UNKNOWN` -- calling it pending would quietly excuse
+a real miss. The window's end is only accepted from a success record whose
+`SNAPSHOT_ID` matches the snapshot being checked; a record for a different
+snapshot says nothing about this one.
+
+**Only `createdAt` answers "did this exist when the backup ran", and the
+production case proved why.** For those five files, measured:
+
+```
+createdAt         2026-10-15 11:09:50      (ingestion -- the truth)
+fileCreatedAt     2026-10-14 16:11-16:17   (capture, the day before)
+fileModifiedAt    2026-10-14 16:56 for TWO of them -- BEFORE the backup
+filesystem birth  2026-10-15 11:09:50.02-.68  (agrees with createdAt)
+```
+
+Capture time would have called all five a gap; `fileModifiedAt` would have
+called two of them a gap. The filesystem **birth** time agrees with `createdAt`
+and is the independent confirmation. This is the third appearance of the mtime
+trap in this file -- never use mtime, `fileModifiedAt`, or capture time for
+timing.
+
+**A classification key read but never written must read as "not classified".**
+Evidence recorded before this existed has no `missing_backup_gap` key, and
+`jq -r '.missing_backup_gap // empty'` returns empty -- which must not become
+`0`, or an unexamined finding would present as a clean one. `missing_classified`
+is defaulted to `unknown` in the accessor, and the test drives evidence with the
+keys absent.
+
+**A routine upload is stated but NOT numbered as a risk.** The pending line is
+printed with the count and the fact that those originals exist only on this host
+-- but it is not listed among the numbered risks, because a report that flags
+normal operation every day is one the operator stops reading. A gap and an
+unknown are numbered risks; a pending upload is not.
+
+**`&&` between an operator's commands means the second never runs on a
+non-zero verdict.** `verify-snapshot-coverage cloud && dr-status` is correct
+failure propagation -- and because the coverage command deliberately exits
+non-zero for any missing original, `dr-status` did not run. That is the chain
+working, not a defect, but a command pair offered to the operator should say
+which part is conditional.
+
 **Recovery is reported on five levels, and the weakest tier governs.**
 `UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
 (`domum-media-backup dr-status`). They are deliberately not collapsible into a
