@@ -236,4 +236,269 @@ grep -q 'EXITCODE=1' <<< "$mout" \
   || fail "the mutant did not produce a verdict from nothing: $mout"
 echo "  without the guard it reports all 3 as missing from a listing it never matched"
 
+# ---------------------------------------------------------------------------
+# A long missing list, under PRODUCTION's shell options.
+#
+# The suite's run_cov sets `set +e`, which is why it could never catch this:
+# with more than 20 originals missing, `sed … "$missing" | head -20 | sed …`
+# gave the first sed SIGPIPE, the pipeline reported 141, and under the CLI's
+# own `set -euo pipefail` the function DIED there -- losing the "... and N
+# more" line, losing its own "result : INCOMPLETE" verdict, and exiting 141
+# instead of 1. Reproduced against the real function before it was fixed.
+#
+# A test that relaxes production's shell options is not a test of production.
+BIG_LIB="$TMP_DIR/biglib"; mkdir -p "$BIG_LIB/upload/aa"
+: > "$TMP_DIR/big-paths"; : > "$TMP_DIR/big-ls"; : > "$TMP_DIR/big-recent"
+for i in $(seq 1 100); do
+  bp="$BIG_LIB/upload/aa/6a835020-9702-4d77-a085-67d2e0bc3c37-$i-000000000000.HEIC"
+  : > "$bp"; echo "$bp" >> "$TMP_DIR/big-paths"
+  [ "$i" -le 31 ] && echo "$bp" >> "$TMP_DIR/big-ls"
+done
+
+# Run the real function in its OWN bash process with production's options.
+#
+# Not `( … ) || rc=$?`: bash suppresses errexit inside a function invoked as
+# part of a `&&`/`||` list, which would defeat the whole point -- the defect was
+# a pipeline aborting the function UNDER errexit. A separate process keeps
+# errexit genuinely active and still yields an exit status to assert on.
+run_strict() {  # $1 = file of paths created after the snapshot (may be empty)
+  local recent="$1" script="$TMP_DIR/strict.sh"
+  cat > "$script" <<SH
+export DOMUM_DATA_ROOT="$TMP_DIR/data" DOMUM_MEDIA_ROOT="$TMP_DIR/media"
+export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$BIG_LIB" BACKUP_TARGETS=cloud
+source "${CLI_UNDER_TEST:-$REPO_ROOT/bin/domum-media-backup}" >/dev/null 2>&1
+set -euo pipefail
+immich_db_original_paths() { cat "$TMP_DIR/big-paths"; }
+immich_db_paths_created_after() { [[ -s "$recent" ]] && cat "$recent"; return 0; }
+snapshot_path_listing() { cp "$TMP_DIR/big-ls" "\$3"; return 0; }
+restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
+backup_target_enabled() { return 0; }
+log() { :; }
+do_verify_snapshot_coverage cloud
+SH
+  local out rc
+  out="$(bash "$script" 2>&1)"; rc=$?
+  printf '%s\nEXITCODE=%s\n' "$out" "$rc"
+}
+
+sect "69 missing under set -e keeps its remainder line AND its verdict"
+: > "$TMP_DIR/big-recent"
+out="$(run_strict "$TMP_DIR/big-recent")"
+grep -q 'MISSING FROM THE SNAPSHOT: 69' <<< "$out" \
+  || fail "the missing count is wrong: $out"
+grep -q '\.\.\. and 49 more' <<< "$out" \
+  || fail "the remainder line was lost -- the pipeline died before it: $out"
+grep -q 'result            : INCOMPLETE' <<< "$out" \
+  || fail "the verdict was lost, which is the whole defect: $out"
+grep -q 'EXITCODE=1' <<< "$out" \
+  || fail "the exit status must be 1, not 141: $out"
+echo "  20 shown, 49 more announced, INCOMPLETE stated, exit 1"
+
+sect "the FULL missing list is durable evidence, not 20 terminal lines"
+mf="$STATE/restore-verification/cloud-snapshot-missing.txt"
+[[ -f "$mf" ]] || fail "the full list was not written"
+[[ "$(grep -c . "$mf")" == "69" ]] \
+  || fail "the durable list holds $(grep -c . "$mf") path(s), not 69"
+[[ "$(stat -c %a "$mf")" == "600" ]] || fail "the list is mode $(stat -c %a "$mf"), not 600"
+grep -q "$mf" <<< "$out" || fail "the report does not name the full list: $out"
+grep -qE '^upload/aa/' "$mf" || fail "the list should be library-relative: $(head -1 "$mf")"
+echo "  69 paths at 0600, named in the report, library-relative"
+
+sect "missing originals are split by whether they EXISTED at snapshot time"
+# All 69 were added after it: expected, and reported as PENDING rather than as
+# a coverage failure. Without this the line fired every day anything was
+# uploaded and read identically to a genuinely dropped original.
+tail -n +32 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
+out="$(run_strict "$TMP_DIR/big-recent")"
+grep -qE 'added AFTER the snapshot +: 69' <<< "$out" \
+  || fail "the newer count is wrong: $out"
+grep -qE 'present BEFORE the snapshot +: 0' <<< "$out" \
+  || fail "the older count is wrong: $out"
+grep -q 'result            : PENDING' <<< "$out" \
+  || fail "all-newer must be PENDING, not a coverage failure: $out"
+grep -q 'only on THIS host now' <<< "$out" \
+  || fail "PENDING must still say they are unprotected right now: $out"
+grep -q 'EXITCODE=3' <<< "$out" || fail "PENDING must have its own exit status: $out"
+echo "  69 after / 0 before -> PENDING, exit 3, still called unprotected"
+
+sect "an original that PREDATES the snapshot is a real gap"
+tail -n +37 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
+out="$(run_strict "$TMP_DIR/big-recent")"
+grep -qE 'present BEFORE the snapshot +: 5' <<< "$out" \
+  || fail "the 5 originals that predate the snapshot are not counted: $out"
+grep -q 'result            : INCOMPLETE' <<< "$out" \
+  || fail "an original older than the snapshot must fail the check: $out"
+grep -q 'EXITCODE=1' <<< "$out" || fail "a real gap must exit 1: $out"
+echo "  5 predate it -> INCOMPLETE, exit 1"
+
+sect "recency comes from the asset TABLE, never the file's mtime"
+# Measured in production 2026-10-12: 69 assets had createdAt after the snapshot
+# while only 27 files had a newer mtime, because an uploaded photo keeps a date
+# from the file it came from. Reasoning from mtime would have reported 42
+# originals as genuinely missing -- a false alarm about family photos.
+#
+# Here EVERY file is given an mtime long before the snapshot while the table
+# says all 69 are new. If the code consulted mtime it would call them a gap.
+find "$BIG_LIB" -type f -exec touch -d '2020-01-01 00:00:00' {} +
+tail -n +32 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
+out="$(run_strict "$TMP_DIR/big-recent")"
+grep -q 'result            : PENDING' <<< "$out" \
+  || fail "mtime appears to have overridden the asset table: $out"
+grep -qE 'present BEFORE the snapshot +: 0' <<< "$out" \
+  || fail "files with a 2020 mtime were treated as predating the snapshot: $out"
+echo "  a 2020 mtime does not make a new asset old; the table decides"
+
+sect "an unreadable split says so rather than guessing"
+out="$(
+  (
+    export DOMUM_DATA_ROOT="$TMP_DIR/data" DOMUM_MEDIA_ROOT="$TMP_DIR/media"
+    export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$BIG_LIB" BACKUP_TARGETS=cloud
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+    set -euo pipefail
+    immich_db_original_paths() { cat "$TMP_DIR/big-paths"; }
+    immich_db_paths_created_after() { return 1; }
+    snapshot_path_listing() { cp "$TMP_DIR/big-ls" "$3"; return 0; }
+    restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
+    backup_target_enabled() { return 0; }
+    log() { :; }
+    do_verify_snapshot_coverage cloud
+    echo "EXITCODE=$?"
+  ) 2>&1
+)"
+grep -q 'cannot be split' <<< "$out" \
+  || fail "an unreadable asset table must be admitted, not guessed: $out"
+grep -q 'result            : INCOMPLETE' <<< "$out" \
+  || fail "an unknown split must not be promoted to PENDING: $out"
+echo "  unknown split is stated, and never promoted to PENDING"
+
+sect "originals ABSENT from disk are still compared against the snapshot"
+# `cut -f2 "$inv"` built the comparison set from a `stat` walk, so an original
+# the table names but which is not on disk never entered it. With all of them
+# absent the set was EMPTY, the comparison did nothing, and the report said
+# "IN the snapshot: 3000 of 3000". Found by a fixture that created no files --
+# the same hole this file already records for the exclusion audit. Whether a
+# file is on disk today is a different question from whether its path is in
+# the snapshot.
+ABS_LIB="$TMP_DIR/abslib"; mkdir -p "$ABS_LIB/upload/aa"
+: > "$TMP_DIR/abs-paths"
+for i in 1 2 3 4 5; do
+  echo "$ABS_LIB/upload/aa/never-written-$i.HEIC" >> "$TMP_DIR/abs-paths"
+done
+head -n 2 "$TMP_DIR/abs-paths" > "$TMP_DIR/abs-ls"
+run_abs() {  # $1 = paths file, $2 = listing file
+  local script="$TMP_DIR/abs.sh"
+  cat > "$script" <<SH
+export DOMUM_DATA_ROOT="$TMP_DIR/data" DOMUM_MEDIA_ROOT="$TMP_DIR/media"
+export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$ABS_LIB" BACKUP_TARGETS=cloud
+source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+set -euo pipefail
+immich_db_original_paths() { [[ -s "$1" ]] && cat "$1"; return 0; }
+immich_db_paths_created_after() { return 1; }
+snapshot_path_listing() { cp "$2" "\$3"; return 0; }
+restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
+backup_target_enabled() { return 0; }
+log() { :; }
+do_verify_snapshot_coverage cloud
+SH
+  local out rc; out="$(bash "$script" 2>&1)"; rc=$?
+  printf '%s\nEXITCODE=%s\n' "$out" "$rc"
+}
+out="$(run_abs "$TMP_DIR/abs-paths" "$TMP_DIR/abs-ls")"
+grep -q 'MISSING FROM THE SNAPSHOT: 3' <<< "$out" \
+  || fail "3 absent-on-disk originals are missing from the snapshot and must be
+reported as such, not skipped because no file exists: $out"
+grep -q '3 of 3' <<< "$out" && fail "it claimed full coverage having compared nothing: $out"
+echo "  5 paths, none on disk: 2 in the snapshot, 3 reported missing"
+
+sect "an asset table that yields NO paths is UNKNOWN, never full coverage"
+: > "$TMP_DIR/abs-empty"
+out="$(run_abs "$TMP_DIR/abs-empty" "$TMP_DIR/abs-ls")"
+grep -qE 'UNKNOWN|REFUS|Refusing' <<< "$out" \
+  || fail "an empty comparison side must refuse, not pass: $out"
+grep -q 'result            : every original' <<< "$out" \
+  && fail "it reported full coverage from an empty table: $out"
+echo "  an empty left-hand side refuses instead of reporting a clean sweep"
+
+sect "mutation: restoring the head pipeline must lose the verdict again"
+# SIGPIPE only fires while the writer still has data to push, so the mutation
+# needs a list that cannot fit the 64 KiB pipe buffer -- 3,000 paths, ~330 KB.
+# At 69 paths the mutant survives, which is precisely why this defect sat in
+# production unnoticed and why the fixture must be sized deliberately rather
+# than left at "enough to exceed 20".
+: > "$TMP_DIR/huge-paths"; : > "$TMP_DIR/huge-ls"
+for i in $(seq 1 3000); do
+  echo "$BIG_LIB/upload/aa/6a835020-9702-4d77-a085-67d2e0bc3c37-$i-00000000000000000000.HEIC"
+done > "$TMP_DIR/huge-paths"
+head -n 1 "$TMP_DIR/huge-paths" > "$TMP_DIR/huge-ls"
+
+run_huge() {  # $1 = CLI to drive
+  local cli="$1" script="$TMP_DIR/huge.sh"
+  cat > "$script" <<SH
+export DOMUM_DATA_ROOT="$TMP_DIR/data" DOMUM_MEDIA_ROOT="$TMP_DIR/media"
+export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$BIG_LIB" BACKUP_TARGETS=cloud
+source "$cli" >/dev/null 2>&1
+set -euo pipefail
+immich_db_original_paths() { cat "$TMP_DIR/huge-paths"; }
+immich_db_paths_created_after() { return 1; }
+snapshot_path_listing() { cp "$TMP_DIR/huge-ls" "\$3"; return 0; }
+restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
+backup_target_enabled() { return 0; }
+log() { :; }
+do_verify_snapshot_coverage cloud
+SH
+  local out rc
+  out="$(bash "$script" 2>&1)"; rc=$?
+  printf '%s\nEXITCODE=%s\n' "$out" "$rc"
+}
+
+MUTH="$TMP_DIR/mut-head"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTH"
+python3 - "$MUTH" <<'PYH'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+a = '''    sed -n "1,20{s|^$lib/||;s|^|    |;p}" "$missing"'''
+assert s.count(a) == 1, "the slice line moved; update this mutation"
+p.write_text(s.replace(a, '''    sed "s|^$lib/||" "$missing" | head -20 | sed 's/^/    /' ''', 1))
+PYH
+grep -q 'head -20' "$MUTH" || fail "the head mutation was not applied"
+
+mout="$(run_huge "$MUTH")"
+mrc="$(sed -nE 's/^EXITCODE=([0-9]+)$/\1/p' <<< "$mout" | tail -1)"
+# Assert the BEHAVIOUR, not the number. The broken pipe surfaces as 141 when
+# SIGPIPE kills sed, and as sed's own exit 4 ("I/O error") when an ancestor
+# ignores SIGPIPE so the write returns EPIPE instead. Measured: 141 here, 4 on
+# the CI runner, from the same mutant and the same fixture. Pinning 141 made
+# this assertion pass locally and fail in CI -- an exit code is not the
+# observable here; losing the verdict is.
+grep -q 'result            : INCOMPLETE' <<< "$mout" \
+  && fail "the mutant kept its verdict; this mutation proves nothing"
+case "$mrc" in
+  1|3) fail "the mutant reached a meaningful verdict status ($mrc); it should have
+died in the pipeline: $mout" ;;
+  "")  fail "no exit status was captured from the mutant: $mout" ;;
+esac
+echo "  killed: with | head -20 and 2999 missing it dies in the pipeline (status"
+echo "  $mrc, neither 1 nor 3) and the verdict is gone"
+
+sect "the FIXED form survives the same 2999-path list"
+fout="$(run_huge "$REPO_ROOT/bin/domum-media-backup")"
+grep -q 'MISSING FROM THE SNAPSHOT: 2999' <<< "$fout" \
+  || fail "the fixed form miscounted: $(grep MISSING <<< "$fout")"
+grep -q '\.\.\. and 2979 more' <<< "$fout" || fail "the remainder line is wrong: $fout"
+grep -q 'result            : INCOMPLETE' <<< "$fout" || fail "the verdict was lost: $fout"
+grep -q 'EXITCODE=1' <<< "$fout" || fail "the fixed form must exit 1: $(grep EXITCODE <<< "$fout")"
+echo "  2999 missing: 20 shown, 2979 announced, INCOMPLETE, exit 1"
+
+sect "mutation: dropping the split must cry wolf on an ordinary upload"
+MUTS="$TMP_DIR/mut-split"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTS"
+sed -i 's/^    if (( split_known == 1 \&\& n_older == 0 )); then$/    if false; then/' "$MUTS"
+grep -q '^    if false; then' "$MUTS" || fail "the split mutation was not applied"
+tail -n +32 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
+mout="$(CLI_UNDER_TEST="$MUTS" run_strict "$TMP_DIR/big-recent")"
+grep -q 'result            : INCOMPLETE' <<< "$mout" \
+  || fail "without the split the all-newer case should report INCOMPLETE: $mout"
+echo "  killed: 69 ordinary uploads report INCOMPLETE instead of PENDING"
+
 echo "PASS: snapshot-coverage-smoke"

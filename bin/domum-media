@@ -6447,7 +6447,12 @@ migrate_verify() {
 
     if ! diff "$src_manifest" "$dst_manifest" >/dev/null; then
       warn "content manifest mismatch"
-      diff "$src_manifest" "$dst_manifest" | head -20 >&2
+      # Capture then slice: `diff | head -20` takes SIGPIPE on a long diff and
+      # the pipeline reports 141, which under set -e kills the function before
+      # its own `return 1` -- the failure only appearing when there is a lot to
+      # report.
+      local dif; dif="$(diff "$src_manifest" "$dst_manifest" || true)"
+      sed -n '1,20p' <<< "$dif" >&2
       rm -f "$src_manifest" "$dst_manifest"
       return 1
     fi
@@ -6510,8 +6515,10 @@ migrate_verify() {
   # directories, permissions, ownership, and symlink targets.
   if ! diff <(migrate_metadata_manifest "$src") <(migrate_metadata_manifest "$dst") >/dev/null; then
     warn "metadata mismatch (type, mode, owner, group, or symlink target)"
-    diff <(migrate_metadata_manifest "$src") <(migrate_metadata_manifest "$dst") \
-      | head -20 >&2
+    local mdif
+    mdif="$(diff <(migrate_metadata_manifest "$src") \
+                 <(migrate_metadata_manifest "$dst") || true)"
+    sed -n '1,20p' <<< "$mdif" >&2
     return 1
   fi
   migrate_stage "$stage" "type, mode, owner, group and symlink targets identical"
