@@ -231,6 +231,48 @@ always checked instead is that the installed binary's sha256 equals the
 production checkout's; a revision pin alone says nothing about `/usr/local/bin`.
 See `docs/OPERATOR-CONTRACT.md`.
 
+**The deployment script generator's problem is fixed by moving it into
+`operator/`, which this file said was "not yet applied".** It is applied now:
+`operator/domum-media-deploy-reporting-fixes.sh` is in the repository, in CI,
+shellchecked by the `operator/*.sh` glob, read by
+`tests/operator-wrapper-audit.py`, and REHEARSED by
+`tests/deploy-reporting-rehearsal-smoke.sh`. A deployment script generated into
+`/home/jfranco` is reviewed by nothing.
+
+Its design follows the rules this file already records:
+
+- **No baked-in revision.** The target is whatever `origin/main` is at run
+  time; `--expect-revision=<sha>` pins it and is supplied by the OPERATOR, not
+  stored. A revision constant inside the repository it pins goes stale by
+  construction.
+- **No absolute per-service production state.** It asserts nothing about which
+  service is protected -- that is live state the deployment neither controls nor
+  changes, and pinning it aborted a correct deployment at its own stage 7.
+- **The one invariant it does assert cannot go stale**: each installed file's
+  sha256 equals that file in the production checkout.
+- **Fast-forward, never `reset --hard`.** A fast-forward cannot discard a
+  commit and git refuses it when history has diverged. It also refuses outright
+  if the checkout has ANY local change, tracked or untracked, rather than
+  deciding which changes are legitimate.
+- **Behaviour through `--json` + `jq`, never prose.** It requires the
+  classification keys to be present and the verdict to be one of the known
+  words. Counts are PRINTED and deliberately not asserted, because the library
+  changes hourly -- asserting them would be the stale-state mistake again.
+- **A reported BACKUP GAP does not fail the deployment.** It is a finding about
+  the backup, not about installing a file, and conflating them would make a real
+  finding look like a deployment problem.
+
+**`--json` prints the machine-readable line and THEN the human report, so the
+JSON is the FIRST line beginning with `{`.** The deployment script first took
+`| tail -n 1`, which returns a line of prose; the rehearsal caught it with a
+`jq` parse error. Extract it from a captured variable with
+`sed -n '/^{/{p;q;}'` -- no pipe, so nothing can short-circuit.
+
+**Rehearsing found what reviewing would not.** Two defects in one sitting: the
+JSON extraction above, and a FIXTURE whose checkout history diverged from its
+upstream -- the script refused, correctly, and the fixture was wrong. A wrapper
+that has only been read has not been tested.
+
 **`domum-media capabilities [--has <token>]` is the stable surface.** `--has`
 exits 0 supported, 1 implementation absent, **2 token unknown** -- a script
 asking about a token this binary never heard of must not read that as a yes.
