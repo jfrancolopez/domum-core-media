@@ -1274,6 +1274,21 @@ inspect → reproduce → develop → test → focused commit → push branch �
   5 valid names must be accepted (a check that refuses valid input is the
   aborted-deployment family) and 7 invalid ones rejected, substring, case,
   trailing-space and empty among them.
+- **Never `--delete-branch` a PR that another PR is based on.** GitHub CLOSES a
+  pull request whose base branch is deleted, and a closed PR cannot be reopened
+  once that base is gone -- `gh pr reopen` fails with "Could not open the pull
+  request". Merging #108 with `--delete-branch` closed the stacked #113 that way.
+  Nothing was lost (the branch and its commits survived), but recovering it
+  meant replaying the commits onto the squashed `main` and opening a new PR.
+  Merge the base WITHOUT deleting, retarget the child to `main`, land it, then
+  delete.
+- **A squash merge makes every stacked branch conflict.** The child's parent
+  commit no longer exists in `main`'s history, so a rebase or cherry-pick is
+  required even when no file content actually disagrees. With several PRs each
+  inserting a rule block at the SAME anchor in this file, every merge invalidates
+  the next, and the conflicts are adjacent insertions where **both sides must be
+  kept** -- resolving one by taking a side silently deletes a rule. Prefer
+  landing such a series in one branch, or expect one rebase per merge.
 - **Take the backup before the mutation, unconditionally.** When mutation-testing,
   `cp` the file on its own line — not chained after the command being tested. A
   short-circuited `&&` chain leaves the mutation applied and no way back.
