@@ -3156,6 +3156,116 @@ authority for which files are originals."
 }
 
 # ---------------------------------------------------------------------------
+# Immich PHASE B: does the recovered application SERVE recovered media?
+# ---------------------------------------------------------------------------
+
+# Phase A proved the application opens the database. It served no file, so it
+# said nothing about the library. Phase B restores a small, representative set
+# of ORIGINALS from the snapshot and asks the application for them through its
+# own API, comparing the returned bytes with the restored file.
+#
+# The claim it can earn is narrow and says its own denominator:
+#
+#   REPRESENTATIVE RECOVERY VERIFIED (n of 23033)
+#
+# It is NOT full recovery. A subset that serves proves the PATH from repository
+# to application works for those media types; it cannot speak for 23,033 files.
+#
+# Two distinctions the report keeps, because conflating them would overstate it:
+#
+#   /api/assets/<id>/original   returns the stored file. Its bytes may be
+#                               compared to the restored original by hash.
+#   /api/assets/<id>/thumbnail  returns a GENERATED preview. It is fetched to
+#                               show the application is functional, and its
+#                               bytes are NEVER claimed to match an original.
+PHASEB_MAX_BYTES="${PHASEB_MAX_BYTES:-268435456}"   # 256 MiB per run
+
+# One representative asset per category, chosen from the RESTORED database.
+#
+# Smallest-first within each category, because the point is coverage of media
+# types and of the live-photo relationship, not volume. Emitted as
+# "<category>|<asset id>|<container path>|<bytes>".
+#
+# The live-photo pair is selected as a pair: an image and the hidden video its
+# livePhotoVideoId points at. Measured on this library, 7,432 images link to
+# 7,428 distinct hidden videos, so 4 videos are shared by two images each --
+# the relationship is not 1:1 and a query assuming it would be wrong.
+phaseb_selection_sql() {  # $1 = owner id to scope to
+  # Each UNION branch is PARENTHESISED. Without that, PostgreSQL applies the
+  # ORDER BY/LIMIT to the whole union and the statement is a syntax error --
+  # which the first version was, and the tool reported only "no representative
+  # asset could be selected" because it swallowed stderr. The error is now
+  # surfaced by the caller.
+  # Scoped to ONE owner, deliberately. Immich enforces per-user ownership, so
+  # asking the admin's session for another user's asset returns nothing -- that
+  # is correct authorization, not a recovery failure. The first rehearsal
+  # selected a PNG belonging to the non-admin user and reported
+  # a failed fetch, which looked like a serving defect and was not.
+  cat <<SQL
+with sized as (
+  select a.id, a."originalPath", a.type, a.visibility,
+         lower(regexp_replace(a."originalPath", '.*\\.', '')) as ext,
+         coalesce(e."fileSizeInByte", 0) as bytes
+  from asset a left join asset_exif e on e."assetId" = a.id
+  where coalesce(e."fileSizeInByte", 0) > 0
+    and a."ownerId" = '$1'
+)
+(select 'photo jpeg|'     || id || '|' || "originalPath" || '|' || bytes from sized where ext in ('jpeg','jpg') and type='IMAGE' order by bytes limit 1)
+union all
+(select 'photo heic|'     || id || '|' || "originalPath" || '|' || bytes from sized where ext='heic' and type='IMAGE' order by bytes limit 1)
+union all
+(select 'photo png|'      || id || '|' || "originalPath" || '|' || bytes from sized where ext='png'  and type='IMAGE' order by bytes limit 1)
+union all
+(select 'photo raw|'      || id || '|' || "originalPath" || '|' || bytes from sized where ext in ('dng','cr2') and type='IMAGE' order by bytes limit 1)
+union all
+(select 'video ordinary|' || id || '|' || "originalPath" || '|' || bytes from sized where type='VIDEO' and visibility='timeline' order by bytes limit 1)
+union all
+(select 'video larger|'   || id || '|' || "originalPath" || '|' || bytes from sized where type='VIDEO' and visibility='timeline' and bytes > 20971520 order by bytes limit 1)
+union all
+(select 'livephoto image|' || i.id || '|' || i."originalPath" || '|' || coalesce(ei."fileSizeInByte",0)
+  from asset i join asset v on v.id = i."livePhotoVideoId"
+  left join asset_exif ei on ei."assetId" = i.id
+  left join asset_exif ev on ev."assetId" = v.id
+  where i."livePhotoVideoId" is not null and i."ownerId" = '$1'
+  order by coalesce(ei."fileSizeInByte",0) + coalesce(ev."fileSizeInByte",0) limit 1)
+SQL
+}
+
+# The hidden video belonging to the chosen live-photo image.
+phaseb_livephoto_video_sql() {  # $1 = image asset id
+  printf "select 'livephoto video|' || v.id || '|' || v.\"originalPath\" || '|' || coalesce(e.\"fileSizeInByte\",0) from asset i join asset v on v.id = i.\"livePhotoVideoId\" left join asset_exif e on e.\"assetId\"=v.id where i.id = '%s'" "$1"
+}
+
+# Fetch one asset through the API and compare with the restored file.
+#
+# Prints "<verdict> [detail]". That string is this function's RETURN VALUE --
+# the caller captures it -- so the verdict words are drawn from the same
+# vocabulary as the rest of the file (match / MISMATCH / NO-RESPONSE /
+# NO-LOCAL-FILE) and never from the LOGGING vocabulary. `ERROR no-response`
+# was the first form, and `tests/captured-stdout-purity-smoke.sh` rightly
+# rejected it: WARN and ERROR on a captured function's stdout are
+# indistinguishable from the log-line contamination that audit exists to catch,
+# and the prefix said nothing `no-response` did not already say.
+#
+# The ORIGINAL endpoint is the only one whose bytes are compared; a mismatch
+# there is a failure, not a note.
+phaseb_fetch_and_compare() {  # $1=container $2=token $3=asset id $4=local file
+  local c="$1" tok="$2" id="$3" local_file="$4"
+  local want got
+  want="$(sha256sum "$local_file" 2>/dev/null | cut -d' ' -f1)"
+  [[ -n "$want" ]] || { printf 'NO-LOCAL-FILE'; return 1; }
+  got="$(docker exec "$c" sh -lc \
+    "curl -sf -m 120 -H 'Authorization: Bearer $tok' \
+      'http://127.0.0.1:2283/api/assets/$id/original' | sha256sum | cut -d' ' -f1" 2>/dev/null || true)"
+  if [[ -z "$got" || "$got" == "$(printf '' | sha256sum | cut -d' ' -f1)" ]]; then
+    printf 'NO-RESPONSE'; return 1
+  fi
+  if [[ "$got" == "$want" ]]; then printf 'match %s' "${want:0:12}"; return 0; fi
+  printf 'MISMATCH local=%s served=%s' "${want:0:12}" "${got:0:12}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Immich PHASE A: can a fresh application open a recovered database?
 # ---------------------------------------------------------------------------
 
@@ -3226,11 +3336,12 @@ phasea_name_free() {  # $1 = container name
 }
 
 do_immich_phase_a() {
-  local target="${1:-}" a keep=0
+  local target="${1:-}" a keep=0 serve=0
   shift || true
   for a in "$@"; do
     case "$a" in
-      --keep) keep=1 ;;
+      --keep)  keep=1 ;;
+      --serve) serve=1 ;;
       *) [[ -n "$a" ]] && die "Unknown argument: $a" ;;
     esac
   done
@@ -3469,9 +3580,136 @@ production actually runs, so it will not substitute a tag."
     return 1
   fi
 
+  # ---- PHASE B: serve real recovered media --------------------------------
+  local served=0 served_ok=0 served_bad=0 served_bytes=0
+  if (( serve == 1 )); then
+    echo
+    echo "  PHASE B -- serving recovered originals"
+    local sel_lines cat aid apath abytes
+    local sel_err; sel_err="$scratch/select.err"
+    local owner_id other_assets
+    owner_id="$(phasea_sql "$c_pg" "select id from \"user\" where email = '$email'")"
+    sel_lines="$(phaseb_selection_sql "$owner_id" | docker exec -i "$c_pg" \
+      psql -U postgres -d immich -At 2>"$sel_err" || true)"
+    other_assets="$(phasea_sql "$c_pg" "select count(*) from asset where \"ownerId\" <> '$owner_id'")"
+    # The live-photo VIDEO is selected from the chosen image, because the
+    # relationship is not 1:1 and must be followed rather than guessed.
+    local lp_img
+    lp_img="$(grep '^livephoto image|' <<< "$sel_lines" | cut -d'|' -f2 | head -1)"
+    if [[ -n "$lp_img" ]]; then
+      sel_lines="$sel_lines
+$(phaseb_livephoto_video_sql "$lp_img" | docker exec -i "$c_pg" psql -U postgres -d immich -At 2>/dev/null || true)"
+    fi
+    sel_lines="$(grep -E '^[a-z]' <<< "$sel_lines" | grep '|' || true)"
+    if [[ -z "$sel_lines" ]]; then
+      echo "  result            : FAILED -- no representative asset could be selected"
+      # An unactionable FAIL trains the operator to ignore it. Say why.
+      [[ -s "$sel_err" ]] && { echo "  selection error   :"; head -4 "$sel_err" | sed 's/^/    /'; }
+      return 1
+    fi
+
+    # Restore just these originals. Bounded: the run refuses to exceed its
+    # byte budget rather than quietly growing into a library download.
+    local -a want_paths=() want_ids=() want_cats=()
+    local total_sel=0
+    while IFS='|' read -r cat aid apath abytes; do
+      [[ -n "$aid" && -n "$apath" ]] || continue
+      if (( total_sel + abytes > PHASEB_MAX_BYTES )); then
+        echo "    skipped $cat ($abytes bytes) -- would exceed the $(sample_human_bytes "$PHASEB_MAX_BYTES") run budget"
+        continue
+      fi
+      want_cats+=("$cat"); want_ids+=("$aid"); want_paths+=("$apath")
+      total_sel=$(( total_sel + abytes ))
+    done <<< "$sel_lines"
+    echo "    selected        : ${#want_ids[@]} asset(s), $(sample_human_bytes "$total_sel") to restore"
+    echo "    ownership scope : the authenticated user only"
+    if [[ "${other_assets:-0}" -gt 0 ]]; then
+      echo "                      ${other_assets} asset(s) belong to OTHER user(s) and were not"
+      echo "                      tested. Immich enforces per-user ownership, so proving one"
+      echo "                      user's assets serve does not prove another's."
+    fi
+
+    # Container path -> host path under the library root, then into scratch at
+    # the SAME relative position so the application finds it where the database
+    # says it is.
+    local cprefix rel hostp
+    cprefix="$(immich_container_library_prefix)"
+    local -a local_files=()
+    local -a include_args2=()
+    local i2
+    for i2 in "${!want_paths[@]}"; do
+      rel="${want_paths[$i2]#"$cprefix"/}"
+      include_args2+=(--include "$lib/$rel")
+    done
+    if (( ${#include_args2[@]} > 0 )); then
+      restic_for_target "$target" restore latest --target "$scratch" "${include_args2[@]}" \
+        >/dev/null 2>&1 || true
+    fi
+    for i2 in "${!want_paths[@]}"; do
+      rel="${want_paths[$i2]#"$cprefix"/}"
+      hostp="$scratch$lib/$rel"
+      if [[ -f "$hostp" ]]; then
+        mkdir -p "$(dirname "$scratch/upload/$rel")"
+        cp -- "$hostp" "$scratch/upload/$rel"
+        local_files+=("$scratch/upload/$rel")
+        served_bytes=$(( served_bytes + $(stat -c %s "$scratch/upload/$rel") ))
+      else
+        local_files+=("")
+      fi
+    done
+    echo "    restored        : $(printf '%s\n' "${local_files[@]}" | grep -c . || true) of ${#want_ids[@]} original(s), $(sample_human_bytes "$served_bytes")"
+
+    # Ask the application for each one.
+    local verdict
+    for i2 in "${!want_ids[@]}"; do
+      if [[ -z "${local_files[$i2]}" ]]; then
+        printf '    %-18s %s\n' "${want_cats[$i2]}" "NOT RESTORED -- not in the snapshot"
+        served_bad=$(( served_bad + 1 )); continue
+      fi
+      served=$(( served + 1 ))
+      verdict="$(phaseb_fetch_and_compare "$c_srv" "$token" "${want_ids[$i2]}" "${local_files[$i2]}")" \
+        && served_ok=$(( served_ok + 1 )) || served_bad=$(( served_bad + 1 ))
+      printf '    %-18s %s\n' "${want_cats[$i2]}" "$verdict"
+    done
+
+    # A generated preview, fetched to show the application works -- and
+    # deliberately NOT compared to any original.
+    local thumb_bytes=""
+    if (( ${#want_ids[@]} > 0 )); then
+      thumb_bytes="$(docker exec "$c_srv" sh -lc \
+        "curl -sf -m 60 -o /dev/null -w '%{size_download}' -H 'Authorization: Bearer $token' \
+          'http://127.0.0.1:2283/api/assets/${want_ids[0]}/thumbnail'" 2>/dev/null || true)"
+    fi
+    if [[ -n "$thumb_bytes" && "$thumb_bytes" != "0" ]]; then
+      echo "    thumbnail        : ${thumb_bytes} byte(s) returned -- GENERATED, not compared to any original"
+    else
+      echo "    thumbnail        : none returned (derivatives were not restored; not a failure)"
+    fi
+
+    if (( served_bad > 0 || served_ok == 0 )); then
+      echo "  result            : FAILED -- $served_ok of $served served original(s) matched"
+      phasea_record "$target" failure "$snapshot_id" "$img_server" "$after_assets" "$after_users" \
+        "phase B: $served_ok of $served originals matched"
+      return 1
+    fi
+  fi
+
   # ---- record and report --------------------------------------------------
   phasea_record "$target" success "$snapshot_id" "$img_server" "$after_assets" "$after_users" ""
   echo
+  if (( serve == 1 )); then
+    echo "  result            : REPRESENTATIVE RECOVERY VERIFIED ($served_ok of $after_assets)"
+    echo "                      $served_ok original(s) were restored from the snapshot and"
+    echo "                      served by a fresh Immich with bytes identical to the"
+    echo "                      restored files, across the media types listed above."
+    echo "                      $(sample_human_bytes "$served_bytes") transferred."
+    echo
+    echo "  This is NOT full recovery. $(( after_assets - served_ok )) originals were never"
+    echo "  restored or served, and only ONE user's assets were tested. A subset"
+    echo "  proves the PATH works for these types; it cannot speak for the whole"
+    echo "  library or for other users."
+    return 0
+  fi
   echo "  result            : APPLICATION STARTUP VERIFIED"
   echo "                      A fresh Immich of the production image opened the"
   echo "                      restored database, migrated it without changing the"
@@ -3835,6 +4073,7 @@ main() {
     verify-large)         shift; do_verify_large "$@" ;;
     verify-snapshot-coverage) shift; do_verify_snapshot_coverage "$@" ;;
     immich-phase-a)       shift; do_immich_phase_a "$@" ;;
+    immich-phase-b)       shift; do_immich_phase_a "$1" --serve "${@:2}" ;;
     dr-offhost-audit)     shift; do_dr_offhost_audit "$@" ;;
     dr-status)            do_dr_status ;;
     -h|--help)
@@ -3921,6 +4160,16 @@ Usage:
                                             mounted, images pinned by ID.
                                             Earns APPLICATION STARTUP VERIFIED
                                             -- never full recovery
+  domum-media-backup immich-phase-b <target> [--keep]
+                                            Phase A, plus: restore a small
+                                            representative set of ORIGINALS
+                                            from the snapshot and have the
+                                            recovered Immich SERVE them,
+                                            comparing bytes by hash. Bounded by
+                                            PHASEB_MAX_BYTES (256 MiB default).
+                                            Earns REPRESENTATIVE RECOVERY
+                                            VERIFIED (n of N) -- never full
+                                            recovery
   domum-media-backup dr-offhost-audit [--probe] [--json]
                                             Could a NEW machine rebuild from
                                             Hetzner if this one were destroyed?
