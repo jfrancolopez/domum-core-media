@@ -137,10 +137,19 @@ REASON=
 EOF
 }
 
+# $5..$7 are the classification: gap, pending, timing-unknown. Omitting them
+# writes evidence with NO classification keys, which is exactly what an
+# evidence file recorded before the classification existed looks like -- it
+# must read as "not classified", never as "zero gap".
 mk_snapshot_coverage() {  # $1 = in_snapshot, $2 = originals, $3 = missing, $4 = snapshot
+  local gap="${5:-}" pend="${6:-}" unk="${7:-}" extra=""
+  if [[ -n "$gap$pend$unk" ]]; then
+    extra=",\"missing_backup_gap\":${gap:-0},\"missing_pending_next_backup\":${pend:-0}"
+    extra="$extra,\"missing_timing_unknown\":${unk:-0},\"missing_classified\":\"known\""
+  fi
   cat > "$VDIR/cloud-snapshot-coverage.json" <<EOF
 {"target":"cloud","snapshot_id":"$4","recorded_at":"2026-10-11T10:00:00-04:00",
- "originals":$2,"in_snapshot":$1,"missing_from_snapshot":$3,"snapshot_paths":64500}
+ "originals":$2,"in_snapshot":$1,"missing_from_snapshot":$3,"snapshot_paths":64500$extra}
 EOF
 }
 
@@ -431,16 +440,60 @@ grep -q 'has run since' <<< "$out" \
   && fail "the current snapshot was flagged as superseded"
 echo "  all 20 in abc123de, the risk clears, and it is not flagged stale"
 
-sect "a MISSING original is reported and becomes a risk"
-mk_snapshot_coverage 17 20 3 abc123de
+sect "a classified BACKUP GAP is reported and escalated"
+# 3 missing, all of them ingested before the backup window opened: a defect,
+# and the only classification that may fail the check.
+mk_snapshot_coverage 17 20 3 abc123de 3 0 0
 out="$(run_dr)"
 grep -q '3 MISSING from snapshot abc123de' <<< "$out" \
   || fail "the missing originals are not reported: $out"
-grep -q '3 original(s) are NOT in snapshot abc123de, the current one' <<< "$out" \
-  || fail "the gap is not raised as a risk: $out"
-grep -q 'not protected off-site' <<< "$out" \
-  || fail "the consequence is not stated: $out"
-echo "  3 missing, stated in the summary and raised as a risk"
+grep -qE 'BACKUP GAP \(a defect\) +3' <<< "$out" \
+  || fail "the summary does not break the missing count down: $out"
+grep -q 'BACKUP GAP: 3 original(s) existed when snapshot abc123de' <<< "$out" \
+  || fail "the gap is not escalated as a risk: $out"
+grep -q 'not a pending upload' <<< "$out" \
+  || fail "the risk must refuse to excuse it as an upload: $out"
+echo "  3 ingested before the window: broken down, escalated, not excused"
+
+sect "a PENDING upload is stated WITHOUT being called a defect"
+# The production case: photos arriving between scheduled backups. Listing them
+# as a risk every day is how a report trains its operator to ignore it.
+mk_snapshot_coverage 17 20 3 abc123de 0 3 0
+out="$(run_dr)"
+grep -qE 'pending next backup +3' <<< "$out" \
+  || fail "the pending count is not shown: $out"
+grep -q 'arrived after snapshot abc123de and await the' <<< "$out" \
+  || fail "the pending originals are not stated at all: $out"
+grep -q 'Expected, not a defect' <<< "$out" \
+  || fail "a routine upload must not read as a defect: $out"
+grep -q 'exist only on' <<< "$out" \
+  || fail "it must still say they are unprotected right now: $out"
+grep -q 'BACKUP GAP: ' <<< "$out" \
+  && fail "a pending upload was escalated as a gap: $out"
+echo "  shown, called expected, still flagged as this-host-only, not a risk"
+
+sect "timing UNKNOWN is neither excused nor blamed"
+mk_snapshot_coverage 17 20 3 abc123de 0 0 3
+out="$(run_dr)"
+grep -qE 'timing unknown +3' <<< "$out" || fail "the unknown count is not shown: $out"
+grep -q 'ingested DURING the backup window' <<< "$out" \
+  || fail "the unknown class is not raised: $out"
+grep -q 'BACKUP GAP: ' <<< "$out" && fail "an unknown was blamed as a gap: $out"
+grep -q 'Expected, not a defect' <<< "$out" && fail "an unknown was excused: $out"
+echo "  raised as its own risk, called neither a gap nor expected"
+
+sect "evidence with NO classification keys reads as NOT CLASSIFIED"
+# A key read but never written is silently empty. Evidence recorded before the
+# classification existed must not come back as "zero gap".
+mk_snapshot_coverage 17 20 3 abc123de
+out="$(run_dr)"
+grep -q 'not classified' <<< "$out" \
+  || fail "unclassified evidence must say so: $out"
+grep -qE 'BACKUP GAP \(a defect\) +0' <<< "$out" \
+  && fail "missing keys were read as a zero gap: $out"
+grep -q 'timing could not be established' <<< "$out" \
+  || fail "the risk must admit the timing is unknown: $out"
+echo "  missing keys read as unclassified, never as a clean zero"
 
 sect "a STALE coverage proof is not a present-tense claim"
 # Production, 2026-10-14. The proof was taken on b18ea965 and reported 69
@@ -449,7 +502,7 @@ sect "a STALE coverage proof is not a present-tense claim"
 # exist locally but are not protected off-site." By then those 69 had almost
 # certainly been collected. A proof is about the snapshot it was taken on, and
 # repeating its count in the present tense outlives its own evidence.
-mk_snapshot_coverage 17 20 3 oldsnap1
+mk_snapshot_coverage 17 20 3 oldsnap1 0 3 0
 out="$(run_dr)"
 grep -q 'reconciliation is STALE' <<< "$out" \
   || fail "a superseded proof is not reported as stale: $out"
@@ -468,9 +521,9 @@ echo "  3 missing from oldsnap1 reported as stale and UNKNOWN, both snapshots na
 sect "the same count IS asserted when the proof is about the current snapshot"
 # The distinction has to cut both ways, or it is just a softer wording that
 # never says anything.
-mk_snapshot_coverage 17 20 3 abc123de
+mk_snapshot_coverage 17 20 3 abc123de 3 0 0
 out="$(run_dr)"
-grep -q 'not protected off-site' <<< "$out" \
+grep -q 'BACKUP GAP: 3 original' <<< "$out" \
   || fail "a current proof must still state the consequence plainly: $out"
 grep -q 'reconciliation is STALE' <<< "$out" \
   && fail "the current snapshot was reported as stale: $out"
@@ -491,7 +544,7 @@ cp "$REPO_ROOT/bin/domum-media-backup" "$MUTST"
 sed -i 's/"\$sc_snap" != "\$cur_snap"/"$sc_snap" != "$sc_snap"/' "$MUTST"
 grep -q '"\$sc_snap" != "\$sc_snap"' "$MUTST" \
   || fail "the staleness mutation was not applied"
-mk_snapshot_coverage 17 20 3 oldsnap1
+mk_snapshot_coverage 17 20 3 oldsnap1 0 3 0
 mout="$(
   (
     # shellcheck disable=SC1090
@@ -503,11 +556,14 @@ mout="$(
     do_dr_status 2>&1
   )
 )"
-grep -q 'not protected off-site' <<< "$mout" \
-  || fail "the mutant should assert the stale count in the present tense: $mout"
+# Without the comparison the mutant treats two-run-old evidence as current and
+# reports it as a routine pending upload -- the reassuring reading of stale
+# evidence, which is the exact failure.
+grep -q 'Expected, not a defect' <<< "$mout" \
+  || fail "the mutant should read the stale count as a current pending upload: $mout"
 grep -q 'reconciliation is STALE' <<< "$mout" \
   && fail "the mutant still reported staleness; the comparison is not load-bearing"
-echo "  killed: without the comparison a two-run-old count is asserted as current"
+echo "  killed: without the comparison a two-run-old count reads as expected"
 mk_snapshot_coverage 20 20 0 abc123de
 
 sect "a reconciliation against an EARLIER snapshot is flagged, not hidden"

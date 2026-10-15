@@ -1731,6 +1731,55 @@ immich_db_original_paths() {
 # file it came from. Reasoning from mtime would have reported 42 originals as
 # "present before the backup and genuinely missing" -- a false alarm about
 # family photos, from exactly the inference this file already forbids.
+# Which originals the asset table says were INGESTED in a given time relation.
+#
+# `createdAt` is when Immich received and stored the file. It is the ONLY
+# column that answers "did this exist when the backup ran", and the production
+# case proved why. Measured 2026-10-15, for the five originals reported missing
+# from snapshot d0829433:
+#
+#   createdAt       2026-10-15 11:09:50  -- 8h37m AFTER the backup finished
+#   fileCreatedAt   2026-10-14 16:11-16:17  (capture time, the day before)
+#   fileModifiedAt  2026-10-14 16:56 for TWO of them -- before the backup
+#   filesystem birth 2026-10-15 11:09:50.02-.68  (agrees with createdAt)
+#
+# So capture time and `fileModifiedAt` would each have misclassified real
+# uploads as a backup gap, two of them from `fileModifiedAt` alone. Never use
+# either for timing, and never use the file's mtime.
+immich_db_paths_by_ingest() {  # $1 = "before"|"after", $2 = ISO-8601 -> host paths
+  local rel="$1" when="$2" op pg_cid pg_user pg_db prefix lib rows tbl
+  [[ -n "$when" ]] || return 1
+  case "$rel" in
+    before) op='<=' ;;   # existed when that moment passed
+    after)  op='>=' ;;   # arrived at or after it
+    *) return 1 ;;
+  esac
+  lib="${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}"
+  pg_user="${IMMICH_DB_USERNAME:-postgres}"
+  pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
+  pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null \
+    | head -1 || true)"
+  [[ -n "$pg_cid" ]] || return 1
+  prefix="$(immich_container_library_prefix)"
+  for tbl in asset assets; do
+    # The timestamp is passed to PostgreSQL WITH its offset, so the comparison
+    # happens in timestamptz and no local timezone is involved.
+    rows="$(docker exec -i "$pg_cid" psql -U "$pg_user" -d "$pg_db" -At \
+              -c "select \"originalPath\" from $tbl
+                  where \"originalPath\" is not null
+                    and \"createdAt\" $op '$when'::timestamptz" \
+              2>/dev/null || true)"
+    # An EMPTY result is a legitimate answer -- nothing matches -- so the
+    # table's existence is what distinguishes it from a failed query.
+    if docker exec -i "$pg_cid" psql -U "$pg_user" -d "$pg_db" -At \
+         -c "select 1 from $tbl limit 1" >/dev/null 2>&1; then
+      [[ -n "$rows" ]] && printf '%s\n' "$rows" | sed "s|^${prefix}|${lib}|"
+      return 0
+    fi
+  done
+  return 1
+}
+
 immich_db_paths_created_after() {  # $1 = ISO-8601 timestamp -> host paths
   local since="$1" pg_cid pg_user pg_db prefix lib rows tbl
   [[ -n "$since" ]] || return 1
@@ -2036,16 +2085,31 @@ dr_last_dbimport() {  # $1 = target -> "ts snapshot assets" or empty
 # root and no exclusion matches it" is an argument; "this path is in snapshot
 # 05a6adb0" is an observation. The report must not present the first as the
 # second.
-dr_snapshot_coverage() {  # $1 = target -> "present originals missing snapshot" or empty
+dr_snapshot_coverage() {
+  # -> "present originals missing snapshot gap pending unknown classified"
+  #
+  # Fields are APPENDED, never reordered, and every caller reads by INDEX --
+  # taking "the last one" with ${x##* } silently redefined itself the last time
+  # a field was added here and made the report claim zero untested originals.
   local f; f="$(snapshot_coverage_file "$1")"
   [[ -f "$f" ]] || return 1
-  local present orig miss snap
+  local present orig miss snap gap pend unk cls
   present="$(jq -r '.in_snapshot // empty' "$f" 2>/dev/null || true)"
   orig="$(jq -r '.originals // empty' "$f" 2>/dev/null || true)"
   miss="$(jq -r '.missing_from_snapshot // empty' "$f" 2>/dev/null || true)"
   snap="$(jq -r '.snapshot_id // empty' "$f" 2>/dev/null || true)"
+  gap="$(jq -r '.missing_backup_gap // empty' "$f" 2>/dev/null || true)"
+  pend="$(jq -r '.missing_pending_next_backup // empty' "$f" 2>/dev/null || true)"
+  unk="$(jq -r '.missing_timing_unknown // empty' "$f" 2>/dev/null || true)"
+  cls="$(jq -r '.missing_classified // empty' "$f" 2>/dev/null || true)"
   [[ -n "$present" && -n "$orig" ]] || return 1
-  printf '%s %s %s %s' "$present" "$orig" "${miss:-0}" "${snap:-unknown}"
+  # An evidence file written before the classification existed has no such
+  # keys. It must read as "not classified", never as "zero gap" -- a key read
+  # but never written is silently empty, and here that would turn an
+  # unexamined finding into a clean one.
+  [[ -n "$cls" ]] || cls=unknown
+  printf '%s %s %s %s %s %s %s %s' "$present" "$orig" "${miss:-0}" "${snap:-unknown}" \
+    "${gap:-0}" "${pend:-0}" "${unk:-0}" "$cls"
 }
 
 # The Phase A rehearsal result, if it passed.
@@ -2198,6 +2262,19 @@ dr_immich_summary() {  # $1 = target, $2 = library root, $3 = counts, $4 = inven
       if [[ "${sc_miss:-0}" -gt 0 ]]; then
         printf '    %-34s %s\n' "IN a snapshot (observed)" \
           "$sc_present of $sc_orig -- $sc_miss MISSING from snapshot $sc_snap"
+        # The four states, because "missing" alone cannot tell a routine upload
+        # from a backup that skipped a file. Only the gap is a defect.
+        local sc_gap sc_pend sc_unk sc_cls
+        sc_gap="$(awk '{print $5}' <<< "$sc")";  sc_pend="$(awk '{print $6}' <<< "$sc")"
+        sc_unk="$(awk '{print $7}' <<< "$sc")";  sc_cls="$(awk '{print $8}' <<< "$sc")"
+        if [[ "$sc_cls" == "known" ]]; then
+          printf '    %-34s %s\n' "  BACKUP GAP (a defect)" "${sc_gap:-0}"
+          printf '    %-34s %s\n' "  pending next backup" "${sc_pend:-0}"
+          printf '    %-34s %s\n' "  timing unknown" "${sc_unk:-0}"
+        else
+          printf '    %-34s %s\n' "  not classified" \
+            "the backup window was unavailable, so these are neither excused nor blamed"
+        fi
       else
         printf '    %-34s %s\n' "IN a snapshot (observed)" \
           "all $sc_present, snapshot $sc_snap"
@@ -2357,7 +2434,9 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
     cur="$(dr_last_success_run "$target" || true)"
     [[ -n "$cur" ]] && cur_snap="${cur##* }"
     if [[ "${scm:-0}" -gt 0 ]]; then
-      n=$((n+1))
+      local sc_gap sc_pend sc_unk sc_cls
+      sc_gap="$(awk '{print $5}' <<< "$cov_row")";  sc_pend="$(awk '{print $6}' <<< "$cov_row")"
+      sc_unk="$(awk '{print $7}' <<< "$cov_row")";  sc_cls="$(awk '{print $8}' <<< "$cov_row")"
       if [[ -n "$cur_snap" && -n "$sc_snap" && "$sc_snap" != "unknown" \
             && "$sc_snap" != "$cur_snap" ]]; then
         # A proof is about the snapshot it was taken on. Reporting its count in
@@ -2365,14 +2444,51 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
         # b18ea965 were still being called "not protected off-site" two backup
         # runs later, by which time 8aae9af2 had almost certainly collected
         # them. The honest state is UNKNOWN, and the remedy is free.
+        n=$((n+1))
         echo "    $n. $scm original(s) were missing from snapshot $sc_snap -- and that"
         echo "       reconciliation is STALE: $cur_snap has run since. Whether those"
         echo "       originals are off-site NOW is unknown; do not read the count as"
         echo "       a present-tense gap. Re-run verify-snapshot-coverage; it reads"
         echo "       snapshot metadata and downloads nothing."
+        # A PENDING original that a LATER run should have swept up is the one
+        # case worth escalating from stale evidence: either it is now covered,
+        # or it has become a gap. Say which question to ask rather than leaving
+        # the count to be read as either.
+        if [[ "$sc_cls" == "known" && "${sc_pend:-0}" -gt 0 ]]; then
+          echo "       Of those, $sc_pend were awaiting a backup run and $cur_snap has"
+          echo "       since completed. If they are still absent they are no longer"
+          echo "       pending -- they are a BACKUP GAP. The re-run answers it."
+        fi
+      elif [[ "$sc_cls" != "known" ]]; then
+        n=$((n+1))
+        echo "    $n. $scm original(s) are NOT in snapshot $sc_snap, the current one, and"
+        echo "       their timing could not be established -- so whether the backup"
+        echo "       skipped them or they arrived after it is UNKNOWN. Not excused."
       else
-        echo "    $n. $scm original(s) are NOT in snapshot $sc_snap, the current one."
-        echo "       They exist locally but are not protected off-site."
+        # Classified against the current snapshot: only a gap is a defect.
+        if [[ "${sc_gap:-0}" -gt 0 ]]; then
+          n=$((n+1))
+          echo "    $n. BACKUP GAP: $sc_gap original(s) existed when snapshot $sc_snap"
+          echo "       began and are not in it. This is not a pending upload. The"
+          echo "       paths are listed in ${target}-snapshot-gap.txt under"
+          echo "       $(restore_verification_dir). Investigate before the next run."
+        fi
+        if [[ "${sc_unk:-0}" -gt 0 ]]; then
+          n=$((n+1))
+          echo "    $n. $sc_unk original(s) were ingested DURING the backup window, so"
+          echo "       whether $sc_snap should contain them cannot be established."
+          echo "       Re-run verify-snapshot-coverage after the next backup; if they"
+          echo "       are still absent they are a gap."
+        fi
+        if [[ "${sc_pend:-0}" -gt 0 && "${sc_gap:-0}" -eq 0 && "${sc_unk:-0}" -eq 0 ]]; then
+          # Deliberately NOT numbered as a risk. Photos arriving between
+          # scheduled backups are the system working; listing them as a defect
+          # every day is how a report trains its operator to ignore it. It is
+          # still stated, because they are only on this host right now.
+          echo "    --  $sc_pend original(s) arrived after snapshot $sc_snap and await the"
+          echo "        next backup. Expected, not a defect -- but they exist only on"
+          echo "        this host until then."
+        fi
       fi
     fi
     # Originals added SINCE the reconciliation have never been observed in any
@@ -3334,50 +3450,88 @@ authority for which files are originals."
     return 2
   fi
 
-  # Split "missing" by whether the original EXISTED when the snapshot was taken.
+  # Classify every missing original against the BACKUP WINDOW, not one instant.
   #
-  # Without this the report said only "they are NOT protected off-site", which
-  # is true and unactionable: 69 photos uploaded at 20:05 cannot be in a 02:42
-  # snapshot, so the line would fire every single day that anything was added
-  # and train the operator to ignore it -- while a genuinely dropped original
-  # would look identical. The two states are:
+  # A snapshot is not a moment: restic records the time the run STARTED, and the
+  # run record holds when it FINISHED. A file ingested between those two points
+  # may or may not have been walked, so it cannot be classified either way --
+  # and calling it "pending" would quietly excuse a real miss.
   #
-  #   added AFTER the snapshot  -- expected; the next run covers them. They are
-  #                                still only on this host right now.
-  #   present BEFORE it         -- a real gap: the backup should have had them.
+  #   GAP      ingested at or before the window OPENED -- it existed when the
+  #            backup began, so its absence is a defect. This is the only
+  #            classification that fails the check.
+  #   PENDING  ingested at or after the window CLOSED -- expected; the next run
+  #            covers it. Still only on this host right now.
+  #   UNKNOWN  ingested DURING the window, or the window could not be
+  #            established. Reported, never promoted.
   #
-  # Recency comes from the asset table, never from the file's mtime. See
-  # immich_db_paths_created_after.
-  local newer_f older_f recent_f n_newer=0 n_older=0 split_known=0
-  if (( n_missing > 0 )) && [[ -n "$snapshot_time" ]]; then
-    newer_f="$(mktemp "$vdir/.cov-new.XXXXXX")"
-    older_f="$(mktemp "$vdir/.cov-old.XXXXXX")"
-    recent_f="$(mktemp "$vdir/.cov-rec.XXXXXX")"
-    local recent=""
-    if recent="$(immich_db_paths_created_after "$snapshot_time")"; then
-      printf '%s\n' "$recent" | LC_ALL=C sort -u > "$recent_f"
-      LC_ALL=C comm -12 "$missing" "$recent_f" > "$newer_f"
-      LC_ALL=C comm -23 "$missing" "$recent_f" > "$older_f"
-      n_newer="$(grep -c . < "$newer_f" || true)"
-      n_older="$(grep -c . < "$older_f" || true)"
-      split_known=1
+  # Timing comes from the asset table's `createdAt`. See
+  # immich_db_paths_by_ingest for the production evidence that capture time,
+  # `fileModifiedAt` and the file's mtime each get this wrong.
+  local gap_f pend_f unk_f tmp_f n_gap=0 n_pend=0 n_unk=0 class_known=0
+  local window_end=""
+  if (( n_missing > 0 )); then
+    # The window closes at the FINISHED_TS of the run that produced THIS
+    # snapshot. A record for a different snapshot says nothing about this one.
+    local run_row
+    if run_row="$(dr_last_success_run "$target" 2>/dev/null)"; then
+      [[ "${run_row##* }" == "$snapshot_id" ]] && window_end="${run_row%% *}"
     fi
-    rm -f -- "$recent_f"
+  fi
+  if (( n_missing > 0 )) && [[ -n "$snapshot_time" && -n "$window_end" ]]; then
+    gap_f="$(mktemp "$vdir/.cov-gap.XXXXXX")"
+    pend_f="$(mktemp "$vdir/.cov-pend.XXXXXX")"
+    unk_f="$(mktemp "$vdir/.cov-unk.XXXXXX")"
+    tmp_f="$(mktemp "$vdir/.cov-tmp.XXXXXX")"
+    local before_set="" after_set=""
+    if before_set="$(immich_db_paths_by_ingest before "$snapshot_time")" \
+       && after_set="$(immich_db_paths_by_ingest after "$window_end")"; then
+      printf '%s\n' "$before_set" | sed '/^$/d' | LC_ALL=C sort -u > "$tmp_f"
+      LC_ALL=C comm -12 "$missing" "$tmp_f" > "$gap_f"
+      printf '%s\n' "$after_set" | sed '/^$/d' | LC_ALL=C sort -u > "$tmp_f"
+      LC_ALL=C comm -12 "$missing" "$tmp_f" > "$pend_f"
+      # Whatever is in neither bucket was ingested inside the window.
+      LC_ALL=C sort -u "$gap_f" "$pend_f" > "$tmp_f"
+      LC_ALL=C comm -23 "$missing" "$tmp_f" > "$unk_f"
+      n_gap="$(grep -c . < "$gap_f" || true)"
+      n_pend="$(grep -c . < "$pend_f" || true)"
+      n_unk="$(grep -c . < "$unk_f" || true)"
+      class_known=1
+    fi
+    rm -f -- "$tmp_f"
+  fi
+
+  # One decision function. The JSON and the human report are thin filters over
+  # it, so a machine-readable "pending" and a printed "INCOMPLETE" cannot
+  # disagree -- the rule this repository already applies to `cleanup images`.
+  local verdict rc_wanted
+  if (( n_missing == 0 )); then
+    verdict=covered;  rc_wanted=0
+  elif (( class_known == 0 )); then
+    verdict=unknown;  rc_wanted=2
+  elif (( n_gap > 0 )); then
+    verdict=gap;      rc_wanted=1
+  elif (( n_unk > 0 )); then
+    verdict=unknown;  rc_wanted=2
+  else
+    verdict=pending;  rc_wanted=3
   fi
 
   if (( want_json == 1 )); then
     jq -cn --arg t "$target" --arg s "$snapshot_id" --arg lib "$lib" \
       --argjson orig "$n_orig" --argjson present "$n_present" \
       --argjson miss "$n_missing" --argjson listed "${n_listed:-0}" \
-      --argjson newer "${n_newer:-0}" --argjson older "${n_older:-0}" \
-      --arg split "$([[ "${split_known:-0}" -eq 1 ]] && echo known || echo unknown)" \
-      --arg res "$([[ "$n_missing" -eq 0 ]] && echo covered \
-                   || { [[ "${split_known:-0}" -eq 1 && "${n_older:-0}" -eq 0 ]] \
-                        && echo pending || echo incomplete; })" \
+      --argjson gap "${n_gap:-0}" --argjson pend "${n_pend:-0}" \
+      --argjson unk "${n_unk:-0}" \
+      --arg wstart "${snapshot_time:-}" --arg wend "${window_end:-}" \
+      --arg classified "$([[ "${class_known:-0}" -eq 1 ]] && echo known || echo unknown)" \
+      --arg res "$verdict" \
       '{target:$t,snapshot_id:$s,library:$lib,originals:$orig,
         in_snapshot:$present,missing_from_snapshot:$miss,
-        missing_added_after_snapshot:$newer,missing_present_before_snapshot:$older,
-        missing_split:$split,snapshot_paths:$listed,result:$res}'
+        missing_backup_gap:$gap,missing_pending_next_backup:$pend,
+        missing_timing_unknown:$unk,missing_classified:$classified,
+        window_start:$wstart,window_end:$wend,
+        snapshot_paths:$listed,result:$res}'
   fi
 
   echo "[domum-media-backup] Snapshot coverage for $target"
@@ -3395,12 +3549,17 @@ authority for which files are originals."
   if jq -cn --arg t "$target" --arg s "$snapshot_id" --arg ts "$(date -Iseconds)" \
        --argjson orig "$n_orig" --argjson present "$n_present" --argjson miss "$n_missing" \
        --argjson listed "${n_listed:-0}" \
-       --argjson newer "${n_newer:-0}" --argjson older "${n_older:-0}" \
-       --arg split "$([[ "${split_known:-0}" -eq 1 ]] && echo known || echo unknown)" \
+       --argjson gap "${n_gap:-0}" --argjson pend "${n_pend:-0}" \
+       --argjson unk "${n_unk:-0}" \
+       --arg wstart "${snapshot_time:-}" --arg wend "${window_end:-}" \
+       --arg classified "$([[ "${class_known:-0}" -eq 1 ]] && echo known || echo unknown)" \
+       --arg res "$verdict" \
        '{target:$t,snapshot_id:$s,recorded_at:$ts,originals:$orig,
          in_snapshot:$present,missing_from_snapshot:$miss,
-         missing_added_after_snapshot:$newer,missing_present_before_snapshot:$older,
-         missing_split:$split,snapshot_paths:$listed}' \
+         missing_backup_gap:$gap,missing_pending_next_backup:$pend,
+         missing_timing_unknown:$unk,missing_classified:$classified,
+         window_start:$wstart,window_end:$wend,
+         snapshot_paths:$listed,result:$res}' \
        > "$cov_file.tmp" 2>/dev/null; then
     chmod 0600 "$cov_file.tmp"; mv -f "$cov_file.tmp" "$cov_file"
     echo "  evidence          : $cov_file"
@@ -3412,13 +3571,23 @@ authority for which files are originals."
   if (( n_missing > 0 )); then
     echo
     echo "  MISSING FROM THE SNAPSHOT: $n_missing original(s)."
-    if (( split_known == 1 )); then
-      echo "    added AFTER the snapshot    : $n_newer -- expected; the next run covers"
-      echo "                                  them, but they are only on THIS host now"
-      echo "    present BEFORE the snapshot : $n_older -- a real gap if above zero"
+    if (( class_known == 1 )); then
+      echo "    backup window     : $snapshot_time"
+      echo "                     -> $window_end"
+      echo "    BACKUP GAP        : $n_gap -- ingested before the window opened, so the"
+      echo "                        backup should have had them. This is the only"
+      echo "                        classification that fails the check."
+      echo "    PENDING next run  : $n_pend -- ingested after the window closed."
+      echo "                        Expected, but only on THIS host right now."
+      echo "    timing UNKNOWN    : $n_unk -- ingested DURING the window, so whether the"
+      echo "                        run should have walked them cannot be established."
     else
-      echo "    the snapshot's own time or the asset table could not be read, so these"
-      echo "    cannot be split into 'added since' and 'should have been there'."
+      echo "    NOT CLASSIFIED    : the backup window or the asset table could not be"
+      echo "                        read, so these cannot be separated into a gap, a"
+      echo "                        pending upload, or an unknown. Not treated as"
+      echo "                        either a pass or a defect."
+      [[ -n "$snapshot_time" ]] || echo "                        (the snapshot's own start time is unavailable)"
+      [[ -n "$window_end" ]]    || echo "                        (no success record pairs with snapshot $snapshot_id)"
     fi
     echo "  These exist in the asset table but their path is not in the snapshot,"
     echo "  so they are NOT protected off-site:"
@@ -3430,8 +3599,8 @@ authority for which files are originals."
     # finding mattered.
     sed -n "1,20{s|^$lib/||;s|^|    |;p}" "$missing"
     (( n_missing > 20 )) && echo "    ... and $(( n_missing - 20 )) more"
-    # Durable evidence. The full list used to exist only as 20 truncated lines
-    # on a terminal, so a finding could not be diagnosed without re-running.
+    # Durable evidence, per classification, so a gap can be acted on without
+    # re-running and without re-deriving which of the missing it was.
     local miss_file="$vdir/${target}-snapshot-missing.txt"
     if sed "s|^$lib/||" "$missing" > "$miss_file.tmp" 2>/dev/null; then
       chmod 0600 "$miss_file.tmp"; mv -f "$miss_file.tmp" "$miss_file"
@@ -3439,15 +3608,33 @@ authority for which files are originals."
     else
       rm -f "$miss_file.tmp"
     fi
-    echo
-    if (( split_known == 1 && n_older == 0 )); then
-      echo "  result            : PENDING -- every original that existed when snapshot"
-      echo "                      $snapshot_id was taken is present in it. The $n_newer"
-      echo "                      newer one(s) await the next backup run."
-      return 3
+    if (( class_known == 1 && n_gap > 0 )); then
+      local gap_file="$vdir/${target}-snapshot-gap.txt"
+      if sed "s|^$lib/||" "$gap_f" > "$gap_file.tmp" 2>/dev/null; then
+        chmod 0600 "$gap_file.tmp"; mv -f "$gap_file.tmp" "$gap_file"
+        echo "  BACKUP GAP list   : $gap_file"
+      else
+        rm -f "$gap_file.tmp"
+      fi
     fi
-    echo "  result            : INCOMPLETE -- off-site coverage is not total."
-    return 1
+    echo
+    case "$verdict" in
+      gap)
+        echo "  result            : BACKUP GAP -- $n_gap original(s) existed when snapshot"
+        echo "                      $snapshot_id began and are not in it. Investigate; do"
+        echo "                      not treat this as a pending upload."
+        ;;
+      pending)
+        echo "  result            : PENDING -- every original that existed when snapshot"
+        echo "                      $snapshot_id was taken is present in it. The $n_pend"
+        echo "                      newer one(s) await the next backup run."
+        ;;
+      *)
+        echo "  result            : UNKNOWN -- $n_missing original(s) are absent and their"
+        echo "                      timing could not be established. Not a pass."
+        ;;
+    esac
+    return "$rc_wanted"
   fi
 
   echo "  result            : every original the asset table names is present in"

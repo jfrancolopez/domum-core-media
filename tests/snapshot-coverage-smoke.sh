@@ -109,14 +109,23 @@ sect "the motion-photo original under encoded-video/ is reconciled too"
 grep -q 'originals         : 3' <<< "$out" || fail "the MP original was not counted: $out"
 echo "  all three, including the one outside upload/"
 
-sect "an original absent from the listing => INCOMPLETE, exit 1, named"
+sect "an original absent from the listing is NAMED and never passes"
+# This asserted exit 1 unconditionally. A missing original whose INGEST TIME
+# cannot be established is now UNKNOWN (exit 2) rather than being called a gap:
+# this fixture stubs no success record for the snapshot, so there is no backup
+# window to classify against. The invariant that matters is that it is named,
+# reported, and does not pass -- not which non-zero status it returns.
 out="$(run_cov "$SNAP_STUB_PART")"
-grep -q 'EXITCODE=1' <<< "$out" || fail "a missing original did not exit 1: $out"
+grep -q 'EXITCODE=0' <<< "$out" && fail "a missing original must never pass: $out"
 grep -q 'IN the snapshot   : 2 of 3' <<< "$out" || fail "wrong count: $out"
 grep -q 'MISSING FROM THE SNAPSHOT: 1' <<< "$out" || fail "the gap is not stated: $out"
 grep -q -- '676850ba' <<< "$out" || fail "the missing original is not NAMED: $out"
 grep -q 'NOT protected off-site' <<< "$out" || fail "the consequence is not stated: $out"
-echo "  2 of 3, exit 1, and the unprotected original is named"
+grep -q 'NOT CLASSIFIED' <<< "$out" \
+  || fail "with no backup window it must say the timing is not established: $out"
+grep -q 'result            : UNKNOWN' <<< "$out" \
+  || fail "an unclassifiable absence must be UNKNOWN, not a gap: $out"
+echo "  2 of 3, named, NOT CLASSIFIED, UNKNOWN -- and never exit 0"
 
 sect "generated files and markers are never counted as originals"
 # The listing contains a thumbnail and the library a marker; neither is in the
@@ -175,9 +184,17 @@ sect "--json is machine-readable and agrees with the text"
 out="$(run_cov "$SNAP_STUB_PART" --json)"
 line="$(grep '^{' <<< "$out" | head -1)"
 [[ -n "$line" ]] || fail "no JSON was emitted: $out"
-jq -e '.result == "incomplete" and .in_snapshot == 2 and .missing_from_snapshot == 1' \
+# The verdict comes from ONE decision function, so the JSON and the printed
+# report cannot disagree. Here the timing is unestablishable, so both say
+# "unknown" -- and the JSON carries the per-class counts and the window it
+# used, which is what automation needs to tell a gap from an upload.
+jq -e '.result == "unknown" and .in_snapshot == 2 and .missing_from_snapshot == 1
+       and .missing_classified == "unknown"
+       and .missing_backup_gap == 0' \
   <<< "$line" >/dev/null || fail "the JSON disagrees with the text: $line"
-echo "  result=incomplete, 2 in, 1 missing -- same as the report"
+grep -q 'result            : UNKNOWN' <<< "$out" \
+  || fail "the text verdict does not match the JSON: $out"
+echo "  result=unknown in BOTH, 2 in, 1 missing, gap=0, classified=unknown"
 
 # ---------------------------------------------------------------------------
 sect "against a REAL restic repository"
@@ -194,10 +211,30 @@ if command -v restic >/dev/null 2>&1; then
     restic backup --exclude "$LIB/encoded-video/**/*-MP.mp4" "$LIB" >/dev/null 2>&1 \
       || fail "the excluding backup failed"
     out="$(run_cov "$REAL")"
-    grep -q 'EXITCODE=1' <<< "$out" \
-      || fail "restic really excluded an original and coverage still passed: $out"
+    grep -q 'EXITCODE=0' <<< "$out" \
+      && fail "restic really excluded an original and coverage still passed: $out"
     grep -q -- '676850ba' <<< "$out" || fail "the really-missing original was not named: $out"
     echo "  restic's own file list drives both verdicts"
+
+    # The same real exclusion, now with a backup WINDOW available and the
+    # original's ingest time before it: a genuine defect must come out as a
+    # BACKUP GAP with exit 1, not be softened to UNKNOWN. This is the assertion
+    # that keeps the new classification from excusing real failures.
+    WINDOWED="$REAL
+dr_last_success_run() { printf '%s %s' '2099-01-01T00:00:00+00:00' \
+  \"\$(restic_for_target cloud snapshots --latest 1 --json 2>/dev/null \
+       | jq -r '.[-1].short_id')\"; }
+immich_db_paths_by_ingest() {
+  case \"\$1\" in before) immich_db_original_paths ;; after) : ;; esac; return 0; }"
+    out="$(run_cov "$WINDOWED")"
+    grep -q 'EXITCODE=1' <<< "$out" \
+      || fail "a real exclusion with a known window must exit 1: $out"
+    grep -q 'result            : BACKUP GAP' <<< "$out" \
+      || fail "a real exclusion must be classified as a BACKUP GAP: $out"
+    grep -qE 'BACKUP GAP +: 1' <<< "$out" || fail "the gap count is wrong: $out"
+    grep -q 'BACKUP GAP list' <<< "$out" \
+      || fail "the gap paths must be written to durable evidence: $out"
+    echo "  a real restic exclusion is a BACKUP GAP: exit 1, counted, listed"
   else
     echo "  SKIPPED: restic is present but a scratch repository could not be created"
   fi
@@ -232,8 +269,12 @@ mout="$(
 )"
 grep -q 'MISSING FROM THE SNAPSHOT: 3' <<< "$mout" \
   || fail "the mutant did not report a void comparison as a result: $mout"
-grep -q 'EXITCODE=1' <<< "$mout" \
-  || fail "the mutant did not produce a verdict from nothing: $mout"
+# A non-zero status, whichever it is: without the guard the mutant produces a
+# VERDICT from a comparison that matched nothing. The specific code depends on
+# whether the timing could be classified, which is not what this mutation is
+# about.
+grep -q 'EXITCODE=0' <<< "$mout" \
+  && fail "the mutant passed a void comparison: $mout"
 echo "  without the guard it reports all 3 as missing from a listing it never matched"
 
 # ---------------------------------------------------------------------------
@@ -262,14 +303,29 @@ done
 # a pipeline aborting the function UNDER errexit. A separate process keeps
 # errexit genuinely active and still yields an exit status to assert on.
 run_strict() {  # $1 = file of paths created after the snapshot (may be empty)
-  local recent="$1" script="$TMP_DIR/strict.sh"
+  # $1 = paths ingested at/after the window CLOSED (pending)
+  # $2 = paths ingested at/before the window OPENED (a gap) -- optional
+  local recent="$1" before="${2:-}" script="$TMP_DIR/strict.sh"
+  local T_OLD="$TMP_DIR/big-old"
+  if [[ -n "$before" ]]; then cp "$before" "$T_OLD"; else : > "$T_OLD"; fi
   cat > "$script" <<SH
 export DOMUM_DATA_ROOT="$TMP_DIR/data" DOMUM_MEDIA_ROOT="$TMP_DIR/media"
 export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$BIG_LIB" BACKUP_TARGETS=cloud
+export T_OLD="$T_OLD"
 source "${CLI_UNDER_TEST:-$REPO_ROOT/bin/domum-media-backup}" >/dev/null 2>&1
 set -euo pipefail
 immich_db_original_paths() { cat "$TMP_DIR/big-paths"; }
-immich_db_paths_created_after() { [[ -s "$recent" ]] && cat "$recent"; return 0; }
+immich_db_paths_by_ingest() {
+  # \$1 is escaped: this heredoc is UNQUOTED, so a bare \$1 would be expanded
+  # by the shell WRITING the script and the case would never match -- which it
+  # did, silently classifying every missing original as "during the window".
+  case "\$1" in
+    before) [[ -s "$T_OLD" ]] && cat "$T_OLD" ;;
+    after)  [[ -s "$recent" ]] && cat "$recent" ;;
+  esac
+  return 0
+}
+dr_last_success_run() { printf '%s %s' '2026-10-12T02:45:00-04:00' 'b18ea965'; }
 snapshot_path_listing() { cp "$TMP_DIR/big-ls" "\$3"; return 0; }
 restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
 backup_target_enabled() { return 0; }
@@ -288,11 +344,16 @@ grep -q 'MISSING FROM THE SNAPSHOT: 69' <<< "$out" \
   || fail "the missing count is wrong: $out"
 grep -q '\.\.\. and 49 more' <<< "$out" \
   || fail "the remainder line was lost -- the pipeline died before it: $out"
-grep -q 'result            : INCOMPLETE' <<< "$out" \
+grep -qE 'result            : (BACKUP GAP|UNKNOWN|PENDING)' <<< "$out" \
   || fail "the verdict was lost, which is the whole defect: $out"
-grep -q 'EXITCODE=1' <<< "$out" \
-  || fail "the exit status must be 1, not 141: $out"
-echo "  20 shown, 49 more announced, INCOMPLETE stated, exit 1"
+# The point is that a MEANINGFUL status survives the long listing, not which
+# one: with no ingest evidence either way these 69 are UNKNOWN, not a gap.
+rc="$(sed -nE 's/^EXITCODE=([0-9]+)$/\1/p' <<< "$out" | tail -1)"
+case "$rc" in
+  1|2|3) : ;;
+  *) fail "the status must be a verdict (1/2/3), not 141 or 0; got '$rc': $out" ;;
+esac
+echo "  20 shown, 49 more announced, a verdict stated, exit $rc (not 141)"
 
 sect "the FULL missing list is durable evidence, not 20 terminal lines"
 mf="$STATE/restore-verification/cloud-snapshot-missing.txt"
@@ -310,24 +371,32 @@ sect "missing originals are split by whether they EXISTED at snapshot time"
 # uploaded and read identically to a genuinely dropped original.
 tail -n +32 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
 out="$(run_strict "$TMP_DIR/big-recent")"
-grep -qE 'added AFTER the snapshot +: 69' <<< "$out" \
+grep -qE 'PENDING next run  +: 69' <<< "$out" \
   || fail "the newer count is wrong: $out"
-grep -qE 'present BEFORE the snapshot +: 0' <<< "$out" \
+grep -qE 'BACKUP GAP        +: 0' <<< "$out" \
   || fail "the older count is wrong: $out"
 grep -q 'result            : PENDING' <<< "$out" \
   || fail "all-newer must be PENDING, not a coverage failure: $out"
-grep -q 'only on THIS host now' <<< "$out" \
+grep -q 'only on THIS host' <<< "$out" \
   || fail "PENDING must still say they are unprotected right now: $out"
 grep -q 'EXITCODE=3' <<< "$out" || fail "PENDING must have its own exit status: $out"
 echo "  69 after / 0 before -> PENDING, exit 3, still called unprotected"
 
-sect "an original that PREDATES the snapshot is a real gap"
+sect "an original INGESTED BEFORE the window opened is a BACKUP GAP"
+# 5 of the 69 were already in Immich when the backup began, so their absence is
+# a defect and not a pending upload. This is the classification that must never
+# be softened.
 tail -n +37 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
-out="$(run_strict "$TMP_DIR/big-recent")"
-grep -qE 'present BEFORE the snapshot +: 5' <<< "$out" \
-  || fail "the 5 originals that predate the snapshot are not counted: $out"
-grep -q 'result            : INCOMPLETE' <<< "$out" \
-  || fail "an original older than the snapshot must fail the check: $out"
+sed -n '32,36p' "$TMP_DIR/big-paths" > "$TMP_DIR/big-before"
+out="$(run_strict "$TMP_DIR/big-recent" "$TMP_DIR/big-before")"
+grep -qE 'BACKUP GAP        +: 5' <<< "$out" \
+  || fail "the 5 originals ingested before the window are not counted: $out"
+grep -q 'BACKUP GAP list' <<< "$out" \
+  || fail "the gap paths must be written to durable evidence: $out"
+[[ "$(grep -c . "$STATE/restore-verification/cloud-snapshot-gap.txt")" == "5" ]] \
+  || fail "the durable gap list does not hold exactly the 5 gap paths"
+grep -q 'result            : BACKUP GAP' <<< "$out" \
+  || fail "an original ingested before the window must be a BACKUP GAP: $out"
 grep -q 'EXITCODE=1' <<< "$out" || fail "a real gap must exit 1: $out"
 echo "  5 predate it -> INCOMPLETE, exit 1"
 
@@ -344,7 +413,7 @@ tail -n +32 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
 out="$(run_strict "$TMP_DIR/big-recent")"
 grep -q 'result            : PENDING' <<< "$out" \
   || fail "mtime appears to have overridden the asset table: $out"
-grep -qE 'present BEFORE the snapshot +: 0' <<< "$out" \
+grep -qE 'BACKUP GAP        +: 0' <<< "$out" \
   || fail "files with a 2020 mtime were treated as predating the snapshot: $out"
 echo "  a 2020 mtime does not make a new asset old; the table decides"
 
@@ -357,7 +426,7 @@ out="$(
     source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
     set -euo pipefail
     immich_db_original_paths() { cat "$TMP_DIR/big-paths"; }
-    immich_db_paths_created_after() { return 1; }
+    immich_db_paths_by_ingest() { return 1; }
     snapshot_path_listing() { cp "$TMP_DIR/big-ls" "$3"; return 0; }
     restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
     backup_target_enabled() { return 0; }
@@ -366,10 +435,10 @@ out="$(
     echo "EXITCODE=$?"
   ) 2>&1
 )"
-grep -q 'cannot be split' <<< "$out" \
+grep -q 'NOT CLASSIFIED' <<< "$out" \
   || fail "an unreadable asset table must be admitted, not guessed: $out"
-grep -q 'result            : INCOMPLETE' <<< "$out" \
-  || fail "an unknown split must not be promoted to PENDING: $out"
+grep -q 'result            : UNKNOWN' <<< "$out" \
+  || fail "an unestablishable window must not be promoted to PENDING: $out"
 echo "  unknown split is stated, and never promoted to PENDING"
 
 sect "originals ABSENT from disk are still compared against the snapshot"
@@ -394,7 +463,7 @@ export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$ABS_LIB" BACKUP_TARGETS=cl
 source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
 set -euo pipefail
 immich_db_original_paths() { [[ -s "$1" ]] && cat "$1"; return 0; }
-immich_db_paths_created_after() { return 1; }
+immich_db_paths_by_ingest() { return 1; }
 snapshot_path_listing() { cp "$2" "\$3"; return 0; }
 restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
 backup_target_enabled() { return 0; }
@@ -440,7 +509,7 @@ export DOMUM_STATE_ROOT="$STATE" IMMICH_LIBRARY_DIR="$BIG_LIB" BACKUP_TARGETS=cl
 source "$cli" >/dev/null 2>&1
 set -euo pipefail
 immich_db_original_paths() { cat "$TMP_DIR/huge-paths"; }
-immich_db_paths_created_after() { return 1; }
+immich_db_paths_by_ingest() { return 1; }
 snapshot_path_listing() { cp "$TMP_DIR/huge-ls" "\$3"; return 0; }
 restic_for_target() { printf '[{"short_id":"b18ea965","time":"2026-10-12T02:42:57-04:00"}]'; }
 backup_target_enabled() { return 0; }
@@ -471,7 +540,7 @@ mrc="$(sed -nE 's/^EXITCODE=([0-9]+)$/\1/p' <<< "$mout" | tail -1)"
 # the CI runner, from the same mutant and the same fixture. Pinning 141 made
 # this assertion pass locally and fail in CI -- an exit code is not the
 # observable here; losing the verdict is.
-grep -q 'result            : INCOMPLETE' <<< "$mout" \
+grep -qE 'result            : (BACKUP GAP|UNKNOWN|PENDING)' <<< "$mout" \
   && fail "the mutant kept its verdict; this mutation proves nothing"
 case "$mrc" in
   1|3) fail "the mutant reached a meaningful verdict status ($mrc); it should have
@@ -486,19 +555,54 @@ fout="$(run_huge "$REPO_ROOT/bin/domum-media-backup")"
 grep -q 'MISSING FROM THE SNAPSHOT: 2999' <<< "$fout" \
   || fail "the fixed form miscounted: $(grep MISSING <<< "$fout")"
 grep -q '\.\.\. and 2979 more' <<< "$fout" || fail "the remainder line is wrong: $fout"
-grep -q 'result            : INCOMPLETE' <<< "$fout" || fail "the verdict was lost: $fout"
-grep -q 'EXITCODE=1' <<< "$fout" || fail "the fixed form must exit 1: $(grep EXITCODE <<< "$fout")"
-echo "  2999 missing: 20 shown, 2979 announced, INCOMPLETE, exit 1"
+grep -qE 'result            : (BACKUP GAP|UNKNOWN|PENDING)' <<< "$fout" \
+  || fail "the verdict was lost: $fout"
+frc="$(sed -nE 's/^EXITCODE=([0-9]+)$/\1/p' <<< "$fout" | tail -1)"
+case "$frc" in
+  1|2|3) : ;;
+  *) fail "the fixed form must reach a verdict status, got '$frc': $fout" ;;
+esac
+echo "  2999 missing: 20 shown, 2979 announced, a verdict, exit $frc (not 141)"
 
-sect "mutation: dropping the split must cry wolf on an ordinary upload"
-MUTS="$TMP_DIR/mut-split"
+sect "mutation: a BACKUP GAP reported as PENDING must be caught"
+# The dangerous direction. If a gap is classified as a pending upload, a backup
+# that silently skipped a family photo reads as the system working normally --
+# which is the whole reason the four classes exist.
+MUTS="$TMP_DIR/mut-gap"
 cp "$REPO_ROOT/bin/domum-media-backup" "$MUTS"
-sed -i 's/^    if (( split_known == 1 \&\& n_older == 0 )); then$/    if false; then/' "$MUTS"
-grep -q '^    if false; then' "$MUTS" || fail "the split mutation was not applied"
-tail -n +32 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
-mout="$(CLI_UNDER_TEST="$MUTS" run_strict "$TMP_DIR/big-recent")"
-grep -q 'result            : INCOMPLETE' <<< "$mout" \
-  || fail "without the split the all-newer case should report INCOMPLETE: $mout"
-echo "  killed: 69 ordinary uploads report INCOMPLETE instead of PENDING"
+sed -i 's/^    verdict=gap;      rc_wanted=1$/    verdict=pending;  rc_wanted=3/' "$MUTS"
+grep -q 'verdict=pending;  rc_wanted=3' "$MUTS" || fail "the gap mutation was not applied"
+# Exactly the gap fixture: 5 ingested before the window, 64 after.
+tail -n +37 "$TMP_DIR/big-paths" > "$TMP_DIR/big-recent"
+sed -n '32,36p' "$TMP_DIR/big-paths" > "$TMP_DIR/big-before"
+mout="$(CLI_UNDER_TEST="$MUTS" run_strict "$TMP_DIR/big-recent" "$TMP_DIR/big-before")"
+grep -q 'result            : PENDING' <<< "$mout" \
+  || fail "the mutation did not change the verdict; it proves nothing: $mout"
+grep -q 'EXITCODE=3' <<< "$mout" \
+  || fail "the mutant should return the pending status: $mout"
+# And the real thing must still disagree with it, on the same fixture.
+gout="$(run_strict "$TMP_DIR/big-recent" "$TMP_DIR/big-before")"
+grep -q 'result            : BACKUP GAP' <<< "$gout" \
+  || fail "the unmutated form must report a BACKUP GAP here: $gout"
+grep -q 'EXITCODE=1' <<< "$gout" || fail "a gap must exit 1: $gout"
+echo "  killed: the mutant calls 5 skipped originals PENDING and exits 3;"
+echo "  the real form calls them a BACKUP GAP and exits 1"
+
+sect "mutation: ignoring the window END must excuse a during-window ingest"
+# Without the window's closing time there is no band in which timing is
+# unknowable, so a file ingested mid-run would be declared pending.
+MUTW="$TMP_DIR/mut-window"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTW"
+sed -i 's/^  if (( n_missing > 0 )) \&\& \[\[ -n "\$snapshot_time" \&\& -n "\$window_end" \]\]; then$/  if (( n_missing > 0 )) \&\& [[ -n "$snapshot_time" ]]; then/' "$MUTW"
+grep -q 'n_missing > 0 )) && \[\[ -n "\$snapshot_time" \]\]; then' "$MUTW" \
+  || fail "the window mutation was not applied"
+: > "$TMP_DIR/big-recent"; : > "$TMP_DIR/big-before"
+wout="$(CLI_UNDER_TEST="$MUTW" run_strict "$TMP_DIR/big-recent" "$TMP_DIR/big-before")"
+# With both sets empty the real form must call all 69 UNKNOWN.
+rout="$(run_strict "$TMP_DIR/big-recent" "$TMP_DIR/big-before")"
+grep -qE 'timing UNKNOWN    +: 69' <<< "$rout" \
+  || fail "with no ingest evidence either way all 69 must be UNKNOWN: $rout"
+grep -q 'result            : UNKNOWN' <<< "$rout" || fail "verdict must be UNKNOWN: $rout"
+echo "  69 with no ingest evidence are UNKNOWN, never pending, never a gap"
 
 echo "PASS: snapshot-coverage-smoke"
