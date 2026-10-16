@@ -397,6 +397,47 @@ saying `FULL RECOVERY VERIFIED` is unreached, which is correct.
 
 ---
 
+## 5e. PENDING → BACKED UP, observed end to end (2026-10-15 / 16)
+
+The first validation of the missing-original **classification** against a real
+backup cycle, rather than against a fixture.
+
+| when | what the asset table and the snapshot said |
+|---|---:|
+| 2026-10-15 02:32 | backup ran, snapshot `d0829433` |
+| 2026-10-15 11:09:50 | five HEIC originals ingested (filesystem birth times `.02`–`.68` s apart) |
+| 2026-10-15 15:40 | coverage: **23,120 of 23,125**, five absent |
+| 2026-10-16 ~02:3x | the next scheduled backup ran |
+| 2026-10-16 10:20 | coverage: **23,127 of 23,127**, `gap 0, pending 0, unknown 0` |
+
+So the five were genuinely `PENDING NEXT BACKUP` and the next run collected
+them. **Confirmed backup gaps across the whole episode: zero.** The library grew
+to 23,127 in the meantime and those additions were collected too.
+
+What this establishes that a fixture cannot:
+
+- the `PENDING` classification was **right**, and the thing it predicted
+  actually happened on the next run;
+- the backup is collecting new originals without intervention;
+- the old reporting called this `INCOMPLETE -- off-site coverage is not total`
+  for a system that was working correctly. The wording was the only defect.
+
+The escalation path is the useful half and is still unexercised: had those five
+been absent from the 10-16 snapshot, their ingestion would have predated that
+backup's window and the same command would have reported **`BACKUP GAP`, exit
+1**, with the paths written to `cloud-snapshot-gap.txt`. That is the alert worth
+having, and it costs no false alarms in between, because a routine upload is
+stated without being numbered as a risk.
+
+### Deployment
+
+`b005d02`, via `operator/domum-media-deploy-reporting-fixes.sh --confirm`.
+Two executables installed (`domum-media`, `domum-media-backup`);
+`domum-media-report` was byte-identical and deliberately not reinstalled. The
+production checkout fast-forwarded `6551bd4` → `b005d02`, seven commits. All
+three installed files verified equal to the checkout afterwards, and verified
+again independently against `origin/main`. Nothing else was touched.
+
 ## 6. What one root run would settle
 
 ```
