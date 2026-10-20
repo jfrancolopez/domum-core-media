@@ -258,6 +258,12 @@ jobs:
       - name: Health checks smoke test
         run: tests/health-checks-smoke.sh
 
+      # checkup must PRODUCE a report. Silence is the one unacceptable outcome:
+      # `sudo domum-media checkup` printed nothing at all in production, and a
+      # blank report is indistinguishable from a healthy one.
+      - name: Checkup produces output
+        run: tests/checkup-produces-output-smoke.sh
+
       # A runbook command that does not exist is discovered during a recovery.
       - name: Documented commands audit
         run: python3 tests/documented-commands-audit.py

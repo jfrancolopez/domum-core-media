@@ -438,6 +438,73 @@ production checkout fast-forwarded `6551bd4` → `b005d02`, seven commits. All
 three installed files verified equal to the checkout afterwards, and verified
 again independently against `origin/main`. Nothing else was touched.
 
+## 5f. Operator-attested independent recovery (2026-10-20)
+
+**Not automated evidence, and not full application recovery.** Recorded because
+it is the first time any part of the chain was exercised from a machine other
+than the N100.
+
+The operator, from their Mac:
+
+1. connected to the Hetzner Storage Box;
+2. unlocked the Restic repository;
+3. downloaded two original HEIC photographs;
+4. opened both successfully.
+
+What this establishes: the off-site repository is reachable, its credentials
+work, and an original photograph can be retrieved and opened **without the
+N100**. That is claim 3 (`RESTORE TESTED`) for those two files, reached
+independently.
+
+What it does not establish: anything about the other 23,153 originals, the
+database, or a working Immich. It is a two-file manual proof, attested by the
+operator rather than produced by a command, and it is recorded as such.
+
+It does close one gap the off-host audit could only state as unproven: that the
+age private key and repository credentials held off the N100 are usable in
+practice. Two items remain unprovable from this host -- the key lives with the
+operator, and pgvecto.rs is deprecated, so the set of Immich versions able to
+import today's dump shrinks over time.
+
+## 5g. Storage health, measured 2026-10-20
+
+| | |
+|---|---|
+| `/dev/sda` | Samsung SSD 870 EVO, 931.5 GB, one partition |
+| | carries **both** `/srv/data` and `/srv/snapshots` |
+| `/dev/sdb` | KOWIN KAE2000A512HI47, 476.9 GB: `/boot/efi`, `/`, swap |
+| both | AHCI/SATA, so SMART is fully available **with smartmontools** |
+| `/srv/data` | 24% used, 715 GiB free; Btrfs reports dynamic inodes, so no inode limit |
+| `/` | 15% used, 366 GiB free, 29.0M free inodes |
+| Btrfs device counters | write/read/flush/corruption/generation all **0** |
+| Btrfs scrub | **never run**; 215.87 GiB to scrub |
+| kernel storage warnings, 30 days | **0** |
+
+### What this does and does not say
+
+No evidence of trouble: zero device errors, zero kernel storage warnings. But
+**there is no SMART measurement at all**, so wear level, reallocated sectors and
+power-on hours are unknown -- and wear-out is the predictable failure mode of an
+SSD. "No disk warnings" is therefore not "the disks are healthy", which is why
+`checkup` reports disk health as UNKNOWN with the remedy rather than staying
+silent.
+
+### Scrub policy
+
+`/dev/sda1` is a **single-device** Btrfs filesystem. A scrub verifies every
+checksum and will name a corrupted file, but with no second copy it **cannot
+repair** anything. That is still worth having: a named corrupt file is a file
+that can be restored from Hetzner, and 23,155 originals currently have nothing
+checking them. The cost is hours of read I/O on a 215.87 GiB filesystem.
+
+Because `/srv/data` and `/srv/snapshots` share that one device, a scrub covers
+both at once, and a failure of that device loses both the live tier and every
+local snapshot -- which is precisely why Hetzner is the recovery plan and local
+snapshots are not.
+
+No scrub has been started and no schedule has been changed.
+
+
 ## 6. What one root run would settle
 
 ```
