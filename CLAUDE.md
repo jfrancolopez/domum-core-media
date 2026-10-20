@@ -944,6 +944,65 @@ prune runs. The saving is therefore gradual by design, and the old snapshots are
 the fallback if the exclusion turns out to be wrong. Never prune to realise a
 saving sooner.
 
+**The report named the wrong backup scope, and the operator caught it from
+another machine.** Production, 2026-10-20: `dr-status` printed
+`included /srv/data` and `image archives 2 in /srv/data/backups/images (in the
+backup set)`. The operator listed the Hetzner snapshot from their Mac and saw
+**three** roots:
+
+    /srv/data/immich/library
+    /srv/data/immich/backup-staging
+    /var/lib/domum-media/recovery-pack
+
+Both are "right": the cloud target is **immich-only by design** -- the comment
+on `immich_only_include_paths` says it exists so `/srv/media` is never swept
+off-site -- while `dr_backup_scope` and `dr_path_configured` read the GLOBAL
+`BACKUP_INCLUDE_PATHS`, which defaults to `/srv/data`. So every coverage
+question was answered against a path set that target never uses, and
+`/srv/data/backups/images` looked covered merely because it sits under
+`/srv/data`.
+
+Measured with the shipped resolver against the real paths:
+
+| artefact | cloud target |
+|---|---|
+| Immich library | PRESENT (23,155/23,155 observed) |
+| Immich PostgreSQL dump (`immich/backup-staging`) | PRESENT |
+| Encrypted recovery pack | PRESENT -- config, secrets, repo metadata, Traefik `acme.json`, validated Uptime Kuma dump |
+| **exact-image archives** (`/srv/data/backups/images`) | **NOT COVERED** |
+| **jellyfin / plex / navidrome / calibre-web / kavita state** | **NOT COVERED** |
+
+The archives matter most: a recovery point is service + snapshot + the
+application that wrote it, and Plex's image is `identity,local` -- dangling,
+with no registry copy. So the snapshot half survives in Hetzner and the
+application half would not. That is now a named risk that states the
+consequence and offers the decision, rather than a line claiming coverage.
+
+`dr_target_roots` is the one implementation, and every caller passes its
+target. A coverage question with no target is answerable only against the
+global default, which is what produced the false claim.
+
+**The recovery pack's own path was hardcoded in the backup scope.**
+`immich_only_include_paths` contained the literal
+`/var/lib/domum-media/recovery-pack`, while the pack is written to
+`${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}`. They are equal on this
+host **by accident**. Move the state root or set `RECOVERY_PACK_DEST` and the
+backup would include a path that does not exist while the pack -- holding the
+config, the secrets, Traefik's ACME private key and Uptime Kuma's database --
+silently stopped being backed up, with the run still reporting success. The path
+is derived now; verified that the production scope is byte-identical and that it
+follows a moved state root.
+
+**Two tests were asserting the old, global-scoped behaviour.** One unset
+`BACKUP_INCLUDE_PATHS` and required UNKNOWN -- but the cloud target has its own
+built-in scope, so reporting UNKNOWN would itself be false; the third state is
+now exercised where it is real, by making the target's roots unresolvable. The
+other set the global to include the media root and required the
+reacquirable-tier finding to fire, against a path the target never reads. Both
+now establish scope the way the code resolves it. Before adapting a test to a
+change, ask which of the two is wrong -- here the behaviour was right and both
+fixtures were addressing a variable that had stopped mattering.
+
 **`dr-status` states the backup SCOPE, so the irreplaceable/reacquirable split
 is checked rather than assumed.** Measured: `/srv/media` (975 MiB of music,
 496 KiB of books) is **not** under the include root, so the replaceable tier is

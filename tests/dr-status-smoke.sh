@@ -70,7 +70,8 @@ for i in $(seq 4 20); do head -c 100 /dev/urandom > "$LIB/upload/aa/f$i.heic"; d
 } > "$TMP_DIR/dbstub.sh"
 bash -n "$TMP_DIR/dbstub.sh" || fail "the generated asset-table stub is not valid shell"
 
-run_dr() {
+run_dr() {  # $1 = optional shell evaluated after sourcing, to stub a function
+  local setup="${1:-}"
   (
     # shellcheck disable=SC1090
     source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
@@ -78,6 +79,7 @@ run_dr() {
     source "$TMP_DIR/dbstub.sh"
     set +e
     die() { echo "DIE: $*"; exit 9; }
+    [[ -n "$setup" ]] && eval "$setup"
     do_dr_status 2>&1
     echo "EXITCODE=$?"
   )
@@ -682,6 +684,88 @@ nas_rows="$(sed -n '/^target: nas/,/^$/p' <<< "$out" | grep -cE '^  immich ' || 
 echo "  the disabled target is named and claims nothing"
 
 # ---------------------------------------------------------------------------
+sect "the backup scope reported is the TARGET's, not the global default"
+# Production, 2026-10-20. The operator listed the Hetzner snapshot from their
+# Mac and saw THREE roots -- immich/library, immich/backup-staging and the
+# recovery pack -- while dr-status said `included /srv/data`. The cloud target
+# is immich-only by design; the report read the GLOBAL BACKUP_INCLUDE_PATHS.
+out="$(run_dr)"
+for want in 'included.*immich/library' 'included.*immich/backup-staging' \
+            'included.*recovery-pack'; do
+  grep -qE "$want" <<< "$out" || fail "the cloud target's root is missing ($want): $out"
+done
+grep -qE '^ +included +'"$TMP_DIR"'/data$' <<< "$out" \
+  && fail "it reported the GLOBAL include root instead of the target's: $out"
+echo "  three target roots reported, the global root is not"
+
+sect "a path under the global root but OUTSIDE the target's scope is NOT COVERED"
+# This is the whole defect in one assertion: /srv/data/backups/images sits
+# under /srv/data, so the global check said "in the backup set" while the cloud
+# target backs up none of it.
+mkdir -p "$DATA/backups/images"
+: > "$DATA/backups/images/plex-abc.tar"
+: > "$DATA/backups/images/calibre-web-def.tar"
+out="$(run_dr)"
+grep -q 'image archives *2 in .*NOT in the backup set' <<< "$out" \
+  || fail "the image archives must be reported as NOT covered: $(grep 'image archives' <<< "$out")"
+echo "  2 archives, correctly reported as NOT in the backup set"
+
+sect "the archives being off-site-absent is raised as a RISK, with the reason"
+# A recovery point is service + snapshot + the application that wrote it. The
+# snapshot half survives in Hetzner and the application half would not.
+grep -q 'exact-image archive(s) are NOT in the cloud backup set' <<< "$out" \
+  || fail "the gap is not raised as a risk: $out"
+grep -q 'APPLICATION half of a recovery point' <<< "$out" \
+  || fail "the risk does not say why it matters: $out"
+grep -q 'dangling with no registry copy' <<< "$out" \
+  || fail "the risk does not state that the local archive is the only copy: $out"
+# "either add" and the path are on separate output lines, so match the line
+# that actually carries the path.
+grep -qE 'backups/images to the target' <<< "$out" \
+  || fail "the risk does not offer the deliberate choice: $out"
+grep -q 'Decide deliberately' <<< "$out" \
+  || fail "the risk does not frame it as a decision: $out"
+echo "  raised, with the consequence and the decision named"
+
+sect "service state outside the target's scope is NAMED"
+# The operator should not have to infer which application state is absent.
+mkdir -p "$DATA/plex" "$DATA/jellyfin"
+out="$(run_dr)"
+grep -q 'application state NOT off-site' <<< "$out" \
+  || fail "uncovered service state is not reported: $out"
+grep -qE 'application state NOT off-site.*(plex|jellyfin)' <<< "$out" \
+  || fail "the services are not named: $(grep 'NOT off-site' <<< "$out")"
+grep -q 'the irreplaceable' <<< "$out" \
+  || fail "it must say the irreplaceable tier IS covered, or this reads as alarm: $out"
+echo "  named, with the irreplaceable tier distinguished"
+
+sect "the Immich library and the dump ARE reported as covered"
+# The fix must not swing the other way and under-report real coverage.
+grep -q 'in the backup set (config) *all' <<< "$out" \
+  || fail "the library must still be reported as configured-covered: $out"
+echo "  library still covered"
+
+sect "mutation: reading the GLOBAL include paths brings the false claim back"
+MUTS="$TMP_DIR/mut-scope"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTS"
+sed -i 's|^  roots="\$(dr_target_roots "\$target")"$|  roots="${BACKUP_INCLUDE_PATHS:-}"|' "$MUTS"
+grep -c 'roots="\${BACKUP_INCLUDE_PATHS:-}"' "$MUTS" | grep -qx 2 \
+  || fail "the scope mutation was not applied to both call sites"
+mout="$(
+  (
+    # shellcheck disable=SC1090
+    source "$MUTS" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    source "$TMP_DIR/dbstub.sh"
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    do_dr_status 2>&1
+  )
+)"
+grep -q 'image archives *2 in .*(in the backup set)' <<< "$mout" \
+  || fail "without the target scope the archives should read as COVERED: $(grep 'image archives' <<< "$mout")"
+echo "  killed: the global paths call the archives covered when they are not"
+
 sect "the scope block states what goes off-site, in both directions"
 out="$(run_dr)"
 grep -q 'BACKUP SCOPE' <<< "$out" || fail "no scope block: $out"
@@ -691,20 +775,46 @@ grep -q 'not in the backup set' <<< "$out" \
   || fail "the media tier is outside the include set and that was not stated: $out"
 echo "  include roots, exclusions and the replaceable tier are all named"
 
-sect "an UNSET include path is UNKNOWN, not 'not backed up'"
+sect "include paths that cannot be RESOLVED are UNKNOWN, not 'not backed up'"
 # A claim about configuration that was never read is worthless, and saying
 # "NOT in the backup set" for it is the same conflation this report prevents.
-out="$(BACKUP_INCLUDE_PATHS= run_dr)"
-grep -q 'BACKUP_INCLUDE_PATHS is not set' <<< "$out" \
-  || fail "an unset include set was not reported as UNKNOWN: $out"
+#
+# This used to unset BACKUP_INCLUDE_PATHS and expect UNKNOWN. That worked only
+# because the reporter read the GLOBAL variable. The cloud target has its own
+# built-in scope (immich-only), so unsetting a global cannot make its roots
+# unknown -- reporting UNKNOWN then would itself be false. The third state is
+# still reachable and still matters: it is when the target's roots cannot be
+# resolved at all.
+out="$(run_dr 'backup_target_include_paths() { printf ""; }')"
+grep -q 'no include paths are configured' <<< "$out" \
+  || fail "unresolvable roots were not reported as UNKNOWN: $out"
 no_row_claims "$out" "BACKED UP" && fail "it claimed BACKED UP with no include set"
-echo "  unset configuration reports UNKNOWN and claims no level"
+echo "  unresolvable roots report UNKNOWN and claim no level"
+
+sect "and a path question against unresolvable roots is UNKNOWN too"
+grep -q 'in the backup set (config) *UNKNOWN' <<< "$out" \
+  || fail "the per-path question must also be UNKNOWN, not NO: $out"
+grep -q 'image archives.*NOT in the backup set' <<< "$out" \
+  && fail "with no roots readable it must not assert the archives are absent: $out"
+echo "  neither the library nor the archives are asserted either way"
 
 sect "the media tier being INSIDE the include set is reported as a finding"
-out="$(BACKUP_INCLUDE_PATHS="$DATA $TMP_DIR/media" run_dr)"
+# Scope is established the way the code now resolves it -- per target. Setting
+# the GLOBAL BACKUP_INCLUDE_PATHS no longer affects the cloud target, which has
+# its own immich-only default, so a fixture that set the global was testing a
+# path the target never reads.
+out="$(run_dr 'backup_target_include_paths() { printf "%s %s" "'"$DATA"'" "'"$TMP_DIR"'/media"; }')"
 grep -q 'IN the backup set' <<< "$out" \
   || fail "a reacquirable tier inside the backup set was not flagged: $out"
+grep -q 'reacquirable data is being stored off-site' <<< "$out" \
+  || fail "it does not say why that is a finding: $out"
 echo "  reacquirable data stored off-site is called out"
+
+sect "and the replaceable tier OUTSIDE the scope is confirmed, not just silent"
+out="$(run_dr)"
+grep -q 'replaceable media tier.*not in the backup set' <<< "$out" \
+  || fail "the correct case must be stated too, or absence reads as unchecked: $out"
+echo "  stated either way"
 
 sect "the summary counts originals by LOCATION and names what is untested"
 out="$(run_dr)"

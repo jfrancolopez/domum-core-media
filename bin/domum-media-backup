@@ -50,9 +50,21 @@ load_cfg() {
 
 # Immich-only profile: photos + database dump + recovery pack. This is the
 # default for the cloud target so large media libraries are never uploaded.
+# The cloud target's scope: the irreplaceable library, the staged PostgreSQL
+# dump, and the encrypted recovery pack.
+#
+# The pack's path is DERIVED, not hardcoded. It was literally
+# `/var/lib/domum-media/recovery-pack`, which happens to equal
+# `$DOMUM_STATE_ROOT/recovery-pack` on this host and only by accident: the pack
+# is written to `${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}`. Move
+# the state root or set RECOVERY_PACK_DEST and the backup would include a path
+# that does not exist while the pack -- which holds the config, the secrets,
+# Traefik's ACME private key and Uptime Kuma's database -- silently stopped
+# being backed up, with the run still reporting success.
 immich_only_include_paths() {
-  printf '%s/immich/library %s/immich/backup-staging /var/lib/domum-media/recovery-pack' \
-    "$DOMUM_DATA_ROOT" "$DOMUM_DATA_ROOT"
+  local pack="${RECOVERY_PACK_DEST:-${DOMUM_STATE_ROOT:-/var/lib/domum-media}/recovery-pack}"
+  printf '%s/immich/library %s/immich/backup-staging %s' \
+    "$DOMUM_DATA_ROOT" "$DOMUM_DATA_ROOT" "$pack"
 }
 
 export_compose_env() {
@@ -2011,14 +2023,67 @@ dr_level_rank() {  # $1 = level -> 0..4, or empty
 # Is this path inside the configured backup set, and not excluded?
 # 0 = in the backup set, 1 = NOT in it, 2 = cannot tell.
 #
+# Every per-service state directory on the protected tier.
+#
+# Read from the filesystem rather than a hardcoded list: a service added later
+# must not silently drop out of the "is it off-site?" question. The immich
+# library is excluded because it is reported in its own right, in detail.
+service_state_dirs() {
+  local root="${DOMUM_DATA_ROOT%/}" d
+  [[ -d "$root" ]] || return 0
+  for d in "$root"/*; do
+    [[ -d "$d" ]] || continue
+    case "${d##*/}" in
+      immich|backups|lost+found) continue ;;
+      *.premigration|*.failed-*)  continue ;;
+    esac
+    printf '%s\n' "$d"
+  done
+}
+
+# The include roots a TARGET actually backs up.
+#
+# One implementation, because the question "is this path off-site?" has a
+# different answer per target and answering it from the global default produced
+# a report that claimed protection the cloud target does not provide.
+# The fallback comes FIRST so the delegating call is the LAST statement.
+#
+# Written the other way round, `backup_target_include_paths "$target"` sat
+# mid-function and tests/captured-stdout-purity-smoke.sh flagged it as leaking
+# another value-returning function's stdout into this one's return value --
+# correctly, because the audit cannot tell delegation from leakage unless the
+# call is last. The behaviour is identical either way; this ordering is the one
+# that is legible to the audit, and widening the audit to admit a caller is not
+# an option.
+dr_target_roots() {  # $1 = target (empty -> the global default)
+  local target="${1:-}"
+  if [[ -z "$target" ]] || ! declare -F backup_target_include_paths >/dev/null 2>&1; then
+    printf '%s' "${BACKUP_INCLUDE_PATHS:-}"
+    return 0
+  fi
+  backup_target_include_paths "$target"
+}
+
 # The third case matters: with no include paths known, "not in the backup set"
 # would be a claim about configuration that was never read, which is the exact
 # conflation this report exists to avoid.
-dr_path_configured() {  # $1 = path
-  local path="$1" root pat
+# $2 is the TARGET, and it matters more than anything else here.
+#
+# This read the GLOBAL `BACKUP_INCLUDE_PATHS` (default `/srv/data`) while the
+# cloud target actually backs up three narrow roots -- immich/library,
+# immich/backup-staging and the recovery pack. So every question asked of it was
+# answered against a path set that target never uses, and the report said
+# `included /srv/data` and `image archives … (in the backup set)` when the
+# archives live at `/srv/data/backups/images`, under none of the three.
+#
+# The operator caught it by listing the snapshot from their Mac and seeing three
+# roots where the report described one.
+dr_path_configured() {  # $1 = path, $2 = target
+  local path="$1" target="${2:-}" root pat roots
   local ok=1
-  [[ -n "${BACKUP_INCLUDE_PATHS:-}" ]] || return 2
-  for root in ${BACKUP_INCLUDE_PATHS:-}; do
+  roots="$(dr_target_roots "$target")"
+  [[ -n "$roots" ]] || return 2
+  for root in $roots; do
     case "$path" in
       "$root"|"$root"/*) ok=0 ;;
     esac
@@ -2247,7 +2312,7 @@ dr_immich_summary() {  # $1 = target, $2 = library root, $3 = counts, $4 = inven
     printf '    %-34s %s\n' "present on disk" "$(( n_orig - n_missing )) of $n_orig"
     (( n_missing > 0 )) && printf '    %-34s %s\n' "MISSING from disk" "$n_missing"
     local brc=0
-    dr_path_configured "$lib" || brc=$?
+    dr_path_configured "$lib" "$target" || brc=$?
     case "$brc" in
       0) printf '    %-34s %s\n' "in the backup set (config)" "all $n_orig" ;;
       1) printf '    %-34s %s\n' "in the backup set (config)" "NO -- not under any backup root" ;;
@@ -2364,14 +2429,15 @@ dr_immich_summary() {  # $1 = target, $2 = library root, $3 = counts, $4 = inven
 #
 # Reported rather than asserted: the include set is configuration, and a claim
 # about it that was never read is worthless.
-dr_backup_scope() {  # $1 = library root
-  local lib="$1" root pat
+dr_backup_scope() {  # $1 = library root, $2 = target
+  local lib="$1" target="${2:-}" root pat roots
   echo "  BACKUP SCOPE (what goes off-site)"
-  if [[ -z "${BACKUP_INCLUDE_PATHS:-}" ]]; then
-    printf '    %-34s %s\n' "include paths" "UNKNOWN -- BACKUP_INCLUDE_PATHS is not set"
+  roots="$(dr_target_roots "$target")"
+  if [[ -z "$roots" ]]; then
+    printf '    %-34s %s\n' "include paths" "UNKNOWN -- no include paths are configured"
     return 0
   fi
-  for root in ${BACKUP_INCLUDE_PATHS:-}; do
+  for root in $roots; do
     printf '    %-34s %s\n' "included" "$root"
   done
   while IFS= read -r pat; do
@@ -2381,7 +2447,7 @@ dr_backup_scope() {  # $1 = library root
 
   # The replaceable tier must not be paid for off-site. State it either way.
   local media_in=1
-  for root in ${BACKUP_INCLUDE_PATHS:-}; do
+  for root in $roots; do
     case "${DOMUM_MEDIA_ROOT%/}" in
       "${root%/}"|"${root%/}"/*) media_in=0 ;;
     esac
@@ -2393,10 +2459,29 @@ dr_backup_scope() {  # $1 = library root
     printf '    %-34s %s\n' "replaceable media tier" \
       "not in the backup set (correct: $DOMUM_MEDIA_ROOT is reacquirable)"
   fi
+  # What lives on the protected tier but is NOT in this target's scope.
+  #
+  # The cloud target is immich-only by design -- three roots, chosen so
+  # /srv/media is never swept off-site. The side effect was never stated: every
+  # other service's application state, and the exact-image archives a recovery
+  # point pairs with, are absent from Hetzner. The report said `included
+  # /srv/data` and left the operator to infer the rest.
+  local svc svc_path uncovered=""
+  for svc in $(service_state_dirs 2>/dev/null || true); do
+    svc_path="$svc"
+    [[ -d "$svc_path" ]] || continue
+    dr_path_configured "$svc_path" "$target" && continue
+    uncovered="$uncovered ${svc_path##*/}"
+  done
+  if [[ -n "$uncovered" ]]; then
+    printf '    %-34s %s\n' "application state NOT off-site" "${uncovered# }"
+    printf '    %-34s %s\n' "" "(reconstructable with effort; the irreplaceable"
+    printf '    %-34s %s\n' "" " tier is the Immich library, which IS covered)"
+  fi
   local arch="$DOMUM_DATA_ROOT/backups/images" arch_n
   arch_n="$(find "$arch" -maxdepth 1 -name '*.tar' 2>/dev/null | grep -c . || true)"
   printf '    %-34s %s\n' "image archives" \
-    "${arch_n:-0} in $arch$(dr_path_configured "$arch" && printf '%s' " (in the backup set)" || printf '%s' " (NOT in the backup set)")"
+    "${arch_n:-0} in $arch$(dr_path_configured "$arch" "$target" && printf '%s' " (in the backup set)" || printf '%s' " (NOT in the backup set)")"
 }
 
 # The risks that remain, named rather than left for the reader to infer.
@@ -2508,6 +2593,36 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
     fi
   fi
 
+  # The exact-image archives are the APPLICATION half of a recovery point, and
+  # they are not off-site.
+  #
+  # A recovery point is service + snapshot + the application that wrote it. The
+  # archives at $DOMUM_DATA_ROOT/backups/images hold the exact pre-upgrade
+  # images, and Plex's running image is identity,local -- dangling, with no
+  # registry copy -- so the local object is the ONLY copy. If this host is lost,
+  # the snapshot half survives in Hetzner and the application half does not.
+  local arch_dir arch_count
+  arch_dir="$DOMUM_DATA_ROOT/backups/images"
+  arch_count="$(find "$arch_dir" -maxdepth 1 -name '*.tar' 2>/dev/null | grep -c . || true)"
+  if [[ "${arch_count:-0}" -gt 0 ]]; then
+    local acfg=0
+    dr_path_configured "$arch_dir" "$target" || acfg=$?
+    if (( acfg == 1 )); then
+      n=$((n+1))
+      echo "    $n. $arch_count exact-image archive(s) are NOT in the $target backup set."
+      echo "       They are the APPLICATION half of a recovery point: the snapshot"
+      echo "       survives off-site and the image that wrote it would not. Plex's"
+      echo "       image is dangling with no registry copy, so the local archive is"
+      echo "       the only one. Decide deliberately -- either add"
+      echo "       $arch_dir to the target's include paths, or accept that"
+      echo "       rollback is a this-host-only capability."
+    elif (( acfg == 2 )); then
+      n=$((n+1))
+      echo "    $n. Whether the exact-image archives are off-site is UNKNOWN: no"
+      echo "       include paths could be read for $target."
+    fi
+  fi
+
   if ! dr_last_phase_a "$target" >/dev/null; then
     n=$((n+1)); echo "    $n. No Immich has ever been started against a recovered database."
     echo "       The dump imports, but nothing shows the APPLICATION accepts the"
@@ -2573,7 +2688,7 @@ do_dr_status() {
     local lvl ev
     lvl=UNKNOWN; ev="no evidence"
     local cfg_rc=0
-    dr_path_configured "$lib/upload" || cfg_rc=$?
+    dr_path_configured "$lib/upload" "$target" || cfg_rc=$?
     if (( cfg_rc == 2 )); then
       lvl=UNKNOWN; ev="BACKUP_INCLUDE_PATHS is not set, so coverage cannot be determined"
     elif (( cfg_rc == 1 )); then
@@ -2652,7 +2767,7 @@ do_dr_status() {
     rank="$(dr_level_rank "$lvl")"; (( rank < worst )) && worst="$rank"
 
     echo
-    dr_backup_scope "$lib"
+    dr_backup_scope "$lib" "$target"
     echo
     dr_immich_summary "$target" "$lib" "$dr_inv_counts" "$dr_inv_file"
     echo
