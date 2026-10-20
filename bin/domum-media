@@ -5431,6 +5431,16 @@ checkup_immich_offsite() {
     unk="$(jq -r '.missing_timing_unknown // 0' "$evidence" 2>/dev/null || echo 0)"
     snap="$(jq -r '.snapshot_id // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
     recorded="$(jq -r '.recorded_at // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
+    # Full coverage first. "Nothing is missing" needs no classification, and
+    # evidence written before that was understood still records
+    # `missing_classified: unknown` -- reading it as a finding turned the best
+    # possible state into an ACTION REQUIRED.
+    local miss
+    miss="$(jq -r '.missing_from_snapshot // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
+    if [[ "$miss" =~ ^[0-9]+$ ]] && (( miss == 0 )); then
+      checkup_add healthy "Immich originals: every one is in snapshot $snap (reconciled $recorded)."
+      continue
+    fi
     if [[ "$cls" != "known" ]]; then
       checkup_add warning "Immich off-site coverage for $target is recorded but NOT classified (snapshot $snap)."
       checkup_add action "sudo domum-media-backup verify-snapshot-coverage $target"

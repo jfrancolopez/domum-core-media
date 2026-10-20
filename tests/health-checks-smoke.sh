@@ -204,6 +204,45 @@ grep -q 'WARN|.*recorded but NOT classified' <<< "$out" \
 grep -q 'OK|Immich originals' <<< "$out" && fail "missing keys were read as healthy: $out"
 echo "  unclassified, never a clean zero"
 
+sect "FULL coverage is healthy even when the evidence predates classification"
+# Production, 2026-10-20. The evidence said 23155 of 23155 with zero missing --
+# the best possible state -- and `checkup` reported "recorded but NOT
+# classified" and demanded a reconciliation of a fully reconciled library. The
+# classification block was guarded on `n_missing > 0`, so nothing missing left
+# `missing_classified: unknown`. That would have been the first notification
+# this host ever sent, and it would have been wrong.
+printf '{"snapshot_id":"ab8c31c8","recorded_at":"t","originals":23155,"in_snapshot":23155,"missing_from_snapshot":0}\n' > "$EV"
+out="$(probe "$STUB" checkup_immich_offsite)"
+grep -q 'OK|Immich originals: every one is in snapshot ab8c31c8' <<< "$out" \
+  || fail "full coverage must be healthy: $out"
+grep -q 'ACT|' <<< "$out" && fail "full coverage demanded an action: $out"
+grep -q 'WARN|' <<< "$out" && fail "full coverage produced a warning: $out"
+echo "  healthy, no action, no warning -- nothing to classify is not unknown"
+
+sect "mutation: reading classification BEFORE the count brings the false alarm back"
+MUTFA="$TMP/mut-fa"
+cp "$CLI" "$MUTFA"
+sed -i 's/^    if \[\[ "\$miss" =~ \^\[0-9\]+\$ \]\] \&\& (( miss == 0 )); then$/    if false; then/' "$MUTFA"
+grep -q '^    if false; then' "$MUTFA" \
+  || fail "the full-coverage mutation was not applied; it proves nothing"
+mout="$(
+  (
+    export PATH="$TMP/bin:$PATH" DOMUM_STATE_ROOT="$TMP/state" ENABLE_IMMICH=1
+    # shellcheck disable=SC1090
+    source "$MUTFA" >/dev/null 2>&1
+    set +e
+    CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+    backup_target_names() { printf 'cloud\n'; }
+    backup_target_enabled() { :; }
+    checkup_immich_offsite
+    (( ${#CHECKUP_ACTIONS[@]} )) && printf 'ACT|%s\n' "${CHECKUP_ACTIONS[@]}"
+    true
+  ) 2>&1
+)"
+grep -q 'ACT|' <<< "$mout" \
+  || fail "without the count check a fully covered library should demand an action: $mout"
+echo "  killed: without it, 23155 of 23155 asks the operator to reconcile again"
+
 sect "never reconciled at all is a warning with the free remedy"
 rm -f "$EV"
 out="$(probe "$STUB" checkup_immich_offsite)"

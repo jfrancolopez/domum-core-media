@@ -26,7 +26,11 @@ mkdir -p "$UP" "$BIN" "$LIB" "$UNITS"
 # An upstream with two revisions: the second changes one of the three files.
 git init -q -b main "$UP"
 git -C "$UP" config user.email t@e; git -C "$UP" config user.name t
-mkdir -p "$UP/bin" "$UP/systemd"
+mkdir -p "$UP/bin" "$UP/systemd" "$UP/operator"
+# The script must exist in the FIRST commit: git does not commit an empty
+# directory, so without this the checkout has no operator/ copy and the
+# self-replacement check has nothing to compare against.
+cp "$SCRIPT" "$UP/operator/domum-media-deploy-reporting-fixes.sh"
 printf '[Unit]\nDescription=weekly\n[Service]\nExecStart=/bin/true\n' \
   > "$UP/systemd/domum-media-weekly-report.service"
 printf '[Unit]\nDescription=weekly\n[Timer]\nOnCalendar=Sun *-*-* 08:00:00\n' \
@@ -247,5 +251,42 @@ grep -q 'not a$\|not a' <<< "$out" || fail "it does not distinguish the two: $ou
 grep -q '== deployed ==' <<< "$out" \
   || fail "a gap must not fail the DEPLOYMENT, only be reported: $out"
 echo "  the gap is reported and the deployment still completes"
+
+sect "a script cannot deploy its own replacement -- it hands over"
+# Production, 2026-10-20: the fast-forward installed a NEWER copy of the
+# deployment script while the shell went on executing the one it had already
+# started. That older logic knew nothing about the systemd units added in the
+# same revision, so it installed one binary, skipped both units, and printed
+# "== deployed ==" as though complete. `systemctl cat` then said "No files
+# found".
+#
+# The fixture puts a CHANGED copy of the script in upstream, and the marker it
+# prints can only come from the new one.
+cp "$SCRIPT" "$UP/operator/domum-media-deploy-reporting-fixes.sh"
+printf 'say "NEW-SCRIPT-RAN"\n' >> "$UP/operator/domum-media-deploy-reporting-fixes.sh"
+git -C "$UP" add -A
+git -C "$UP" -c user.email=t@e -c user.name=t commit -qm 'change the deploy script'
+out="$(run --confirm)"
+grep -q 'handing over to the new one' <<< "$out" \
+  || fail "it did not hand over to its replacement: $out"
+grep -q 'NEW-SCRIPT-RAN' <<< "$out" \
+  || fail "the REPLACEMENT never ran -- this is the production defect: $out"
+# Exactly once: the handover must not loop.
+[[ "$(grep -c 'handing over to the new one' <<< "$out")" == "1" ]] \
+  || fail "it handed over more than once; the guard does not hold: $out"
+grep -q '== deployed ==' <<< "$out" || fail "the handover did not complete: $out"
+echo "  handed over once, the new version ran, and the run completed"
+
+sect "the DRY RUN warns that the script itself will change"
+# A dry run cannot hand over -- nothing has been fast-forwarded -- so it must
+# say the list may grow rather than present it as final.
+git -C "$CO" reset -q --hard "$REV1"
+out="$(run)"
+grep -q 'this deployment script itself changes in that revision' <<< "$out" \
+  || fail "the dry run does not warn that the script will change: $out"
+grep -q 'the list above may grow' <<< "$out" \
+  || fail "it does not say the file list is not final: $out"
+grep -q 'NEW-SCRIPT-RAN' <<< "$out" && fail "a dry run must not run the replacement: $out"
+echo "  warns the list may grow, and runs nothing"
 
 echo "PASS: deploy-reporting-rehearsal"

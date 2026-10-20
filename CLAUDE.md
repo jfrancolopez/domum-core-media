@@ -262,6 +262,44 @@ Its design follows the rules this file already records:
   the backup, not about installing a file, and conflating them would make a real
   finding look like a deployment problem.
 
+**A script cannot deploy its own replacement.** Production, 2026-10-20: the
+deployment fast-forwarded the checkout, which installed a NEWER copy of
+`operator/domum-media-deploy-reporting-fixes.sh`, while the shell went on
+executing the version it had already started. That older logic knew nothing
+about the systemd units added in the same revision, so it installed one binary,
+skipped BOTH unit files, and printed `== deployed ==` as though the job were
+complete. `systemctl cat` then reported `No files found` and the operator had to
+be told why. The dry run had looked right, because it was also the old script.
+
+It now records its own sha256 before anything can change it, and once the
+checkout holds a different copy it hands over -- `exec env
+DOMUM_DEPLOY_REEXECED=1 bash "$CHECKOUT/$SELF_REL" "$@"`. The guard makes it
+happen exactly once, and by then the fast-forward is a no-op so the second pass
+does all the installing with the complete target list. The dry run cannot hand
+over, so it says the script itself changes in that revision and the file list
+may grow. The rehearsal asserts the replacement really ran (a marker only the
+new copy prints), that the handover happens exactly once, and that a dry run
+runs nothing.
+
+Git does not commit an empty directory, so a fixture that needs the checkout to
+contain the script must put it in the FIRST commit; `mkdir -p` alone left
+nothing to compare against and the dry-run assertion silently had no subject.
+
+**"Nothing to classify" is not "unknown", and the distinction turned the best
+possible state into an alert.** Production, 2026-10-20: coverage reported
+`23155 of 23155, gap 0, pending 0, unknown 0` -- complete -- and `checkup` said
+*"recorded but NOT classified"* and demanded a reconciliation of a fully
+reconciled library. The classification block was guarded on `n_missing > 0`, so
+with nothing missing `class_known` stayed 0 and the evidence recorded
+`missing_classified: unknown`. **That would have been the first notification
+this host ever sent, and it would have been wrong** -- precisely the false alarm
+the four classes exist to prevent.
+
+Fixed at both ends, deliberately: the writer sets `class_known=1` when nothing
+is missing, and the reader checks the COUNT before the classification, so
+evidence already on disk from before this was understood also reads as healthy.
+A mutation removes the count check and requires the false alarm to return.
+
 **Installing a unit is not enabling it, and the deployment does only the
 first.** The weekly unit carries the `health-notify` step, so installing the
 file is what makes the notification AVAILABLE; enabling the timer is what starts

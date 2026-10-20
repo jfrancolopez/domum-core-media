@@ -3470,6 +3470,15 @@ authority for which files are originals."
   # `fileModifiedAt` and the file's mtime each get this wrong.
   local gap_f pend_f unk_f tmp_f n_gap=0 n_pend=0 n_unk=0 class_known=0
   local window_end=""
+  # Nothing missing means there is nothing to classify, and the classification
+  # is therefore COMPLETE -- not unknown. Guarding the whole block on
+  # `n_missing > 0` left class_known=0 for the best possible outcome, so the
+  # evidence recorded `missing_classified: unknown` for full coverage and
+  # `checkup` turned "23155 of 23155, gap 0" into an ACTION REQUIRED asking the
+  # operator to reconcile a library that was already fully reconciled. That
+  # would have been the first notification this host ever sent, and it would
+  # have been wrong.
+  (( n_missing == 0 )) && class_known=1
   if (( n_missing > 0 )); then
     # The window closes at the FINISHED_TS of the run that produced THIS
     # snapshot. A record for a different snapshot says nothing about this one.

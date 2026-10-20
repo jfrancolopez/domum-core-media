@@ -44,6 +44,11 @@ UNIT_DIR="${DOMUM_DEPLOY_UNIT_DIR:-/etc/systemd/system}"
 REMOTE="${DOMUM_DEPLOY_REMOTE:-origin}"
 BRANCH="${DOMUM_DEPLOY_BRANCH:-main}"
 
+# Where this script lives inside the repository, so it can tell when a
+# fast-forward replaces IT.
+SELF_REL="operator/domum-media-deploy-reporting-fixes.sh"
+REEXECED="${DOMUM_DEPLOY_REEXECED:-0}"
+
 CONFIRM=0
 EXPECT_REV=""
 SKIP_BEHAVIOUR=0
@@ -66,6 +71,8 @@ say()   { printf '  %s\n' "$*"; }
 [ "$(id -u)" -eq 0 ] || abort "must run as root: it installs into $BIN_DIR"
 [ -d "$CHECKOUT/.git" ] || abort "not a git checkout: $CHECKOUT"
 command -v jq >/dev/null 2>&1 || abort "jq is required to verify the new output"
+
+SELF_HASH="$(sha256sum "$0" | cut -d' ' -f1)"
 
 printf '== domum-media reporting deployment ==\n'
 say "checkout : $CHECKOUT"
@@ -149,6 +156,12 @@ for entry in $TARGETS $UNIT_TARGETS; do
 done
 
 if [ "$CONFIRM" -ne 1 ]; then
+  if [ -f "$CHECKOUT/$SELF_REL" ] \
+     && [ "$SELF_HASH" != "$(git -C "$CHECKOUT" show "$TARGET_REV:$SELF_REL" | sha256sum | cut -d' ' -f1)" ]; then
+    printf '\n  %s\n' "NOTE: this deployment script itself changes in that revision."
+    printf '  %s\n' "A --confirm run will fast-forward, then hand over to the new"
+    printf '  %s\n' "version, so the list above may grow. That is deliberate."
+  fi
   printf '\n  %s\n' "DRY RUN. $CHANGES file(s) would be installed; nothing was changed."
   printf '  %s\n' "Re-run with --confirm to apply."
   exit 0
@@ -162,6 +175,27 @@ if [ "$BEFORE_REV" != "$TARGET_REV" ]; then
   git -C "$CHECKOUT" merge --ff-only "$REMOTE/$BRANCH" >/dev/null \
     || abort "fast-forward failed"
   say "checkout now at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
+fi
+
+# A script cannot deploy its own replacement.
+#
+# This happened, in production, 2026-10-20: the fast-forward installed a NEWER
+# version of this very file into the checkout, while the shell went on executing
+# the version it had already started. That older logic knew nothing about the
+# systemd units added in the same revision, so it installed one binary, skipped
+# both unit files, and printed "== deployed ==" as though the job were complete.
+# `systemctl cat` then reported "No files found" and the operator had to be told
+# why.
+#
+# So once the checkout holds a different copy of this script than the one
+# running, hand over to it. The guard makes it exactly once: the replacement
+# sees DOMUM_DEPLOY_REEXECED=1, and by then the fast-forward is a no-op, so the
+# second pass does all the installing with the complete target list.
+if [ "$REEXECED" -eq 0 ] && [ -f "$CHECKOUT/$SELF_REL" ]; then
+  if [ "$SELF_HASH" != "$(sha256sum "$CHECKOUT/$SELF_REL" | cut -d' ' -f1)" ]; then
+    say "this deployment script changed in that fast-forward; handing over to the new one"
+    exec env DOMUM_DEPLOY_REEXECED=1 bash "$CHECKOUT/$SELF_REL" "$@"
+  fi
 fi
 
 for entry in $TARGETS; do
