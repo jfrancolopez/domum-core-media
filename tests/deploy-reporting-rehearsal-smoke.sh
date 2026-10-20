@@ -20,12 +20,17 @@ TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 
 UP="$TMP/upstream"; CO="$TMP/checkout"; BIN="$TMP/bin"; LIB="$TMP/lib"
-mkdir -p "$UP" "$BIN" "$LIB"
+UNITS="$TMP/units"
+mkdir -p "$UP" "$BIN" "$LIB" "$UNITS"
 
 # An upstream with two revisions: the second changes one of the three files.
 git init -q -b main "$UP"
 git -C "$UP" config user.email t@e; git -C "$UP" config user.name t
-mkdir -p "$UP/bin"
+mkdir -p "$UP/bin" "$UP/systemd"
+printf '[Unit]\nDescription=weekly\n[Service]\nExecStart=/bin/true\n' \
+  > "$UP/systemd/domum-media-weekly-report.service"
+printf '[Unit]\nDescription=weekly\n[Timer]\nOnCalendar=Sun *-*-* 08:00:00\n' \
+  > "$UP/systemd/domum-media-weekly-report.timer"
 for f in domum-media domum-media-backup domum-media-report; do
   printf '#!/usr/bin/env bash\necho old-%s\n' "$f" > "$UP/bin/$f"
   chmod +x "$UP/bin/$f"
@@ -49,6 +54,10 @@ fi
 echo new-backup
 NEWBK
 chmod +x "$UP/bin/domum-media-backup"
+# The weekly unit gains the notify step, which is what makes installing it the
+# thing that enables the FEATURE (not the timer).
+printf '[Unit]\nDescription=weekly\n[Service]\nExecStart=/bin/true\nExecStart=-/bin/true\n' \
+  > "$UP/systemd/domum-media-weekly-report.service"
 git -C "$UP" add -A; git -C "$UP" commit -qm two
 REV2="$(git -C "$UP" rev-parse HEAD)"
 
@@ -60,13 +69,32 @@ for f in domum-media domum-media-backup; do
   install -m 0755 "$CO/bin/$f" "$BIN/$f"
 done
 install -m 0755 "$CO/bin/domum-media-report" "$LIB/domum-media-report"
+install -m 0644 "$CO/systemd/domum-media-weekly-report.service" "$UNITS/"
+install -m 0644 "$CO/systemd/domum-media-weekly-report.timer" "$UNITS/"
 # Untracked, like the real production configuration: it must survive.
 mkdir -p "$CO/config"; printf 'SECRET_LOOKING=value\n' > "$CO/config/domum-media.conf"
 
+# systemd is not reachable inside `unshare -r`, so a real `daemon-reload` fails
+# and the script aborts -- correctly. The sandbox provides the external
+# dependency, exactly as it provides a fake git upstream, and RECORDS the call
+# so the reload can be asserted rather than assumed. The script's own check is
+# not weakened: a failing reload is still fatal.
+mkdir -p "$TMP/stub"
+cat > "$TMP/stub/systemctl" <<'SYSCTL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SYSCTL_LOG:?}"
+exit 0
+SYSCTL
+chmod +x "$TMP/stub/systemctl"
+export SYSCTL_LOG="$TMP/systemctl.log"
+: > "$SYSCTL_LOG"
+
 run() {  # rehearse as uid 0 without touching the host
   unshare -r env \
+    PATH="$TMP/stub:$PATH" SYSCTL_LOG="$SYSCTL_LOG" \
     DOMUM_DEPLOY_CHECKOUT="$CO" DOMUM_DEPLOY_BIN_DIR="$BIN" \
-    DOMUM_DEPLOY_LIB_DIR="$LIB" DOMUM_DEPLOY_REMOTE=origin \
+    DOMUM_DEPLOY_LIB_DIR="$LIB" DOMUM_DEPLOY_UNIT_DIR="$UNITS" \
+    DOMUM_DEPLOY_REMOTE=origin \
     bash "$SCRIPT" "$@" 2>&1
 }
 
@@ -142,6 +170,35 @@ grep -q 'verified domum-media-backup' <<< "$out" \
    == "$(sha256sum "$CO/bin/domum-media-backup" | cut -d' ' -f1)" ]] \
   || fail "the installed binary does not match the checkout"
 echo "  installed the changed file, skipped the unchanged, verified both"
+
+sect "the weekly unit is INSTALLED 0644, and NOTHING is enabled or started"
+# Installing the unit is what makes the notification available; enabling the
+# timer is what starts sending mail, and that stays the operator's decision.
+grep -q "installed $UNITS/domum-media-weekly-report.service (not enabled, not started)" <<< "$out" \
+  || fail "the weekly unit was not installed: $out"
+[[ "$(stat -c %a "$UNITS/domum-media-weekly-report.service")" == "644" ]] \
+  || fail "a unit must be 0644, got $(stat -c %a "$UNITS/domum-media-weekly-report.service")"
+[[ "$(sha256sum "$UNITS/domum-media-weekly-report.service" | cut -d" " -f1)" \
+   == "$(sha256sum "$CO/systemd/domum-media-weekly-report.service" | cut -d" " -f1)" ]] \
+  || fail "the installed unit does not match the checkout"
+grep -q 'no unit was enabled or started' <<< "$out" \
+  || fail "it does not state that nothing was enabled: $out"
+grep -qx 'daemon-reload' "$SYSCTL_LOG" \
+  || fail "systemd was never reloaded, so it has not seen the new unit: $(cat "$SYSCTL_LOG")"
+grep -qE '^(enable|start|restart)' "$SYSCTL_LOG" \
+  && fail "the deployment enabled or started a unit: $(cat "$SYSCTL_LOG")"
+grep -qE 'systemctl (enable|start|restart) ' <<< \
+  "$(grep -v '^ *#' "$SCRIPT" | grep -v 'printf')" \
+  && fail "the deployment script itself enables or starts a unit"
+grep -q 'systemctl enable --now domum-media-weekly-report.timer' <<< "$out" \
+  || fail "it does not tell the operator how to enable it deliberately: $out"
+echo "  installed 0644, matches the checkout, nothing enabled, remedy offered"
+
+sect "an UNCHANGED unit is not reinstalled"
+out2="$(run --confirm)"
+grep -q 'installed .*domum-media-weekly-report' <<< "$out2" \
+  && fail "an unchanged unit was reinstalled: $out2"
+echo "  skipped on a second run"
 
 sect "the untracked production configuration survived"
 [[ -f "$CO/config/domum-media.conf" ]] || fail "the production config was removed"
