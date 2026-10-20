@@ -176,6 +176,124 @@ grep -q 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out" \
 grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy: $out"
 echo "  flagged, with the scrub command"
 
+sect "the remedy quotes the MEASURED size and a derived duration, not \"hours\""
+# The remedy used to say "takes hours". Measured on this host, `Total to scrub`
+# is 215.87GiB on a SATA SSD -- about ten minutes. An order-of-magnitude
+# overstatement of a remedy's cost is the "a remedy that reads as expensive does
+# not get run" defect, applied to the one check that guards the photo library.
+out="$(probe '
+stat() { case "$*" in *-f*%T*) printf "btrfs\n" ;; *) command stat "$@" ;; esac; }
+btrfs() {
+  case "$1" in
+    device) printf "[/dev/sda1].write_io_errs 0\n" ;;
+    scrub)  printf "UUID: x\n        no stats available\nTotal to scrub:   215.87GiB\nError summary:    no errors found\n" ;;
+  esac
+}' checkup_btrfs_health)"
+grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy: $out"
+grep -q 'takes hours' <<< "$out" && fail "the remedy still overstates the cost: $out"
+grep -qE 'ACT\|btrfs scrub start .*~10 min' <<< "$out" \
+  || fail "the remedy must derive ~10 min for 215.87GiB on a non-rotational device: $out"
+grep -q '215.87GiB it reports' <<< "$out" \
+  || fail "the remedy must quote the size the filesystem itself reported: $out"
+echo "  ~10 min for the measured 215.87GiB, and the word 'hours' is gone"
+
+sect "an unparseable size omits the estimate instead of printing a zero"
+# A caller that gets nothing from the estimator must drop the clause. Printing
+# "~0 min" would be a fabricated measurement, and the whole point of the
+# estimate is that it was derived from something.
+out="$(probe '
+stat() { case "$*" in *-f*%T*) printf "btrfs\n" ;; *) command stat "$@" ;; esac; }
+btrfs() {
+  case "$1" in
+    device) printf "[/dev/sda1].write_io_errs 0\n" ;;
+    scrub)  printf "UUID: x\n        no stats available\nError summary:    no errors found\n" ;;
+  esac
+}' checkup_btrfs_health)"
+grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "the remedy must survive a missing size: $out"
+grep -q 'min for the' <<< "$out" && fail "it invented a duration from no size: $out"
+grep -q '~0 min' <<< "$out" && fail "it printed a zero estimate: $out"
+grep -q 'cannot repair without a second copy' <<< "$out" \
+  || fail "the repair limit must be stated either way: $out"
+echo "  no size, no estimate, and the repair limit is still stated"
+
+sect "the estimate uses the device's OWN rotational flag, both ways"
+# Both disks on this host are SSDs, so without DOMUM_SYSBLOCK_ROOT the 100 MB/s
+# branch could never be driven and a test would default to 400 and pass for the
+# wrong reason -- the fixture-skips-the-iteration mistake. Assert BOTH rates.
+SB="$TMP/sysblock"; mkdir -p "$SB/sdz/queue"
+est() {
+  (
+    export DOMUM_SYSBLOCK_ROOT="$SB"
+    # shellcheck disable=SC1090
+    source "$CLI" >/dev/null 2>&1
+    findmnt() { printf '/dev/sdz1[/@data]\n'; }
+    btrfs_scrub_estimate 'Total to scrub:   215.87GiB' /srv/data
+  )
+}
+echo 1 > "$SB/sdz/queue/rotational"
+rot="$(est)"
+echo 0 > "$SB/sdz/queue/rotational"
+ssd="$(est)"
+[[ "$rot" == "39 215.87GiB 100" ]] \
+  || fail "a rotational device must be rated 100 MB/s: got '$rot'"
+[[ "$ssd" == "10 215.87GiB 400" ]] \
+  || fail "a non-rotational device must be rated 400 MB/s: got '$ssd'"
+[[ "$rot" != "$ssd" ]] || fail "the rotational flag changed nothing: '$rot'"
+echo "  39 min spinning, 10 min solid-state, from sdz1 -> sdz"
+
+sect "a partition suffix is trimmed to find the block device"
+# findmnt reports /dev/sdz1[/@data]; the rotational flag lives under sdz.
+# Without the trim the lookup misses, the fallback rate applies, and the
+# rotational case would silently read as an SSD.
+rm -rf "$SB/sdz"; mkdir -p "$SB/nvme0n1/queue"; echo 1 > "$SB/nvme0n1/queue/rotational"
+nv="$(
+  export DOMUM_SYSBLOCK_ROOT="$SB"
+  # shellcheck disable=SC1090
+  source "$CLI" >/dev/null 2>&1
+  findmnt() { printf '/dev/nvme0n1p1[/@data]\n'; }
+  btrfs_scrub_estimate 'Total to scrub:   215.87GiB' /srv/data
+)"
+[[ "$nv" == "39 215.87GiB 100" ]] \
+  || fail "nvme0n1p1 must resolve to nvme0n1: got '$nv'"
+echo "  nvme0n1p1 -> nvme0n1"
+
+sect "mutation: ignoring the rotational flag makes a spinning disk read as an SSD"
+# An estimate that silently ignores the device class is how a plausible wrong
+# figure survives -- the same shape as quoting the cap that does not bind. The
+# mutation removes the rate selection and requires the two devices to agree,
+# which they must not.
+MUTROT="$TMP/mut-rot"
+cp "$CLI" "$MUTROT"
+sed -i 's/^    \[\[ "\$rota" == "1" \]\] \&\& rate=100$/    rate="$rate"/' "$MUTROT"
+grep -q '^    rate="\$rate"$' "$MUTROT" \
+  || fail "the rotational mutation was not applied; it proves nothing"
+grep -q 'rota" == "1" \]\] && rate=100' "$MUTROT" \
+  && fail "the mutation left the original line in place; it proves nothing"
+rm -rf "$SB/nvme0n1"; mkdir -p "$SB/sdz/queue"; echo 1 > "$SB/sdz/queue/rotational"
+mrot="$(
+  export DOMUM_SYSBLOCK_ROOT="$SB"
+  # shellcheck disable=SC1090
+  source "$MUTROT" >/dev/null 2>&1
+  findmnt() { printf '/dev/sdz1[/@data]\n'; }
+  btrfs_scrub_estimate 'Total to scrub:   215.87GiB' /srv/data
+)"
+[[ "$mrot" == "10 215.87GiB 400" ]] \
+  || fail "the mutation should rate a spinning disk as an SSD: got '$mrot'"
+echo "  killed: without the flag a 39-minute scrub is advertised as 10"
+
+sect "an unknown device falls back to the FASTER rate, and says the size anyway"
+# The fallback must not inflate the cost: an unknown device reported as
+# rotational would reintroduce the overstatement this section exists to remove.
+unk="$(
+  export DOMUM_SYSBLOCK_ROOT="$TMP/absent"
+  # shellcheck disable=SC1090
+  source "$CLI" >/dev/null 2>&1
+  findmnt() { printf '\n'; }
+  btrfs_scrub_estimate 'Total to scrub:   215.87GiB' /srv/data
+)"
+[[ "$unk" == "10 215.87GiB 400" ]] || fail "unknown device must not inflate: got '$unk'"
+echo "  unknown device -> 400 MB/s, size still quoted"
+
 sect "two roots on ONE filesystem are reported once, not twice"
 # Measured 2026-10-20: /srv/data and /srv/snapshots are both subvolumes of
 # /dev/sda1, uuid 211e06b3-.... Iterating by PATH produced two identical
