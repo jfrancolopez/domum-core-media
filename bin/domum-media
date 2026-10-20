@@ -5306,6 +5306,78 @@ checkup_systemd_health() {
   done <<< "$timers"
 }
 
+# How long a scrub of THIS filesystem will take, and whether it could repair
+# anything -- both read from the filesystem rather than asserted.
+#
+# The remedy used to say "takes hours". Measured on this host that is wrong by
+# roughly an order of magnitude: `Total to scrub: 215.87GiB` on a SATA SSD is
+# about ten minutes. The rule this project already records is that a remedy
+# which reads as expensive does not get run, and a 10-minute read-only
+# verification of 23,155 irreplaceable originals is the cheapest safety work
+# available here. So the estimate is derived, and the operator is told the real
+# size.
+#
+# Dividing bytes by a rate is legitimate HERE, unlike the verify-large estimate
+# that had to simulate its packing: a scrub is one pass over the allocated
+# extents with no per-run count cap and nothing it cannot split. The mechanism
+# IS the division. The rate is chosen from the device's own rotational flag,
+# because 100 MB/s and 400 MB/s are not the same answer.
+#
+# Emits "<minutes> <size> <rate>" on stdout, or nothing when the size could not
+# be parsed -- a caller that gets nothing must omit the estimate rather than
+# print a zero.
+btrfs_scrub_estimate() {  # $1 = scrub status text, $2 = root
+  local status="$1" root="$2" size unit bytes src dev rota rate mins
+  size="$(sed -nE 's/^[[:space:]]*Total to scrub:[[:space:]]+([0-9.]+)[[:space:]]*([KMGTP]i?B)[[:space:]]*$/\1 \2/p' <<< "$status" | tail -1)"
+  [[ -n "$size" ]] || return 0
+  unit="${size##* }"
+  size="${size%% *}"
+  case "$unit" in
+    KiB|KB) bytes="$(awk -v n="$size" 'BEGIN{printf "%d", n*1024}')" ;;
+    MiB|MB) bytes="$(awk -v n="$size" 'BEGIN{printf "%d", n*1024*1024}')" ;;
+    GiB|GB) bytes="$(awk -v n="$size" 'BEGIN{printf "%d", n*1024*1024*1024}')" ;;
+    TiB|TB) bytes="$(awk -v n="$size" 'BEGIN{printf "%d", n*1024*1024*1024*1024}')" ;;
+    *) return 0 ;;
+  esac
+  (( bytes > 0 )) || return 0
+
+  # Rotational is per-device; any spinning member sets the slower rate, because
+  # the scrub is only as fast as its slowest device.
+  #
+  # DOMUM_SYSBLOCK_ROOT exists so the rotational branch can be TESTED. Both
+  # disks on this host are SSDs, so without an overridable root the 100 MB/s
+  # path could never be driven and the test would default to 400 and pass for
+  # the wrong reason -- the fixture-skips-the-iteration mistake again. It
+  # defaults to the production path.
+  rate=400
+  local sysblock="${DOMUM_SYSBLOCK_ROOT:-/sys/block}"
+  src="$(findmnt -no SOURCE --target "$root" 2>/dev/null || true)"
+  src="${src%%[*}"
+  dev="${src##*/}"
+  if [[ -n "$dev" ]]; then
+    # sda1 -> sda, nvme0n1p1 -> nvme0n1.
+    #
+    # Shave ONE trailing [0-9p] at a time, not "all trailing digits": stripping
+    # only digits stops at nvme0n1p and never reaches nvme0n1, so an NVMe
+    # device fell through to the fallback rate and a spinning disk would have
+    # read as an SSD. The existence check is what stops it over-trimming -- it
+    # cannot walk past a real device name, because that name matches first.
+    rota=""
+    while [[ -n "$dev" ]]; do
+      if [[ -r "$sysblock/$dev/queue/rotational" ]]; then
+        rota="$(cat "$sysblock/$dev/queue/rotational" 2>/dev/null || true)"
+        break
+      fi
+      [[ "$dev" == *[0-9p] ]] || break
+      dev="${dev%?}"
+    done
+    [[ "$rota" == "1" ]] && rate=100
+  fi
+
+  mins="$(awk -v b="$bytes" -v r="$rate" 'BEGIN{m=b/(r*1000000)/60; printf "%d", (m<1?1:m+0.5)}')"
+  printf '%s %s%s %s' "$mins" "${size}" "$unit" "$rate"
+}
+
 # Btrfs device error counters and scrub age, for every Btrfs root this project
 # depends on.
 #
@@ -5385,7 +5457,14 @@ checkup_btrfs_health() {
     # a clean result.
     if grep -qE 'no stats available|never ran' <<< "$scrub"; then
       checkup_add warning "Btrfs on $root has NEVER been scrubbed -- nothing is looking for silent corruption (one scrub covers every subvolume on this filesystem)."
-      checkup_add action "btrfs scrub start $root   # read-only verify, takes hours; detects checksum errors but cannot repair without a second copy"
+      local est est_mins est_size
+      est="$(btrfs_scrub_estimate "$scrub" "$root")"
+      if [[ -n "$est" ]]; then
+        est_mins="${est%% *}"; est_size="$(cut -d' ' -f2 <<< "$est")"
+        checkup_add action "btrfs scrub start $root   # read-only, ~${est_mins} min for the ${est_size} it reports; detects checksum errors but cannot repair without a second copy"
+      else
+        checkup_add action "btrfs scrub start $root   # read-only; detects checksum errors but cannot repair without a second copy"
+      fi
       continue
     fi
     last="$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+(.*)$/\1/p' <<< "$scrub" | tail -1)"

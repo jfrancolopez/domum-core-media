@@ -1926,6 +1926,77 @@ which a comment naming `service_upgrade` once fooled identically. Stripping too
 much would blind it, so the smoke test asserts BOTH directions: the real tree is
 clean, and a genuine `$(health_summary_text)` capture is still caught.
 
+**The scrub remedy overstated its own cost by an order of magnitude.**
+`checkup` told the operator `btrfs scrub start /srv/data   # read-only verify,
+takes hours`. Measured: `Total to scrub: 215.87GiB` on a `Samsung SSD 870 EVO
+1TB` (SATA, non-rotational) is about **ten minutes**, not hours. This file
+already records that *a remedy that reads as expensive does not get run*, and
+this was that rule applied to the one check standing between silent bit-rot and
+23,155 irreplaceable originals. `btrfs_scrub_estimate` now reads the
+`Total to scrub:` line the filesystem itself reports and picks the rate from
+`/sys/block/<dev>/queue/rotational` -- 400 MB/s solid-state, 100 MB/s spinning.
+Dividing bytes by a rate is legitimate HERE, unlike the `verify-large`
+estimate: a scrub is one pass over the allocated extents with no count cap and
+nothing it cannot split, so the division IS the mechanism. An unparseable size
+omits the clause rather than printing `~0 min`.
+
+Three things that only driving it revealed:
+
+- **Stripping trailing DIGITS stops at `nvme0n1p`** and never reaches
+  `nvme0n1`, so an NVMe root fell through to the fallback rate and a spinning
+  disk would have read as an SSD. Shave one trailing `[0-9p]` at a time and let
+  the existence check stop the walk -- it cannot pass a real device name,
+  because that name matches first.
+- **`DOMUM_SYSBLOCK_ROOT` exists so the rotational branch can be tested at
+  all.** Both disks here are SSDs, so without an overridable root the 100 MB/s
+  path could never be driven and the test would default to 400 and pass for the
+  wrong reason -- the fixture-skips-the-iteration mistake. It defaults to the
+  production path, and the mutation that ignores the flag must make a
+  39-minute scrub advertise itself as 10.
+- **I rewrote a clause that was already correct.** "cannot repair without a
+  second copy" became "cannot repair data on a single-device filesystem", and
+  an existing assertion caught it. The original is the better statement: it is
+  true of `Data: single` AND correctly implies `Metadata: DUP` *can* be
+  repaired, whereas a single-device filesystem with `-d dup` could repair data
+  too. Before adapting a test to a change, ask which of the two is wrong -- here
+  the test was right.
+
+**`ionice` does nothing to a scrub on this host, so never offer it as the
+throttle.** `btrfs scrub start -c 3` is the obvious gentleness flag and is
+silently ineffective: `/sys/block/sda/queue/scheduler` is `mq-deadline`, and
+`btrfs-scrub(8)` states that ionice is supported only by BFQ and that the
+options "may not work as expected" otherwise. (`-n 18` was wrong independently
+-- ioprio classdata is 0-7, not a nice value.) The lever that works on any
+scheduler is btrfs-progs' own `--limit`, which resets itself when the scrub
+finishes. A flag that describes a protection it does not provide is the defect
+family this file keeps correcting; it is named in
+`docs/BTRFS-SCRUB-PLAN.md` rather than quietly included in the command.
+
+**One scrub covers the whole filesystem, and the profiles decide what it can
+fix.** Measured 2026-10-20, without root -- `btrfs filesystem df` needs no
+privilege, which is why these facts could be established at all:
+
+```
+Data,     single: total=218.01GiB, used=215.26GiB   <- ONE copy
+Metadata, DUP:    total=1.00GiB,   used=313.98MiB   <- two copies, same SSD
+System,   DUP:    total=8.00MiB,   used=48.00KiB
+```
+
+So a **metadata** checksum error is repairable by scrub and a **data** one is
+not: there is no second copy of the photo library. The honest claim is that a
+scrub on this host **detects** silent corruption in the family photos and
+**cannot repair** it -- the remedy is restoring the named file from restic, and
+the backup-scope correction above decides whether that is even possible
+(`immich/library` yes; `/srv/data/backups/images` and the five migrated
+services NOT COVERED). Both DUP copies are on the same physical SSD, so DUP
+protects against a bad block, not against the device failing.
+
+**No scrub has been started, and no scrub timer exists.**
+`docs/BTRFS-SCRUB-PLAN.md` holds the duration arithmetic, the windows to avoid,
+what a checksum error means, the recovery actions, and a proposed monthly unit
+that is deliberately not written. Starting a scrub and enabling a timer are
+operator actions.
+
 ---
 
 ## 15. Known open safety defects
