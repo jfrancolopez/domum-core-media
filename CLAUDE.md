@@ -1673,6 +1673,45 @@ configured and no path is moved.
 
 ---
 
+**A grep that finds nothing killed `checkup` entirely.** Production,
+2026-10-20: `sudo domum-media checkup` printed NOTHING -- not a header, not an
+error -- and `bash -x` located it at
+
+```
+reset_recent="$(find … -print0 | xargs -0 grep -l … | wc -l | tr -d ' ')"
+```
+
+With history files present but no `delay_reset` event among them, `grep -l`
+exits 1, `pipefail` fails the pipeline, the ASSIGNMENT fails, and `set -e`
+exits the shell -- after every check has run and before one line of the report
+is printed. Reproduced standalone: exit 123, and the next line never executed.
+**The command died precisely when there was nothing wrong to report**, and a
+blank report is indistinguishable from a healthy one. Finding nothing is the
+normal answer, so it takes `|| true`, and `xargs -r` stops grep being run with
+no file arguments at all. This is the rule this file already states -- "when a
+function's failure is EXPECTED and handled, capture it with `|| true`" -- in the
+one place where breaking it blinded the whole report.
+
+**The same two lines could never have matched anything.** The patterns were
+`\"EVENT='delay_reset'\"`, and inside a double-quoted command substitution
+those backslashed quotes reach grep as LITERAL characters, so the pattern
+searched for was `"EVENT='delay_reset'"`, quotes included. `write_env_kv` uses
+`printf '%s=%q'`, and `%q` leaves a plain word unquoted, so the file contains
+`EVENT=delay_reset`. Measured: the shipped pattern matches that file zero times.
+**Both the delay-reset and failed-update checks could only ever answer zero,
+for as long as they have existed** -- the same shape as the archive marker that
+could only answer "yes". The fixture had to be corrected too: it invented
+quotes, which would have matched the broken pattern and hidden the defect.
+
+**`command -v` depends on PATH, and root's PATH is not the operator's.** I
+reported that `smartmontools` was absent and that no SMART measurement existed
+on this host. It was installed all along (7.4-3): `smartctl` lives in
+`/usr/sbin`, which is on root's PATH and not on the user's, so my probe as
+`jfranco` found nothing while `checkup` -- which runs under sudo -- was reading
+SMART successfully for both disks. Two of the six healthy checks were those
+SMART passes. Never conclude a tool is missing from a `command -v` run as a
+different user than the one that will execute the code.
+
 **HEALTHY must not mean UNMEASURED.** Production, 2026-10-20: `health-notify
 --dry-run` reported `VERDICT: HEALTHY, 6 healthy, 0 warnings` on a host where
 `smartmontools` was absent and `/srv/data` had **never been scrubbed** --

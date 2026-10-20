@@ -5813,8 +5813,32 @@ checkup_cmd() {
   (( waiting_count > 0 )) && checkup_add warning "${waiting_count} service update candidates are waiting."
   [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]] && checkup_add warning "Immich bundle candidate is pending."
 
-  reset_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -7 -print0 2>/dev/null | xargs -0 grep -l \"EVENT='delay_reset'\" 2>/dev/null | wc -l | tr -d ' ')"
-  failed_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -30 -print0 2>/dev/null | xargs -0 grep -l \"RESULT='failure'\" 2>/dev/null | wc -l | tr -d ' ')"
+  # `|| true` and `xargs -r`, because FINDING NOTHING IS THE NORMAL ANSWER.
+  #
+  # This killed `domum-media checkup` outright in production, 2026-10-20: it
+  # printed nothing at all -- not a header, not an error. With history files
+  # present but no delay_reset event among them, `grep -l` exits 1, `pipefail`
+  # makes the pipeline fail, the ASSIGNMENT fails, and `set -e` exits the shell
+  # right here -- after every check has run and before a single line of the
+  # report is printed. Reproduced standalone: exit 123 (xargs relaying grep's
+  # status) and the following line never executed.
+  #
+  # So the command died precisely when there was nothing wrong to report, and a
+  # blank report is indistinguishable from a healthy one. `xargs -r` also stops
+  # grep being run with no file arguments at all, where it would read stdin.
+  # The patterns match what write_env_kv ACTUALLY writes.
+  #
+  # They were `\"EVENT='delay_reset'\"`, and inside a double-quoted command
+  # substitution those backslashed quotes reach grep as LITERAL characters --
+  # so the pattern searched for was `"EVENT='delay_reset'"`, quotes and all.
+  # write_env_kv uses `printf '%s=%q'`, and %q leaves a plain word unquoted, so
+  # the file contains `EVENT=delay_reset`. The pattern could NEVER match:
+  # measured, both checks could only ever answer zero, for as long as they have
+  # existed. A check that cannot report a finding is not a check -- the same
+  # shape as the archive marker that could only answer "yes".
+  reset_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -7 -print0 2>/dev/null | xargs -0 -r grep -l '^EVENT=delay_reset$' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  failed_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -30 -print0 2>/dev/null | xargs -0 -r grep -l '^RESULT=failure$' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  reset_recent="${reset_recent:-0}"; failed_recent="${failed_recent:-0}"
   (( reset_recent > 0 )) && checkup_add warning "${reset_recent} delay-reset events in the last 7 days."
   (( failed_recent > 0 )) && checkup_add warning "${failed_recent} failed update events in the last 30 days."
 
