@@ -85,6 +85,42 @@ $out"
 done
 echo "  header and all four sections present"
 
+sect "checkup survives history files that contain NO matching event"
+# The production cause, 2026-10-20. `domum-media checkup` printed nothing at
+# all. With .env history files present but no delay_reset event among them,
+# `grep -l` exits 1, pipefail fails the pipeline, the ASSIGNMENT fails, and
+# set -e exits the shell -- after every check has run and before one line of
+# the report is printed.
+#
+# The command therefore died precisely when there was nothing wrong to report,
+# and a blank report is indistinguishable from a healthy one.
+mkdir -p "$TMP/state/update-history"
+# The real format: write_env_kv uses printf '%s=%q', and %q leaves a plain
+# word UNQUOTED. A fixture that invents quotes would have matched the broken
+# pattern and hidden the defect.
+printf 'RESULT=success\n' > "$TMP/state/update-history/a.env"
+printf 'RESULT=success\n' > "$TMP/state/update-history/b.env"
+out="$(run_checkup)"
+grep -q 'domum-media checkup' <<< "$out" \
+  || fail "history files with no matching event killed the report again:
+$out"
+for section in 'Critical:' 'Warnings:' 'Healthy:' 'Suggested actions:'; do
+  grep -q "$section" <<< "$out" || fail "the '$section' section is missing: $out"
+done
+grep -q 'delay-reset events' <<< "$out" \
+  && fail "it reported delay-reset events when none exist: $out"
+echo "  report intact, and no phantom delay-reset warning"
+
+sect "and it still COUNTS the events when they do exist"
+# The fix must not silence a real finding: `|| true` absorbs grep's no-match
+# status, not its matches.
+printf 'EVENT=delay_reset\n' > "$TMP/state/update-history/c.env"
+printf 'EVENT=delay_reset\n' > "$TMP/state/update-history/d.env"
+out="$(run_checkup)"
+grep -q '2 delay-reset events in the last 7 days' <<< "$out" \
+  || fail "real delay-reset events were not counted: $out"
+echo "  2 events counted -- the guard absorbs no-match, not matches"
+
 sect "every section is reached even when the new host checks find problems"
 # The four host/storage/off-site checks run LAST, immediately before the
 # report. If one of them aborts, the operator sees nothing -- which is exactly
