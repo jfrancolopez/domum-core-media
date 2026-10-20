@@ -1619,6 +1619,76 @@ configured and no path is moved.
 
 ---
 
+**Nothing on this host proactively told the operator anything.** Measured
+2026-10-20: five timers ran (backup nightly, restic check weekly, snapshot
+prune weekly, host update weekly, DR reminder quarterly), every one wrote to the
+journal, the DR reminder appended to a logfile, and
+`domum-media-weekly-report.service` wrote a report file -- and **nothing read
+any of it**. The weekly-report timer was not even installed on the host. The
+operator learned the state of the server by running commands by hand, which is
+the babysitting the whole phase exists to end.
+
+`domum-media health-notify` is the one notification path, wired as a second
+`ExecStart` on the existing weekly unit rather than as a new timer. Its contract:
+
+| state | behaviour |
+|---|---|
+| healthy | **no mail at all** -- silence IS the healthy signal |
+| expected activity | recorded in the summary, never mailed on its own |
+| action required | one mail, naming the remedy |
+| critical | one mail, named first |
+
+Silence is only trustworthy if the checks cannot fail quietly, so **an input
+that cannot be read is a WARNING naming the remedy, never a pass.** Measured:
+`smartctl` and `nvme` are absent here, so disk health reports
+`UNKNOWN: smartmontools is not installed` with the `apt-get` line rather than
+"no disk warnings" from a host that cannot read SMART at all. Nothing is
+installed automatically -- that is a host change and belongs to the operator.
+
+`tests/health-notify-smoke.sh` mutates the silence gate away and requires a
+perfectly healthy server to start mailing; without that mutation the gate could
+rot into "always send" and nobody would notice, because mail arriving is not
+evidence that mail is meaningful.
+
+**Checks added because nothing covered them**, all of which existed only as
+journal lines before:
+
+- `systemctl --failed` lists only units CURRENTLY failed, so the last exit
+  status of every domum timer's service is read separately -- a weekly restic
+  integrity check that failed and was restarted was completely invisible;
+- Btrfs **device error counters** per Btrfs root. A non-zero `corruption_errs`
+  is a checksum failure on the photo tier and is reported as one;
+- Btrfs **scrub age**, because a library that is never scrubbed has nothing
+  looking for silent bit-rot;
+- Immich **off-site coverage**, read from the recorded evidence: only a
+  `BACKUP GAP` is a defect, and originals ingested after the backup window are
+  reported as HEALTHY with their count. A report that flags normal uploads every
+  day is one the operator stops reading.
+
+**One SMTP transport.** `smtp_send_message` is now the only place that knows how
+mail leaves this host; the recovery pack and the health notifier each build
+their own message and hand it over. Two senders would be two places to get
+credentials wrong.
+
+**A summary is a stream, not a captured value.**
+`summary="$(health_summary_text)"` made it a captured function, and
+`tests/captured-stdout-purity-smoke.sh` flagged
+`printf '  - %s' "${CHECKUP_WARNINGS[@]}"` -- because `LOGLIKE` matches `WARN`
+anywhere on the line, here only inside a VARIABLE NAME. Widening that pattern to
+admit a caller is forbidden, so the summary is written to a file with
+`> "$body"` and the same file is printed or mailed. The ambiguity is removed
+rather than excused.
+
+**That audit read COMMENTS as code.** `captured_names` searched the whole source
+for `$(name`, so the comment explaining why `health_summary_text` must not be
+captured made the audit flag a function that is never captured anywhere. It now
+strips comments first -- the rule already recorded for the capability audit,
+which a comment naming `service_upgrade` once fooled identically. Stripping too
+much would blind it, so the smoke test asserts BOTH directions: the real tree is
+clean, and a genuine `$(health_summary_text)` capture is still caught.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

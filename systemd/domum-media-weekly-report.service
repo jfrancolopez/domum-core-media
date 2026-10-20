@@ -10,4 +10,10 @@ RequiresMountsFor=/srv/data /srv/snapshots
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/domum-media report --write
+# Writing a report nobody reads is not monitoring. The second step mails the
+# operator ONLY when something needs attention; a healthy run sends nothing, so
+# silence is the healthy signal. It runs even if the report write fails (`-`),
+# because a failed report is itself worth being told about and the notifier
+# reports systemd failures.
+ExecStart=-/usr/local/bin/domum-media health-notify
 TimeoutStartSec=10m

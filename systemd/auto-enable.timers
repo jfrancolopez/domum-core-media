@@ -17,8 +17,13 @@
 #       audited. See docs/P0-BACKUP-BASELINE.md and CLAUDE.md.
 #
 #   domum-media-weekly-report.timer
-#       Opt-in reporting. Harmless, but enable it deliberately once its output
-#       has been reviewed on the host. See docs/WEEKLY-REPORT.md.
+#       Opt-in reporting, and now the only thing that PROACTIVELY tells the
+#       operator anything: it writes the weekly report and then runs
+#       `health-notify`, which mails only when something needs attention. Still
+#       deliberately not auto-enabled -- it sends mail, so enabling it is an
+#       operator decision, and its output should be reviewed on the host once
+#       first (`domum-media health-notify --dry-run`).
+#       See docs/WEEKLY-REPORT.md.
 
 domum-media-backup.timer
 domum-media-check.timer

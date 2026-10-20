@@ -62,11 +62,19 @@ def captured_names(src, names):
     and an audit that cries wolf is one somebody switches off -- the same alert
     fatigue this codebase fixes elsewhere.
     """
+    # Comments are stripped FIRST. A comment explaining why a function must not
+    # be captured contains the very text `$(name)`, and reading it as code made
+    # this audit flag a function that is never captured anywhere -- it was
+    # pointed at `health_summary_text`, whose whole output IS its value and
+    # which is written to a file with `> "$body"`, not captured. This is the
+    # rule already recorded for the capability audit, which a comment naming
+    # `service_upgrade` once fooled in the same way.
+    code = "\n".join(re.sub(r"(^|\s)#.*$", "", ln) for ln in src.split("\n"))
     found = set()
     for n in names:
         e = re.escape(n)
-        if (re.search(r"\$\(\s*" + e + r"[\s)]", src)
-                or re.search(r"<\s*\(\s*" + e + r"[\s)]", src)):
+        if (re.search(r"\$\(\s*" + e + r"[\s)]", code)
+                or re.search(r"<\s*\(\s*" + e + r"[\s)]", code)):
             found.add(n)
     return found
 

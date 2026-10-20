@@ -24,4 +24,28 @@ printf '%s\n' "$out"
 grep -q 'captured with' <<< "$out" \
   || fail "the audit reported nothing; it is not actually scanning"
 
+# The audit strips comments before deciding what is captured, because a comment
+# explaining why a function must NOT be captured contains the text `$(name)`.
+# Stripping too much would blind it, so both directions are asserted here: the
+# real tree is clean, and a genuine capture of a value-returning function is
+# still caught.
+MUT_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$MUT_DIR"' EXIT
+mkdir -p "$MUT_DIR/bin"
+cp "$REPO_ROOT/bin/domum-media-backup" "$REPO_ROOT/bin/domum-media-report" "$MUT_DIR/bin/"
+# Introduce a REAL capture of a function whose stdout is its value.
+awk '
+  /^  health_summary_text > "\$body"$/ {
+    print "  leaked=\"$(health_summary_text)\""
+  }
+  { print }
+' "$REPO_ROOT/bin/domum-media" > "$MUT_DIR/bin/domum-media"
+grep -q 'leaked="\$(health_summary_text)"' "$MUT_DIR/bin/domum-media" \
+  || fail "the capture mutation was not applied; this assertion proves nothing"
+if python3 "$REPO_ROOT/tests/lib-stdout-purity-audit.py" "$MUT_DIR" >/dev/null 2>&1; then
+  fail "a real capture of a value-returning function was NOT caught -- the
+comment stripping has blinded the audit"
+fi
+echo "  comments ignored, but a real capture is still caught"
+
 echo "PASS: captured stdout purity smoke test"

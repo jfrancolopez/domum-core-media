@@ -194,3 +194,63 @@ means recording new durable state, which is separate work.
 - [CORE-MEDIA-OPERATIONS-AUDIT.md](CORE-MEDIA-OPERATIONS-AUDIT.md) — the
   capability audit this report implements.
 - [CHECKUP.md](CHECKUP.md) — the immediate, interactive health sweep.
+
+## Notification: silence means healthy (added 2026-10-20)
+
+The weekly unit now has a second step:
+
+```
+ExecStart=/usr/local/bin/domum-media report --write
+ExecStart=-/usr/local/bin/domum-media health-notify
+```
+
+Writing a report nobody reads is not monitoring. Before this, every scheduled
+job on the host wrote to the journal, the weekly report wrote a file, and
+**nothing read either** — the operator learned the state of the server by
+running commands by hand.
+
+`health-notify` runs the host, storage and off-site checks and mails the
+operator **only when something needs attention**:
+
+| state | behaviour |
+|---|---|
+| healthy | **no mail at all** — silence is the healthy signal |
+| expected activity (new photos awaiting the nightly backup) | recorded in the summary, not mailed |
+| action required | one mail, naming the remedy |
+| critical (data-loss or recovery risk) | one mail, named first |
+
+Silence is only trustworthy if the checks cannot fail quietly, so **an input
+that cannot be read is a WARNING naming the remedy — never a pass.** The host
+has no `smartmontools`, so disk health currently reports
+`UNKNOWN: smartmontools is not installed` with the `apt-get` line, rather than
+"no disk warnings" from a host that cannot read SMART at all.
+
+### What it checks that nothing checked before
+
+- **failed systemd units**, and separately the **last exit status of every
+  domum timer's service** — `systemctl --failed` lists only units *currently*
+  failed, so a weekly restic integrity check that failed and was restarted was
+  completely invisible;
+- **Btrfs device error counters** per Btrfs root; a non-zero `corruption_errs`
+  is a checksum failure on the photo tier and is reported as such;
+- **Btrfs scrub age**, because a library that is never scrubbed has nothing
+  looking for silent bit-rot;
+- **physical disk health** via `smartctl` when present;
+- **Immich off-site coverage**, read from the recorded evidence: only a
+  `BACKUP GAP` is a defect; originals ingested after the backup window are
+  reported as healthy, because a report that flags normal uploads every day is
+  one the operator stops reading.
+
+### Before enabling it
+
+```
+sudo domum-media health-notify --dry-run     # see the summary, send nothing
+sudo domum-media health-notify --force       # prove delivery works
+```
+
+The timer stays **out of `systemd/auto-enable.timers`** deliberately: it sends
+mail, so enabling it is an operator decision. Delivery reuses the SMTP
+transport the recovery pack already uses — `smtp_send_message` is now the one
+implementation — so there is no new dependency and no second place to get
+credentials wrong. With delivery disabled it prints the summary and says so; it
+never reports mail as delivered when it was not.
