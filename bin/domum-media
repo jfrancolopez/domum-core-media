@@ -5316,11 +5316,28 @@ checkup_systemd_health() {
 # nothing LOOKING for silent bit-rot.
 checkup_btrfs_health() {
   local root counters line key val total scrub last age_days
+  # One filesystem is reported ONCE, even when several roots live on it.
+  #
+  # Measured 2026-10-20: /srv/data and /srv/snapshots are both subvolumes of
+  # /dev/sda1, uuid 211e06b3-6aaf-40d8-8646-9361b8399eb2. Iterating by PATH
+  # produced two identical "never been scrubbed" warnings and told the operator
+  # to run TWO scrubs of the same device -- the second would re-read the same
+  # 215.87 GiB for nothing. Device error counters are per-filesystem too, so
+  # they were also reported twice.
+  local seen_fs=" " fsid
   for root in "$DOMUM_DATA_ROOT" "${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"; do
     [[ -d "$root" ]] || continue
     # The filesystem type, not subvolume-ness: a plain directory on Btrfs still
     # has device counters worth reading. `domum_is_subvolume` would skip it.
     [[ "$(stat -f -c %T "$root" 2>/dev/null)" == "btrfs" ]] || continue
+    # Identify the filesystem, not the path. Falls back to the device id from
+    # stat when findmnt is unavailable, so the dedup still holds.
+    fsid="$(findmnt -no UUID --target "$root" 2>/dev/null || true)"
+    [[ -n "$fsid" ]] || fsid="$(stat -c %d "$root" 2>/dev/null || true)"
+    if [[ -n "$fsid" ]]; then
+      [[ "$seen_fs" == *" $fsid "* ]] && continue
+      seen_fs="$seen_fs$fsid "
+    fi
 
     counters="$(btrfs device stats "$root" 2>/dev/null || true)"
     if [[ -z "$counters" ]]; then
@@ -5367,7 +5384,7 @@ checkup_btrfs_health() {
     # found" is printed for a scrub that never ran, so it must never be read as
     # a clean result.
     if grep -qE 'no stats available|never ran' <<< "$scrub"; then
-      checkup_add warning "Btrfs on $root has NEVER been scrubbed -- nothing is looking for silent corruption."
+      checkup_add warning "Btrfs on $root has NEVER been scrubbed -- nothing is looking for silent corruption (one scrub covers every subvolume on this filesystem)."
       checkup_add action "btrfs scrub start $root   # read-only verify, takes hours; detects checksum errors but cannot repair without a second copy"
       continue
     fi

@@ -13,7 +13,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/state/restore-verification" "$TMP/data"
+# BOTH roots must exist, or checkup_btrfs_health skips the second one on
+# `[[ -d ]]` and every per-filesystem assertion below passes for the wrong
+# reason -- the dedup test would "pass" while iterating a single root.
+mkdir -p "$TMP/bin" "$TMP/state/restore-verification" "$TMP/data" "$TMP/snapshots"
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq unavailable"; exit 0; }
 
 # $1 = shell defining the stubs, $2 = function to run -> the four arrays, flat
@@ -172,6 +175,60 @@ grep -q 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out" \
   || fail "a never-scrubbed filesystem must be flagged: $out"
 grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy: $out"
 echo "  flagged, with the scrub command"
+
+sect "two roots on ONE filesystem are reported once, not twice"
+# Measured 2026-10-20: /srv/data and /srv/snapshots are both subvolumes of
+# /dev/sda1, uuid 211e06b3-.... Iterating by PATH produced two identical
+# "never been scrubbed" warnings and told the operator to run TWO scrubs of the
+# same device -- the second re-reading the same 215.87 GiB for nothing.
+out="$(probe '
+stat() { case "$*" in *-f*%T*) printf "btrfs\n" ;; *) command stat "$@" ;; esac; }
+findmnt() { printf "SAME-FS-UUID\n"; }
+btrfs() {
+  case "$1" in
+    device) printf "[/dev/sda1].write_io_errs 0\n" ;;
+    scrub)  printf "UUID: x\n        no stats available\n" ;;
+  esac
+}' checkup_btrfs_health)"
+[[ "$(grep -c 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out")" == "1" ]] \
+  || fail "one filesystem produced $(grep -c 'NEVER been scrubbed' <<< "$out") scrub
+warnings; it must produce exactly one:
+$out"
+[[ "$(grep -c 'ACT|btrfs scrub start' <<< "$out")" == "1" ]] \
+  || fail "it suggested more than one scrub for one filesystem: $out"
+grep -q 'one scrub covers every subvolume' <<< "$out" \
+  || fail "the warning does not say one scrub is enough: $out"
+echo "  one warning, one scrub suggested, and it says why"
+
+sect "two roots on DIFFERENT filesystems are both reported"
+# The dedup must not hide a second, genuinely separate filesystem.
+out="$(probe '
+stat() { case "$*" in *-f*%T*) printf "btrfs\n" ;; *) command stat "$@" ;; esac; }
+findmnt() { case "$*" in *snapshots*) printf "FS-B\n" ;; *) printf "FS-A\n" ;; esac; }
+btrfs() {
+  case "$1" in
+    device) printf "[/dev/sda1].write_io_errs 0\n" ;;
+    scrub)  printf "UUID: x\n        no stats available\n" ;;
+  esac
+}' checkup_btrfs_health)"
+[[ "$(grep -c 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out")" == "2" ]] \
+  || fail "two distinct filesystems must both be reported: $out"
+echo "  both reported when the UUIDs differ"
+
+sect "with findmnt unavailable it falls back to the device id"
+# The dedup must still hold, or an absent tool silently doubles every finding.
+out="$(probe '
+stat() { case "$*" in *-f*%T*) printf "btrfs\n" ;; *-c*%d*) printf "66\n" ;; *) command stat "$@" ;; esac; }
+findmnt() { return 1; }
+btrfs() {
+  case "$1" in
+    device) printf "[/dev/sda1].write_io_errs 0\n" ;;
+    scrub)  printf "UUID: x\n        no stats available\n" ;;
+  esac
+}' checkup_btrfs_health)"
+[[ "$(grep -c 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out")" == "1" ]] \
+  || fail "without findmnt the dedup failed and doubled the finding: $out"
+echo "  st_dev fallback keeps it to one"
 
 sect "a filesystem that has never been scrubbed is caught in BOTH wordings"
 # Measured on the production host 2026-10-20: btrfs-progs reports
