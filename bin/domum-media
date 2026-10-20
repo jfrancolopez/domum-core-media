@@ -5038,12 +5038,8 @@ recovery_pack_secret_files() {
 
 send_recovery_pack_email() {
   local archive="$1"
-  local smtp_user smtp_pass message
+  local message
   [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]] || return 0
-  [[ -n "${RECOVERY_PACK_SMTP_HOST:-}" ]] || die "RECOVERY_PACK_SMTP_HOST is required when email delivery is enabled."
-  [[ -f "$RECOVERY_PACK_SMTP_USERNAME_FILE" && -f "$RECOVERY_PACK_SMTP_PASSWORD_FILE" ]] || die "SMTP credential files are missing."
-  smtp_user="$(read_secret_file_value "$RECOVERY_PACK_SMTP_USERNAME_FILE")"
-  smtp_pass="$(read_secret_file_value "$RECOVERY_PACK_SMTP_PASSWORD_FILE")"
   message="$(mktemp)"
   {
     printf 'From: %s\n' "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}"
@@ -5061,13 +5057,28 @@ send_recovery_pack_email() {
     base64 < "$archive"
     printf '\n--domum-boundary--\n'
   } > "$message"
+  smtp_send_message "$message"
+  rm -f "$message"
+}
+
+# The one SMTP transport. Both the recovery-pack delivery and the health
+# notification build their own message and hand it here, so there is one place
+# that knows how mail leaves this host and one place to get the credentials
+# right. Credentials are read from their files into locals and never echoed.
+smtp_send_message() {  # $1 = a complete RFC-822 message file
+  local message="$1" smtp_user smtp_pass
+  [[ -f "$message" ]] || die "smtp_send_message: no message file"
+  [[ -n "${RECOVERY_PACK_SMTP_HOST:-}" ]] || die "RECOVERY_PACK_SMTP_HOST is required to send mail."
+  [[ -f "$RECOVERY_PACK_SMTP_USERNAME_FILE" && -f "$RECOVERY_PACK_SMTP_PASSWORD_FILE" ]] \
+    || die "SMTP credential files are missing."
+  smtp_user="$(read_secret_file_value "$RECOVERY_PACK_SMTP_USERNAME_FILE")"
+  smtp_pass="$(read_secret_file_value "$RECOVERY_PACK_SMTP_PASSWORD_FILE")"
   curl --silent --show-error --ssl-reqd \
     --url "smtps://${RECOVERY_PACK_SMTP_HOST}:${RECOVERY_PACK_SMTP_PORT}" \
     --user "${smtp_user}:${smtp_pass}" \
     --mail-from "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}" \
     --mail-rcpt "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}" \
     --upload-file "$message"
-  rm -f "$message"
 }
 
 recovery_pack_create() {
@@ -5241,6 +5252,343 @@ checkup_add() {
     healthy) CHECKUP_HEALTHY+=("$*") ;;
     action) CHECKUP_ACTIONS+=("$*") ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Host and storage health checks.
+#
+# These fill the gaps measured against the existing 56: nothing checked failed
+# systemd units, Btrfs error counters, scrub age, physical disk health, or
+# whether the Immich originals have a real BACKUP GAP. The timers ran, wrote to
+# the journal, and nothing read it.
+#
+# Each one says UNKNOWN with the remedy when its input cannot be read. A check
+# that silently skips is worse than no check: it reads as healthy.
+# ---------------------------------------------------------------------------
+
+# Did any systemd unit fail -- and did each domum timer's service SUCCEED?
+#
+# A failed `domum-media-check.service` (the weekly restic integrity check) was
+# completely invisible: the backup-age check covers the backup, but nothing
+# covered the checker. `systemctl --failed` only lists units in the failed
+# state, and a service that failed and was later restarted is not in it, so the
+# last exit status of each timer's service is read separately.
+checkup_systemd_health() {
+  local failed unit svc status
+  failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)"
+  if [[ -n "$failed" ]]; then
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      case "$unit" in
+        domum-media*) checkup_add critical "systemd unit $unit has FAILED." ;;
+        *)            checkup_add warning  "systemd unit $unit has failed." ;;
+      esac
+    done <<< "$failed"
+    checkup_add action "systemctl status <unit> && journalctl -u <unit> -n 50"
+  else
+    checkup_add healthy "No systemd unit is in the failed state."
+  fi
+
+  # The last run of every enabled domum timer's service.
+  local timers
+  timers="$(systemctl list-timers 'domum*' --all --no-legend --no-pager 2>/dev/null \
+            | awk '{print $NF}' || true)"
+  [[ -n "$timers" ]] || return 0
+  while IFS= read -r svc; do
+    [[ "$svc" == domum-media*.service ]] || continue
+    status="$(systemctl show -p ExecMainStatus --value "$svc" 2>/dev/null || true)"
+    # An empty status means it has never run in this boot's journal, which is
+    # not a failure; a non-zero one is.
+    if [[ -n "$status" && "$status" != "0" ]]; then
+      checkup_add critical "$svc last exited non-zero (status $status)."
+      checkup_add action "journalctl -u $svc -n 50"
+    fi
+  done <<< "$timers"
+}
+
+# Btrfs device error counters and scrub age, for every Btrfs root this project
+# depends on.
+#
+# The counters are cumulative and cannot be cleared except deliberately, so any
+# non-zero value is a real event on a real device -- corruption_errs in
+# particular means a checksum did not match, which on the photo tier is the
+# thing all of this exists to prevent. A library that is never scrubbed has
+# nothing LOOKING for silent bit-rot.
+checkup_btrfs_health() {
+  local root counters line key val total scrub last age_days
+  for root in "$DOMUM_DATA_ROOT" "${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"; do
+    [[ -d "$root" ]] || continue
+    # The filesystem type, not subvolume-ness: a plain directory on Btrfs still
+    # has device counters worth reading. `domum_is_subvolume` would skip it.
+    [[ "$(stat -f -c %T "$root" 2>/dev/null)" == "btrfs" ]] || continue
+
+    counters="$(btrfs device stats "$root" 2>/dev/null || true)"
+    if [[ -z "$counters" ]]; then
+      checkup_add warning "Btrfs error counters for $root could not be read."
+      continue
+    fi
+    total=0
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      key="${line%% *}"; val="${line##* }"
+      [[ "$val" =~ ^[0-9]+$ ]] || continue
+      if (( val > 0 )); then
+        total=$(( total + val ))
+        case "$key" in
+          *corruption_errs*) checkup_add critical "Btrfs CHECKSUM failures on $root: ${key##*.} = $val." ;;
+          *)                 checkup_add critical "Btrfs device errors on $root: ${key##*.} = $val." ;;
+        esac
+      fi
+    done <<< "$counters"
+    if (( total == 0 )); then
+      checkup_add healthy "Btrfs error counters for $root are all zero."
+    else
+      checkup_add action "btrfs device stats $root  # then investigate the device before writing more"
+    fi
+
+    # Scrub age. `btrfs scrub status` reports the last completed run.
+    scrub="$(btrfs scrub status "$root" 2>/dev/null || true)"
+    if [[ -z "$scrub" ]]; then
+      checkup_add warning "Btrfs scrub status for $root could not be read."
+      continue
+    fi
+    if grep -q 'never ran' <<< "$scrub"; then
+      checkup_add warning "Btrfs on $root has NEVER been scrubbed -- nothing is looking for silent corruption."
+      checkup_add action "btrfs scrub start $root   # read-only verify; safe while running, takes hours"
+      continue
+    fi
+    last="$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+(.*)$/\1/p' <<< "$scrub" | tail -1)"
+    if [[ -n "$last" ]]; then
+      local last_epoch now_epoch
+      last_epoch="$(date -d "$last" +%s 2>/dev/null || true)"
+      now_epoch="$(date +%s)"
+      if [[ -n "$last_epoch" ]]; then
+        age_days=$(( (now_epoch - last_epoch) / 86400 ))
+        if (( age_days > ${BTRFS_SCRUB_MAX_AGE_DAYS:-90} )); then
+          checkup_add warning "Btrfs on $root was last scrubbed ${age_days} days ago."
+          checkup_add action "btrfs scrub start $root"
+        else
+          checkup_add healthy "Btrfs on $root scrubbed ${age_days} day(s) ago."
+        fi
+      fi
+    fi
+  done
+}
+
+# Physical disk health.
+#
+# smartmontools is NOT installed on this host, so this reports UNKNOWN with the
+# remedy rather than passing silently -- "no disk warnings" from a host that
+# cannot read SMART at all would be the weaker claim in the stronger claim's
+# words. Nothing is installed automatically: that is a host change and belongs
+# to the operator.
+checkup_disk_health() {
+  if ! cmd_exists smartctl; then
+    checkup_add warning "Disk SMART health is UNKNOWN: smartmontools is not installed."
+    checkup_add action "apt-get install -y smartmontools   # then checkup reports real disk health"
+    return 0
+  fi
+  local dev health
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    health="$(smartctl -H "/dev/$dev" 2>/dev/null || true)"
+    if [[ -z "$health" ]]; then
+      checkup_add warning "SMART health for /dev/$dev could not be read."
+    elif grep -qiE 'PASSED|OK' <<< "$health"; then
+      checkup_add healthy "SMART self-assessment for /dev/$dev: passed."
+    else
+      checkup_add critical "SMART self-assessment for /dev/$dev did NOT pass."
+      checkup_add action "smartctl -a /dev/$dev   # replace the device before it fails"
+    fi
+  done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+}
+
+# Are the Immich originals actually protected off-site?
+#
+# Read from the coverage evidence that verify-snapshot-coverage records, so this
+# does not re-list a snapshot. Only a BACKUP GAP is a defect: originals ingested
+# after the backup window are expected and are reported without being alarming.
+# An evidence file with no classification keys reads as UNKNOWN, never as zero.
+checkup_immich_offsite() {
+  [[ "${ENABLE_IMMICH:-0}" == "1" ]] || return 0
+  if ! cmd_exists jq; then
+    checkup_add warning "Immich off-site coverage is UNKNOWN: jq is not installed."
+    checkup_add action "apt-get install -y jq"
+    return 0
+  fi
+  local target evidence gap pend unk cls snap recorded
+  for target in $(backup_target_names 2>/dev/null || true); do
+    backup_target_enabled "$target" 2>/dev/null || continue
+    evidence="${DOMUM_STATE_ROOT:-/var/lib/domum-media}/restore-verification/${target}-snapshot-coverage.json"
+    if [[ ! -f "$evidence" ]]; then
+      checkup_add warning "Immich off-site coverage for $target has never been reconciled."
+      checkup_add action "sudo domum-media-backup verify-snapshot-coverage $target   # metadata only, no download"
+      continue
+    fi
+    cls="$(jq -r '.missing_classified // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
+    gap="$(jq -r '.missing_backup_gap // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
+    pend="$(jq -r '.missing_pending_next_backup // 0' "$evidence" 2>/dev/null || echo 0)"
+    unk="$(jq -r '.missing_timing_unknown // 0' "$evidence" 2>/dev/null || echo 0)"
+    snap="$(jq -r '.snapshot_id // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
+    recorded="$(jq -r '.recorded_at // "unknown"' "$evidence" 2>/dev/null || echo unknown)"
+    if [[ "$cls" != "known" ]]; then
+      checkup_add warning "Immich off-site coverage for $target is recorded but NOT classified (snapshot $snap)."
+      checkup_add action "sudo domum-media-backup verify-snapshot-coverage $target"
+      continue
+    fi
+    if [[ "$gap" =~ ^[0-9]+$ ]] && (( gap > 0 )); then
+      checkup_add critical "BACKUP GAP: $gap Immich original(s) existed when snapshot $snap began and are not in it."
+      checkup_add action "sudo domum-media-backup verify-snapshot-coverage $target   # then read ${target}-snapshot-gap.txt"
+    elif [[ "$unk" =~ ^[0-9]+$ ]] && (( unk > 0 )); then
+      checkup_add warning "$unk Immich original(s) were ingested during the backup window; coverage is UNKNOWN for them."
+    elif [[ "$pend" =~ ^[0-9]+$ ]] && (( pend > 0 )); then
+      # Expected activity: recorded, deliberately not alarming.
+      checkup_add healthy "Immich originals: no backup gap; $pend awaiting the next run (snapshot $snap)."
+    else
+      checkup_add healthy "Immich originals: every one is in snapshot $snap (reconciled $recorded)."
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Tell the operator when, and only when, something needs attention.
+#
+# Before this, every scheduled job wrote to the journal and the weekly report
+# wrote a file, and nothing read either. The operator learned the state of the
+# server by running commands -- which is precisely the babysitting this is meant
+# to end.
+#
+# The contract, deliberately narrow:
+#
+#   HEALTHY            no mail at all. Silence means healthy, and silence is
+#                      only trustworthy if the check itself cannot fail quietly
+#                      -- so an UNREADABLE input is a WARNING, never a pass.
+#   EXPECTED ACTIVITY  recorded in the summary, never mailed on its own. New
+#                      photos awaiting the nightly backup are not an incident.
+#   ACTION REQUIRED    one mail, naming what to do.
+#   CRITICAL           one mail, named first, because it is a data-loss or
+#                      recovery risk.
+#
+# `--force` mails regardless, so the operator can prove delivery works without
+# waiting for something to break. `--dry-run` prints the summary and sends
+# nothing.
+health_summary_text() {  # stdout: the operator-facing summary
+  local n_crit="${#CHECKUP_CRITICAL[@]}" n_warn="${#CHECKUP_WARNINGS[@]}"
+  local n_act="${#CHECKUP_ACTIONS[@]}" n_ok="${#CHECKUP_HEALTHY[@]}"
+  local verdict
+  if (( n_crit > 0 )); then verdict="CRITICAL"
+  elif (( n_act > 0 )); then verdict="ACTION REQUIRED"
+  elif (( n_warn > 0 )); then verdict="ATTENTION"
+  else verdict="HEALTHY"; fi
+
+  printf 'DOMUM-CORE-MEDIA health summary\n'
+  printf '%s\n\n' "$(date -Iseconds)"
+  printf 'VERDICT: %s\n' "$verdict"
+  printf '  critical %d   action %d   warning %d   healthy %d\n\n' \
+    "$n_crit" "$n_act" "$n_warn" "$n_ok"
+
+  if (( n_crit > 0 )); then
+    printf 'CRITICAL -- data-loss or recovery risk:\n'
+    printf '  - %s\n' "${CHECKUP_CRITICAL[@]}"
+    printf '\n'
+  fi
+  if (( n_act > 0 )); then
+    printf 'ACTION REQUIRED:\n'
+    printf '  - %s\n' "${CHECKUP_ACTIONS[@]}"
+    printf '\n'
+  fi
+  if (( n_warn > 0 )); then
+    printf 'Warnings:\n'
+    printf '  - %s\n' "${CHECKUP_WARNINGS[@]}"
+    printf '\n'
+  fi
+  if (( n_crit == 0 && n_act == 0 && n_warn == 0 )); then
+    printf 'Nothing needs attention. %d check(s) reported healthy.\n\n' "$n_ok"
+  fi
+  printf 'Full detail:  sudo domum-media checkup\n'
+  printf 'Recovery:     sudo domum-media-backup dr-status\n'
+}
+
+health_notify_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  local force=0 dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force)   force=1 ;;
+      --dry-run) dry=1 ;;
+      *) die "Usage: domum-media health-notify [--force] [--dry-run]" ;;
+    esac
+  done
+
+  CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+  # The same checks the operator would run by hand. One implementation: if
+  # checkup and the notification could disagree, the silence would be worthless.
+  checkup_systemd_health
+  checkup_btrfs_health
+  checkup_disk_health
+  checkup_immich_offsite
+
+  # The summary is written to a FILE, never captured with $( ).
+  #
+  # `summary="$(health_summary_text)"` made it a captured function, and
+  # tests/captured-stdout-purity-smoke.sh flagged
+  # `printf '  - %s' "${CHECKUP_WARNINGS[@]}"` because LOGLIKE matches `WARN`
+  # anywhere on the line -- here only inside a VARIABLE NAME. The audit cannot
+  # tell a value from contamination, and widening its pattern to admit this
+  # caller is exactly what CLAUDE.md forbids. Writing to a stream removes the
+  # ambiguity instead, and the same file is then both printed and mailed.
+  local subject body
+  body="$(mktemp)" || die "cannot stage the summary"
+  health_summary_text > "$body"
+  if (( ${#CHECKUP_CRITICAL[@]} > 0 )); then
+    subject="domum-media CRITICAL: ${#CHECKUP_CRITICAL[@]} issue(s) need attention"
+  elif (( ${#CHECKUP_ACTIONS[@]} > 0 )); then
+    subject="domum-media: ${#CHECKUP_ACTIONS[@]} action(s) required"
+  else
+    subject="domum-media: healthy"
+  fi
+
+  if (( dry == 1 )); then
+    cat "$body"
+    printf -- '--- dry run: no mail was sent (subject would be: %s) ---\n' "$subject"
+    rm -f "$body"
+    return 0
+  fi
+
+  # Silence IS the healthy signal.
+  if (( ${#CHECKUP_CRITICAL[@]} == 0 && ${#CHECKUP_ACTIONS[@]} == 0 && force == 0 )); then
+    echo "[domum-media] health-notify: nothing needs attention; no mail sent"
+    rm -f "$body"
+    return 0
+  fi
+
+  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" != "1" ]]; then
+    # Do not fail the timer over this, but never pretend it was delivered.
+    warn "health-notify: mail delivery is not enabled (RECOVERY_PACK_EMAIL_ENABLED=0)."
+    cat "$body"
+    rm -f "$body"
+    return 0
+  fi
+
+  local message
+  message="$(mktemp)" || die "cannot stage the message"
+  {
+    printf 'From: %s\n' "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}"
+    printf 'To: %s\n' "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}"
+    printf 'Subject: %s\n' "$subject"
+    printf 'MIME-Version: 1.0\n'
+    printf 'Content-Type: text/plain; charset="utf-8"\n\n'
+    cat "$body"
+  } > "$message"
+  if smtp_send_message "$message"; then
+    echo "[domum-media] health-notify: sent -- $subject"
+  else
+    rm -f "$message" "$body"
+    die "health-notify: the summary could NOT be delivered"
+  fi
+  rm -f "$message" "$body"
 }
 
 checkup_cmd() {
@@ -5453,6 +5801,15 @@ checkup_cmd() {
   sim_general="$(printf '%s\n' "$sim_updates" | grep -c '^Inst ' || true)"
   (( sim_security > 0 )) && checkup_add warning "${sim_security} security updates are available."
   (( sim_general > 0 )) && checkup_add warning "${sim_general} general package updates are available."
+
+  # Host, storage and off-site checks. Added because nothing covered failed
+  # units, Btrfs error counters, scrub age, physical disk health, or whether the
+  # Immich originals have a real BACKUP GAP -- the timers ran and nothing read
+  # the result.
+  checkup_systemd_health
+  checkup_btrfs_health
+  checkup_disk_health
+  checkup_immich_offsite
 
   if (( json == 1 )); then
     printf '{\n'
@@ -9154,6 +9511,11 @@ Usage:
                                             the archive if needed. Refuses if the
                                             identity cannot be matched
   domum-media checkup [--json]
+  domum-media health-notify [--force] [--dry-run]
+      Runs the host, storage and off-site checks and mails the operator ONLY
+      when something needs attention. A healthy run sends nothing, so silence
+      is the healthy signal. --dry-run prints the summary and sends no mail;
+      --force sends even when healthy, to prove delivery works.
   domum-media report [--json|--write]
   domum-media storage migrate-subvolume <service>
   domum-media storage topology              Deterministic inventory of managed
@@ -9239,6 +9601,7 @@ main() {
     snapshot)  shift; snapshot_cmd "$@" ;;
     rollback)  shift; rollback_cmd "$@" ;;
     checkup)   shift; checkup_cmd "$@" ;;
+    health-notify) shift; health_notify_cmd "$@" ;;
     report)    shift; report_entry "$@" ;;
     storage)   shift; storage_cmd "$@" ;;
     compose)   shift; compose_passthrough "$@" ;;

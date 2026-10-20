@@ -250,6 +250,14 @@ jobs:
       - name: Deploy reporting rehearsal
         run: tests/deploy-reporting-rehearsal-smoke.sh
 
+      # Silence must mean healthy: no mail when nothing needs doing, one mail
+      # when it does, and never a claim of delivery that did not happen.
+      - name: Health notify smoke test
+        run: tests/health-notify-smoke.sh
+
+      - name: Health checks smoke test
+        run: tests/health-checks-smoke.sh
+
       # A runbook command that does not exist is discovered during a recovery.
       - name: Documented commands audit
         run: python3 tests/documented-commands-audit.py
