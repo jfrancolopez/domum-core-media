@@ -1673,6 +1673,47 @@ configured and no path is moved.
 
 ---
 
+**HEALTHY must not mean UNMEASURED.** Production, 2026-10-20: `health-notify
+--dry-run` reported `VERDICT: HEALTHY, 6 healthy, 0 warnings` on a host where
+`smartmontools` was absent and `/srv/data` had **never been scrubbed** --
+215.87 GiB holding 23,155 irreplaceable originals with nothing looking for
+silent corruption. Two causes, both mine:
+
+- **The never-scrubbed matcher looked only for `never ran`.** btrfs-progs on
+  this host prints `no stats available`, so the check fell through, found no
+  `Scrub started:` line either, and said **nothing at all** -- neither healthy
+  nor a warning. It now matches both wordings, and an unparseable status is a
+  warning rather than silence. Note that `Error summary: no errors found` is
+  printed for a scrub that NEVER RAN, so it must never be read as a clean
+  result. The remedy also states its own limit: a scrub detects checksum errors
+  but cannot repair them without a second copy, and `/srv/data` and
+  `/srv/snapshots` share one physical SSD.
+- `sudo domum-media checkup` printed **nothing at all** -- not a header, not an
+  error. The report prints only after every check has run, so one abort under
+  `set -euo pipefail` anywhere in the chain produces a blank screen, and a
+  blank report is indistinguishable from a healthy one.
+  `tests/checkup-produces-output-smoke.sh` drives `checkup_cmd` and asserts the
+  header and all four sections exist. Writing it immediately exposed the
+  mechanism: stubbing `load_cfg` left `RECOVERY_PACK_DEST` unbound and `set -u`
+  killed the shell before a single line printed. The fixture now runs the REAL
+  `load_cfg` against a real config, because that function is what applies every
+  default the rest of the chain reads.
+
+**The `-` prefixes on a multi-ExecStart oneshot unit were exactly backwards.**
+systemd runs each `ExecStart` in order, and a non-zero one WITHOUT a `-` fails
+the unit and the remaining lines are **never executed**. The weekly unit had
+`report --write` unprefixed and `health-notify` prefixed, which meant:
+
+- a failed report **suppressed the alert** -- precisely when being told matters;
+- an **undeliverable alert left the unit green**, so nothing surfaced it.
+  Silence would have meant "healthy" when it actually meant "could not tell
+  you".
+
+They are now the other way round: the report is tolerated, a delivery failure
+fails the unit, and `checkup_systemd_health` reports a failed domum unit as
+CRITICAL -- which is what closes the loop. Both halves are asserted, including
+the ordering, because `-` on the report only helps if the report runs first.
+
 **Nothing on this host proactively told the operator anything.** Measured
 2026-10-20: five timers ran (backup nightly, restic check weekly, snapshot
 prune weekly, host update weekly, DR reminder quarterly), every one wrote to the

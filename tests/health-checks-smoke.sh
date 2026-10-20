@@ -86,6 +86,48 @@ grep -q 'CRIT|domum' <<< "$out" && fail "a never-run service was reported as fai
 echo "  an empty status is not a non-zero one"
 
 # ---------------------------------------------------------------------------
+sect "the weekly unit's ExecStart prefixes make failures VISIBLE"
+# systemd semantics for Type=oneshot: each ExecStart runs in order, and a
+# non-zero one WITHOUT a `-` prefix fails the unit and the remaining lines are
+# never executed. Both prefixes were originally the wrong way round:
+#
+#   report --write had no `-`, so a failed report SUPPRESSED the alert -- which
+#   is precisely when the operator needs telling;
+#   health-notify had `-`, so an UNDELIVERABLE alert left the unit green and
+#   nothing surfaced it. Silence would have meant "healthy" when it actually
+#   meant "could not tell you".
+UNIT="$REPO_ROOT/systemd/domum-media-weekly-report.service"
+[[ -f "$UNIT" ]] || fail "the weekly unit is missing"
+grep -qx 'ExecStart=-/usr/local/bin/domum-media report --write' "$UNIT" \
+  || fail "the report step must be prefixed with '-' so a failed report cannot
+suppress the alert:
+$(grep ExecStart "$UNIT")"
+grep -qx 'ExecStart=/usr/local/bin/domum-media health-notify' "$UNIT" \
+  || fail "the notify step must NOT be prefixed, so an undeliverable alert
+fails the unit and becomes visible in systemctl --failed:
+$(grep ExecStart "$UNIT")"
+# Order matters too: the report must come first, or `-` on it is pointless.
+[[ "$(grep -n 'ExecStart=-.*report --write' "$UNIT" | cut -d: -f1)" \
+   -lt "$(grep -n 'ExecStart=/usr/local/bin/domum-media health-notify' "$UNIT" | cut -d: -f1)" ]] \
+  || fail "the report step must precede the notify step"
+echo "  report tolerated, notify failure fatal, report first"
+
+sect "a failed unit is what SURFACES an undeliverable alert"
+# The two halves must join up: health-notify failing puts the unit in the failed
+# state, and checkup_systemd_health reports a failed domum unit as CRITICAL.
+# Without that link, a delivery failure would be invisible.
+out="$(probe '
+systemctl() {
+  case "$*" in
+    *--failed*) printf "domum-media-weekly-report.service loaded failed failed x\n" ;;
+    *list-timers*) : ;;
+  esac
+}' checkup_systemd_health)"
+grep -q 'CRIT|systemd unit domum-media-weekly-report.service has FAILED' <<< "$out" \
+  || fail "a failed weekly unit must be critical, or delivery failures are
+invisible: $out"
+echo "  a failed weekly unit is CRITICAL, closing the loop"
+
 sect "a non-zero Btrfs error counter is CRITICAL, and checksums are named"
 mkdir -p "$TMP/data"
 out="$(probe '
@@ -130,6 +172,66 @@ grep -q 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out" \
   || fail "a never-scrubbed filesystem must be flagged: $out"
 grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy: $out"
 echo "  flagged, with the scrub command"
+
+sect "a filesystem that has never been scrubbed is caught in BOTH wordings"
+# Measured on the production host 2026-10-20: btrfs-progs reports
+#
+#   UUID:             211e06b3-...
+#           no stats available
+#   Total to scrub:   215.87GiB
+#   Error summary:    no errors found
+#
+# The first matcher looked only for "never ran", so it fell through, found no
+# "Scrub started:" line either, and said NOTHING. A filesystem holding 23,155
+# irreplaceable originals that has never been scrubbed reported as neither
+# healthy nor a warning -- the silence read as fine.
+for wording in 'no stats available' 'Scrub status: never ran'; do
+  out="$(probe "
+stat() { case \"\$*\" in *-f*%T*) printf 'btrfs\n' ;; *) command stat \"\$@\" ;; esac; }
+btrfs() {
+  case \"\$1\" in
+    device) printf '[/dev/sda1].write_io_errs 0\n' ;;
+    scrub)  printf 'UUID: x\n        $wording\nTotal to scrub:   215.87GiB\nError summary:    no errors found\n' ;;
+  esac
+}" checkup_btrfs_health)"
+  grep -q 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out" \
+    || fail "wording '$wording' was not recognised as never-scrubbed: $out"
+  grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy for '$wording': $out"
+  grep -q 'cannot repair without a second copy' <<< "$out" \
+    || fail "the remedy must state what a scrub cannot do: $out"
+  grep -q 'OK|Btrfs on .* scrubbed' <<< "$out" \
+    && fail "'$wording' was also reported as recently scrubbed: $out"
+done
+echo "  both wordings warn, with a remedy that states its own limit"
+
+sect "'Error summary: no errors found' from a scrub that NEVER RAN is not a pass"
+# That line is printed even when no scrub has ever happened, so reading it as a
+# clean result would turn an unmeasured filesystem into a healthy one.
+out="$(probe "
+stat() { case \"\$*\" in *-f*%T*) printf 'btrfs\n' ;; *) command stat \"\$@\" ;; esac; }
+btrfs() {
+  case \"\$1\" in
+    device) printf '[/dev/sda1].write_io_errs 0\n' ;;
+    scrub)  printf 'UUID: x\n        no stats available\nError summary:    no errors found\n' ;;
+  esac
+}" checkup_btrfs_health)"
+grep -q 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out" \
+  || fail "it must still warn: $out"
+echo "  warned despite the reassuring error summary"
+
+sect "an UNPARSEABLE scrub status is UNKNOWN, not healthy"
+out="$(probe "
+stat() { case \"\$*\" in *-f*%T*) printf 'btrfs\n' ;; *) command stat \"\$@\" ;; esac; }
+btrfs() {
+  case \"\$1\" in
+    device) printf '[/dev/sda1].write_io_errs 0\n' ;;
+    scrub)  printf 'some future format nobody has seen\n' ;;
+  esac
+}" checkup_btrfs_health)"
+grep -q 'WARN|Btrfs scrub history for .* could not be parsed' <<< "$out" \
+  || fail "an unparseable status must warn: $out"
+grep -q 'OK|Btrfs on .* scrubbed' <<< "$out" && fail "it claimed a scrub happened: $out"
+echo "  says it could not parse, claims nothing"
 
 sect "UNREADABLE Btrfs counters are a warning, never healthy"
 out="$(probe '

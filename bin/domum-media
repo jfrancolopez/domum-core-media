@@ -5352,12 +5352,32 @@ checkup_btrfs_health() {
       checkup_add warning "Btrfs scrub status for $root could not be read."
       continue
     fi
-    if grep -q 'never ran' <<< "$scrub"; then
+    # btrfs-progs says "no stats available" for a filesystem that has never
+    # been scrubbed; only some versions say "never ran". Measured on this host:
+    #
+    #   UUID:             211e06b3-...
+    #           no stats available
+    #   Total to scrub:   215.87GiB
+    #   Error summary:    no errors found
+    #
+    # The first matcher looked only for "never ran", so it fell through, found
+    # no "Scrub started:" line either, and said NOTHING -- a filesystem holding
+    # 23,155 irreplaceable originals that has never been scrubbed reported as
+    # neither healthy nor a warning. Note also that "Error summary: no errors
+    # found" is printed for a scrub that never ran, so it must never be read as
+    # a clean result.
+    if grep -qE 'no stats available|never ran' <<< "$scrub"; then
       checkup_add warning "Btrfs on $root has NEVER been scrubbed -- nothing is looking for silent corruption."
-      checkup_add action "btrfs scrub start $root   # read-only verify; safe while running, takes hours"
+      checkup_add action "btrfs scrub start $root   # read-only verify, takes hours; detects checksum errors but cannot repair without a second copy"
       continue
     fi
     last="$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+(.*)$/\1/p' <<< "$scrub" | tail -1)"
+    if [[ -z "$last" ]]; then
+      # A status we cannot parse is UNKNOWN, not healthy. Silence here would
+      # read as "scrubbing is fine".
+      checkup_add warning "Btrfs scrub history for $root could not be parsed."
+      continue
+    fi
     if [[ -n "$last" ]]; then
       local last_epoch now_epoch
       last_epoch="$(date -d "$last" +%s 2>/dev/null || true)"
