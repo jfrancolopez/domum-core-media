@@ -262,6 +262,22 @@ Its design follows the rules this file already records:
   the backup, not about installing a file, and conflating them would make a real
   finding look like a deployment problem.
 
+**Installing a unit is not enabling it, and the deployment does only the
+first.** The weekly unit carries the `health-notify` step, so installing the
+file is what makes the notification AVAILABLE; enabling the timer is what starts
+sending mail. The deployment installs it 0644, runs `daemon-reload`, says "not
+enabled, not started", and prints the `systemctl enable --now` line for the
+operator. The rehearsal asserts the reload HAPPENED (via a recording stub) and
+that no `enable`/`start`/`restart` was ever issued -- in the script's own text
+and in the calls it made.
+
+**A sandbox may PROVIDE an external dependency; it may not weaken the check.**
+systemd is unreachable inside `unshare -r`, so a real `daemon-reload` fails and
+the deployment aborts -- correctly, because a failed reload means systemd has
+not seen the new unit. The rehearsal supplies a recording `systemctl` stub on
+`PATH`, exactly as it supplies a fake git upstream, and then asserts the call.
+Making the reload non-fatal to suit the test would have been the wrong fix.
+
 **A dry run must not speak in the indicative.** The deployment's dry run
 printed `fast-forward: 6551bd48 -> 3bb4e79c` before its own `--confirm` gate,
 which reads as though the checkout had already moved. It had not -- verified

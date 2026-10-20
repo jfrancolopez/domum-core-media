@@ -7,6 +7,12 @@
 #   /usr/local/bin/domum-media-backup    (if its hash differs)
 #   /opt/domum-core-media                fast-forwarded to origin/main
 #   operator/ scripts inside that checkout, as part of the fast-forward
+#   /etc/systemd/system/domum-media-weekly-report.{service,timer}
+#       Installed if their hashes differ, then `systemctl daemon-reload`.
+#       NEITHER IS ENABLED OR STARTED. The weekly unit carries the
+#       `health-notify` step, so installing the file is what makes the
+#       notification available; enabling the timer sends mail and stays an
+#       explicit operator decision.
 #
 # WHAT IT DOES NOT TOUCH: containers, images, compose files, systemd units,
 # timers, Restic schedules, Restic exclusions, the Immich database, originals,
@@ -34,6 +40,7 @@ set -euo pipefail
 CHECKOUT="${DOMUM_DEPLOY_CHECKOUT:-/opt/domum-core-media}"
 BIN_DIR="${DOMUM_DEPLOY_BIN_DIR:-/usr/local/bin}"
 LIB_DIR="${DOMUM_DEPLOY_LIB_DIR:-/usr/local/lib/domum-media}"
+UNIT_DIR="${DOMUM_DEPLOY_UNIT_DIR:-/etc/systemd/system}"
 REMOTE="${DOMUM_DEPLOY_REMOTE:-origin}"
 BRANCH="${DOMUM_DEPLOY_BRANCH:-main}"
 
@@ -121,12 +128,20 @@ $BIN_DIR/domum-media-backup:bin/domum-media-backup
 $LIB_DIR/domum-media-report:bin/domum-media-report
 "
 
+# Unit files, installed 0644 into the systemd directory. Deliberately a
+# separate list: a different mode, a different destination, and a daemon-reload
+# afterwards. Installing a unit neither enables nor starts it.
+UNIT_TARGETS="
+$UNIT_DIR/domum-media-weekly-report.service:systemd/domum-media-weekly-report.service
+$UNIT_DIR/domum-media-weekly-report.timer:systemd/domum-media-weekly-report.timer
+"
+
 hash_of() { [ -f "$1" ] && sha256sum "$1" | cut -d' ' -f1 || printf 'ABSENT'; }
 blob_of() { git -C "$CHECKOUT" show "$TARGET_REV:$1" | sha256sum | cut -d' ' -f1; }
 
 printf '\n  %-42s %-14s %-14s %s\n' FILE INSTALLED TARGET ACTION
 CHANGES=0
-for entry in $TARGETS; do
+for entry in $TARGETS $UNIT_TARGETS; do
   inst="${entry%%:*}"; rel="${entry##*:}"
   have="$(hash_of "$inst")"; want="$(blob_of "$rel")"
   if [ "$have" = "$want" ]; then act="unchanged"; else act="INSTALL"; CHANGES=$((CHANGES+1)); fi
@@ -159,11 +174,27 @@ for entry in $TARGETS; do
   fi
 done
 
+UNITS_CHANGED=0
+for entry in $UNIT_TARGETS; do
+  inst="${entry%%:*}"; rel="${entry##*:}"
+  src="$CHECKOUT/$rel"
+  [ -f "$src" ] || abort "missing in the checkout after fast-forward: $rel"
+  if [ "$(hash_of "$inst")" != "$(sha256sum "$src" | cut -d' ' -f1)" ]; then
+    install -D -m 0644 "$src" "$inst" || abort "install failed: $inst"
+    say "installed $inst (not enabled, not started)"
+    UNITS_CHANGED=1
+  fi
+done
+if [ "$UNITS_CHANGED" -eq 1 ]; then
+  systemctl daemon-reload || abort "systemctl daemon-reload failed"
+  say "systemd reloaded; no unit was enabled or started"
+fi
+
 # ---------------------------------------------------------------------------
 # 5. The invariant that cannot go stale: installed == checkout, for every file.
 # ---------------------------------------------------------------------------
 printf '\n'
-for entry in $TARGETS; do
+for entry in $TARGETS $UNIT_TARGETS; do
   inst="${entry%%:*}"; rel="${entry##*:}"
   a="$(hash_of "$inst")"; b="$(sha256sum "$CHECKOUT/$rel" | cut -d' ' -f1)"
   [ "$a" = "$b" ] || abort "$inst does not match $CHECKOUT/$rel after install"
@@ -210,7 +241,14 @@ fi
 
 printf '\n== deployed ==\n'
 say "revision  : $(git -C "$CHECKOUT" rev-parse --short HEAD)"
-say "untouched : containers, images, compose, systemd units, timers, Restic"
+if [ "${UNITS_CHANGED:-0}" -eq 1 ]; then
+  printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED but NOT"
+  printf '  %s\n' "enabled. It mails only when something needs attention. To review"
+  printf '  %s\n' "its output and then enable it:"
+  printf '\n    %s\n' "sudo domum-media health-notify --dry-run"
+  printf '    %s\n' "sudo systemctl enable --now domum-media-weekly-report.timer"
+fi
+say "untouched : containers, images, compose, OTHER systemd units, timers, Restic"
 say "            schedules and exclusions, the Immich database, originals,"
 say "            Btrfs subvolumes, snapshots, recovery archives, and the"
 say "            production configuration"
