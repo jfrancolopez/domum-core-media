@@ -1217,7 +1217,6 @@ UNKNOWN instead of a clean sweep.
 terminal lines, so a finding could not be diagnosed without re-running the
 command. It is written to `<target>-snapshot-missing.txt` at 0600 and the report
 names it.
-||||||| parent of 3ba6290 (safety: two "never restore-tested" numbers, 69 apart)
 **A recovered Immich SERVES recovered originals — proven 2026-10-12.**
 `immich-phase-b` restored 8 originals from the snapshot and the application
 returned all 8 with **bytes identical** to the restored files: jpeg, heic, png,
@@ -1273,9 +1272,6 @@ assumed: the age PRIVATE key is held by the operator, and pgvecto.rs is
 deprecated so the set of Immich versions able to import today's dump shrinks
 over time. The whole chain rests on that age key -- 37 copies are equally
 useless without it.
-||||||| parent of e64a33c (safety: two "never restore-tested" numbers, 69 apart)
-||||||| parent of c6c0e5e (safety: the missing-originals report lost its own verdict)
-||||||| parent of 3ba6290 (safety: two "never restore-tested" numbers, 69 apart)
 
 **A stale coverage proof was reported in the present tense.** Production,
 2026-10-14: the reconciliation had been taken on `b18ea965`, and two backup
@@ -1672,6 +1668,56 @@ See `docs/NAS-INTEGRATION-ARCHITECTURE.md`. Planning only — no mount is
 configured and no path is moved.
 
 ---
+
+**Four git conflict markers were committed to this file and survived several
+merges.** `merge.conflictStyle` is `zdiff3` here, so a conflict has THREE
+sections, not two:
+
+```
+  <<<<<<< HEAD
+  ours
+  ||||||| base            <- the one that was missed
+  the common ancestor
+  =======
+  theirs
+  >>>>>>> commit
+```
+
+(indented by two spaces on purpose: the audit below matches only a marker at
+the START of a line, so this illustration documents the shape without tripping
+it, and the audit keeps its full strictness rather than learning to skip code
+fences.)
+
+The resolver used to land the stacked PRs handled `<<<<<<<`, `=======` and
+`>>>>>>>`, kept "both sides", and treated the `|||||||` line as ordinary
+content. Nothing noticed, because a stray line in Markdown breaks no test, fails
+no shellcheck, and renders as plain text -- the rules file carried visible
+merge debris while every suite passed. Every rule between the markers turned
+out to be present exactly once, so only the four marker LINES were removed.
+
+`tests/no-conflict-markers-audit.py` scans every tracked text file.
+`=======` alone is deliberately NOT matched: it is legitimate Markdown setext
+heading underlining, and an audit that fires on ordinary documents gets switched
+off. A marker INSIDE a line is not matched either, because prose quoting one is
+how a fix documents itself. The audit also fails when it scans zero files, so it
+cannot pass vacuously.
+
+**One filesystem must be reported once, however many roots live on it.**
+Measured 2026-10-20: `/srv/data` and `/srv/snapshots` are both subvolumes of
+`/dev/sda1`, uuid `211e06b3-6aaf-40d8-8646-9361b8399eb2`. Iterating by PATH gave
+the operator two identical "never been scrubbed" warnings and told them to run
+TWO scrubs of the same device -- the second re-reading the same 215.87 GiB for
+nothing. Device error counters are per-filesystem too, so those were doubled as
+well. Dedup is keyed on the filesystem UUID from `findmnt`, falling back to
+`stat -c %d`, because an absent tool must not silently double every finding.
+
+**A fixture that skips a loop iteration makes the assertion pass for the wrong
+reason.** The dedup test asserted "exactly one warning" and passed immediately
+-- but `$TMP/snapshots` did not exist, so `[[ -d "$root" ]]` skipped the second
+root entirely and the loop never had two iterations to dedup. The companion
+"two DIFFERENT filesystems are both reported" case is what exposed it: it
+demanded two warnings and got one. Assert both directions of a dedup, or the
+single-result case is indistinguishable from never having looked.
 
 **A grep that finds nothing killed `checkup` entirely.** Production,
 2026-10-20: `sudo domum-media checkup` printed NOTHING -- not a header, not an

@@ -264,6 +264,14 @@ jobs:
       - name: Checkup produces output
         run: tests/checkup-produces-output-smoke.sh
 
+      # Four `|||||||` zdiff3 base markers reached main inside CLAUDE.md and
+      # survived several merges: a stray line in Markdown breaks no test.
+      - name: No conflict markers
+        run: python3 tests/no-conflict-markers-audit.py
+
+      - name: No conflict markers smoke test
+        run: tests/no-conflict-markers-smoke.sh
+
       # A runbook command that does not exist is discovered during a recovery.
       - name: Documented commands audit
         run: python3 tests/documented-commands-audit.py
