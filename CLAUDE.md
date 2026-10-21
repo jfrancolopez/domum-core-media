@@ -2480,6 +2480,14 @@ delegates to the report library and that an unknown `weekly` flag is refused --
 a function that works when called directly but is unreachable through the
 dispatcher is the defect the capabilities audit exists for.
 
+That assertion passed here and failed in CI, for the fourth time this session:
+`report --json` loads the report LIBRARY, and `load_report_lib` looks for it at
+`REPORT_LIB_DEFAULT` -- an INSTALLED path that exists on this machine and not on
+a runner. The fixture now points `DOMUM_DIR` at the repository and blinds
+`REPORT_LIB_DEFAULT`, so the repository's own copy is what loads either way.
+Every root a fixture uses must be redirected into it, and that includes the
+paths a function falls BACK to.
+
 ---
 
 ## 15. Known open safety defects

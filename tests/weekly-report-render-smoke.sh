@@ -503,6 +503,7 @@ sect "the argv path reaches the implementation, and report stays compatible"
 dispatch() {  # $1.. = argv
   (
     export CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state" DOMUM_DATA_ROOT="$TMP/data"
+    export DOMUM_DIR="$REPO_ROOT" REPORT_LIB_DEFAULT="$TMP/no-such-lib"
     # shellcheck disable=SC1090
     source "$CLI" >/dev/null 2>&1
     need_root() { :; }; ensure_dirs() { :; }; export_env_for_compose() { :; }
