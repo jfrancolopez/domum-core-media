@@ -5502,9 +5502,9 @@ checkup_btrfs_health() {
       est="$(btrfs_scrub_estimate "$scrub" "$root")"
       if [[ -n "$est" ]]; then
         est_mins="${est%% *}"; est_size="$(cut -d' ' -f2 <<< "$est")"
-        checkup_add action "btrfs scrub start $root   # read-only, ~${est_mins} min for the ${est_size} it reports; detects checksum errors but cannot repair without a second copy"
+        checkup_add action "btrfs scrub start $root   # ~${est_mins} min for the ${est_size} it reports; repairs a block that has a second copy, reports one that does not"
       else
-        checkup_add action "btrfs scrub start $root   # read-only; detects checksum errors but cannot repair without a second copy"
+        checkup_add action "btrfs scrub start $root   # repairs a block that has a second copy, reports one that does not"
       fi
       continue
     fi
@@ -5546,18 +5546,47 @@ checkup_disk_health() {
     checkup_add action "apt-get install -y smartmontools   # then checkup reports real disk health"
     return 0
   fi
-  local dev health
+  # Read the verdict from --json, not from prose.
+  #
+  # The previous version grepped `smartctl -H` for 'PASSED|OK' case-insensitively
+  # -- which matches "ok" as a SUBSTRING anywhere in the output -- and sent a
+  # device it could not read to CRITICAL "did NOT pass", a false alarm telling
+  # the operator to replace a healthy disk. Measured: under permission denied
+  # `smartctl -j -H` returns well-formed JSON with exit_status 2 and NO
+  # smart_status at all. "I could not check it" is not "it is broken".
+  #
+  # The JSON form is used because it is the one this was verified against: real
+  # captures from both drives on this host, plus the permission-denied shape.
+  # A text pattern could not be checked without root and would have failed
+  # closed into two warnings if smartctl's wording differed.
+  if ! cmd_exists jq; then
+    checkup_add warning "Disk SMART health is UNKNOWN: jq is not installed."
+    checkup_add action "apt-get install -y jq"
+    return 0
+  fi
+  local dev out passed
   while IFS= read -r dev; do
     [[ -n "$dev" ]] || continue
-    health="$(smartctl -H "/dev/$dev" 2>/dev/null || true)"
-    if [[ -z "$health" ]]; then
-      checkup_add warning "SMART health for /dev/$dev could not be read."
-    elif grep -qiE 'PASSED|OK' <<< "$health"; then
-      checkup_add healthy "SMART self-assessment for /dev/$dev: passed."
-    else
-      checkup_add critical "SMART self-assessment for /dev/$dev did NOT pass."
-      checkup_add action "smartctl -a /dev/$dev   # replace the device before it fails"
-    fi
+    out="$(smartctl -j -H "/dev/$dev" 2>/dev/null || true)"
+    # NOT `// empty`. jq's `//` is FALSE-coalescing, not null-coalescing:
+    # `false // empty` produces NOTHING, so a drive that genuinely FAILED its
+    # self-assessment would be indistinguishable from one that could not be
+    # read -- and would be reported as UNKNOWN instead of CRITICAL, which is the
+    # dangerous direction. Measured:
+    #
+    #   {"smart_status":{"passed":false}} | .smart_status.passed // empty  -> (nothing)
+    #   {"smart_status":{"passed":true}}  | .smart_status.passed // empty  -> true
+    #   {}                                | .smart_status.passed // empty  -> (nothing)
+    #
+    # `tostring` keeps all three distinct: false / true / null.
+    passed="$(jq -r '.smart_status.passed | tostring' <<< "$out" 2>/dev/null || true)"
+    case "$passed" in
+      true)  checkup_add healthy "SMART self-assessment for /dev/$dev: passed." ;;
+      false) checkup_add critical "SMART self-assessment for /dev/$dev did NOT pass."
+             checkup_add action "smartctl -a /dev/$dev   # replace the device before it fails" ;;
+      *)     checkup_add warning "SMART health for /dev/$dev is UNKNOWN: smartctl reported no verdict."
+             checkup_add action "smartctl -H /dev/$dev   # run as root; an unreadable device is not a failed one" ;;
+    esac
   done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
 }
 
@@ -9698,7 +9727,7 @@ capabilities_cmd() {
   return 0
 }
 
-# Btrfs scrub: one per FILESYSTEM, read-only, and it repairs nothing by itself.
+# Btrfs scrub: one per FILESYSTEM, and it is READ-WRITE.
 #
 # `btrfs scrub` verifies every allocated extent against its stored checksum. It
 # is the only thing that LOOKS for silent corruption; nothing else on this host
@@ -9712,11 +9741,12 @@ capabilities_cmd() {
 # repair it; the remedy is restoring the named file from restic. That is stated
 # rather than implied, because "scrub" sounds like "repair".
 #
-# Deliberately does NOT take the operation lock. A scrub is read-only and
-# cannot conflict destructively, btrfs itself refuses a second scrub on the same
-# filesystem, and a 10-20 minute job holding the global lock could make the
-# nightly backup fail to acquire it -- trading a detection pass for a missed
-# backup. See docs/BTRFS-SCRUB-PLAN.md.
+# Deliberately does NOT take the operation lock. The justification is NOT that
+# the scrub is read-only -- it is not. It is that btrfs serialises scrubs on a
+# filesystem itself, a metadata repair is an internal consistency operation
+# rather than an application-visible mutation, and a 7-26 minute job holding the
+# global lock could make the nightly backup fail to acquire it -- trading a
+# detection pass for a missed backup. See docs/BTRFS-SCRUB-PLAN.md.
 storage_scrub_status() {
   need_root
   load_cfg
@@ -9771,14 +9801,30 @@ storage_scrub_start() {
     echo "[domum-media] scrubbing $root (uuid ${fsid:-unknown})"
     est="$(btrfs_scrub_estimate "$(btrfs scrub status "$root" 2>/dev/null || true)" "$root")"
     [[ -n "$est" ]] && echo "  expect ~${est%% *} min for $(cut -d' ' -f2 <<< "$est")"
-    echo "  read-only: this DETECTS checksum errors. Data is 'single' here, so a"
-    echo "  data error cannot be repaired -- the remedy is a restore from restic."
+    echo "  READ-WRITE: a default scrub REPAIRS a block that has a second copy,"
+    echo "  and only reports one that does not. It is not passed -r."
+    local prof
+    prof="$(btrfs filesystem df "$root" 2>/dev/null \
+            | sed -nE 's/^(Data|Metadata), ([A-Za-z0-9]+):.*/    \1: \2/p' || true)"
+    if [[ -n "$prof" ]]; then
+      echo "  profiles on this filesystem:"
+      printf '%s\n' "$prof"
+      echo "  A replicated profile (DUP/RAID1/...) is repairable; 'single' is not --"
+      echo "  for that the remedy is a restore from restic."
+    else
+      echo "  The profiles could not be read, so which half is repairable here is"
+      echo "  UNKNOWN; see docs/BTRFS-SCRUB-PLAN.md for the measured layout."
+    fi
     rc=0
     # shellcheck disable=SC2086
     btrfs scrub start -B ${limit:+--limit "$limit"} "$root" || rc=$?
     case "$rc" in
       0) echo "  result          : clean -- every allocated extent matched its checksum" ;;
       3) echo "  result          : UNCORRECTABLE ERRORS FOUND on $root"
+         echo "                    With DUP metadata a metadata error would have been"
+         echo "                    CORRECTED and reported as corrected_errors, so this"
+         echo "                    exit status means DATA corruption -- the half that"
+         echo "                    has no second copy on this filesystem."
          echo "                    This is recovery evidence, not a transient fault."
          echo "                    Capture it before doing anything else:"
          echo "                      btrfs scrub status -R $root"

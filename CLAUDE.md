@@ -2023,9 +2023,11 @@ fail: without blocking, `btrfs scrub start` returns immediately and a oneshot
 unit goes green before reading a single block. The worst result across
 filesystems governs, so a clean filesystem can never mask corruption on
 another. It deliberately does **not** take the operation lock: a scrub is
-read-only, btrfs itself refuses a second scrub on the same filesystem, and a
-20-minute job holding the global lock could make the nightly backup fail to
-acquire it -- trading a detection pass for a missed backup.
+NOT read-only -- see below -- but btrfs serialises scrubs on a filesystem
+itself, a metadata repair is an internal consistency operation rather than an
+application-visible mutation, and a 7-26 minute job holding the global lock
+could make the nightly backup fail to acquire it, trading a detection pass for a
+missed backup.
 
 **A scrub that found corruption must leave a FAILED unit.** `ExecStart` carries
 no `-` prefix, so exit 3 fails `domum-media-btrfs-scrub.service`, which
@@ -2034,7 +2036,7 @@ report names the capture commands (`scrub status -R`, `device stats`, the
 kernel log that names the FILE) and says explicitly **not** to attempt a
 repair. "Warn and continue" is not a safety mechanism, least of all here.
 
-**The scrub timer is read-only and protective and is still NOT in
+**The scrub timer is protective and low-cost and is still NOT in
 `auto-enable.timers`**, because enabling it means a scrub *will* start
 unattended and starting one is an operator decision. The test requires the unit
 file to EXIST and the timer to be absent, so the assertion cannot pass by
@@ -2049,15 +2051,55 @@ into the bargain. Anchor a programmatic edit on code, never on a string that
 also appears in test data, and re-run the mutation afterwards: the section
 printed nothing and the suite still said PASS.
 
-**`checkup_disk_health` reads only `smartctl -H`, which cannot see a
-DEVELOPING problem.** The self-assessment is a post-hoc pass/fail; it says
-nothing about reallocated sectors, pending sectors, wear level or CRC errors,
-which are what move before a drive fails. Separately, an unreadable device
-produces well-formed output with no verdict -- measured, `smartctl -j -H` under
-permission denied returns `exit_status: 2` and `smart_status: null` -- and the
-text path greps for `PASSED|OK`, so it falls through to **CRITICAL "did NOT
-pass"**: a false alarm telling the operator to replace a healthy disk. It only
-hides because `checkup` runs under sudo. Both are open.
+**`checkup_disk_health` sent an UNREADABLE device to CRITICAL, and the fix
+introduced a worse bug that the test caught.** The original greped
+`smartctl -H` for `PASSED|OK` -- matching `ok` as a case-insensitive SUBSTRING
+anywhere in the output -- and sent anything else to **CRITICAL "did NOT pass"**,
+so a permission failure told the operator to replace a healthy disk. Measured:
+under permission denied `smartctl -j -H` returns well-formed JSON with
+`exit_status: 2` and NO `smart_status`. "I could not check it" is not "it is
+broken". The verdict is now read from `--json`, which is also the form the real
+captures are in -- a text pattern could not be verified without root and would
+have failed closed into two mailing warnings if smartctl's wording differed.
+
+**`jq`'s `//` is FALSE-coalescing, not null-coalescing.** My fix used
+`.smart_status.passed // empty`, so a drive that genuinely **FAILED** its
+self-assessment produced NOTHING and was reported as UNKNOWN rather than
+CRITICAL -- the dangerous direction, in the one check that exists to notice a
+dying disk. Measured:
+
+```
+{"smart_status":{"passed":false}} | .smart_status.passed // empty  -> (nothing)
+{"smart_status":{"passed":true}}  | .smart_status.passed // empty  -> true
+{}                                | .smart_status.passed // empty  -> (nothing)
+```
+
+`| tostring` keeps all three distinct: `false` / `true` / `null`. jq's falsy set
+is exactly `null` and `false`, so only a BOOLEAN read is at risk -- the
+codebase's other `// empty` reads are counts, ids and strings and are
+unaffected; verified, `{"n":0} | .n // empty` yields `0`. Never read a boolean
+through `//`.
+
+**Measured 2026-10-21: neither SSD has an actionable wear or error indicator,
+and the asymmetry between them is the finding.** `/dev/sda` (Samsung 870 EVO
+1TB, holds `/srv/data`) has **0.52% of its 600 TBW used** -- 3.11 TB written in
+148.7 days, ~79 years at that rate -- every error counter zero, and
+`Wear_Leveling_Count` normalized 99/100 agreeing independently. `/dev/sdb`
+(KOWIN, holds `/`) reports **all 30 attributes at `value=100, threshold=50`**,
+10 of them unknown to smartmontools, `Wear_Leveling_Count` raw 0 after 3054
+hours, and a `Total_LBAs_Written` whose unit is not determinable: it is
+reporting PLACEHOLDERS, not measurements, and **will report "passed" until it
+does not**.
+
+The drive whose health can be measured is the one holding data that cannot be
+replaced; the drive that measures nothing holds only a rebuildable OS. That is
+the right way round, which is why there is no action. **Attribute thresholds
+were deliberately NOT added to `checkup`**: nothing would fire on sda today, and
+on sdb comparing `value` against `threshold` would produce a confident
+"healthy, 0% wear" from a drive that measures nothing -- the
+HEALTHY-means-UNMEASURED defect, manufactured on purpose. Evidence, including
+sda's historical 62 °C peak and its 8 unclean power-loss recoveries:
+`docs/SSD-HEALTH-STATUS.md`.
 
 **Three tested volume primitives had ZERO reachable call sites.**
 `storage_volume_pre_upgrade_point`, `storage_verify_volume_dumps` and
@@ -2242,6 +2284,59 @@ stub of the non-called collector remains matched the comment explaining why it
 must not be stubbed. Assert on the DEFINITION form (`name() {`), the same
 mistake the capability audit and the stdout-purity audit each made once.
 
+**THE SCRUB IS NOT READ-ONLY, and I called it read-only in thirteen places.**
+The operator asked whether the implementation passes `-r`. It does not:
+
+```
+btrfs scrub start -B ${limit:+--limit "$limit"} "$root"
+```
+
+`btrfs-scrub(8)` is explicit -- *"read-write scrub will also automatically
+repair any damage by copying verified good data from one of the other
+replicas"* -- and Metadata and System on this filesystem are **DUP**, a
+replicated profile. So a default scrub **writes**: it rewrites a corrupt
+metadata block from its second copy. The claim appeared in the runtime message
+the operator actually reads, in two `checkup` remedies, in the unit's
+`Description=`, in the function header, in the lock justification, and five
+times in the plan document -- including *"it never writes, never moves data,
+and cannot be the cause of corruption"*, which is three false statements in one
+sentence.
+
+This is the defect family this whole file exists to correct, committed by me in
+the middle of correcting it: a report describing an operation as something it is
+not. Nothing was harmed -- repairing DUP metadata is the desirable behaviour --
+but the operator was told the blast radius was zero when it was not.
+
+The accurate statement, per profile:
+
+| profile | on a checksum error | writes? |
+|---|---|---|
+| `Metadata: DUP` | **corrected** from the second copy (`corrected_errors`) | **yes** |
+| `System: DUP` | corrected, same mechanism | **yes** |
+| `Data: single` | reported (`uncorrectable_errors`) -- no second copy | no |
+
+Two consequences worth keeping:
+
+- **`exit 3` means DATA corruption specifically.** A metadata error would have
+  been corrected and exited 0, so "uncorrectable errors found" on this
+  filesystem can only be the half that has no second copy.
+- **`-r` is deliberately NOT passed.** Refusing to fix metadata the filesystem
+  can fix would leave it knowingly damaged. A read-only detection pass, for a
+  disk already suspected of failing, is `btrfs scrub start -r -B` run directly;
+  the CLI does not wrap it, because a second mode is a second thing to get
+  wrong.
+- **The "no operation lock" decision survives but its justification does not.**
+  It was argued from "a scrub is read-only". The real reasons are that btrfs
+  serialises scrubs itself, that a metadata repair is an internal consistency
+  operation, and that holding the global lock for 7-26 minutes could fail the
+  nightly backup.
+
+**A measured operation can still be described wrongly.** The scrub ran, was
+clean, and was reported accurately in every numeric respect -- 215.87 GiB,
+7m14s, 509.34 MiB/s, zero errors -- while the sentence next to those numbers
+mischaracterised what the command does. Measuring the outcome is not the same as
+describing the mechanism, and only reading `--help` and the man page caught it.
+
 ---
 
 ## 15. Known open safety defects
@@ -2269,6 +2364,36 @@ it is actually fixed; keep the detail in `docs/`.
 - Documentation may still describe protection that production does not have
   (snapshot coverage, backup targets that are not enabled). Verify claims
   against live evidence before repeating them.
+- **Media-service state and the image archives are NOT backed up off-site, and
+  this is a KNOWN, ACCEPTED limitation -- not an oversight to be quietly
+  fixed.** The cloud restic target is immich-only by design (three roots:
+  `immich/library`, `immich/backup-staging`, the recovery pack). So
+  `/srv/data/{plex,jellyfin,kavita,navidrome,calibre-web}` and
+  `/srv/data/backups/images` exist on exactly one device -- the Samsung 870 EVO
+  that also holds every snapshot and every `.premigration` copy. A local
+  snapshot is not off-site protection.
+
+  It matters most for the archives: measured 2026-10-21, **three** running
+  images are dangling (`RepoTags: []` AND `RepoDigests: []`) -- plex, traefik,
+  uptime-kuma -- so for those the `docker save` archive is the only obtainable
+  copy of the application half of a recovery point. Lose the SSD and the
+  snapshot half is gone with it anyway; lose the archive alone and the data
+  survives with no application to open it.
+
+  **Do not expand the Hetzner scope without a measured, selective proposal.**
+  `du -sb` on the candidate paths needs root and has not been run, and
+  recommending coverage without a size is how a nightly backup window grows
+  silently. Family photographs keep priority: any new coverage is additive and
+  must never displace or slow the Immich paths. No replaceable bulk media --
+  `/srv/media`, movies, TV, downloaded books, derivatives, transcodes,
+  thumbnails -- may enter the set. The design and the open measurements are in
+  `docs/OFFSITE-COVERAGE-CLASSIFICATION.md`.
+- **Mail delivery has never been proven.** `health-notify` has only run with
+  `--dry-run`; `smtp_send_message` has never reached the server from this
+  command. A healthy host sends nothing, which is the contract and also why
+  delivery could stay broken indefinitely unnoticed. The approval-gated test is
+  `health-notify --force`, documented in `docs/WEEKLY-REPORT.md`. Until it has
+  run, silence means "nothing needed attention OR mail is broken".
 
 ---
 

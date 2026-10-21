@@ -1,5 +1,5 @@
 [Unit]
-Description=domum-media: btrfs scrub (monthly, read-only)
+Description=domum-media: btrfs scrub (monthly, read-write: repairs DUP metadata)
 Documentation=file:///opt/domum-core-media/docs/BTRFS-SCRUB-PLAN.md
 ConditionPathExists=/usr/local/bin/domum-media
 # /srv/data identifies the filesystem to scrub, and the scrub covers every
@@ -12,8 +12,14 @@ RequiresMountsFor=/srv/data
 
 [Service]
 Type=oneshot
+# A default scrub is READ-WRITE: it repairs corrupt metadata from the DUP copy.
+# It is NOT passed `-r`, deliberately -- refusing to fix metadata it can fix
+# would leave the filesystem knowingly damaged. Data is `single`, so data errors
+# are reported and cannot be repaired.
+#
 # `storage scrub start` blocks (-B internally), so this unit's exit status is
-# the scrub's own: 0 clean, 1 could not scrub, 3 UNCORRECTABLE ERRORS FOUND.
+# the scrub's own: 0 clean, 1 could not scrub, 3 UNCORRECTABLE ERRORS FOUND
+# (which, with DUP metadata, means DATA corruption specifically).
 # Without blocking the unit would go green before reading a single block.
 # No `-` prefix: a scrub that found corruption must leave a FAILED unit, which
 # is what checkup_systemd_health reports as CRITICAL and health-notify mails.

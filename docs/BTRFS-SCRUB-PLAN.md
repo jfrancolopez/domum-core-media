@@ -74,9 +74,39 @@ constant is already honest about being an estimate.)
 
 ## 3. IO impact and which applications feel it
 
-A scrub is **read-only**. It never writes, never moves data, and cannot be the
-cause of corruption. It can be cancelled (`btrfs scrub cancel`) and resumed
-(`btrfs scrub resume`); cancelling loses only progress.
+**A scrub is READ-WRITE, and this document said the opposite.** The claim
+"read-only ... never writes ... cannot be the cause of corruption" was wrong,
+and the implementation does **not** pass `-r`:
+
+```
+btrfs scrub start -B ${limit:+--limit "$limit"} "$root"
+```
+
+`btrfs-scrub(8)`: *"read-write scrub will also automatically repair any damage
+by copying verified good data from one of the other replicas."* Metadata and
+System here are **DUP** — a replicated profile — so a default scrub **writes**:
+a corrupt metadata block is rewritten from its second copy.
+
+What that means per profile, from section 1:
+
+| profile | on a checksum error | writes? |
+|---|---|---|
+| `Metadata: DUP` | **corrected** from the second copy, counted in `corrected_errors` | **yes** |
+| `System: DUP` | corrected, same mechanism | **yes** |
+| `Data: single` | reported, counted in `uncorrectable_errors` — no second copy exists | no |
+
+So on this host a scrub **repairs metadata and cannot repair data**, and
+`exit 3` ("uncorrectable errors found") means **data** corruption specifically,
+because a metadata error would have been corrected and exited 0.
+
+**`-r` is deliberately not passed.** Refusing to fix metadata the filesystem
+*can* fix would leave it knowingly damaged. If a read-only detection pass is
+ever wanted — on a disk already suspected of failing, where writing is the
+thing to avoid — `sudo btrfs scrub start -r -B /srv/data` does that directly;
+the CLI does not wrap it, because a second mode is a second thing to get wrong.
+
+It can be cancelled (`btrfs scrub cancel`) and resumed (`btrfs scrub resume`);
+cancelling loses only progress.
 
 Every container that binds `/srv/data` shares the device: Immich (library and
 PostgreSQL), Plex, Jellyfin, Kavita, Navidrome, Calibre-Web. On an SSD at 24%
@@ -113,12 +143,31 @@ minutes instead of ~10.
 
 **That recommendation was followed, and the measurement is in.** The first run
 was unthrottled, at 10:24 on a working day, **with all eleven containers up**,
-and finished in 7m14s. Whether anyone noticed latency during those seven
-minutes is the one thing this document cannot measure — only the operator can
-say. If nobody did, the `--limit 150M` in the proposed unit below is buying
-protection against a cost that was never observed, while tripling the window
-during which the scrub is running at all. **Open question for the operator, not
-a defect.**
+and finished in 7m14s at 509.34 MiB/s.
+
+**The scheduled unit keeps `--limit 150M` anyway, deliberately.** One
+unthrottled run proves the scrub *completes* quickly; it does not measure what
+it cost the eleven containers sharing the device, and nobody was watching
+latency at the time. A manual run is supervised — the operator is sitting there
+and can cancel it — while a scheduled one fires unattended at 05:30 on a
+Sunday. Those are different risk profiles, and the conservative figure is the
+right default for the unattended one.
+
+At 150 MB/s the monthly pass is about 26 minutes instead of 7. That is the price
+of not having measured the contention, and it is cheap.
+
+**What would justify raising or removing it**, in order of strength:
+
+1. a scheduled run completing with no observed effect on any service — which
+   needs the timer enabled first, so this is evidence that accumulates *after*
+   the decision, not before it;
+2. an unthrottled run performed deliberately while watching service latency,
+   rather than incidentally;
+3. nothing else. "It finished fast once" is not evidence about contention.
+
+Until one of those exists, the limit stays. This is the "quote the figure for
+the cap that BINDS" rule applied to a different kind of cap: the binding
+constraint on an unattended job is not how fast it *can* run.
 
 **Avoid these windows**, which are the host's own scheduled IO:
 
@@ -247,27 +296,27 @@ Four deliberate decisions, each asserted by a test:
   `/srv/snapshots` could only block a scrub of a filesystem that is mounted
   and healthy — trading this host's one corruption-detection pass for a
   dependency it does not need. Asserted in both directions.
-- **Not auto-enabled.** It is read-only and protective, which would normally
+- **Not auto-enabled.** It is protective and low-cost, which would normally
   qualify it, but enabling it means a scrub *will* start unattended. A test
   requires the unit file to exist and the timer to be absent from the list, so
   the assertion cannot pass vacuously.
 
 Why monthly rather than weekly:
 
-- At ~10–26 minutes read-only the cost is near zero, so the interval is set by
+- At ~10–26 minutes the cost is near zero, so the interval is set by
   how long silent corruption may go unnoticed, not by expense. Monthly bounds
   that at 31 days.
 - Weekly would collide with the three jobs already on Sunday and buys little:
   bit-rot on an SSD at 24% capacity is slow-moving.
 - `Persistent=true` means a missed run fires at the next boot. Harmless for a
-  read-only job — unlike `snapshot prune`, which deletes — and the randomized
+  job that deletes nothing — unlike `snapshot prune`, which does — and the randomized
   delay keeps it off the boot critical path. No `OnBootSec=`/`OnStartupSec=`,
   and no `WantedBy=` on the service.
 
 **That precondition is now satisfied.** The first scrub was run by hand on
 2026-10-21, came back clean, and its real rate is recorded in section 2. The
 monthly schedule is therefore justified by measurement rather than by argument:
-a 7-minute read-only pass, once a month, over the only copy of the family photo
+a 7-minute verification pass, once a month, over the only copy of the family photo
 library.
 
 Enabling it is still an operator action, and it needs the unit files
@@ -296,7 +345,7 @@ After the next deployment, the same thing with the dedup, the estimate, the
 profile warning and a meaningful exit status:
 
 ```
-sudo domum-media storage scrub status     # read-only, says what it would cost
+sudo domum-media storage scrub status     # genuinely read-only: reports, scrubs nothing
 sudo domum-media storage scrub start      # blocks; 0 clean, 1 failed, 3 errors found
 ```
 
