@@ -141,7 +141,7 @@ grep -q 'no errors found' <<< "$out" && fail "it echoed 'no errors found' for a 
 grep -qE 'first run.*~10 min.*215\.87GiB' <<< "$out" \
   || fail "status does not quote the measured size and derived duration: $out"
 grep -q 'storage scrub start' <<< "$out" || fail "no remedy named: $out"
-grep -q '^RC=0$' <<< "$out" || fail "status is read-only and must exit 0: $out"
+grep -q '^RC=0$' <<< "$out" || fail "status reports only and must exit 0: $out"
 echo "  flagged, estimated, remedy named, and 'no errors found' withheld"
 
 sect "status: an unreadable scrub status is UNKNOWN, never healthy"
@@ -195,5 +195,77 @@ mout="$(
 )"
 grep -qE -- '-B' <<< "$mout" && fail "the mutant still passed -B: $mout"
 echo "  killed: without -B the invocation does not block ($mout)"
+
+sect "the scrub does NOT claim to be read-only, because it is not"
+# The implementation does not pass -r, and btrfs-scrub(8) says a read-write
+# scrub repairs damage from a replica. Metadata here is DUP, so a scrub WRITES.
+# "read-only" appeared in the runtime message, two checkup remedies, the unit
+# Description, the function header and five places in the plan -- including
+# "it never writes ... and cannot be the cause of corruption". A report that
+# describes an operation as something it is not is the defect this repository
+# exists to correct.
+out="$(drive "$CLEAN" 'storage_scrub_start')"
+grep -qi 'read-only' <<< "$out" \
+  && fail "the scrub still describes itself as read-only. It does not pass -r,
+so on any replicated profile it repairs by writing: $out"
+grep -q 'READ-WRITE' <<< "$out" || fail "it does not say it is read-write: $out"
+grep -q 'not passed -r' <<< "$out" || fail "it does not say -r is absent: $out"
+echo "  says READ-WRITE and that -r is not passed"
+
+sect "it READS the profiles rather than asserting this host's"
+# The first version of the message hardcoded "Metadata is DUP here, Data is
+# 'single'". That is THIS filesystem's layout baked into generic code -- the
+# stale-assertion mistake. A filesystem with `-d dup` repairs data too.
+PROF='btrfs() { printf "%s\n" "$*" >> "$BTRFS_LOG"; case "$1 $2" in
+  "scrub status") printf "Scrub started:    Mon Oct 20 03:00:00 2026\nError summary:    no errors found\n" ;;
+  "filesystem df") printf "Data, single: total=218.01GiB, used=215.26GiB\nMetadata, DUP: total=1.00GiB, used=313.98MiB\n" ;;
+  "scrub start") return 0 ;;
+esac; }'
+out="$(drive "$PROF" 'storage_scrub_start')"
+grep -q 'filesystem df' <<< "$out" || fail "it never asked for the profiles: $out"
+grep -qE 'Data: single' <<< "$out" || fail "it did not print the real data profile: $out"
+grep -qE 'Metadata: DUP' <<< "$out" || fail "it did not print the real metadata profile: $out"
+grep -q "replicated profile" <<< "$out" || fail "it does not say which kind is repairable: $out"
+echo "  prints Data: single and Metadata: DUP, read from the filesystem"
+
+sect "profiles that cannot be read are UNKNOWN, not guessed"
+# Saying "metadata is DUP" when the profiles are unreadable would be asserting
+# the common case as fact. The whole point of reading them is that they vary.
+out="$(drive "$CLEAN" 'storage_scrub_start')"
+grep -q 'could not be read' <<< "$out" \
+  || fail "unreadable profiles did not report UNKNOWN: $out"
+grep -qE 'Data: |Metadata: ' <<< "$out" \
+  && fail "it printed a profile it could not read: $out"
+grep -qi 'DUP' <<< "$out" && fail "it named DUP without having read it: $out"
+echo "  UNKNOWN, and it names no profile it did not read"
+
+sect "the invocation really has no -r, so the claim above matches the code"
+# Assert on the CODE as well as the message: a future edit could add -r and make
+# the message wrong in the other direction. Comments stripped first, because the
+# explanation above legitimately contains the flag.
+code="$(sed -e 's/#.*//' "$CLI")"
+# Several lines mention `btrfs scrub start` -- the invocation and the two
+# remedies. Select the EXECUTED one by the -B that only it carries, or the
+# assertion below reads a remedy string and reports the wrong line.
+inv="$(grep 'btrfs scrub start' <<< "$code" | grep -- '-B' | tr -s ' ' | sed 's/^ *//')"
+[[ "$(wc -l <<< "$inv")" == "1" ]] \
+  || fail "expected exactly one executed invocation, got:
+$inv"
+grep -qE '^btrfs scrub start -B' <<< "$inv" || fail "the invocation lost -B: $inv"
+grep -qE '(^| )-r( |$)' <<< "$inv" \
+  && fail "the invocation now passes -r, so it IS read-only and every message is
+wrong in the other direction: $inv"
+echo "  no -r in: $inv"
+
+sect "exit 3 is attributed to DATA corruption, which is what DUP metadata implies"
+# A metadata error would have been CORRECTED and exited 0, so on this filesystem
+# "uncorrectable" can only be the half with no second copy. Saying only
+# "uncorrectable errors" leaves the operator to work that out.
+out="$(drive "$BAD" 'storage_scrub_start')"
+grep -q 'means DATA corruption' <<< "$out" \
+  || fail "exit 3 is not attributed to data specifically: $out"
+grep -qi 'corrected_errors' <<< "$out" \
+  || fail "it does not explain that a metadata error would have been corrected: $out"
+echo "  exit 3 attributed to data, with the reason"
 
 echo "PASS: btrfs scrub smoke test"

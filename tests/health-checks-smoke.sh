@@ -225,8 +225,9 @@ btrfs() {
 grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "the remedy must survive a missing size: $out"
 grep -q 'min for the' <<< "$out" && fail "it invented a duration from no size: $out"
 grep -q '~0 min' <<< "$out" && fail "it printed a zero estimate: $out"
-grep -q 'cannot repair without a second copy' <<< "$out" \
-  || fail "the repair limit must be stated either way: $out"
+grep -q 'reports one that does not' <<< "$out" \
+  || fail "the repair limit must be stated either way -- a scrub REPAIRS what has a
+second copy and only reports what does not, and the remedy has to say so: $out"
 echo "  no size, no estimate, and the repair limit is still stated"
 
 sect "the estimate uses the device's OWN rotational flag, both ways"
@@ -385,7 +386,7 @@ btrfs() {
   grep -q 'WARN|Btrfs on .* has NEVER been scrubbed' <<< "$out" \
     || fail "wording '$wording' was not recognised as never-scrubbed: $out"
   grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy for '$wording': $out"
-  grep -q 'cannot repair without a second copy' <<< "$out" \
+  grep -q 'reports one that does not' <<< "$out" \
     || fail "the remedy must state what a scrub cannot do: $out"
   grep -q 'OK|Btrfs on .* scrubbed' <<< "$out" \
     && fail "'$wording' was also reported as recently scrubbed: $out"
@@ -443,7 +444,7 @@ sect "a SMART self-assessment that does not pass is CRITICAL"
 out="$(probe '
 cmd_exists() { :; }
 lsblk() { printf "sda disk\n"; }
-smartctl() { printf "SMART overall-health self-assessment test result: FAILED!\n"; }' \
+smartctl() { printf "%s" "{\"smart_status\":{\"passed\":false}}"; }' \
   checkup_disk_health)"
 grep -q 'CRIT|SMART self-assessment for /dev/sda did NOT pass' <<< "$out" \
   || fail "a failing disk must be critical: $out"
@@ -540,5 +541,66 @@ grep -q 'WARN|Immich off-site coverage for cloud has never been reconciled' <<< 
   || fail "an absent proof must warn: $out"
 grep -q 'metadata only, no download' <<< "$out" || fail "the remedy must state its cost: $out"
 echo "  warned, and the remedy says it downloads nothing"
+
+sect "SMART: a device that cannot be READ is UNKNOWN, never CRITICAL"
+# The old check grepped `smartctl -H` for PASSED|OK case-insensitively and sent
+# an unreadable device to CRITICAL "did NOT pass" -- a false alarm telling the
+# operator to replace a healthy disk. Measured: under permission denied
+# `smartctl -j -H` returns well-formed JSON with exit_status 2 and NO
+# smart_status. "I could not check it" is not "it is broken".
+DENIED='{"json_format_version":[1,0],"smartctl":{"exit_status":2,"messages":[{"string":"Smartctl open device: /dev/sda failed: Permission denied","severity":"error"}]}}'
+out="$(probe "
+lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '$DENIED'; }
+" checkup_disk_health)"
+grep -q 'CRIT|' <<< "$out" && fail "an unreadable device was reported as a FAILED disk: $out"
+grep -q 'WARN|SMART health for /dev/sda is UNKNOWN' <<< "$out" \
+  || fail "an unreadable device must be UNKNOWN: $out"
+grep -q 'OK|SMART' <<< "$out" && fail "an unreadable device was reported healthy: $out"
+grep -q 'ACT|smartctl -H' <<< "$out" || fail "no remedy, so it never mails: $out"
+grep -qi 'not a failed one' <<< "$out" || fail "the remedy does not say it is not a failure: $out"
+echo "  UNKNOWN with a remedy, neither healthy nor critical"
+
+sect "SMART: a real PASSED capture reads healthy; a failed one reads CRITICAL"
+# Driven with the shape of the real captures taken from this host 2026-10-21,
+# where both drives report smart_status.passed = true.
+out="$(probe "
+lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{\"smart_status\":{\"passed\":true}}'; }
+" checkup_disk_health)"
+grep -q 'OK|SMART self-assessment for /dev/sda: passed' <<< "$out" \
+  || fail "a passing drive was not reported healthy: $out"
+grep -qE 'CRIT\||WARN\|SMART' <<< "$out" && fail "a passing drive raised something: $out"
+out="$(probe "
+lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{\"smart_status\":{\"passed\":false}}'; }
+" checkup_disk_health)"
+grep -q 'CRIT|SMART self-assessment for /dev/sda did NOT pass' <<< "$out" \
+  || fail "a FAILING drive was not critical: $out"
+grep -q 'ACT|smartctl -a' <<< "$out" || fail "a failing drive has no remedy: $out"
+echo "  true -> healthy, false -> critical, both with the right class"
+
+sect "SMART: the verdict is not matched as a SUBSTRING"
+# `grep -qiE 'PASSED|OK'` matched "ok" anywhere in the output. Unrelated prose
+# containing those letters must not read as a pass.
+out="$(probe "
+lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{\"smartctl\":{\"messages\":[{\"string\":\"Device looks OK but SMART is disabled\"}]}}'; }
+" checkup_disk_health)"
+grep -q 'OK|SMART' <<< "$out" \
+  && fail "prose containing 'OK' was read as a passing self-assessment: $out"
+grep -q 'WARN|SMART health for /dev/sda is UNKNOWN' <<< "$out" \
+  || fail "a verdict-less capture must be UNKNOWN: $out"
+echo "  prose containing OK is still UNKNOWN"
+
+sect "SMART: jq absent is UNKNOWN with a remedy, not silence"
+out="$(probe "
+lsblk() { printf 'sda disk\n'; }
+cmd_exists() { [[ \"\$1\" != jq ]]; }
+" checkup_disk_health)"
+grep -qi 'jq is not installed' <<< "$out" || fail "a missing jq is not reported: $out"
+grep -q 'ACT|apt-get install -y jq' <<< "$out" || fail "no remedy for missing jq: $out"
+grep -q 'OK|SMART' <<< "$out" && fail "it claimed disk health with no way to parse it: $out"
+echo "  UNKNOWN, named, with the remedy"
 
 echo "PASS: health-checks smoke test"

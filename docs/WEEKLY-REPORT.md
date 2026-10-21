@@ -254,3 +254,66 @@ transport the recovery pack already uses — `smtp_send_message` is now the one
 implementation — so there is no new dependency and no second place to get
 credentials wrong. With delivery disabled it prints the summary and says so; it
 never reports mail as delivered when it was not.
+
+## The controlled real-email test — REQUIRES OPERATOR APPROVAL
+
+**No test mail has been sent.** `health-notify` has only ever been run with
+`--dry-run`, which stages the message, prints it, and deletes it without
+contacting the SMTP server.
+
+### Why a real send still needs proving
+
+Everything up to the transport is verified: the four checks run, the verdict is
+computed, the silence gate works in both directions (observed in production
+2026-10-21, HEALTHY → ACTION REQUIRED → HEALTHY on real state), the message is
+assembled, and the unit's `ExecStart` prefixes make a delivery failure fail the
+unit. What has **never** been exercised is `smtp_send_message` actually reaching
+the server and the mail arriving in a mailbox.
+
+A dry run cannot prove that. Neither can the weekly timer while the host is
+healthy, because a healthy host sends nothing — which is the contract, and also
+why delivery could stay broken indefinitely without anyone noticing.
+
+### The test
+
+```
+sudo domum-media health-notify --force
+```
+
+`--force` is the only thing that bypasses the silence gate. It sends the real
+summary, through the real transport, to the configured recipient.
+
+**What to expect, given the host is currently healthy:**
+
+| | |
+|---|---|
+| subject | `domum-media: healthy` |
+| body | the same text `--dry-run` printed: `VERDICT: HEALTHY`, the check counts, and the two follow-up commands |
+| recipient | `RECOVERY_PACK_EMAIL_TO`, falling back to `DOMUM_EMAIL` |
+| exit 0 | `health-notify: sent -- <subject>` |
+| exit non-zero | the send failed; the message is removed and nothing claims it was delivered |
+
+**Preconditions.** `RECOVERY_PACK_EMAIL_ENABLED` must be `1` and the SMTP host,
+port and credential files must be configured. If email is disabled the command
+reports that and does **not** fail the timer — deliberately, so a host with no
+mail configured does not show a failed unit every week, but it never pretends
+the mail was delivered either.
+
+**It prints no credentials.** `smtp_send_message` is the one transport and reads
+the username and password from their files; neither the summary, the message
+headers nor any log line contains them.
+
+### Why `--force` and not a separate test mode
+
+A dedicated test path would prove a dedicated test path works. `--force` sends
+the *real* message through the *real* function the timer calls, so the only
+difference from a genuine alert is the verdict it happens to be carrying.
+
+### After it succeeds
+
+Nothing to undo — `--force` changes no state and sets no flag. The next weekly
+run returns to the normal contract: silence while healthy, one mail when
+something needs attention. Record the date here so a future reader knows
+delivery was proven and when.
+
+**Delivery proven:** not yet.
