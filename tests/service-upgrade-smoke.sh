@@ -100,9 +100,21 @@ grep -q -- '--archive-image' <<< "$shim" \
   || fail "the upgrade path can create an UNARCHIVED point; the archive is the half
 that makes it a rollback rather than a museum piece"
 l_point="$(line_in "$up" 'create_upgrade_rollback_point')"
-l_verify="$(line_in "$up" 'storage_verify_archive "\$point"')"
-[ "$l_point" -lt "$l_verify" ] || fail "the archive is verified before it is created"
-[ "$l_verify" -lt "$l_deploy" ] || fail "the archive is verified AFTER the deploy ($l_verify vs $l_deploy)"
+# The verification is dispatched on the state model now, so the call site is
+# verify_upgrade_rollback_point rather than storage_verify_archive directly.
+# The ordering invariant is unchanged and still asserted -- and so is the chain,
+# because a rename that stopped reaching the real verifier would otherwise
+# satisfy this section without verifying anything.
+l_verify="$(line_in "$up" 'verify_upgrade_rollback_point "\$point"')"
+[ "$l_point" -lt "$l_verify" ] || fail "the recovery point is verified before it is created"
+[ "$l_verify" -lt "$l_deploy" ] || fail "the recovery point is verified AFTER the deploy ($l_verify vs $l_deploy)"
+vshim="$(awk '/^verify_upgrade_rollback_point\(\) \{/,/^\}/' "$CLI")"
+grep -q 'storage_verify_archive' <<< "$vshim" \
+  || fail "verify_upgrade_rollback_point does not verify the image archive; the
+ordering above would then be proving nothing"
+grep -q 'storage_verify_volume_dumps' <<< "$vshim" \
+  || fail "verify_upgrade_rollback_point does not verify volume dumps, so a
+docker-volume point would pass having checked nothing it contains"
 # And each must abort rather than warn.
 pb="$(awk '/if ! create_upgrade_rollback_point/,/^  fi$/' <<< "$up")"
 grep -q 'die ' <<< "$pb" || fail "a failed pre-upgrade point does not abort the upgrade:

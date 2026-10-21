@@ -264,6 +264,12 @@ jobs:
       - name: Btrfs scrub smoke test
         run: tests/btrfs-scrub-smoke.sh
 
+      # The docker-volume upgrade path. Its three primitives existed with ZERO
+      # reachable call sites: assert_pre_upgrade_possible refused a
+      # docker-volume service before any of them could run.
+      - name: Volume upgrade dispatch smoke test
+        run: tests/volume-upgrade-dispatch-smoke.sh
+
       # checkup must PRODUCE a report. Silence is the one unacceptable outcome:
       # `sudo domum-media checkup` printed nothing at all in production, and a
       # blank report is indistinguishable from a healthy one.

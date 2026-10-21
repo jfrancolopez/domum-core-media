@@ -2050,6 +2050,108 @@ text path greps for `PASSED|OK`, so it falls through to **CRITICAL "did NOT
 pass"**: a false alarm telling the operator to replace a healthy disk. It only
 hides because `checkup` runs under sudo. Both are open.
 
+**Three tested volume primitives had ZERO reachable call sites.**
+`storage_volume_pre_upgrade_point`, `storage_verify_volume_dumps` and
+`rollback_volume_upgrade` all existed, were tested, and nothing could reach
+them: `create_upgrade_rollback_point` called `storage_pre_upgrade_point`
+unconditionally, so a docker-volume service was refused by
+`assert_pre_upgrade_possible` for the generic reason that its path is not a
+subvolume. The orchestration is now dispatched on the DECLARED state model --
+`create_upgrade_rollback_point`, `verify_upgrade_rollback_point` and
+`rollback_dispatch` -- and an `unknown` or `stateless` model is REFUSED rather
+than guessed, because restoring a subvolume snapshot over a Docker volume would
+report success having restored nothing.
+
+**I then wrote the gate in the wrong place and my own dispatch was still dead
+code.** `assert_pre_upgrade_possible` runs near the top of `service_upgrade` and
+**dies** on `docker-volume` ("there is no pre-upgrade recovery point for this
+service yet") -- a refusal that predates the volume path. So the new dispatch
+below it could never execute. The model is now resolved FIRST, the gate refuses
+before the lock and before compose, and the tier-specific assert is called only
+for `protected-tier`; the volume path relies on
+`storage_volume_pre_upgrade_point`'s own equivalent checks. Found by DRIVING the
+function; reading it had looked fine twice.
+
+**`VOLUME_UPGRADE_ENABLED` defaults to 0 and the gate is the point.** The volume
+path is implemented and exercised only against fixtures -- it has never run
+against a real service -- so production refuses until the operator sets it. The
+refusal happens before the lock is acquired and before any container is stopped,
+because a closed gate that still causes downtime is not a closed gate. The
+mutation neutralises the COMPARISON (`"$X" != "$X"`, never `&& false` inside
+`[[ ]]`) and requires the refusal to disappear.
+
+**Name the observable a mutation actually changes.** The gate mutant was first
+asserted to "reach the lock". It does not: with the gate neutralised the
+function runs on into `other_container_identities` and the staged-image
+resolution, which the fixture does not stub, so it dies there for an unrelated
+reason and the assertion failed against a mutant that had genuinely got past the
+gate. What the mutation changes is whether the REFUSAL happens at all.
+
+**Measured 2026-10-21: traefik and uptime-kuma are BOTH running dangling
+images, with a newer image already staged under the same tag.**
+
+| service | running image | tag now points at |
+|---|---|---|
+| traefik | `9c3b91d5…` (`RepoTags: []`, `RepoDigests: []`) | `9c2a54d87f76` |
+| uptime-kuma | `a8610b3b…` (`RepoTags: []`, `RepoDigests: []`) | `3e24e96c89ef` |
+
+That is the Plex condition in both: the running image survives only because a
+container references it, so a prune would make the application half of any
+recovery point unobtainable. The `--archive-image` step is therefore not
+optional for these two -- it is the only copy that would survive.
+
+**uptime-kuma ships sqlite3 3.40.1 and nothing was using it.**
+`service_sqlite_binary uptime-kuma` now declares `/usr/bin/sqlite3`, which turns
+`kuma.db` from `unsupported: not checked` into a real integrity check -- the
+same gap calibre-web had. It matters more here: `kuma.db` is WAL-mode and the
+application forward-migrates it on startup, which is exactly the state a
+rollback point has to vouch for.
+
+**uptime-kuma's readiness is the best-evidenced of the eleven; traefik's cannot
+be evidenced at all.** Measured across a real restart, uptime-kuma logs
+`Connected to the database` and then `Listening on:`, so the declared pattern
+comes AFTER the database is open -- a stronger claim than Plex's TCP-listener
+probe -- and it also has a container healthcheck. traefik has **no** healthcheck
+and logs **no** readiness line: its providers start asynchronously, the last
+lines of a clean start are `Starting provider *acme.Provider` and friends, and
+there is no `Configuration loaded from` line at all on this host (0
+occurrences). `service_ready_log_pattern` deliberately leaves traefik
+undeclared, because declaring a `Starting provider` line would assert readiness
+from evidence that only shows a provider beginning to start. Its readiness is
+reported as unproven instead.
+
+**Local Btrfs snapshots are not off-site protection, and the per-service
+classification says so explicitly.** `/srv/data` and `/srv/snapshots` are
+subvolumes of ONE filesystem on ONE device, and a proof snapshot plus its
+`.premigration` copy both live there. They protect against a bad upgrade, a bad
+migration and operator error; they do not survive the SSD failing.
+`docs/OFFSITE-COVERAGE-CLASSIFICATION.md` classifies every service and never
+counts a local snapshot as off-site coverage.
+
+The five migrated media services -- plex, jellyfin, kavita, navidrome,
+calibre-web -- are **local snapshots only**. So are the image archives, and
+that is the sharpest gap: measured 2026-10-21, THREE running images are
+dangling (plex, traefik, uptime-kuma), so for those the `docker save` archive is
+the only obtainable copy of the application half of a recovery point, and
+`/srv/data/backups/images` is not in the cloud target.
+
+**The production config is `0600 root`, so which backup targets are ENABLED
+cannot be established from the development account.** A second target `nas` is
+declared with `/srv/data` as its root. `load_cfg` run as `jfranco` silently
+falls back to defaults -- `BACKUP_TARGETS=unset` and both targets reporting
+ENABLED -- which is a DEFAULT, not a measurement, and reporting it as one would
+be the fixture-backed-probe mistake. It is recorded as an open question needing
+root, because if `nas` is enabled then `/srv/data` is already covered and the
+proposed selective backup is unnecessary.
+
+**No new backup coverage is proposed until the bytes are measured.**
+`du -sb` on the candidate paths needs root. The design is written down; the
+recommendation is deliberately withheld, because recommending coverage without
+a size is how a nightly window gets quietly lengthened. Family photographs keep
+priority: any new coverage is additive and must never displace or slow the
+Immich paths, and no replaceable bulk media -- `/srv/media`, movies, TV,
+downloaded books, derivatives, transcodes, thumbnails -- enters the set.
+
 ---
 
 ## 15. Known open safety defects
