@@ -469,3 +469,69 @@ on the other side.
 last: its state is a live PostgreSQL cluster plus the photo library, both under
 `/srv/data/immich`, and `CLAUDE.md` §7 governs it. It needs its own reviewed
 phase, not this wrapper.
+
+## `VOLUME_UPGRADE_ENABLED` — the gate the refusal names
+
+A `docker-volume` service used to be blocked because **no pre-upgrade recovery
+point was possible** for it. That is no longer true: the machinery exists, and
+`updates apply --service <svc>` now dispatches on the declared state model.
+
+```
+protected-tier  ->  storage_pre_upgrade_point --archive-image   (Btrfs snapshot)
+docker-volume   ->  storage_volume_pre_upgrade_point --archive-image  (volume dumps)
+unknown         ->  REFUSED
+stateless       ->  REFUSED
+```
+
+A volume point is verified by **both** `storage_verify_archive` and
+`storage_verify_volume_dumps`; checking only the archive would report a point as
+verified having inspected nothing it actually contains, because the dumps *are*
+the state. Rollback is dispatched the same way, and an unknown model is refused
+rather than guessed — restoring a subvolume snapshot over a Docker volume would
+report success having restored nothing, which is the worst outcome for a
+rollback because the operator stops looking.
+
+**The gate is now about evidence, not possibility.** `VOLUME_UPGRADE_ENABLED`
+defaults to `0` and production refuses:
+
+```
+Refusing: uptime-kuma keeps its durable state in a DOCKER VOLUME, and
+VOLUME_UPGRADE_ENABLED is not 1.
+```
+
+The path is exercised against disposable fixtures only — it has never run
+against a real service. The refusal happens **before** the operation lock is
+acquired and **before** any container is stopped, because a closed gate that
+still causes downtime is not a closed gate.
+
+### Before opening it
+
+`VOLUME_UPGRADE_ENABLED=1` in the production configuration is a deliberate
+operator decision. What is worth knowing first, measured 2026-10-21:
+
+- **Both services run DANGLING images** — `RepoTags: []` and `RepoDigests: []`
+  for traefik (`9c3b91d5…`) and uptime-kuma (`a8610b3b…`), each with a newer
+  image already staged under the same tag. The running image survives only
+  because a container references it, so the `docker save` archive is the only
+  obtainable copy of the application half. `--archive-image` is not optional for
+  these two.
+- **`/srv/data/backups/images` is not in the cloud target**, so those archives
+  are on the protected tier and nowhere else. See
+  `docs/OFFSITE-COVERAGE-CLASSIFICATION.md`.
+- **traefik's `acme.json` is the Let's Encrypt account private key** plus issued
+  certificates, mode 0600. The volume dump must preserve that mode.
+- **`kuma.db` is WAL-mode and uptime-kuma forward-migrates it on startup.**
+  `service_sqlite_binary uptime-kuma` now declares the sqlite3 3.40.1 that ships
+  in the image, so the dump gets a real integrity check instead of
+  `unsupported: not checked`.
+- **Readiness is asymmetric.** uptime-kuma logs `Connected to the database` and
+  then `Listening on:`, and has a container healthcheck — the best-evidenced
+  readiness of the eleven. traefik has **no** healthcheck and logs **no**
+  readiness line, so `service_ready_log_pattern` deliberately leaves it
+  undeclared and its readiness is reported as unproven. Declaring one of its
+  `Starting provider` lines would assert readiness from evidence that only shows
+  a provider beginning to start.
+
+So the honest position is that traefik is the weaker of the two to upgrade
+first, despite being the smaller change: its state is a private key and its
+readiness cannot be observed.

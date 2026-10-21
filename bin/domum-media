@@ -1021,6 +1021,26 @@ verify_backup_freshness() {
 service_ready_log_pattern() {  # $1 = service
   case "$1" in
     navidrome)   printf 'Navidrome server is ready!' ;;
+    # Observed on this host across a real restart, in this order:
+    #
+    #   INFO: Connected to the database
+    #   INFO: Listening on:
+    #   INFO: -  http://localhost:3001
+    #
+    # So this line comes AFTER the database is open, which makes it a stronger
+    # claim than Plex's TCP-listener probe. uptime-kuma also has a container
+    # healthcheck (CMD-SHELL extra/healthcheck, 180s start period), so its
+    # readiness is the best-evidenced of the eleven.
+    uptime-kuma) printf 'Listening on:' ;;
+    # traefik is DELIBERATELY absent. Measured: it has no container healthcheck
+    # and logs no definitive readiness line -- its providers start
+    # asynchronously and the last lines of a clean start are
+    # `Starting provider *acme.Provider` and friends. There is no
+    # `Configuration loaded from` line at all on this host (0 occurrences).
+    # Declaring one of the `Starting provider` lines would assert readiness from
+    # evidence that only shows a provider beginning to start, which is the kind
+    # of claim this project treats as a defect. traefik's readiness is reported
+    # as unproven instead.
     # The LinuxServer.io init script's own probe of PMS's listener, observed on
     # this host across a real restart:
     #
@@ -7127,6 +7147,14 @@ service_sqlite_binary() {  # $1 = service -> path INSIDE its container
     # journal_mode -> delete (so no WAL hazard, unlike Plex and Uptime Kuma),
     # 21 tables, 2 users.
     calibre-web) printf '/usr/bin/sqlite3' ;;
+    # uptime-kuma ships sqlite3 3.40.1 at /usr/bin/sqlite3 (measured in
+    # louislam/uptime-kuma:2). Without this declaration a volume recovery point
+    # reports kuma.db as `unsupported: not checked` -- honest, because there is
+    # no sqlite3 on this HOST at all, but weaker than what is available, and
+    # kuma.db is a live WAL-mode database the application forward-migrates on
+    # startup. That is precisely the state a rollback point has to be able to
+    # vouch for.
+    uptime-kuma) printf '/usr/bin/sqlite3' ;;
     *) return 1 ;;
   esac
 }
@@ -8967,6 +8995,21 @@ of whatever was there is named in them, and $service is stopped."
   return 1
 }
 
+rollback_dispatch() {  # $1 = service, $2 = recovery point
+  need_root
+  load_cfg
+  local service="${1:-}" model
+  [[ -n "$service" ]] || die "Usage: domum-media rollback-upgrade <service> <recovery-point>"
+  model="$(service_state_model "$service")"
+  model="${model%% *}"
+  case "$model" in
+    protected-tier) rollback_upgrade "$@" ;;
+    docker-volume)  rollback_volume_upgrade "$@" ;;
+    *) die "Refusing: $service has state model '$model'. There is no rollback
+machinery for it, and guessing would report success having restored nothing." ;;
+  esac
+}
+
 rollback_upgrade() {  # $1 = service, $2 = recovery point
   need_root
   load_cfg
@@ -9218,10 +9261,41 @@ service_upgrade() {  # $1 = service, [--dry-run]
   is_managed_service "$service" \
     || die "Refusing: '$service' is not an upgradable service.
 Known: $(managed_image_specs | cut -d'|' -f1 | tr '\n' ' ')"
+  # The STATE MODEL decides which machinery applies, and it is resolved HERE --
+  # before assert_pre_upgrade_possible, which is specific to the protected tier
+  # and DIES on a docker-volume service ("there is no pre-upgrade recovery point
+  # for this service yet"). That refusal predates the volume path and would have
+  # made the whole dispatch below dead code: three tested volume primitives,
+  # still zero reachable call sites. Found by driving the function instead of
+  # reading it.
+  local model model_line
+  model_line="$(service_state_model "$service")"
+  model="${model_line%% *}"
+
+  if [[ "$model" == "docker-volume" && "${VOLUME_UPGRADE_ENABLED:-0}" != "1" ]]; then
+    die "Refusing: $service keeps its durable state in a DOCKER VOLUME, and
+VOLUME_UPGRADE_ENABLED is not 1.
+
+The volume upgrade path is implemented -- pre-upgrade point, volume dumps, exact
+image archive and a rollback that restores both halves -- and is exercised only
+against disposable fixtures. It has never run against a real service. Opening
+this gate is a deliberate operator decision: set VOLUME_UPGRADE_ENABLED=1 in the
+production configuration after reading docs/STATE-CLASSIFICATION.md.
+
+Nothing was changed and $service is on its original image."
+  fi
+
   # Refuse while the service is still RUNNING if its state cannot be snapshotted.
+  # Protected-tier only: for a docker-volume service
+  # storage_volume_pre_upgrade_point does its own equivalent checks (the model,
+  # and that a NAMED rw volume actually exists), and for any other model the
+  # dispatch in create_upgrade_rollback_point refuses.
+  #
   # The path it prints is not needed here, only the refusal -- and leaving its
   # stdout unredirected printed the data path into the operator's upgrade log.
-  assert_pre_upgrade_possible "$service" >/dev/null
+  if [[ "$model" == "protected-tier" ]]; then
+    assert_pre_upgrade_possible "$service" >/dev/null
+  fi
 
   local compose_svcs old_images staged_verdicts target_image others_before
   compose_svcs="$(service_compose_services "$service" || true)"
@@ -9271,9 +9345,9 @@ $service is on its original image. Nothing was deleted."
     || die "Pre-upgrade protection did not produce a point, metadata and an archive.
 The staged image was NOT deployed."
 
-  echo "[domum-media] phase 2/4: verifying the archive before deploying"
-  storage_verify_archive "$point" \
-    || die "The pre-upgrade archive did not verify. The staged image was NOT deployed."
+  echo "[domum-media] phase 2/4: verifying the recovery point before deploying"
+  verify_upgrade_rollback_point "$point" "$model" \
+    || die "The pre-upgrade recovery point did not verify. The staged image was NOT deployed."
 
   # ---- phase 3: deploy ONLY this service -------------------------------------
   echo "[domum-media] phase 3/4: deploying $target_image to $compose_svcs only"
@@ -9330,9 +9404,9 @@ rollback instructions in $meta."
   [[ "$(btrfs property get -ts "$DOMUM_SNAPSHOT_ROOT/$point" 2>/dev/null | tr -d ' ')" == "ro=true" ]] \
     && echo "  pre-upgrade snap: $point still read-only" \
     || { warn "$point is not read-only any more"; rc=1; }
-  storage_verify_archive "$point" >/dev/null \
-    && echo "  image archive   : still verifies" \
-    || { warn "the pre-upgrade archive no longer verifies"; rc=1; }
+  verify_upgrade_rollback_point "$point" "$model" >/dev/null \
+    && echo "  recovery point  : still verifies" \
+    || { warn "the pre-upgrade recovery point no longer verifies"; rc=1; }
 
   # ---- the metadata-only cleanup proof ---------------------------------------
   # The old image is now unreferenced by any container, so this is the first time
@@ -9376,8 +9450,44 @@ rollback instructions in $meta."
 # UNARCHIVED point: for an upgrade the archive is the half that makes the point a
 # rollback rather than a museum piece, and `--archive-image` being optional on the
 # standalone command must not leak into the upgrade path as a default.
+# The pre-upgrade recovery point, dispatched on the service's STATE MODEL.
+#
+# This used to call storage_pre_upgrade_point unconditionally, so a
+# docker-volume service could only ever be refused -- by assert_pre_upgrade_
+# possible, for the generic reason that its path is not a subvolume. The
+# primitives for the volume case already existed and nothing reached them.
+#
+# Durability cannot be inferred from a mount list, which is why the model is
+# DECLARED and then checked against the live mounts (service_state_model). An
+# undeclared service, or one whose declaration disagrees with reality, reads as
+# `unknown` and is refused here rather than silently taking either path.
 create_upgrade_rollback_point() {  # $1 = service
-  storage_pre_upgrade_point "$1" --archive-image
+  local service="$1" model
+  model="$(service_state_model "$service")"
+  model="${model%% *}"
+  case "$model" in
+    protected-tier) storage_pre_upgrade_point "$service" --archive-image ;;
+    docker-volume)  storage_volume_pre_upgrade_point "$service" --archive-image ;;
+    *)
+      # Not a die: the caller's message explains that nothing was deployed, and
+      # it owns the lock. Returning non-zero keeps that one exit path.
+      warn "Refusing: $service has state model '$model'. A pre-upgrade recovery
+point can only be built for 'protected-tier' (Btrfs snapshot) or 'docker-volume'
+(volume dump). Fix the declaration in service_state_models, or the live mounts
+it disagrees with, before upgrading."
+      return 1 ;;
+  esac
+}
+
+# What proves a recovery point intact depends on which KIND it is, and using the
+# wrong verifier would report a point as verified having checked nothing it
+# contains. A volume point must satisfy BOTH: the image archive and every
+# volume dump it records.
+verify_upgrade_rollback_point() {  # $1 = point, $2 = model
+  local point="$1" model="$2"
+  storage_verify_archive "$point" || return 1
+  [[ "$model" == "docker-volume" ]] || return 0
+  storage_verify_volume_dumps "$point"
 }
 
 storage_verify_recovery() {  # $1 = service, $2 = recovery point, [--deep]
@@ -9503,7 +9613,9 @@ archive-image|storage pre-upgrade-point --archive-image|archive_image_to_file
 verify-image-archive|storage verify-archive|storage_verify_archive
 image-archive-inventory|storage archives|storage_archives
 rollback-upgrade|rollback-upgrade|rollback_upgrade
-rollback-volume-upgrade|rollback-volume-upgrade|rollback_volume_upgrade
+rollback-volume-upgrade|rollback-upgrade|rollback_volume_upgrade
+model-dispatched-upgrade|updates apply --service|create_upgrade_rollback_point
+model-dispatched-rollback|rollback-upgrade|rollback_dispatch
 recovery-image-protection|cleanup images|cleanup_protected_image_ids
 machine-readable-cleanup-images|cleanup images --json|cleanup_images_json
 verify-recovery-deep|storage verify-recovery|storage_verify_recovery
@@ -9873,7 +9985,11 @@ main() {
       # Restores BOTH halves: the pre-upgrade data AND the exact recorded image,
       # loaded from its archive if the local object is gone. Refuses rather than
       # pairing old data with a newer application (task-24).
-      rollback_upgrade "${1:-}" "${2:-}" ;;
+      # Dispatched on the state model, for the same reason the point is: a
+      # Btrfs rollback cannot restore a Docker volume and a volume rollback
+      # cannot restore a subvolume. Taking the wrong one would report success
+      # having restored nothing.
+      rollback_dispatch "${1:-}" "${2:-}" ;;
     updates)   shift; updates_cmd "$@" ;;
     refresh-images) shift; refresh_images "$@" ;;
     host-upgrade) shift; host_upgrade "$@" ;;
