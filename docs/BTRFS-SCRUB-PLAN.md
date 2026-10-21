@@ -37,50 +37,40 @@ GlobalReserve, single: total=242.33MiB, used=0.00B
 Total to scrub ≈ **215.9 GiB** = 215.26 GiB of data + both DUP copies of the
 313.98 MiB of metadata.
 
-## 2. Expected duration
+## 2. Duration — MEASURED
 
-Not hours. The device is a SATA SSD with a sequential read ceiling of
-~550 MB/s (SATA 6 Gb/s link), and btrfs scrub on a SATA SSD typically sustains
-300–500 MB/s while checksum-verifying.
-
-| sustained rate | 215.9 GiB takes |
-|---|---|
-| 550 MB/s (link ceiling) | ~7 min |
-| 400 MB/s (likely) | ~10 min |
-| 250 MB/s (contended) | ~16 min |
-| 100 MB/s (pessimistic) | ~40 min |
-
-**Plan for 10–20 minutes; treat anything past 45 as worth investigating.**
-
-This is an estimate from the device class, not a measurement — nothing on this
-host has ever scrubbed, so there is no local rate to quote. **The first run is
-the measurement**: `btrfs scrub status /srv/data` reports the achieved rate and
-`btrfs scrub status -R /srv/data` the raw counters. Record the real figure here
-afterwards and delete the table above if it turns out to be wrong.
-
-`checkup`'s remedy used to say *"takes hours"*. That is wrong by roughly an
-order of magnitude for this device, and it is the mistake this project already
-has a rule about: *a remedy that reads as expensive does not get run*. A
-10-minute read-only verification of 23,155 irreplaceable originals is the
-cheapest safety work available here.
-
-It is now derived rather than asserted. `btrfs_scrub_estimate` reads the
-`Total to scrub:` line out of `btrfs scrub status` — so the operator is told
-the size **this** filesystem reported, not a guess — and picks the rate from the
-device's own `/sys/block/<dev>/queue/rotational` flag, 400 MB/s solid-state
-against 100 MB/s spinning. The production remedy now reads:
+**The first scrub ran 2026-10-21 and the plan no longer needs an estimate.**
 
 ```
-btrfs scrub start /srv/data   # read-only, ~10 min for the 215.87GiB it reports;
-                              # detects checksum errors but cannot repair
-                              # without a second copy
+Scrub started:    Wed Oct 21 10:24:23 2026
+Status:           finished
+Duration:         0:07:14
+Total to scrub:   215.87GiB
+Rate:             509.34MiB/s
+Error summary:    no errors found
 ```
 
-Dividing bytes by a rate is legitimate here, unlike the `verify-large` estimate
-that had to simulate its own packing: a scrub is one pass over the allocated
-extents, with no per-run count cap and nothing it cannot split, so the division
-*is* the mechanism. When the size cannot be parsed the clause is omitted
-entirely rather than printed as `~0 min`.
+**7 minutes 14 seconds. 215.87 GiB. Zero errors.** `worst result 0`, exit 0.
+That is 23,155 irreplaceable originals verified against their stored checksums
+for the first time in this host's life.
+
+509.34 MiB/s is about 534 MB/s — close to the ~550 MB/s SATA 6 Gb/s link
+ceiling, i.e. the scrub is link-bound, not CPU- or checksum-bound.
+
+The estimate `btrfs_scrub_estimate` produced beforehand was **~10 minutes**, from
+a conservative 400 MB/s constant for a non-rotational device. It over-stated the
+cost by about 38%, which is the safe direction for a planning figure: an
+estimate that under-promises does not deter the operator from running the thing.
+The *mechanism* — one sequential pass over the allocated extents, divided by a
+rate chosen from the device's rotational flag — was correct.
+
+The 400 MB/s constant is deliberately **not** raised to match. It is a generic
+figure for any SATA SSD this code might run on, and a conservative planning
+number is worth more than one tuned to a single measurement. (A self-calibrating
+version is possible — once a scrub has completed, `btrfs scrub status` reports
+the achieved `Rate:`, so the estimate could use the last real figure and fall
+back to the constant. That is deliberately not built: it is churn, and the
+constant is already honest about being an estimate.)
 
 ## 3. IO impact and which applications feel it
 
@@ -121,11 +111,14 @@ It resets to the previous value when the scrub finishes, so it leaves no
 persistent state. The cost is duration: at 150 MB/s the 215.9 GiB takes ~26
 minutes instead of ~10.
 
-**Recommendation for the first run: do not limit it.** Ten unthrottled minutes
-at a quiet time is less disruption than twenty-six throttled ones, and an
-unthrottled run is also the clean measurement that section 2 is missing. Keep
-`--limit` for the recurring schedule, or for a re-run if the first one proves
-disruptive in practice.
+**That recommendation was followed, and the measurement is in.** The first run
+was unthrottled, at 10:24 on a working day, **with all eleven containers up**,
+and finished in 7m14s. Whether anyone noticed latency during those seven
+minutes is the one thing this document cannot measure — only the operator can
+say. If nobody did, the `--limit 150M` in the proposed unit below is buying
+protection against a cost that was never observed, while tripling the window
+during which the scrub is running at all. **Open question for the operator, not
+a defect.**
 
 **Avoid these windows**, which are the host's own scheduled IO:
 
@@ -271,8 +264,16 @@ Why monthly rather than weekly:
   delay keeps it off the boot critical path. No `OnBootSec=`/`OnStartupSec=`,
   and no `WantedBy=` on the service.
 
-**The first scrub should be run by hand**, and its real rate recorded in
-section 2, before this timer is enabled.
+**That precondition is now satisfied.** The first scrub was run by hand on
+2026-10-21, came back clean, and its real rate is recorded in section 2. The
+monthly schedule is therefore justified by measurement rather than by argument:
+a 7-minute read-only pass, once a month, over the only copy of the family photo
+library.
+
+Enabling it is still an operator action, and it needs the unit files
+**installed** first — `operator/domum-media-deploy-reporting-fixes.sh` does not
+carry them, deliberately, so a deployment cannot install a timer nobody asked
+for. Installing a unit is not enabling it; both steps are the operator's.
 
 ## 8. The one operator command
 
