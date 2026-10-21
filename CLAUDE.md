@@ -1997,6 +1997,59 @@ what a checksum error means, the recovery actions, and a proposed monthly unit
 that is deliberately not written. Starting a scrub and enabling a timer are
 operator actions.
 
+**`btrfs_unique_roots` is the ONE implementation of the per-filesystem
+dedup.** `checkup_btrfs_health` carried its own copy, and `storage scrub`
+would have been a second -- two chances to tell the operator to scrub the same
+device twice, which is the defect the dedup was written to fix. Both consume it
+now. The refactor was proved behaviour-preserving by the dedup tests that
+already existed, including the "two DIFFERENT filesystems are both reported"
+direction; a single-result assertion alone cannot tell a dedup from never
+having looked.
+
+**`domum-media storage scrub {start|status}` is the scrub surface, and its
+EXIT STATUS is the contract** -- `0` clean, `1` could not scrub, `3`
+uncorrectable errors found, which is `btrfs-scrub(8)`'s own meaning kept rather
+than reinvented. `start` passes `-B` internally and a mutation removing it must
+fail: without blocking, `btrfs scrub start` returns immediately and a oneshot
+unit goes green before reading a single block. The worst result across
+filesystems governs, so a clean filesystem can never mask corruption on
+another. It deliberately does **not** take the operation lock: a scrub is
+read-only, btrfs itself refuses a second scrub on the same filesystem, and a
+20-minute job holding the global lock could make the nightly backup fail to
+acquire it -- trading a detection pass for a missed backup.
+
+**A scrub that found corruption must leave a FAILED unit.** `ExecStart` carries
+no `-` prefix, so exit 3 fails `domum-media-btrfs-scrub.service`, which
+`checkup_systemd_health` reports as CRITICAL and `health-notify` mails. The
+report names the capture commands (`scrub status -R`, `device stats`, the
+kernel log that names the FILE) and says explicitly **not** to attempt a
+repair. "Warn and continue" is not a safety mechanism, least of all here.
+
+**The scrub timer is read-only and protective and is still NOT in
+`auto-enable.timers`**, because enabling it means a scrub *will* start
+unattended and starting one is an operator decision. The test requires the unit
+file to EXIST and the timer to be absent, so the assertion cannot pass by
+naming a unit that was never written.
+
+**I inserted a test section into a quoted heredoc and it became FIXTURE
+DATA.** The anchor I matched -- `# comment mentioning
+domum-media-image-refresh.timer` -- was a line of test *input*, not a code
+comment. The block never executed, the mutation that lists the scrub timer in
+`auto-enable.timers` SURVIVED, and the hostile-parser fixture was corrupted
+into the bargain. Anchor a programmatic edit on code, never on a string that
+also appears in test data, and re-run the mutation afterwards: the section
+printed nothing and the suite still said PASS.
+
+**`checkup_disk_health` reads only `smartctl -H`, which cannot see a
+DEVELOPING problem.** The self-assessment is a post-hoc pass/fail; it says
+nothing about reallocated sectors, pending sectors, wear level or CRC errors,
+which are what move before a drive fails. Separately, an unreadable device
+produces well-formed output with no verdict -- measured, `smartctl -j -H` under
+permission denied returns `exit_status: 2` and `smart_status: null` -- and the
+text path greps for `PASSED|OK`, so it falls through to **CRITICAL "did NOT
+pass"**: a false alarm telling the operator to replace a healthy disk. It only
+hides because `checkup` runs under sudo. Both are open.
+
 ---
 
 ## 15. Known open safety defects

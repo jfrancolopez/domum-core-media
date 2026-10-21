@@ -1,0 +1,15 @@
+[Unit]
+Description=domum-media: schedule monthly btrfs scrub
+
+[Timer]
+# First Sunday of the month, after the Sun 04:30 snapshot prune has finished.
+OnCalendar=Sun *-*-01..07 05:30:00
+RandomizedDelaySec=20m
+# A missed run fires at the next boot. Harmless here: unlike `snapshot prune`
+# this job deletes nothing, and the randomized delay keeps it off the boot
+# critical path. No OnBootSec=/OnStartupSec=.
+Persistent=true
+Unit=domum-media-btrfs-scrub.service
+
+[Install]
+WantedBy=timers.target

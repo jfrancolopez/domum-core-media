@@ -5378,6 +5378,39 @@ btrfs_scrub_estimate() {  # $1 = scrub status text, $2 = root
   printf '%s %s%s %s' "$mins" "${size}" "$unit" "$rate"
 }
 
+# The Btrfs roots this project depends on, ONE LINE PER FILESYSTEM.
+#
+# Emits "<root>\t<fsid>". Several roots can live on one filesystem -- measured
+# 2026-10-20, /srv/data and /srv/snapshots are both subvolumes of /dev/sda1,
+# uuid 211e06b3-6aaf-40d8-8646-9361b8399eb2 -- and iterating by PATH told the
+# operator to run TWO scrubs of the same device, the second re-reading the same
+# 215.87 GiB for nothing. Device error counters are per-filesystem too.
+#
+# This is the ONE implementation. `checkup_btrfs_health` and `storage scrub`
+# both consume it, because two copies of a dedup are two chances to report a
+# filesystem twice -- the mistake this function exists to prevent.
+#
+# Pure stdout: no logging, because callers capture it.
+btrfs_unique_roots() {
+  local root fsid seen=" "
+  for root in "$DOMUM_DATA_ROOT" "${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"; do
+    [[ -d "$root" ]] || continue
+    # The filesystem TYPE, not subvolume-ness: a plain directory on Btrfs still
+    # has device counters worth reading. `domum_is_subvolume` would skip it.
+    [[ "$(stat -f -c %T "$root" 2>/dev/null)" == "btrfs" ]] || continue
+    # Identify the filesystem, not the path. Falls back to stat's device id when
+    # findmnt is unavailable, so the dedup still holds rather than silently
+    # doubling every finding.
+    fsid="$(findmnt -no UUID --target "$root" 2>/dev/null || true)"
+    [[ -n "$fsid" ]] || fsid="$(stat -c %d "$root" 2>/dev/null || true)"
+    if [[ -n "$fsid" ]]; then
+      [[ "$seen" == *" $fsid "* ]] && continue
+      seen="$seen$fsid "
+    fi
+    printf '%s\t%s\n' "$root" "$fsid"
+  done
+}
+
 # Btrfs device error counters and scrub age, for every Btrfs root this project
 # depends on.
 #
@@ -5387,29 +5420,11 @@ btrfs_scrub_estimate() {  # $1 = scrub status text, $2 = root
 # thing all of this exists to prevent. A library that is never scrubbed has
 # nothing LOOKING for silent bit-rot.
 checkup_btrfs_health() {
-  local root counters line key val total scrub last age_days
-  # One filesystem is reported ONCE, even when several roots live on it.
-  #
-  # Measured 2026-10-20: /srv/data and /srv/snapshots are both subvolumes of
-  # /dev/sda1, uuid 211e06b3-6aaf-40d8-8646-9361b8399eb2. Iterating by PATH
-  # produced two identical "never been scrubbed" warnings and told the operator
-  # to run TWO scrubs of the same device -- the second would re-read the same
-  # 215.87 GiB for nothing. Device error counters are per-filesystem too, so
-  # they were also reported twice.
-  local seen_fs=" " fsid
-  for root in "$DOMUM_DATA_ROOT" "${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}"; do
-    [[ -d "$root" ]] || continue
-    # The filesystem type, not subvolume-ness: a plain directory on Btrfs still
-    # has device counters worth reading. `domum_is_subvolume` would skip it.
-    [[ "$(stat -f -c %T "$root" 2>/dev/null)" == "btrfs" ]] || continue
-    # Identify the filesystem, not the path. Falls back to the device id from
-    # stat when findmnt is unavailable, so the dedup still holds.
-    fsid="$(findmnt -no UUID --target "$root" 2>/dev/null || true)"
-    [[ -n "$fsid" ]] || fsid="$(stat -c %d "$root" 2>/dev/null || true)"
-    if [[ -n "$fsid" ]]; then
-      [[ "$seen_fs" == *" $fsid "* ]] && continue
-      seen_fs="$seen_fs$fsid "
-    fi
+  local root counters line key val total scrub last age_days fsid
+  # One filesystem is reported ONCE, even when several roots live on it --
+  # btrfs_unique_roots is the one implementation of that dedup.
+  while IFS=$'\t' read -r root fsid; do
+    [[ -n "$root" ]] || continue
 
     counters="$(btrfs device stats "$root" 2>/dev/null || true)"
     if [[ -z "$counters" ]]; then
@@ -5488,7 +5503,7 @@ checkup_btrfs_health() {
         fi
       fi
     fi
-  done
+  done < <(btrfs_unique_roots)
 }
 
 # Physical disk health.
@@ -9493,6 +9508,7 @@ recovery-image-protection|cleanup images|cleanup_protected_image_ids
 machine-readable-cleanup-images|cleanup images --json|cleanup_images_json
 verify-recovery-deep|storage verify-recovery|storage_verify_recovery
 protection-state|storage protection|storage_protection
+btrfs-scrub|storage scrub start|storage_scrub_start
 service-migration|storage migrate-subvolume|storage_migrate_subvolume
 migration-integrity-proof|storage migrate-subvolume|migrate_verify_recovery_point
 migration-live-tree-classification|storage migrate-subvolume|migrate_report_live_tree
@@ -9538,6 +9554,104 @@ capabilities_cmd() {
   return 0
 }
 
+# Btrfs scrub: one per FILESYSTEM, read-only, and it repairs nothing by itself.
+#
+# `btrfs scrub` verifies every allocated extent against its stored checksum. It
+# is the only thing that LOOKS for silent corruption; nothing else on this host
+# does. What it can then do about a failure depends on the profile, measured
+# 2026-10-20 on /dev/sda1:
+#
+#   Data,     single  -> ONE copy. A data checksum error is NOT repairable.
+#   Metadata, DUP     -> two copies, same device. Scrub rewrites the bad one.
+#
+# So on this host a scrub DETECTS corruption in the photo library and cannot
+# repair it; the remedy is restoring the named file from restic. That is stated
+# rather than implied, because "scrub" sounds like "repair".
+#
+# Deliberately does NOT take the operation lock. A scrub is read-only and
+# cannot conflict destructively, btrfs itself refuses a second scrub on the same
+# filesystem, and a 10-20 minute job holding the global lock could make the
+# nightly backup fail to acquire it -- trading a detection pass for a missed
+# backup. See docs/BTRFS-SCRUB-PLAN.md.
+storage_scrub_status() {
+  need_root
+  load_cfg
+  local root fsid status est n=0
+  while IFS=$'\t' read -r root fsid; do
+    [[ -n "$root" ]] || continue
+    n=$(( n + 1 ))
+    echo "filesystem        : $root (uuid ${fsid:-unknown})"
+    status="$(btrfs scrub status "$root" 2>/dev/null || true)"
+    if [[ -z "$status" ]]; then
+      echo "  state           : UNKNOWN -- scrub status could not be read"
+      continue
+    fi
+    # "Error summary: no errors found" is printed for a scrub that NEVER RAN, so
+    # it must never be read as a clean result. Check for a start line first.
+    if grep -qE 'no stats available|never ran' <<< "$status"; then
+      echo "  state           : NEVER SCRUBBED -- nothing has looked for silent corruption"
+      est="$(btrfs_scrub_estimate "$status" "$root")"
+      [[ -n "$est" ]] && echo "  first run       : ~${est%% *} min for $(cut -d' ' -f2 <<< "$est") at $(cut -d' ' -f3 <<< "$est") MB/s"
+      echo "  remedy          : domum-media storage scrub start"
+      continue
+    fi
+    echo "  last started    : $(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+(.*)$/\1/p' <<< "$status" | tail -1)"
+    echo "  summary         : $(sed -nE 's/^[[:space:]]*Error summary:[[:space:]]+(.*)$/\1/p' <<< "$status" | tail -1)"
+  done < <(btrfs_unique_roots)
+  (( n > 0 )) || die "No Btrfs filesystem found among the configured roots."
+  return 0
+}
+
+# Exit status is the contract, so a wrapper asserts on it rather than on prose:
+#   0  every filesystem scrubbed clean
+#   1  a scrub could not be performed
+#   3  UNCORRECTABLE errors were found -- btrfs-scrub(8)'s own meaning, kept
+#
+# `-B` is not optional. Without it `btrfs scrub start` returns immediately and
+# a oneshot unit would report success before reading a single block -- green
+# because it did not wait.
+storage_scrub_start() {
+  need_root
+  load_cfg
+  local limit="" root fsid rc worst=0 n=0 est
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) [[ -n "${2:-}" ]] || die "--limit needs a size, e.g. --limit 150M"
+               limit="$2"; shift 2 ;;
+      *) die "Usage: domum-media storage scrub start [--limit SIZE]" ;;
+    esac
+  done
+  while IFS=$'\t' read -r root fsid; do
+    [[ -n "$root" ]] || continue
+    n=$(( n + 1 ))
+    echo "[domum-media] scrubbing $root (uuid ${fsid:-unknown})"
+    est="$(btrfs_scrub_estimate "$(btrfs scrub status "$root" 2>/dev/null || true)" "$root")"
+    [[ -n "$est" ]] && echo "  expect ~${est%% *} min for $(cut -d' ' -f2 <<< "$est")"
+    echo "  read-only: this DETECTS checksum errors. Data is 'single' here, so a"
+    echo "  data error cannot be repaired -- the remedy is a restore from restic."
+    rc=0
+    # shellcheck disable=SC2086
+    btrfs scrub start -B ${limit:+--limit "$limit"} "$root" || rc=$?
+    case "$rc" in
+      0) echo "  result          : clean -- every allocated extent matched its checksum" ;;
+      3) echo "  result          : UNCORRECTABLE ERRORS FOUND on $root"
+         echo "                    This is recovery evidence, not a transient fault."
+         echo "                    Capture it before doing anything else:"
+         echo "                      btrfs scrub status -R $root"
+         echo "                      btrfs device stats $root"
+         echo "                      journalctl -k --since '2 hours ago' | grep -i 'csum failed'"
+         echo "                    The kernel log names the affected FILE. Restore that"
+         echo "                    file from restic; do NOT attempt a repair."
+         (( worst < 3 )) && worst=3 ;;
+      *) echo "  result          : scrub FAILED on $root (exit $rc)"
+         (( worst < 1 )) && worst=1 ;;
+    esac
+  done < <(btrfs_unique_roots)
+  (( n > 0 )) || die "No Btrfs filesystem found among the configured roots."
+  echo "[domum-media] scrubbed $n filesystem(s); worst result $worst"
+  return "$worst"
+}
+
 storage_cmd() {
   local sub="${1:-}"
   case "$sub" in
@@ -9555,6 +9669,15 @@ storage_cmd() {
         --verify)  [[ -n "${2:-}" ]] || die "Usage: domum-media storage topology --verify <capture-file>"
                    storage_topology_verify "$2" ;;
         *)         die "Usage: domum-media storage topology [--verify <capture-file>]" ;;
+      esac ;;
+    scrub)
+      shift
+      # Read-only verification. `start` blocks (-B) so its exit status means
+      # something: 0 clean, 1 could not scrub, 3 uncorrectable errors found.
+      case "${1:-status}" in
+        start)  shift; storage_scrub_start "$@" ;;
+        status) storage_scrub_status ;;
+        *)      die "Usage: domum-media storage scrub {start [--limit SIZE]|status}" ;;
       esac ;;
     protection)
       shift
@@ -9678,6 +9801,14 @@ Usage:
                                             snapshottable, degraded,
                                             unprotected or unknown. Exits 0 only
                                             for "protected"
+  domum-media storage scrub {start [--limit SIZE]|status}
+                                            Verify every allocated extent
+                                            against its checksum, ONCE per
+                                            filesystem. Read-only: it DETECTS
+                                            corruption and, with data "single",
+                                            cannot repair it. start blocks and
+                                            exits 0 clean, 1 could not scrub,
+                                            3 uncorrectable errors found
   domum-media storage verify-recovery <service> <point> [--deep]
   domum-media storage archives              Which recovery point needs each
                                             image archive, and which are

@@ -216,74 +216,89 @@ the photo tier. `checkup_btrfs_health` reports it as one.
 5. A single corrected metadata error is not an emergency. **Repeated or growing
    counters are a device-replacement signal**, not a scrub-again signal.
 
-## 7. Proposed recurring schedule — not enabled
+## 7. The recurring schedule — written, NOT installed, NOT enabled
 
-Monthly, read-only, throughput-limited, outside every existing window:
+`systemd/domum-media-btrfs-scrub.service` and `.timer` now exist in the
+repository. Neither is installed on the host and the timer is **not** in
+`systemd/auto-enable.timers`, so installation and convergence cannot enable it.
 
 ```
 # domum-media-btrfs-scrub.timer
-# first Sunday of the month, 05:30 -- after the Sun 04:30 prune has finished
-OnCalendar=Sun *-*-01..07 05:30:00
+OnCalendar=Sun *-*-01..07 05:30:00     # first Sunday, after the 04:30 prune
 RandomizedDelaySec=20m
 Persistent=true
 
 # domum-media-btrfs-scrub.service
 Type=oneshot
 RequiresMountsFor=/srv/data
-ExecStart=/usr/bin/btrfs scrub start -B --limit 150M /srv/data
+ExecStart=/usr/local/bin/domum-media storage scrub start --limit 150M
+TimeoutStartSec=6h
 ```
 
-`systemd-analyze calendar 'Sun *-*-01..07 05:30:00'` confirms the expression
-normalizes and next elapses Sun 2026-11-01 05:30 EST.
+`systemd-analyze verify` passes on both, and
+`systemd-analyze calendar 'Sun *-*-01..07 05:30:00'` next elapses
+Sun 2026-11-01 05:30 EST.
 
-`-B` (do not background) is required: without it `btrfs scrub start` returns
-immediately and the unit would report success before the scrub had read
-anything — a unit that is green because it did not wait. With `-B` the exit
-status is the scrub's own, and `btrfs-scrub(8)` documents **exit 3 as "scrub
-found uncorrectable errors"** (1 = could not be performed, 2 = nothing to
-resume). So the unit fails exactly when there is something to say, and
-`checkup_systemd_health` reports a failed domum unit as CRITICAL — which is
-what turns a kernel message nobody reads into one mail.
+Four deliberate decisions, each asserted by a test:
 
-`RequiresMountsFor=/srv/data` and nothing else: this job touches no other root,
-and declaring `/srv/snapshots` would let a failure of a filesystem it does not
-read stop it. (It is the same filesystem anyway — section 1.)
+- **No `-` prefix on `ExecStart`.** `storage scrub start` exits 3 when
+  uncorrectable errors are found, which must leave the unit **failed** —
+  that is what `checkup_systemd_health` reports as CRITICAL and what
+  `health-notify` mails. Tolerating it would make the one thing worth being
+  told about invisible.
+- **It blocks.** `storage scrub start` passes `-B` internally. Without it
+  `btrfs scrub start` returns immediately and the unit would go green before
+  reading a single block. A mutation removing `-B` is required to fail.
+- **`RequiresMountsFor=/srv/data` only.** `/srv/data` identifies the
+  filesystem and the scrub covers every subvolume on it, so requiring
+  `/srv/snapshots` could only block a scrub of a filesystem that is mounted
+  and healthy — trading this host's one corruption-detection pass for a
+  dependency it does not need. Asserted in both directions.
+- **Not auto-enabled.** It is read-only and protective, which would normally
+  qualify it, but enabling it means a scrub *will* start unattended. A test
+  requires the unit file to exist and the timer to be absent from the list, so
+  the assertion cannot pass vacuously.
 
-Rationale, and why monthly rather than weekly:
+Why monthly rather than weekly:
 
-- At ~10–20 minutes read-only, the cost is near zero, so the schedule is driven
-  by how long silent corruption is allowed to go unnoticed, not by expense.
-  Monthly bounds that at 31 days.
+- At ~10–26 minutes read-only the cost is near zero, so the interval is set by
+  how long silent corruption may go unnoticed, not by expense. Monthly bounds
+  that at 31 days.
 - Weekly would collide with the three jobs already on Sunday and buys little:
-  bit-rot on an SSD at 24% capacity is a slow-moving risk.
-- **`Persistent=true` means a missed run fires at the next boot.** For a
-  read-only job that is harmless — unlike `snapshot prune`, which deletes.
-  Still, a scrub starting unexpectedly after a reboot is surprising, so the
-  randomized delay keeps it off the boot critical path.
-- No `OnBootSec`/`OnStartupSec`, and no `WantedBy` on the service: the rule that
-  a reboot must not become an image-deployment vector applies to every unit this
-  project installs.
+  bit-rot on an SSD at 24% capacity is slow-moving.
+- `Persistent=true` means a missed run fires at the next boot. Harmless for a
+  read-only job — unlike `snapshot prune`, which deletes — and the randomized
+  delay keeps it off the boot critical path. No `OnBootSec=`/`OnStartupSec=`,
+  and no `WantedBy=` on the service.
 
-**This unit does not exist and is not installed.** Writing and installing it is
-separate work, and enabling a timer is an operator action. The first scrub
-should be run by hand and its real rate recorded in section 2 before any
-schedule is committed to.
+**The first scrub should be run by hand**, and its real rate recorded in
+section 2, before this timer is enabled.
 
 ## 8. The one operator command
 
+`domum-media storage scrub` is **not in the deployed binary yet** — production
+is at `8054ea0` and the subcommand lands with the next deployment. Until then,
+and this works today:
+
 ```
 sudo btrfs scrub start /srv/data
-```
-
-Then, whenever convenient:
-
-```
 sudo btrfs scrub status /srv/data
 ```
 
-`scrub start` returns immediately; the work runs in the kernel. Nothing needs to
-stay open, no service needs stopping, and the result is persistent — it survives
-a reboot and is what `checkup` reads afterwards.
+`scrub start` without `-B` returns immediately; the work continues in the
+kernel and the result is persistent, so `scrub status` can be checked whenever
+convenient. Nothing needs to stay open and no service needs stopping. Add
+`--limit 150M` if the host is busy and latency matters more than finishing in
+ten minutes.
 
-Add `--limit 150M` if the host is busy and the latency matters more than
-finishing in ten minutes.
+After the next deployment, the same thing with the dedup, the estimate, the
+profile warning and a meaningful exit status:
+
+```
+sudo domum-media storage scrub status     # read-only, says what it would cost
+sudo domum-media storage scrub start      # blocks; 0 clean, 1 failed, 3 errors found
+```
+
+The CLI form is what the timer uses, and it is the one implementation of the
+per-filesystem dedup — `checkup` reads the same `btrfs_unique_roots`, so the
+two cannot disagree about how many filesystems there are.

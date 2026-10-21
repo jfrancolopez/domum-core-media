@@ -16,6 +16,14 @@
 #       imply deployment, and the update/apply/rollback pipeline has not been
 #       audited. See docs/P0-BACKUP-BASELINE.md and CLAUDE.md.
 #
+#   domum-media-btrfs-scrub.timer
+#       Read-only, and protective -- it is the only thing that LOOKS for silent
+#       corruption. Still deliberately not auto-enabled: enabling it means a
+#       scrub WILL start unattended on the first Sunday of a month, and
+#       starting one is an operator decision. Run it once by hand first
+#       (`domum-media storage scrub start`) and read what it reports.
+#       See docs/BTRFS-SCRUB-PLAN.md.
+#
 #   domum-media-weekly-report.timer
 #       Opt-in reporting, and now the only thing that PROACTIVELY tells the
 #       operator anything: it writes the weekly report and then runs

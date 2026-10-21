@@ -1,0 +1,23 @@
+[Unit]
+Description=domum-media: btrfs scrub (monthly, read-only)
+Documentation=file:///opt/domum-core-media/docs/BTRFS-SCRUB-PLAN.md
+ConditionPathExists=/usr/local/bin/domum-media
+# /srv/data identifies the filesystem to scrub, and the scrub covers every
+# subvolume on it -- measured, /srv/data and /srv/snapshots are subvolumes of
+# the same /dev/sda1. /srv/snapshots is deliberately NOT required: it would add
+# a second mount that could block a scrub of a filesystem that is mounted and
+# healthy, trading the only corruption-detection pass this host has for a
+# dependency it does not need.
+RequiresMountsFor=/srv/data
+
+[Service]
+Type=oneshot
+# `storage scrub start` blocks (-B internally), so this unit's exit status is
+# the scrub's own: 0 clean, 1 could not scrub, 3 UNCORRECTABLE ERRORS FOUND.
+# Without blocking the unit would go green before reading a single block.
+# No `-` prefix: a scrub that found corruption must leave a FAILED unit, which
+# is what checkup_systemd_health reports as CRITICAL and health-notify mails.
+ExecStart=/usr/local/bin/domum-media storage scrub start --limit 150M
+# ~10 min unlimited on this SSD, ~26 min at the 150M limit. The ceiling is
+# generous for a spinning replacement, not an expectation.
+TimeoutStartSec=6h
