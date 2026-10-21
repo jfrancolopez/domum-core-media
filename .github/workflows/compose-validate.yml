@@ -270,6 +270,12 @@ jobs:
       - name: Volume upgrade dispatch smoke test
         run: tests/volume-upgrade-dispatch-smoke.sh
 
+      # A warning with no paired action NEVER mails: the silence gate sends only
+      # on CRITICAL or ACTION. Seven real problems were in that state, a
+      # container going UNHEALTHY among them.
+      - name: Warning remedy smoke test
+        run: tests/warning-remedy-smoke.sh
+
       # checkup must PRODUCE a report. Silence is the one unacceptable outcome:
       # `sudo domum-media checkup` printed nothing at all in production, and a
       # blank report is indistinguishable from a healthy one.
