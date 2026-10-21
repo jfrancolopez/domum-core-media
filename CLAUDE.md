@@ -2182,11 +2182,56 @@ and are therefore invisible to the notifier:
 | Btrfs scrub history could not be parsed | same |
 | restic password file looks very short | a backup credential problem |
 
-The fix is a remedy on each, NOT making warnings mail: the other five
-non-notifying warnings (package updates available, update candidates waiting,
-Immich bundle candidate) are routine and must stay silent. This is the
-HEALTHY-means-unmeasured defect one layer out -- the check runs, records the
-problem, and the notifier cannot see it.
+**Fixed by adding a remedy to each, NOT by making warnings mail.** The other
+four non-notifying warnings -- package updates available, update candidates
+waiting, Immich bundle candidate -- are routine and must stay silent, or the
+operator starts getting weekly mail about available updates and stops reading
+it. The Immich UNKNOWN-timing coverage DID get a remedy, because this file
+already says a gap and an unknown are numbered risks while a pending upload is
+not. `tests/warning-remedy-smoke.sh` asserts both directions and requires the
+non-notifying set to be EXACTLY those four, so a future warning added without a
+remedy fails CI.
+
+Two rules the remedies themselves had to obey:
+
+- **The remedy for a stopped service is `compose start`, NEVER `up -d`.**
+  `up -d` reconciles, so a routine "start it again" would recreate the container
+  on whatever the tag now resolves to -- turning a restart into an unreviewed
+  deployment. Asserted, in both directions.
+- **It must name the COMPOSE services, not the logical one.** `immich` maps to
+  four containers, so `docker logs immich` would fail on the one service where
+  being told about a failed healthcheck matters most. Both container remedies
+  resolve `service_compose_services`.
+- **The short-restic-password remedy suggests no restic operation and prints
+  nothing.** Rotating a repository password needs approval and is not a routine
+  remedy; the likely cause is a truncated write, so that is what it checks.
+
+**A stub of a function nobody calls is not a stub, and it made two sections
+test the HOST.** Both notifier sections stubbed `checkup_run_all`, which does
+not exist -- `health_notify_cmd` calls the four checks directly -- so the real
+checks ran against this machine and the "it mails" section passed only because
+the host happened to produce an action. Related, found in the same sitting:
+`health_notify_cmd` RESETS all four arrays at entry, so an action seeded by the
+caller is wiped; the action has to be added BY one of the checks. And asserting
+"it did not take the silent path" is satisfied by dying in between, so the
+positive form -- the transport was reached -- is asserted too.
+
+**A negative control is what makes a notification assertion falsifiable.**
+"An action does not take the silent path" would pass against a notifier that
+never prints that line for any input. The healthy case -- a routine warning,
+zero actions -- is required to take it.
+
+**`grep -A3` is a dependency on comment length.** Three pairing assertions
+failed against correct code because an explanatory comment sits between the
+warning and its remedy. The window has to exceed the comment, and the
+comment-stripping pass is what keeps a note saying "deliberately does NOT
+suggest `restic key`" from tripping the assertion that no restic operation is
+suggested.
+
+**Asserting on a bare function name flagged my own comment.** The check that no
+stub of the non-called collector remains matched the comment explaining why it
+must not be stubbed. Assert on the DEFINITION form (`name() {`), the same
+mistake the capability audit and the stdout-purity audit each made once.
 
 ---
 

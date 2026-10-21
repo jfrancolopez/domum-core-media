@@ -5448,7 +5448,12 @@ checkup_btrfs_health() {
 
     counters="$(btrfs device stats "$root" 2>/dev/null || true)"
     if [[ -z "$counters" ]]; then
+      # Not silence: this counter IS the corruption signal for the photo tier,
+      # so being unable to read it has to reach the operator. A warning without
+      # a remedy never mails, because the notifier only sends on CRITICAL or
+      # ACTION.
       checkup_add warning "Btrfs error counters for $root could not be read."
+      checkup_add action "btrfs device stats $root   # a non-zero corruption_errs is a checksum failure on the photo tier"
       continue
     fi
     total=0
@@ -5474,6 +5479,7 @@ checkup_btrfs_health() {
     scrub="$(btrfs scrub status "$root" 2>/dev/null || true)"
     if [[ -z "$scrub" ]]; then
       checkup_add warning "Btrfs scrub status for $root could not be read."
+      checkup_add action "btrfs scrub status $root   # without this, nothing can say whether corruption is being looked for"
       continue
     fi
     # btrfs-progs says "no stats available" for a filesystem that has never
@@ -5507,6 +5513,7 @@ checkup_btrfs_health() {
       # A status we cannot parse is UNKNOWN, not healthy. Silence here would
       # read as "scrubbing is fine".
       checkup_add warning "Btrfs scrub history for $root could not be parsed."
+      checkup_add action "btrfs scrub status -R $root   # the raw counters, when the summary cannot be read"
       continue
     fi
     if [[ -n "$last" ]]; then
@@ -5602,6 +5609,10 @@ checkup_immich_offsite() {
       checkup_add action "sudo domum-media-backup verify-snapshot-coverage $target   # then read ${target}-snapshot-gap.txt"
     elif [[ "$unk" =~ ^[0-9]+$ ]] && (( unk > 0 )); then
       checkup_add warning "$unk Immich original(s) were ingested during the backup window; coverage is UNKNOWN for them."
+      # A gap and an UNKNOWN are numbered risks; a pending upload is not. So
+      # this one gets a remedy and therefore notifies, while "N package updates
+      # are available" deliberately does not.
+      checkup_add action "sudo domum-media-backup verify-snapshot-coverage $target   # metadata only, no download"
     elif [[ "$pend" =~ ^[0-9]+$ ]] && (( pend > 0 )); then
       # Expected activity: recorded, deliberately not alarming.
       checkup_add healthy "Immich originals: no backup gap; $pend awaiting the next run (snapshot $snap)."
@@ -5801,6 +5812,11 @@ checkup_cmd() {
       pw_size="$(wc -c < "$pw_file" | tr -d ' ')"
       if [[ "${pw_size:-0}" -lt 12 ]]; then
         checkup_add warning "$target: restic password file looks very short ($pw_size bytes): $pw_file"
+        # Deliberately does NOT suggest `restic key`: rotating a repository
+        # password is an approved operation, not a routine remedy. The likely
+        # cause is a truncated write, and that is what to check first. Never
+        # print the value.
+        checkup_add action "sudo wc -c $pw_file   # confirm it is the intended password and not a truncated write; rotating it needs approval"
       fi
     fi
     local repo
@@ -5879,8 +5895,19 @@ checkup_cmd() {
       # after any restart, and calling that unhealthy would make the report cry
       # wolf every time a service is restarted.
       starting)  checkup_add healthy "${service} starting (healthcheck has not passed yet)." ;;
-      unhealthy) checkup_add warning "${service} is UNHEALTHY." ;;
-      stopped)   checkup_add warning "${service} is not running." ;;
+      # The remedy names the COMPOSE services, not the logical one: immich maps
+      # to four containers (immich_server, immich_machine_learning,
+      # immich_postgres, immich_redis), so `docker logs immich` would fail on the
+      # one service where being told about a failed healthcheck matters most.
+      unhealthy) checkup_add warning "${service} is UNHEALTHY."
+                 checkup_add action "cd $DOMUM_DIR && docker compose logs --tail 50 $(service_compose_services "$service" | tr '\n' ' ')" ;;
+      # The remedy is `compose start`, NEVER `up -d`. `up -d` reconciles and
+      # would RECREATE the container on whatever its image tag now resolves to,
+      # so a routine "start the service again" would silently deploy a staged
+      # image. `compose start` starts the container that was stopped and
+      # resolves no image reference at all.
+      stopped)   checkup_add warning "${service} is not running."
+                 checkup_add action "cd $DOMUM_DIR && docker compose start $(service_compose_services "$service" | tr '\n' ' ')  # NOT 'up -d': that recreates on the staged image" ;;
       # No healthcheck: running is the whole claim, and saying more than that is
       # the CLAUDE.md section 14 defect -- a report implying health it cannot see.
       *)         checkup_add healthy "${service} running (no healthcheck; application health unverified)." ;;
@@ -5905,6 +5932,11 @@ checkup_cmd() {
     pcent="$(df -P "$path" | awk 'NR==2 {gsub("%","",$5); print $5}')"
     if (( pcent >= 90 )); then
       checkup_add warning "$path is ${pcent}% full."
+      # The protected tier filling up is a data-loss precursor, not an FYI, and
+      # a warning with no remedy never mails. The remedy LOCATES the usage
+      # rather than deleting anything: every deletion path here is
+      # operator-initiated by design.
+      checkup_add action "df -h $path && sudo du -xh --max-depth=2 $path 2>/dev/null | sort -h | tail -20"
     fi
   done
 
