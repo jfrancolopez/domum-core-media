@@ -1817,11 +1817,20 @@ SMART successfully for both disks. Two of the six healthy checks were those
 SMART passes. Never conclude a tool is missing from a `command -v` run as a
 different user than the one that will execute the code.
 
+**`/srv/data` HAS now been scrubbed, and it was clean.** Production,
+2026-10-21: 215.87 GiB, 7m14s, 509.34 MiB/s, **zero errors**, exit 0 -- the
+first time anything on this host had looked for silent corruption. The derived
+estimate said ~10 minutes, over-stating the cost by 38%, which is the safe
+direction. Evidence and the measured rate: `docs/BTRFS-SCRUB-PLAN.md`. The
+monthly timer is now justified by measurement rather than argument, and is
+still neither installed nor enabled.
+
 **HEALTHY must not mean UNMEASURED.** Production, 2026-10-20: `health-notify
 --dry-run` reported `VERDICT: HEALTHY, 6 healthy, 0 warnings` on a host where
-`smartmontools` was absent and `/srv/data` had **never been scrubbed** --
-215.87 GiB holding 23,155 irreplaceable originals with nothing looking for
-silent corruption. Two causes, both mine:
+`/srv/data` had **never been scrubbed** -- 215.87 GiB holding 23,155
+irreplaceable originals with nothing looking for silent corruption. (The same
+report also claimed `smartmontools` was absent; it was not -- see the
+`command -v` rule below.) Two causes, both mine:
 
 - **The never-scrubbed matcher looked only for `never ran`.** btrfs-progs on
   this host prints `no stats available`, so the check fell through, found no
