@@ -135,6 +135,29 @@ for u in "${needs_storage[@]}"; do
   [[ "$sect" == "[Unit]" ]] || fail "$u puts RequiresMountsFor in $sect; it only has meaning in [Unit]"
 done
 
+# The scrub unit is scoped DELIBERATELY NARROWER than the rest, and that choice
+# is asserted in both directions. /srv/data identifies the filesystem; the scrub
+# covers every subvolume on it, so requiring /srv/snapshots would add a mount
+# that could block the only corruption-detection pass this host has from running
+# against a filesystem that is mounted and healthy.
+scrubu="$REPO_ROOT/systemd/domum-media-btrfs-scrub.service"
+[[ -r "$scrubu" ]] || fail "unit not found: $scrubu"
+sreq="$(sed -nE 's/^RequiresMountsFor=(.*)$/\1/p' "$scrubu" | tr '\n' ' ')"
+grep -qF -- /srv/data <<< "$sreq" \
+  || fail "domum-media-btrfs-scrub.service does not require /srv/data (has '$sreq')"
+grep -qF -- /srv/snapshots <<< "$sreq" \
+  && fail "domum-media-btrfs-scrub.service requires /srv/snapshots.
+It scrubs the whole filesystem that /srv/data identifies, so that dependency can
+only block a scrub of a healthy filesystem."
+ssect="$(awk '/^\[/{s=$0} /^RequiresMountsFor=/{print s; exit}' "$scrubu")"
+[[ "$ssect" == "[Unit]" ]] \
+  || fail "the scrub unit puts RequiresMountsFor in $ssect; it only has meaning in [Unit]"
+# A scrub that found corruption must leave the unit FAILED, which is what
+# checkup_systemd_health escalates. A `-` prefix would hide exactly that.
+grep -qE '^ExecStart=-' "$scrubu" \
+  && fail "the scrub unit tolerates its own failure with a '-' prefix.
+Exit 3 means uncorrectable errors were found; that must fail the unit."
+
 # The negative control: a unit that writes only /var/log must NOT acquire a
 # dependency on the data tier, or a storage failure would suppress the DR
 # reminder -- exactly when it matters most.

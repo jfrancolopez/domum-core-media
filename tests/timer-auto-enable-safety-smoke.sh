@@ -25,6 +25,10 @@ LIST="$REPO_ROOT/systemd/auto-enable.timers"
 
 # Timers that must never be enabled by installation or convergence.
 DEPLOYMENT_TIMERS=(domum-media-image-refresh.timer)
+# Not a DEPLOYMENT timer -- read-only -- but still never auto-enabled, because
+# enabling it means a scrub WILL start unattended and starting one is an
+# operator decision. Listed separately so the reason stays attached to it.
+OPERATOR_ONLY_TIMERS=(domum-media-btrfs-scrub.timer)
 
 # ---------------------------------------------------------------------------
 # 1. The canonical list exists and excludes every deployment timer.
@@ -165,5 +169,22 @@ hostile="$(sed -E 's/#.*//; s/[[:space:]]+//g' "$TMP_DIR/hostile.timers" \
 grep -qx 'domum-media-backup.timer' <<< "$hostile" || fail "parser dropped a valid entry"
 grep -q 'image-refresh' <<< "$hostile" && fail "parser accepted a timer named only inside a comment"
 grep -q 'passwd\|not-a-unit\|\.service' <<< "$hostile" && fail "parser accepted a non-timer entry"
+
+# ---------------------------------------------------------------------------
+# 7. A read-only timer that still must not be auto-enabled.
+#
+# The first version of this section was inserted into the quoted heredoc above
+# and became FIXTURE DATA: it never executed, the mutation that lists the timer
+# survived, and the hostile-parser fixture was corrupted too. Anchor on code,
+# not on a string that also appears in test input.
+# ---------------------------------------------------------------------------
+for t in "${OPERATOR_ONLY_TIMERS[@]}"; do
+  [[ -r "$REPO_ROOT/systemd/$t" ]] \
+    || fail "$t is asserted to be operator-only but its unit file does not exist; the assertion has no subject"
+  grep -qxF "$t" "$REPO_ROOT/systemd/auto-enable.timers" \
+    && fail "$t is listed in auto-enable.timers. Enabling it starts a scrub unattended;
+that is an operator decision, not something convergence may do."
+  echo "  $t exists and is NOT auto-enabled"
+done
 
 echo "PASS: timer auto-enable safety smoke test"

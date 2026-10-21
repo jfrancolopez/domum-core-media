@@ -258,6 +258,12 @@ jobs:
       - name: Health checks smoke test
         run: tests/health-checks-smoke.sh
 
+      # One scrub per FILESYSTEM, `-B` always, and exit 3 (uncorrectable errors)
+      # propagated rather than flattened -- a scrub that found corruption must
+      # fail its unit, which is what escalates it to a notification.
+      - name: Btrfs scrub smoke test
+        run: tests/btrfs-scrub-smoke.sh
+
       # checkup must PRODUCE a report. Silence is the one unacceptable outcome:
       # `sudo domum-media checkup` printed nothing at all in production, and a
       # blank report is indistinguishable from a healthy one.
