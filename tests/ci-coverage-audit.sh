@@ -22,12 +22,34 @@ WORKFLOW="$REPO_ROOT/.github/workflows/compose-validate.yml"
 workflow="$(cat "$WORKFLOW")"
 
 missing=()
+unreferenced=()
 checked=0
 while IFS= read -r f; do
   rel="${f#"$REPO_ROOT"/}"
   checked=$(( checked + 1 ))
+  if [[ "$rel" == tests/fixtures/* ]]; then
+    # A helper, not a suite: it needs no step of its own, but it must be
+    # invoked by a suite that CI runs, or it is unenforced either way.
+    ref_by=""
+    while IFS= read -r suite; do
+      srel="${suite#"$REPO_ROOT"/}"
+      [[ "$srel" == tests/fixtures/* ]] && continue
+      grep -qF -- "$(basename "$rel")" "$suite" || continue
+      grep -qF -- "$srel" <<< "$workflow" || continue
+      ref_by="$srel"; break
+    done < <(find "$REPO_ROOT/tests" -maxdepth 1 -type f \( -name '*.sh' -o -name '*.py' \) | sort)
+    [[ -n "$ref_by" ]] || unreferenced+=("$rel")
+    continue
+  fi
   grep -qF -- "$rel" <<< "$workflow" || missing+=("$rel")
 done < <(find "$REPO_ROOT/tests" -maxdepth 2 -type f \( -name '*.sh' -o -name '*.py' \) | sort)
+
+if (( ${#unreferenced[@]} > 0 )); then
+  printf 'FAIL: %d fixture helper(s) are not invoked by any CI-run suite:\n' "${#unreferenced[@]}" >&2
+  printf '  %s\n' "${unreferenced[@]}" >&2
+  printf '\nA helper nothing runs is dead code wearing a test name.\n' >&2
+  exit 1
+fi
 
 if (( ${#missing[@]} > 0 )); then
   printf 'FAIL: %d test file(s) exist but are not run by CI:\n' "${#missing[@]}" >&2

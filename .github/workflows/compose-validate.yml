@@ -276,6 +276,18 @@ jobs:
       - name: Warning remedy smoke test
         run: tests/warning-remedy-smoke.sh
 
+      # The terminal-style weekly report: rendering, MIME assembly, HTML
+      # escaping, header-injection, and that a PREVIEW never sends. Asserts on
+      # decoded MIME parts, not on HTML strings in the source.
+      - name: Weekly report render smoke test
+        run: tests/weekly-report-render-smoke.sh
+
+      # checkup, health-notify and report weekly must evaluate the SAME
+      # complete set of checks. health-notify ran only a four-check SUBSET, so
+      # an unhealthy container could appear in checkup and never be mailed.
+      - name: Monitoring completeness smoke test
+        run: tests/monitoring-completeness-smoke.sh
+
       # checkup must PRODUCE a report. Silence is the one unacceptable outcome:
       # `sudo domum-media checkup` printed nothing at all in production, and a
       # blank report is indistinguishable from a healthy one.

@@ -149,15 +149,16 @@ CFG
   # stubbed a collector function that DOES NOT EXIST, so the real checks ran
   # against the HOST and this section passed only because the host happened
   # to produce an action. A stub of a function nobody calls is not a stub.
-  checkup_systemd_health() { :; }
-  checkup_btrfs_health()   { :; }
-  checkup_disk_health()    { :; }
-  checkup_immich_offsite() { :; }
+  # The COLLECTION is stubbed, not the four individual checks: health_notify_cmd
+  # collects through checkup_collect_all now, so stubbing the four left the
+  # real collection running against the host fixture and the notifier was
+  # never silent. The case below replaces the collection itself.
+  checkup_collect_all() { :; }
   smtp_send_message() { echo "MAIL SENT"; return 0; }
   # The action must be added BY a check: health_notify_cmd resets all four
   # arrays at entry, so a value seeded by the caller is wiped. Seeding it was
   # how the first version of this section silently tested nothing.
-  checkup_disk_health() {
+  checkup_collect_all() {
     checkup_add warning "traefik is not running."
     checkup_add action  "cd /x && docker compose start traefik"
   }
@@ -182,13 +183,14 @@ silent_out="$(
   source "$CLI" >/dev/null 2>&1
   need_root() { :; }
   export_env_for_compose() { :; }
-  checkup_systemd_health() { :; }
-  checkup_btrfs_health()   { :; }
-  checkup_disk_health()    { :; }
-  checkup_immich_offsite() { :; }
+  # The COLLECTION is stubbed, not the four individual checks: health_notify_cmd
+  # collects through checkup_collect_all now, so stubbing the four left the
+  # real collection running against the host fixture and the notifier was
+  # never silent. The case below replaces the collection itself.
+  checkup_collect_all() { :; }
   smtp_send_message() { echo "MAIL SENT"; return 0; }
   # A routine warning and NO action -- the healthy-with-noise case.
-  checkup_disk_health() { checkup_add warning "3 general package updates are available."; }
+  checkup_collect_all() { checkup_add warning "3 general package updates are available."; }
   set +e
   RECOVERY_PACK_EMAIL_ENABLED=1
   health_notify_cmd 2>&1

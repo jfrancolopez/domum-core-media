@@ -5263,6 +5263,17 @@ json_array_from_items() {
   fi
 }
 
+# Declared at FILE SCOPE deliberately. `${#arr[@]}` on an unset array is an
+# unbound-variable error under `set -u`, so health_verdict would have killed the
+# shell if it were ever reached before a collector reset them. Every current
+# caller resets first, which is exactly why this was invisible -- the same shape
+# as the unbound variable that made `checkup` print nothing at all in
+# production. Collectors still reset; this only guarantees they exist.
+CHECKUP_CRITICAL=()
+CHECKUP_WARNINGS=()
+CHECKUP_HEALTHY=()
+CHECKUP_ACTIONS=()
+
 checkup_add() {
   local level="$1"
   shift
@@ -5673,6 +5684,758 @@ checkup_immich_offsite() {
 # `--force` mails regardless, so the operator can prove delivery works without
 # waiting for something to break. `--dry-run` prints the summary and sends
 # nothing.
+# ===========================================================================
+#  Section: the terminal-style weekly report (HTML + plain text)
+# ===========================================================================
+#
+# Adapted from domum-core's weekly report (studied at jfrancolopez/domum-core
+# @ bin/domum-core, report_render_weekly*). The architecture is reused
+# deliberately, because it is the part that makes the two representations
+# trustworthy:
+#
+#   THE PLAIN TEXT IS THE SOURCE. The HTML renderer does not re-derive
+#   anything; it wraps the already-rendered text line by line, keyed on line
+#   PREFIX (box drawing, "> ", "Verdict: ", "-- SECTION") and coloured by the
+#   escalation GLYPH the text already carries. So the two MIME parts cannot
+#   disagree about a number, which is this repository's "two numbers that must
+#   agree are one number" rule applied to presentation.
+#
+# What was deliberately NOT copied from domum-core:
+#
+#   - its POWER section. That reads Raspberry Pi wattage via vcgencmd; there is
+#     no trustworthy power measurement on an N100, and inventing one would be
+#     worse than omitting the section.
+#   - its Pi temperature probe (pi_temp_c) and throttling flags.
+#   - its lack of header sanitisation. `send_email_body` there interpolates the
+#     subject straight into the message with no CR/LF guard. Not currently
+#     exploitable (the subject is built from a controlled verdict), but a
+#     header-injection hole by construction. This implementation strips CR/LF
+#     from every header value.
+#
+# Design constraints held: one 600px column, all styles inline, monospace
+# stack, no images, no JS, no remote assets, no tracking. If this renderer
+# outgrows roughly 150 lines of HTML emission, simplify the DESIGN, not the
+# data -- the same guard domum-core records.
+
+# The verdict, shared by the report and the notifier so they cannot drift.
+# Warnings alone are deliberately NOT a verdict change: the silence gate sends
+# only on CRITICAL or ACTION, and a report whose verdict disagreed with the
+# notifier's would be two answers to one question.
+# Four levels, and the NOTIFY GATE IS NOT ONE OF THEM. Warnings get their own
+# verdict word because the operator asked to see them, but the silence gate
+# still sends only on CRITICAL or ACTION -- so a warnings-only host is reported
+# as WARNINGS and still mails nothing. The subject is derived from this same
+# function, because otherwise a --force send on such a host would carry the
+# subject "healthy" over a body saying WARNINGS: two answers to one question
+# inside one email.
+health_verdict() {
+  local v
+  if (( ${#CHECKUP_CRITICAL[@]} > 0 )); then
+    v="CRITICAL (${#CHECKUP_CRITICAL[@]} critical, ${#CHECKUP_ACTIONS[@]} action(s))"
+  elif (( ${#CHECKUP_ACTIONS[@]} > 0 )); then
+    v="ACTION REQUIRED (${#CHECKUP_ACTIONS[@]})"
+  elif (( ${#CHECKUP_WARNINGS[@]} > 0 )); then
+    v="WARNINGS (${#CHECKUP_WARNINGS[@]})"
+  else
+    v="HEALTHY"
+  fi
+  printf '%s' "$v"
+}
+
+health_verdict_glyph() {
+  if   (( ${#CHECKUP_CRITICAL[@]} > 0 )); then printf '\xe2\x9c\x97'   # cross
+  elif (( ${#CHECKUP_ACTIONS[@]}  > 0 )); then printf '\xe2\x96\xb2'   # up triangle
+  elif (( ${#CHECKUP_WARNINGS[@]} > 0 )); then printf '\xe2\x96\xb4'   # small triangle
+  else printf '\xe2\x97\x8f'                                            # filled circle
+  fi
+}
+
+# Escalation suffix for a numeric value. The HTML renderer colours whole lines
+# by these glyphs, so the decision lives here once and the plain-text fallback
+# carries the identical signal. Visual attention only -- verdict policy stays
+# in checkup, which remains the single source of truth.
+mreport_flag() {  # $1 = value, $2 = soft, $3 = strong, $4 = critical
+  local v="${1%%.*}" soft="$2" strong="$3" crit="$4"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 0
+  if   (( v >= crit ));   then printf ' \xe2\x9c\x97'
+  elif (( v >= strong )); then printf ' \xe2\x96\xb2'
+  elif (( v >= soft ));   then printf ' \xe2\x96\xb4'
+  fi
+}
+
+# Section divider. The padding is built by a loop because printf's precision
+# counts BYTES, not the 3-byte UTF-8 box-drawing characters -- the same reason
+# domum-core does it this way.
+MREPORT_WIDTH=42
+mreport_hdr() {
+  local title="$1" pad="" n i
+  n=$(( MREPORT_WIDTH - ${#title} )); (( n < 3 )) && n=3
+  for (( i = 0; i < n; i++ )); do pad+="\xe2\x94\x80"; done
+  printf -- '\xe2\x94\x80\xe2\x94\x80 %s %b\n' "$title" "$pad"
+}
+
+# 8-level sparkline. Levels are computed as ASCII digits in awk and mapped to
+# glyphs in bash, because substr() over multibyte glyphs is locale-dependent.
+mreport_sparkline() {
+  local glyphs=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █) levels out="" i
+  levels="$(printf '%s\n' "$@" | awk '
+    NF { v[++n] = $1 + 0; if (n == 1 || v[n] < min) min = v[n]; if (n == 1 || v[n] > max) max = v[n] }
+    END {
+      if (n == 0) exit
+      r = max - min
+      for (i = 1; i <= n; i++) {
+        l = (r == 0) ? 3 : int((v[i] - min) / r * 7 + 0.5)
+        if (l < 0) l = 0
+        if (l > 7) l = 7
+        printf "%d", l
+      }
+    }')"
+  for (( i = 0; i < ${#levels}; i++ )); do out+="${glyphs[${levels:i:1}]}"; done
+  printf '%s' "$out"
+}
+
+mreport_history_file() { printf '%s/report/history.csv' "${DOMUM_STATE_ROOT:-/var/lib/domum-media}"; }
+
+# One row per DAY, last run wins, so trends stay genuinely week-by-week when the
+# report is run several times. The canonical header is always rewritten rather
+# than copied, so a schema addition migrates old files automatically -- column
+# positions of existing fields never change. Bounded at 120 rows.
+#
+# Every value is cheap: no asset-table query, no restic call, no media download.
+# The Immich count comes from the RECORDED coverage evidence, not a live query.
+mreport_append_history() {
+  local hist tmp today disk mem containers errs originals scrub_age dtemp
+  hist="$(mreport_history_file)"
+  install -d -m 0750 "$(dirname "$hist")" 2>/dev/null || return 0
+  [[ -f "$hist" ]] || : > "$hist"
+  today="$(date -I)"
+  disk="$(df -P "${DOMUM_DATA_ROOT:-/srv/data}" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')"
+  mem=""
+  if [[ -r /proc/meminfo ]]; then
+    local mt ma
+    mt="$(awk '/^MemTotal/{print $2}' /proc/meminfo)"
+    ma="$(awk '/^MemAvailable/{print $2}' /proc/meminfo)"
+    [[ -n "$mt" && -n "$ma" && "$mt" -gt 0 ]] && mem=$(( (mt - ma) * 100 / mt ))
+  fi
+  containers="$(docker ps --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')"
+  errs="$(journalctl -p err --since -7d --no-pager 2>/dev/null | wc -l | tr -d ' ')"
+  originals="$(mreport_coverage_value originals)"
+  [[ "$originals" =~ ^[0-9]+$ ]] || originals=""
+  scrub_age="$(mreport_scrub_age_days)"
+  dtemp="$(mreport_disk_temp_c)"
+  tmp="$(mktemp)" || return 0
+  {
+    printf 'date,disk_data_pct,mem_pct,containers_running,journal_errors,immich_originals,scrub_age_days,disk_temp_c\n'
+    { tail -n +2 "$hist" | grep -v '^date,' || true
+      printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$today" "${disk:-}" "${mem:-}" \
+        "${containers:-0}" "${errs:-0}" "${originals:-}" "${scrub_age:-}" "${dtemp:-}"
+    } | awk -F, '{ row[$1] = $0; if (!seen[$1]++) order[++n] = $1 }
+                 END { for (i = 1; i <= n; i++) print row[order[i]] }' \
+      | tail -n 120 || true
+  } > "$tmp"
+  mv -f "$tmp" "$hist" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  chmod 0640 "$hist" 2>/dev/null || true
+}
+
+mreport_trend_line() {  # $1 = history, $2 = column, $3 = label, $4 = suffix
+  local hist="$1" col="$2" label="$3" suffix="$4" vals last
+  vals="$(tail -n +2 "$hist" | tail -n 8 | awk -F, -v c="$col" '$c ~ /^[0-9]+([.][0-9]+)?$/ { print $c }')"
+  [[ -n "$vals" ]] || return 0
+  last="$(printf '%s\n' "$vals" | tail -n 1)"
+  # shellcheck disable=SC2086
+  printf '  %-14s %s  %s%s\n' "$label" "$(mreport_sparkline $vals)" "$last" "$suffix"
+}
+
+# Trends are shown ONLY when real history exists. A single current measurement
+# is never spread across eight weeks: with fewer than two rows this says so.
+mreport_trends() {
+  local hist rows
+  hist="$(mreport_history_file)"
+  mreport_hdr "TRENDS (WEEK BY WEEK)"
+  if [[ ! -f "$hist" ]]; then
+    printf '  No history recorded yet. Each report adds one\n'
+    printf '  point; trends appear from the second run.\n\n'
+    return 0
+  fi
+  rows="$(( $(wc -l < "$hist" 2>/dev/null || echo 1) - 1 ))"
+  if (( rows < 2 )); then
+    printf '  Still collecting: %s point(s) recorded. Trends\n' "$rows"
+    printf '  appear from the second run.\n'
+  else
+    mreport_trend_line "$hist" 2 "Data disk"    "%"
+    mreport_trend_line "$hist" 3 "Memory"       "%"
+    mreport_trend_line "$hist" 4 "Containers"   ""
+    mreport_trend_line "$hist" 5 "Log errors"   ""
+    mreport_trend_line "$hist" 6 "Immich orig." ""
+    mreport_trend_line "$hist" 7 "Scrub age"    "d"
+    mreport_trend_line "$hist" 8 "Disk temp"    "\xc2\xb0C"
+    printf '  (oldest -> newest, up to 8 points)\n'
+  fi
+  printf '\n'
+}
+
+# ---------------------------------------------------------------------------
+#  Evidence readers. Everything here is RECORDED state or a cheap local probe.
+#  Nothing queries the Immich asset table, contacts Hetzner, or downloads a
+#  byte: a scheduled report must not do recovery work.
+# ---------------------------------------------------------------------------
+
+mreport_coverage_file() {
+  printf '%s/restore-verification/%s-snapshot-coverage.json' \
+    "${DOMUM_STATE_ROOT:-/var/lib/domum-media}" "${1:-cloud}"
+}
+
+# One key from the recorded coverage evidence, or the empty string.
+#
+# NOT `// empty`: jq's `//` is false-coalescing, so a genuine `false` would come
+# back as absent. These keys are counts and strings today, but the accessor is
+# shared and must not become a trap later.
+mreport_coverage_value() {  # $1 = key, $2 = target
+  local f; f="$(mreport_coverage_file "${2:-cloud}")"
+  [[ -r "$f" ]] || return 0
+  cmd_exists jq || return 0
+  jq -r --arg k "$1" '.[$k] | if . == null then "" else tostring end' "$f" 2>/dev/null || true
+}
+
+# Age in whole days since the last completed scrub of the data tier, or empty.
+mreport_scrub_age_days() {
+  local root status last epoch now
+  root="${DOMUM_DATA_ROOT:-/srv/data}"
+  cmd_exists btrfs || return 0
+  status="$(btrfs scrub status "$root" 2>/dev/null || true)"
+  [[ -n "$status" ]] || return 0
+  last="$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]+(.*)$/\1/p' <<< "$status" | tail -1)"
+  [[ -n "$last" ]] || return 0
+  epoch="$(date -d "$last" +%s 2>/dev/null || true)"
+  [[ -n "$epoch" ]] || return 0
+  now="$(date +%s)"
+  printf '%s' "$(( (now - epoch) / 86400 ))"
+}
+
+# Highest drive temperature across physical disks, or empty when unreadable.
+mreport_disk_temp_c() {
+  local dev t best=""
+  cmd_exists smartctl && cmd_exists jq || return 0
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    t="$(smartctl -j -A "/dev/$dev" 2>/dev/null \
+         | jq -r '.temperature.current | if . == null then "" else tostring end' 2>/dev/null || true)"
+    [[ "$t" =~ ^[0-9]+$ ]] || continue
+    [[ -z "$best" ]] && best="$t"
+    (( t > best )) && best="$t"
+  done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+  printf '%s' "$best"
+}
+
+# Are a drive's SMART attributes INTERPRETABLE, or placeholders?
+#
+# Measured 2026-10-21: the KOWIN OS drive reports all 30 attributes at
+# value=100, threshold=50 -- one distinct pair across the whole table. A drive
+# whose every attribute reads identically after 3054 hours is reporting
+# placeholders, and deriving a wear figure from that would manufacture a
+# confident "0% used" from nothing. Returns 0 when interpretable.
+mreport_smart_interpretable() {  # $1 = device name
+  local n
+  cmd_exists jq || return 1
+  n="$(smartctl -j -A "/dev/$1" 2>/dev/null \
+       | jq -r '[.ata_smart_attributes.table[]?.value] | unique | length' 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  (( n > 1 ))
+}
+
+mreport_file_age() {  # $1 = label, $2 = file
+  local label="$1" file="$2" epoch
+  if [[ -f "$file" ]]; then
+    epoch="$(stat -c %Y "$file" 2>/dev/null || true)"
+    if [[ -n "$epoch" ]]; then
+      printf '  %-22s %s ago\n' "$label" "$(human_age_from_epoch "$epoch")"
+      return 0
+    fi
+  fi
+  printf '  %-22s not recorded yet\n' "$label"
+}
+
+# Cumulative count of proven originals from a durable history file. These are
+# the files restic actually restored and compared byte-wise.
+mreport_history_count() {  # $1 = filename under restore-verification
+  local f="${DOMUM_STATE_ROOT:-/var/lib/domum-media}/restore-verification/$1"
+  [[ -r "$f" ]] || { printf '0'; return 0; }
+  awk 'NF' "$f" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ---------------------------------------------------------------------------
+#  The plain-text report. THIS IS THE SOURCE; the HTML wraps these lines.
+#
+#  Line grammar the HTML renderer keys on -- changing it changes the HTML:
+#    box-drawing     the terminal header / footer
+#    "> "            the boot line, gets the blinking cursor
+#    "Verdict: "     the prominent bordered verdict
+#    "-- TITLE ---"  a section heading
+#    anything else   body, coloured by its escalation glyph
+# ---------------------------------------------------------------------------
+mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
+  local out="$1" mode="${2:-full}" verdict glyph target
+  verdict="$(health_verdict)"
+  glyph="$(health_verdict_glyph)"
+  target="${REPORT_COVERAGE_TARGET:-cloud}"
+  {
+    printf '\xe2\x95\x94'; printf '\xe2\x95\x90%.0s' $(seq 1 $(( MREPORT_WIDTH + 2 ))); printf '\xe2\x95\x97\n'
+    printf '\xe2\x95\x91 %-*s \xe2\x95\x91\n' "$MREPORT_WIDTH" "DOMUM-CORE-MEDIA // INFRASTRUCTURE MONITOR"
+    if [[ "$mode" == "alert" ]]; then
+      printf '\xe2\x95\x91 %-*s \xe2\x95\x91\n' "$MREPORT_WIDTH" "HEALTH ALERT // $(date -I)"
+    else
+      printf '\xe2\x95\x91 %-*s \xe2\x95\x91\n' "$MREPORT_WIDTH" "WEEKLY REPORT // $(date -I)"
+    fi
+    printf '\xe2\x95\x9a'; printf '\xe2\x95\x90%.0s' $(seq 1 $(( MREPORT_WIDTH + 2 ))); printf '\xe2\x95\x9d\n'
+    if [[ "$mode" == "alert" ]]; then
+      printf '> something needs your attention\n'
+    else
+      printf '> weekly self-diagnostic complete\n'
+    fi
+    printf 'Verdict: %s %s\n' "$glyph" "$verdict"
+    printf '  %s healthy, %s warning(s), %s action(s), %s critical\n\n' \
+      "${#CHECKUP_HEALTHY[@]}" "${#CHECKUP_WARNINGS[@]}" "${#CHECKUP_ACTIONS[@]}" "${#CHECKUP_CRITICAL[@]}"
+
+    # --- the findings come FIRST in an alert: the problem before statistics --
+    if [[ "$mode" == "alert" ]]; then
+      mreport_hdr "WHAT NEEDS ATTENTION"
+      (( ${#CHECKUP_CRITICAL[@]} == 0 )) || printf '  \xe2\x9c\x97 %s\n' "${CHECKUP_CRITICAL[@]}"
+      (( ${#CHECKUP_WARNINGS[@]} == 0 )) || printf '  \xe2\x96\xb2 %s\n' "${CHECKUP_WARNINGS[@]}"
+      printf '\n'
+      mreport_hdr "SUGGESTED ACTIONS"
+      if (( ${#CHECKUP_ACTIONS[@]} == 0 )); then
+        printf '  none recorded\n'
+      else
+        local ai=0 action
+        for action in "${CHECKUP_ACTIONS[@]}"; do
+          ai=$(( ai + 1 )); (( ai > 5 )) && break
+          printf '  %d. %s\n' "$ai" "$action"
+        done
+      fi
+      printf '\n'
+    fi
+
+    # --- IMMICH & DISASTER RECOVERY -----------------------------------------
+    mreport_hdr "IMMICH & DISASTER RECOVERY"
+    local c_orig c_present c_miss c_gap c_pend c_unk c_cls c_snap c_when
+    c_orig="$(mreport_coverage_value originals "$target")"
+    c_present="$(mreport_coverage_value in_snapshot "$target")"
+    c_miss="$(mreport_coverage_value missing_from_snapshot "$target")"
+    c_gap="$(mreport_coverage_value missing_backup_gap "$target")"
+    c_pend="$(mreport_coverage_value missing_pending_next_backup "$target")"
+    c_unk="$(mreport_coverage_value missing_timing_unknown "$target")"
+    c_cls="$(mreport_coverage_value missing_classified "$target")"
+    c_snap="$(mreport_coverage_value snapshot_id "$target")"
+    c_when="$(mreport_coverage_value recorded_at "$target")"
+    if [[ -z "$c_orig" ]]; then
+      printf '  %-22s NOT CHECKED \xe2\x96\xb2\n' "Off-site coverage"
+      printf '  Run: domum-media-backup verify-snapshot-coverage %s\n' "$target"
+      printf '  (reads snapshot metadata only -- downloads nothing)\n'
+    else
+      printf '  %-22s %s\n' "Immich originals" "$c_orig"
+      printf '  %-22s %s of %s\n' "In off-site snapshot" "${c_present:-?}" "$c_orig"
+      if [[ "$c_miss" == "0" ]]; then
+        printf '  %-22s none\n' "Missing"
+      else
+        printf '  %-22s %s\n' "Missing" "${c_miss:-?}"
+        if [[ "$c_cls" == "known" ]]; then
+          [[ "${c_gap:-0}" == "0" ]]  || printf '  %-22s %s \xe2\x9c\x97 (should have been backed up)\n' "  BACKUP GAP" "$c_gap"
+          [[ "${c_pend:-0}" == "0" ]] || printf '  %-22s %s (ingested after the window)\n' "  pending next run" "$c_pend"
+          [[ "${c_unk:-0}" == "0" ]]  || printf '  %-22s %s \xe2\x96\xb2 (ingested during the window)\n' "  timing unknown" "$c_unk"
+        else
+          printf '  %-22s NOT CLASSIFIED \xe2\x96\xb2\n' "  classification"
+        fi
+      fi
+      printf '  %-22s %s\n' "Reconciled snapshot" "${c_snap:-unknown}"
+      printf '  %-22s %s\n' "Reconciled at" "${c_when:-unknown}"
+    fi
+    local n_sample n_large
+    n_sample="$(mreport_history_count "${target}-sample-verified.jsonl")"
+    n_large="$(mreport_history_count "${target}-large-verified.jsonl")"
+    printf '  %-22s %s sampled + %s large\n' "Restore-tested files" "$n_sample" "$n_large"
+    printf '  %-22s NOT ACHIEVED -- a whole tier has never\n' "Full recovery"
+    printf '  %-22s been restored and served\n' ""
+    printf '\n'
+
+    # --- BACKUPS -------------------------------------------------------------
+    mreport_hdr "BACKUPS"
+    local lb
+    lb="$(backup_last_success_epoch 2>/dev/null || true)"
+    if [[ "$lb" =~ ^[0-9]+$ ]]; then
+      local age_h=$(( ( $(date +%s) - lb ) / 3600 ))
+      printf '  %-22s %s ago%s\n' "Last backup" "$(human_age_from_epoch "$lb")" "$(mreport_flag "$age_h" 30 48 72)"
+    else
+      printf '  %-22s not recorded \xe2\x96\xb2\n' "Last backup"
+    fi
+    mreport_file_age "Recovery pack" "$(recovery_pack_state_file 2>/dev/null || true)"
+    printf '  %-22s Immich library, PostgreSQL dump,\n' "Cloud scope"
+    printf '  %-22s and the encrypted recovery pack\n' ""
+    printf '  %-22s media-service state and the exact-image\n' "NOT in that scope"
+    printf '  %-22s archives. Local snapshots only.\n' ""
+    printf '\n'
+
+    if [[ "$mode" != "alert" ]]; then
+      # --- SYSTEM ------------------------------------------------------------
+      mreport_hdr "SYSTEM"
+      cmd_exists uptime && printf '  %-22s %s\n' "Uptime" "$(uptime -p 2>/dev/null | sed 's/^up //' || true)"
+      if [[ -r /proc/loadavg ]]; then
+        printf '  %-22s %s (1/5/15 min, not CPU%%)\n' "Load average" "$(awk '{print $1", "$2", "$3}' /proc/loadavg)"
+      fi
+      if [[ -r /proc/meminfo ]]; then
+        local mt ma mp
+        mt="$(awk '/^MemTotal/{print $2}' /proc/meminfo)"
+        ma="$(awk '/^MemAvailable/{print $2}' /proc/meminfo)"
+        if [[ -n "$mt" && -n "$ma" && "$mt" -gt 0 ]]; then
+          mp=$(( (mt - ma) * 100 / mt ))
+          printf '  %-22s %s%% of %s GiB%s\n' "Memory used" "$mp" \
+            "$(awk -v k="$mt" 'BEGIN{printf "%.1f", k/1048576}')" "$(mreport_flag "$mp" 75 85 93)"
+        fi
+      fi
+      printf '  %-22s %s\n' "Kernel" "$(uname -r)"
+      # One line per FILESYSTEM, not per mountpoint: /srv/data and
+      # /srv/snapshots are subvolumes of one device and must not read as two.
+      local seen=" " root fsid pct free
+      for root in / "${DOMUM_DATA_ROOT:-/srv/data}" "${DOMUM_SNAPSHOT_ROOT:-/srv/snapshots}" "${DOMUM_MEDIA_ROOT:-/srv/media}"; do
+        [[ -d "$root" ]] || continue
+        fsid="$(findmnt -no UUID --target "$root" 2>/dev/null || true)"
+        [[ -n "$fsid" ]] || fsid="$(stat -c %d "$root" 2>/dev/null || true)"
+        [[ -n "$fsid" && "$seen" == *" $fsid "* ]] && continue
+        seen="$seen$fsid "
+        read -r pct free < <(df -P -h "$root" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5, $4}') || true
+        [[ -n "$pct" ]] || continue
+        printf '  %-22s %s%% used, %s free%s\n' "Disk $root" "$pct" "$free" "$(mreport_flag "$pct" 70 80 90)"
+      done
+      printf '\n'
+
+      mreport_trends
+    fi
+
+    # --- DRIVE HEALTH --------------------------------------------------------
+    mreport_hdr "DRIVE HEALTH"
+    if ! cmd_exists smartctl; then
+      printf '  %-22s UNKNOWN \xe2\x96\xb2 smartmontools absent\n' "SMART"
+    else
+      local dev model passed poh wear
+      while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        model="$(smartctl -j -i "/dev/$dev" 2>/dev/null | jq -r '.model_name // "unknown"' 2>/dev/null || echo unknown)"
+        passed="$(smartctl -j -H "/dev/$dev" 2>/dev/null | jq -r '.smart_status.passed | tostring' 2>/dev/null || echo null)"
+        case "$passed" in
+          true)  printf '  %-22s %s: passed\n' "SMART /dev/$dev" "$model" ;;
+          false) printf '  %-22s %s: DID NOT PASS \xe2\x9c\x97\n' "SMART /dev/$dev" "$model" ;;
+          *)     printf '  %-22s %s: UNKNOWN \xe2\x96\xb2 no verdict\n' "SMART /dev/$dev" "$model" ;;
+        esac
+        poh="$(smartctl -j -i "/dev/$dev" 2>/dev/null | jq -r '.power_on_time.hours | if . == null then "" else tostring end' 2>/dev/null || true)"
+        [[ -n "$poh" ]] && printf '  %-22s %s h\n' "  power on" "$poh"
+        # Wear is reported ONLY when the attribute table is interpretable. A
+        # drive reporting every attribute identically is reporting placeholders,
+        # and "0% wear" derived from that would be invented.
+        if mreport_smart_interpretable "$dev"; then
+          wear="$(smartctl -j -A "/dev/$dev" 2>/dev/null \
+                  | jq -r '[.ata_smart_attributes.table[]? | select(.name|test("Wear_Leveling|Percent_Lifetime|Media_Wearout"))][0].value | if . == null then "" else tostring end' 2>/dev/null || true)"
+          if [[ "$wear" =~ ^[0-9]+$ ]]; then
+            printf '  %-22s %s%% of rated life remaining%s\n' "  wear" "$wear" "$(mreport_flag "$(( 100 - wear ))" 50 80 90)"
+          else
+            printf '  %-22s no wear attribute reported\n' "  wear"
+          fi
+        else
+          printf '  %-22s NOT INTERPRETABLE -- vendor attributes\n' "  wear"
+        fi
+      done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+    fi
+    # Btrfs, once per filesystem.
+    local broot bstatus bcount
+    while IFS=$'\t' read -r broot _; do
+      [[ -n "$broot" ]] || continue
+      bstatus="$(btrfs scrub status "$broot" 2>/dev/null || true)"
+      printf '  Btrfs %s\n' "$broot"
+      if [[ -z "$bstatus" ]]; then
+        printf '  %-22s UNKNOWN \xe2\x96\xb2 unreadable\n' "  scrub"
+      elif grep -qE 'no stats available|never ran' <<< "$bstatus"; then
+        printf '  %-22s NEVER SCRUBBED \xe2\x96\xb2\n' "  scrub"
+      else
+        local sage sres ssize
+        sage="$(mreport_scrub_age_days)"
+        sres="$(sed -nE 's/^[[:space:]]*Error summary:[[:space:]]+(.*)$/\1/p' <<< "$bstatus" | tail -1)"
+        ssize="$(sed -nE 's/^[[:space:]]*Total to scrub:[[:space:]]+(.*)$/\1/p' <<< "$bstatus" | tail -1)"
+        printf '  %-22s %s, %s ago%s\n' "  scrub" "${sres:-unknown}" "${sage:-?} day(s)" \
+          "$(mreport_flag "${sage:-0}" 45 90 180)"
+        [[ -n "$ssize" ]] && printf '  %-22s %s\n' "  verified" "$ssize"
+      fi
+      bcount="$(btrfs device stats "$broot" 2>/dev/null | awk '{s += $NF} END {print s+0}' || true)"
+      if [[ "$bcount" =~ ^[0-9]+$ ]]; then
+        if (( bcount == 0 )); then printf '  %-22s all zero\n' "  error counters"
+        else printf '  %-22s %s \xe2\x9c\x97 non-zero\n' "  error counters" "$bcount"; fi
+      else
+        printf '  %-22s UNKNOWN \xe2\x96\xb2 unreadable\n' "  error counters"
+      fi
+    done < <(btrfs_unique_roots)
+    printf '\n'
+
+    if [[ "$mode" != "alert" ]]; then
+      # --- SERVICES ----------------------------------------------------------
+      mreport_hdr "SERVICES"
+      local svc enable_var state running=0 total=0 nohc=0 bad=""
+      while IFS='|' read -r svc enable_var _ _ _ _ _; do
+        [[ "${!enable_var:-0}" == "1" ]] || continue
+        total=$(( total + 1 ))
+        state="$(service_health_state "$svc" 2>/dev/null || echo unknown)"
+        case "$state" in
+          healthy)            running=$(( running + 1 )) ;;
+          starting)           running=$(( running + 1 )) ;;
+          unhealthy|stopped)  bad="${bad:+$bad }$svc:$state" ;;
+          *)                  running=$(( running + 1 )); nohc=$(( nohc + 1 )) ;;
+        esac
+      done < <(service_lifecycle_specs)
+      printf '  %-22s %s of %s\n' "Up" "$running" "$total"
+      printf '  %-22s %s running with no healthcheck --\n' "Unverified" "$nohc"
+      printf '  %-22s RUNNING is not HEALTHY for those\n' ""
+      if [[ -n "$bad" ]]; then
+        printf '  %-22s \xe2\x9c\x97 %s\n' "Problem services" "$bad"
+      else
+        printf '  %-22s none\n' "Problem services"
+      fi
+      printf '\n'
+
+      # --- UPDATES -----------------------------------------------------------
+      mreport_hdr "UPDATES"
+      printf '  %-22s disabled by design -- staging an\n' "Auto image refresh"
+      printf '  %-22s image never implies deploying it\n' ""
+      local staged
+      staged="$(find "${DOMUM_STATE_ROOT:-/var/lib/domum-media}/updates" -maxdepth 1 -name '*.env' 2>/dev/null | wc -l | tr -d ' ' || true)"
+      printf '  %-22s %s record(s) -- reported, never\n' "Staged" "${staged:-0}"
+      printf '  %-22s treated as a failure\n' ""
+      printf '\n'
+
+      # --- LOG ERRORS --------------------------------------------------------
+      mreport_hdr "LOG ERRORS (7 DAYS)"
+      local ec
+      ec="$(journalctl -p err --since -7d --no-pager 2>/dev/null | wc -l | tr -d ' ' || true)"
+      printf '  %-22s %s\n' "Error lines" "${ec:-0}"
+      if [[ "${ec:-0}" != "0" ]]; then
+        printf '  Most repeated:\n'
+        journalctl -p err --since -7d --no-pager 2>/dev/null \
+          | sed 's/[0-9][0-9:]\{7,8\}//g' \
+          | sort | uniq -c | sort -rn | sed -n '1,3{s/^ */    /;p}' || true
+      fi
+      printf '\n'
+
+      # --- FINDINGS ----------------------------------------------------------
+      mreport_hdr "FINDINGS"
+      (( ${#CHECKUP_CRITICAL[@]} == 0 )) || printf '  \xe2\x9c\x97 %s\n' "${CHECKUP_CRITICAL[@]}"
+      (( ${#CHECKUP_WARNINGS[@]} == 0 )) || printf '  \xe2\x96\xb2 %s\n' "${CHECKUP_WARNINGS[@]}"
+      (( ${#CHECKUP_CRITICAL[@]} || ${#CHECKUP_WARNINGS[@]} )) || printf '  \xe2\x97\x8f all clear\n'
+      printf '\n'
+
+      mreport_hdr "SUGGESTED ACTIONS"
+      if (( ${#CHECKUP_ACTIONS[@]} == 0 )); then
+        printf '  none -- nothing needs doing\n'
+      else
+        local i=0 act
+        for act in "${CHECKUP_ACTIONS[@]}"; do
+          i=$(( i + 1 )); (( i > 5 )) && break
+          printf '  %d. %s\n' "$i" "$act"
+        done
+      fi
+      printf '\n'
+    fi
+    printf '\xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90 end of report \xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d\n'
+  } > "$out"
+}
+
+# sed, not ${var//…/&amp;}: bash 5.2's patsub_replacement expands a bare `&`
+# in the replacement to the matched text, silently corrupting the escape.
+# Quotes are escaped too -- not needed while every value lands in element
+# CONTENT, but the function is shared and a future attribute use must not
+# become an injection.
+mreport_html_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+                         -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
+}
+
+# The HTML representation. It re-derives NOTHING: it wraps the plain text's
+# lines, keyed on prefix and coloured by the escalation glyph the text already
+# carries, so the two MIME parts cannot disagree about a number.
+#
+# Email-safe by construction: one 600px column, every style inline, monospace
+# stack, no images, no JS, no remote assets, no tracking. The explicit
+# color-scheme hints stop Apple Mail re-inverting the dark palette. The blinking
+# cursor is progressive enhancement -- Apple Mail animates it, Gmail strips the
+# <style> block and shows a solid cursor, losing nothing.
+mreport_render_html() {  # $1 = text file, $2 = output file
+  local text="$1" out="$2"
+  local mono="'SF Mono',Menlo,Consolas,'Courier New',monospace"
+  local paper="#141a15" ink="#cfe3cf" green="#42e07d" amber="#e5b567"
+  local soft="#c2a35f" red="#ff7a6e" rule="#2a352c" dim="#748978" boot="#6fbe8e"
+  local glow="text-shadow:0 0 6px rgba(66,224,125,0.45);"
+  local line esc title in_body=0 seen_verdict=0 vcolor vbg vtext
+  {
+    printf '<!DOCTYPE html><html><head><meta charset="utf-8">'
+    printf '<meta name="viewport" content="width=device-width">'
+    printf '<meta name="color-scheme" content="dark">'
+    printf '<meta name="supported-color-schemes" content="dark">\n'
+    printf '<style>:root{color-scheme:dark}@keyframes dcb{0%%,55%%{opacity:1}56%%,100%%{opacity:0}}.dcb{animation:dcb 1.1s step-end infinite}</style></head>\n'
+    printf '<body bgcolor="%s" style="margin:0;padding:0;background-color:%s;">\n' "$paper" "$paper"
+    printf '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" border="0" bgcolor="%s" style="background-color:%s;"><tr><td align="center" style="padding:24px 12px;">\n' "$paper" "$paper"
+    printf '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;"><tr><td align="left">\n'
+    while IFS= read -r line; do
+      case "$line" in
+        ╔*|║*)
+          printf '<div style="font-family:%s;font-size:12px;line-height:1.35;color:%s;%swhite-space:pre-wrap;">%s</div>\n' \
+            "$mono" "$green" "$glow" "$(mreport_html_escape "$line")"
+          ;;
+        ╚*)
+          (( in_body == 0 )) || { printf '</div>\n'; in_body=0; }
+          if (( seen_verdict == 0 )); then
+            printf '<div style="font-family:%s;font-size:12px;line-height:1.35;color:%s;%swhite-space:pre-wrap;">%s</div>\n' \
+              "$mono" "$green" "$glow" "$(mreport_html_escape "$line")"
+          else
+            printf '<div style="margin-top:24px;font-family:%s;font-size:11px;color:%s;">%s</div>\n' \
+              "$mono" "$dim" "$(mreport_html_escape "$line")"
+          fi
+          ;;
+        "> "*)
+          printf '<div style="margin-top:8px;font-family:%s;font-size:12px;color:%s;">%s <span class="dcb" style="color:%s;">▌</span></div>\n' \
+            "$mono" "$boot" "$(mreport_html_escape "$line")" "$green"
+          ;;
+        "Verdict: "*)
+          seen_verdict=1
+          vtext="${line#Verdict: }"
+          case "$vtext" in
+            ▲*) vcolor="$amber"; vbg="#292217" ;;
+            ▴*) vcolor="$soft";  vbg="#241f16" ;;
+            ✗*) vcolor="$red";   vbg="#2a1a17" ;;
+            *)  vcolor="$green"; vbg="#18271c" ;;
+          esac
+          printf '<div style="margin:14px 0 4px;border:1px solid %s;background-color:%s;padding:10px 12px;font-family:%s;font-size:15px;font-weight:bold;color:%s;">%s</div>\n' \
+            "$vcolor" "$vbg" "$mono" "$vcolor" "$(mreport_html_escape "$vtext")"
+          ;;
+        "── "*)
+          (( in_body == 0 )) || { printf '</div>\n'; in_body=0; }
+          title="${line#── }"; title="${title%% ─*}"
+          printf '<div style="margin-top:20px;padding-bottom:4px;border-bottom:1px solid %s;font-family:%s;font-size:11px;letter-spacing:2px;color:%s;">%s</div>\n' \
+            "$rule" "$mono" "$green" "$(mreport_html_escape "$title")"
+          ;;
+        "") : ;;
+        *)
+          if (( in_body == 0 )); then
+            printf '<div style="font-family:%s;font-size:13px;line-height:1.6;color:%s;white-space:pre-wrap;padding-top:6px;">' "$mono" "$ink"
+            in_body=1
+          fi
+          esc="$(mreport_html_escape "$line")"
+          case "$line" in
+            *✗*) printf '<span style="color:%s;font-weight:bold;">%s</span>\n' "$red" "$esc" ;;
+            *▲*) printf '<span style="color:%s;font-weight:bold;">%s</span>\n' "$amber" "$esc" ;;
+            *▴*) printf '<span style="color:%s;">%s</span>\n' "$soft" "$esc" ;;
+            *)   printf '%s\n' "$esc" ;;
+          esac
+          ;;
+      esac
+    done < "$text"
+    (( in_body == 0 )) || printf '</div>\n'
+    printf '</td></tr></table></td></tr></table></body></html>\n'
+  } > "$out"
+}
+
+# A header value with CR/LF removed. domum-core interpolates the subject
+# straight into the message; that is a header-injection hole by construction
+# even though its subject happens to be a controlled verdict string. Anything
+# reaching a header goes through here.
+mreport_header_safe() {
+  printf '%s' "$1" | tr -d '\r\n' | tr -d '\000'
+}
+
+# multipart/alternative, plain text FIRST (the fallback) then HTML (preferred).
+# Hands a complete RFC-822 message to the one SMTP transport; it does not send.
+mreport_build_mime() {  # $1 = subject, $2 = text, $3 = html, $4 = out
+  local subject="$1" text="$2" html="$3" out="$4" boundary from to
+  boundary="=_domum_media_$(date +%s)_$$"
+  from="$(mreport_header_safe "${RECOVERY_PACK_EMAIL_FROM:-${DOMUM_EMAIL:-}}")"
+  to="$(mreport_header_safe "${RECOVERY_PACK_EMAIL_TO:-${DOMUM_EMAIL:-}}")"
+  {
+    printf 'From: %s\n' "$from"
+    printf 'To: %s\n' "$to"
+    printf 'Subject: %s\n' "$(mreport_header_safe "$subject")"
+    printf 'MIME-Version: 1.0\n'
+    printf 'Content-Type: multipart/alternative; boundary="%s"\n\n' "$boundary"
+    printf 'This is a MIME multipart message.\n'
+    printf '\n--%s\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n' "$boundary"
+    cat "$text"
+    printf '\n--%s\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n' "$boundary"
+    cat "$html"
+    printf '\n--%s--\n' "$boundary"
+  } > "$out"
+}
+
+# domum-media report weekly [--stdout|--html|--email|--dry-run]
+#
+# Mirrors domum-core's `report weekly` on purpose: the operator already knows
+# that shape. Backward compatible -- bare `report`, `--json` and `--write` are
+# untouched and still dispatch to the report library.
+#
+# PREVIEW NEVER SENDS. --email is the only form that mails, and it refuses
+# unless email is configured.
+mreport_weekly_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_dirs
+  local mode="stdout" arg
+  while (( $# )); do
+    arg="$1"; shift
+    case "$arg" in
+      --stdout)  mode="stdout" ;;
+      --html)    mode="html" ;;
+      --email)   mode="email" ;;
+      --dry-run) mode="dry" ;;
+      *) die "Usage: domum-media report weekly [--stdout|--html|--email|--dry-run]" ;;
+    esac
+  done
+
+  CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+  checkup_collect_all
+  mreport_append_history || warn "Could not append report history."
+
+  local text html subject
+  text="$(mktemp)" || die "cannot stage the report"
+  mreport_render_text "$text" full
+  subject="domum-media weekly report - $(health_verdict)"
+
+  case "$mode" in
+    stdout) cat "$text"; rm -f "$text" ;;
+    html)
+      html="$(mktemp)"
+      mreport_render_html "$text" "$html"
+      cat "$html"
+      rm -f "$text" "$html"
+      ;;
+    dry)
+      html="$(mktemp)"
+      mreport_render_html "$text" "$html"
+      cat "$text"
+      printf -- '--- dry run: no mail sent. subject would be: %s ---\n' "$subject"
+      printf -- '--- html is %s bytes; see --html to inspect it ---\n' "$(stat -c %s "$html")"
+      rm -f "$text" "$html"
+      ;;
+    email)
+      if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" != "1" ]]; then
+        rm -f "$text"
+        die "Email is disabled (RECOVERY_PACK_EMAIL_ENABLED is not 1). Use --stdout or --html to preview."
+      fi
+      html="$(mktemp)"; local msg; msg="$(mktemp)"
+      mreport_render_html "$text" "$html"
+      mreport_build_mime "$subject" "$text" "$html" "$msg"
+      if smtp_send_message "$msg"; then
+        echo "[domum-media] weekly report emailed -- $subject"
+      else
+        rm -f "$text" "$html" "$msg"
+        die "The weekly report could not be sent."
+      fi
+      rm -f "$text" "$html" "$msg"
+      ;;
+  esac
+}
+
 health_summary_text() {  # stdout: the operator-facing summary
   local n_crit="${#CHECKUP_CRITICAL[@]}" n_warn="${#CHECKUP_WARNINGS[@]}"
   local n_act="${#CHECKUP_ACTIONS[@]}" n_ok="${#CHECKUP_HEALTHY[@]}"
@@ -5726,10 +6489,10 @@ health_notify_cmd() {
   CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
   # The same checks the operator would run by hand. One implementation: if
   # checkup and the notification could disagree, the silence would be worthless.
-  checkup_systemd_health
-  checkup_btrfs_health
-  checkup_disk_health
-  checkup_immich_offsite
+  # The SAME collection checkup runs. Calling only the four extracted checks
+  # here meant a notification could never mention a stopped container or a
+  # filling filesystem, because those checks are inline in the collection.
+  checkup_collect_all
 
   # The summary is written to a FILE, never captured with $( ).
   #
@@ -5743,13 +6506,10 @@ health_notify_cmd() {
   local subject body
   body="$(mktemp)" || die "cannot stage the summary"
   health_summary_text > "$body"
-  if (( ${#CHECKUP_CRITICAL[@]} > 0 )); then
-    subject="domum-media CRITICAL: ${#CHECKUP_CRITICAL[@]} issue(s) need attention"
-  elif (( ${#CHECKUP_ACTIONS[@]} > 0 )); then
-    subject="domum-media: ${#CHECKUP_ACTIONS[@]} action(s) required"
-  else
-    subject="domum-media: healthy"
-  fi
+  # The subject keeps its existing wording -- operator mail filters may match it
+  # -- but the verdict shown in the body comes from health_verdict, which the
+  # weekly report uses too, so the two can never disagree.
+  subject="domum-media: $(health_verdict)"
 
   if (( dry == 1 )); then
     cat "$body"
@@ -5773,16 +6533,16 @@ health_notify_cmd() {
     return 0
   fi
 
-  local message
+  # multipart/alternative, built by the same renderer the weekly report uses, in
+  # ALERT mode: the finding first, then only the sections needed to act on it.
+  # The plain-text part remains the fallback and carries every finding.
+  local message alert_text alert_html
   message="$(mktemp)" || die "cannot stage the message"
-  {
-    printf 'From: %s\n' "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}"
-    printf 'To: %s\n' "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}"
-    printf 'Subject: %s\n' "$subject"
-    printf 'MIME-Version: 1.0\n'
-    printf 'Content-Type: text/plain; charset="utf-8"\n\n'
-    cat "$body"
-  } > "$message"
+  alert_text="$(mktemp)"; alert_html="$(mktemp)"
+  mreport_render_text "$alert_text" alert
+  mreport_render_html "$alert_text" "$alert_html"
+  mreport_build_mime "$subject" "$alert_text" "$alert_html" "$message"
+  rm -f "$alert_text" "$alert_html"
   if smtp_send_message "$message"; then
     echo "[domum-media] health-notify: sent -- $subject"
   else
@@ -5792,20 +6552,21 @@ health_notify_cmd() {
   rm -f "$message" "$body"
 }
 
-checkup_cmd() {
-  need_root
-  load_cfg
-  export_env_for_compose
-  ensure_state_dirs
-
-  local json=0
-  [[ "${1:-}" == "--json" ]] && json=1
-
-  CHECKUP_CRITICAL=()
-  CHECKUP_WARNINGS=()
-  CHECKUP_HEALTHY=()
-  CHECKUP_ACTIONS=()
-
+# Every check, in one place, so the three commands that ask "is this host
+# healthy?" cannot answer differently.
+#
+# This was inline in checkup_cmd, and the consequence was measured:
+# health_notify_cmd called only the four EXTRACTED functions (systemd, btrfs,
+# disk, immich), so the inline checks never ran for a notification. Container
+# health and filesystem capacity are inline -- meaning a container going
+# UNHEALTHY, a service down, or /srv/data filling up could appear in `checkup`
+# and NEVER be mailed, however good their remedies were. The remedies added for
+# exactly those cases were unreachable from the notifier.
+#
+# "Commands that answer the same question must read the same evidence" --
+# checkup, health-notify and the weekly report all collect through here.
+# Callers reset the four arrays; this only appends.
+checkup_collect_all() {
   [[ -n "${DOMUM_DOMAIN:-}" ]] || checkup_add critical "DOMUM_DOMAIN is empty."
   [[ -n "${BACKUP_POLICY:-}" ]] || checkup_add critical "BACKUP_POLICY is unset."
   case "${BACKUP_POLICY^^}" in
@@ -6056,6 +6817,23 @@ checkup_cmd() {
   checkup_btrfs_health
   checkup_disk_health
   checkup_immich_offsite
+}
+
+checkup_cmd() {
+  need_root
+  load_cfg
+  export_env_for_compose
+  ensure_state_dirs
+
+  local json=0
+  [[ "${1:-}" == "--json" ]] && json=1
+
+  CHECKUP_CRITICAL=()
+  CHECKUP_WARNINGS=()
+  CHECKUP_HEALTHY=()
+  CHECKUP_ACTIONS=()
+
+  checkup_collect_all
 
   if (( json == 1 )); then
     printf '{\n'
@@ -9940,6 +10718,15 @@ load_report_lib() {
 # probe to "unknown", which is worse than refusing.
 report_entry() {
   need_root
+  # `report weekly` is the terminal-style HTML/text report and is handled here,
+  # because it needs the checkup arrays and the SMTP transport that live in this
+  # file. Bare `report`, `--json` and `--write` keep their exact meaning and
+  # still dispatch to the report library.
+  if [[ "${1:-}" == "weekly" ]]; then
+    shift
+    mreport_weekly_cmd "$@"
+    return
+  fi
   load_report_lib
   report_cmd "$@"
 }
@@ -9980,6 +10767,11 @@ Usage:
       is the healthy signal. --dry-run prints the summary and sends no mail;
       --force sends even when healthy, to prove delivery works.
   domum-media report [--json|--write]
+  domum-media report weekly [--stdout|--html|--email|--dry-run]
+                                            The terminal-style infrastructure
+                                            report, in HTML and plain text.
+                                            Preview NEVER sends; --email is the
+                                            only form that mails
   domum-media storage migrate-subvolume <service>
   domum-media storage topology              Deterministic inventory of managed
                                             subvolumes and snapshots. Capture it
