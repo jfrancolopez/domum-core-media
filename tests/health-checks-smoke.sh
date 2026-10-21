@@ -17,6 +17,17 @@ trap 'rm -rf -- "$TMP"' EXIT
 # `[[ -d ]]` and every per-filesystem assertion below passes for the wrong
 # reason -- the dedup test would "pass" while iterating a single root.
 mkdir -p "$TMP/bin" "$TMP/state/restore-verification" "$TMP/data" "$TMP/snapshots"
+
+# A fake /sys/block with a KNOWN non-rotational device. The estimate's rate
+# comes from the device's rotational flag, so a section that asserts a duration
+# must pin the device -- otherwise it reads the HOST's disk. That is exactly
+# what happened: this suite asserted "~10 min" and CI reported 39, because the
+# runner's device backing /tmp reports rotational=1. A test that depends on host
+# state is not a test.
+SB="$TMP/sysblock"
+mkdir -p "$SB/ssdz/queue"; echo 0 > "$SB/ssdz/queue/rotational"
+# Pin BOTH halves: the device name findmnt reports, and the flag under $SB.
+PIN_SSD='export DOMUM_SYSBLOCK_ROOT="'"$SB"'"; findmnt() { printf "/dev/ssdz1[/@data]\n"; }'
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq unavailable"; exit 0; }
 
 # $1 = shell defining the stubs, $2 = function to run -> the four arrays, flat
@@ -188,7 +199,8 @@ btrfs() {
     device) printf "[/dev/sda1].write_io_errs 0\n" ;;
     scrub)  printf "UUID: x\n        no stats available\nTotal to scrub:   215.87GiB\nError summary:    no errors found\n" ;;
   esac
-}' checkup_btrfs_health)"
+}
+'"$PIN_SSD" checkup_btrfs_health)"
 grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "no remedy: $out"
 grep -q 'takes hours' <<< "$out" && fail "the remedy still overstates the cost: $out"
 grep -qE 'ACT\|btrfs scrub start .*~10 min' <<< "$out" \
@@ -208,7 +220,8 @@ btrfs() {
     device) printf "[/dev/sda1].write_io_errs 0\n" ;;
     scrub)  printf "UUID: x\n        no stats available\nError summary:    no errors found\n" ;;
   esac
-}' checkup_btrfs_health)"
+}
+'"$PIN_SSD" checkup_btrfs_health)"
 grep -q 'ACT|btrfs scrub start' <<< "$out" || fail "the remedy must survive a missing size: $out"
 grep -q 'min for the' <<< "$out" && fail "it invented a duration from no size: $out"
 grep -q '~0 min' <<< "$out" && fail "it printed a zero estimate: $out"
@@ -220,7 +233,7 @@ sect "the estimate uses the device's OWN rotational flag, both ways"
 # Both disks on this host are SSDs, so without DOMUM_SYSBLOCK_ROOT the 100 MB/s
 # branch could never be driven and a test would default to 400 and pass for the
 # wrong reason -- the fixture-skips-the-iteration mistake. Assert BOTH rates.
-SB="$TMP/sysblock"; mkdir -p "$SB/sdz/queue"
+mkdir -p "$SB/sdz/queue"
 est() {
   (
     export DOMUM_SYSBLOCK_ROOT="$SB"

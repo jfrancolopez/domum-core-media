@@ -2152,6 +2152,42 @@ priority: any new coverage is additive and must never displace or slow the
 Immich paths, and no replaceable bulk media -- `/srv/media`, movies, TV,
 downloaded books, derivatives, transcodes, thumbnails -- enters the set.
 
+**The scrub estimate assertion depended on the RUNNER'S DISK.** It passed here
+and failed in CI: `health-checks-smoke` asserted the remedy derives
+`~10 min` for 215.87 GiB, and CI reported **39** -- because the rate is chosen
+from `/sys/block/<dev>/queue/rotational` and the device backing `/tmp` on the
+runner reports **1**. The dedicated rotational sections pinned both halves
+(`DOMUM_SYSBLOCK_ROOT` plus a `findmnt` stub); the `probe`-based section used
+the REAL `findmnt` and the real sysfs. "A test that depends on host state is not
+a test" -- and the irony is that this is the suite that introduced
+`DOMUM_SYSBLOCK_ROOT` precisely so the device class could be pinned. Both
+probe-based sections now pin it, and flipping the FIXTURE's flag is required to
+make the section fail, which is what proves it reads the fixture rather than the
+machine.
+
+**A warning with no paired action NEVER mails, and seven real problems were in
+that state.** `health_notify_cmd`'s silence gate sends only when
+`CHECKUP_CRITICAL` or `CHECKUP_ACTIONS` is non-empty, by design -- warnings
+alone are "expected activity", which is what stops a weekly mail saying
+"3 general package updates are available". But seven warnings carry no remedy
+and are therefore invisible to the notifier:
+
+| warning | why it matters |
+|---|---|
+| `<service> is UNHEALTHY` | a container healthcheck failing |
+| `<service> is not running` | a service is down |
+| `<path> is N% full` | the protected tier filling up |
+| Btrfs error counters **could not be read** | that counter IS the photo-tier corruption signal |
+| Btrfs scrub status could not be read | the corruption check cannot be seen |
+| Btrfs scrub history could not be parsed | same |
+| restic password file looks very short | a backup credential problem |
+
+The fix is a remedy on each, NOT making warnings mail: the other five
+non-notifying warnings (package updates available, update candidates waiting,
+Immich bundle candidate) are routine and must stay silent. This is the
+HEALTHY-means-unmeasured defect one layer out -- the check runs, records the
+problem, and the notifier cannot see it.
+
 ---
 
 ## 15. Known open safety defects
