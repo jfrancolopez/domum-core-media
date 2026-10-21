@@ -5729,15 +5729,17 @@ checkup_immich_offsite() {
 # subject "healthy" over a body saying WARNINGS: two answers to one question
 # inside one email.
 health_verdict() {
+  local v
   if (( ${#CHECKUP_CRITICAL[@]} > 0 )); then
-    printf 'CRITICAL (%d critical, %d action(s))' "${#CHECKUP_CRITICAL[@]}" "${#CHECKUP_ACTIONS[@]}"
+    v="CRITICAL (${#CHECKUP_CRITICAL[@]} critical, ${#CHECKUP_ACTIONS[@]} action(s))"
   elif (( ${#CHECKUP_ACTIONS[@]} > 0 )); then
-    printf 'ACTION REQUIRED (%d)' "${#CHECKUP_ACTIONS[@]}"
+    v="ACTION REQUIRED (${#CHECKUP_ACTIONS[@]})"
   elif (( ${#CHECKUP_WARNINGS[@]} > 0 )); then
-    printf 'WARNINGS (%d)' "${#CHECKUP_WARNINGS[@]}"
+    v="WARNINGS (${#CHECKUP_WARNINGS[@]})"
   else
-    printf 'HEALTHY'
+    v="HEALTHY"
   fi
+  printf '%s' "$v"
 }
 
 health_verdict_glyph() {
@@ -6264,7 +6266,7 @@ mreport_render_html() {  # $1 = text file, $2 = output file
   local text="$1" out="$2"
   local mono="'SF Mono',Menlo,Consolas,'Courier New',monospace"
   local paper="#141a15" ink="#cfe3cf" green="#42e07d" amber="#e5b567"
-  local soft="#c2a35f" red="#ff7a6e" rule="#2a352c" dim="#5f7263" boot="#6fbe8e"
+  local soft="#c2a35f" red="#ff7a6e" rule="#2a352c" dim="#748978" boot="#6fbe8e"
   local glow="text-shadow:0 0 6px rgba(66,224,125,0.45);"
   local line esc title in_body=0 seen_verdict=0 vcolor vbg vtext
   {
@@ -10765,6 +10767,11 @@ Usage:
       is the healthy signal. --dry-run prints the summary and sends no mail;
       --force sends even when healthy, to prove delivery works.
   domum-media report [--json|--write]
+  domum-media report weekly [--stdout|--html|--email|--dry-run]
+                                            The terminal-style infrastructure
+                                            report, in HTML and plain text.
+                                            Preview NEVER sends; --email is the
+                                            only form that mails
   domum-media storage migrate-subvolume <service>
   domum-media storage topology              Deterministic inventory of managed
                                             subvolumes and snapshots. Capture it

@@ -383,4 +383,151 @@ drive "" --stdout >/dev/null
 [[ -f "$TMP/captured.eml" ]] && fail "the REAL preview sent mail"
 echo "  killed: the mutant sends, the real preview does not"
 
+sect "every palette colour meets WCAG AA against the background"
+# domum-core's dim (#5f7263) measures 3.43:1 on #141a15 -- below AA for body
+# text, and it is used for the 11px footer. Lifted to #748978. Pinned here so a
+# future palette edit cannot silently regress contrast.
+out="$(drive "" --html)"
+PYTHONIOENCODING=utf-8 python3 -I -c '
+import re, sys
+html = sys.stdin.read()
+def lin(c):
+    c = c / 255
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+def lum(h):
+    r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+bg = lum("141a15")
+assert "background-color:#141a15" in html, "the background colour changed"
+bad = []
+for h in sorted(set(re.findall(r"color:#([0-9a-f]{6})", html))):
+    if h in ("141a15", "292217", "2a1a17", "18271c", "241f16", "2a352c"):
+        continue  # backgrounds and rules, not text
+    f = lum(h)
+    r = (max(f, bg) + 0.05) / (min(f, bg) + 0.05)
+    if r < 4.5:
+        bad.append("#%s %.2f:1" % (h, r))
+assert not bad, "text colours below WCAG AA 4.5:1 on #141a15: " + ", ".join(bad)
+print("  all text colours >= 4.5:1 on #141a15")
+' <<< "$out" || fail "a palette colour is below WCAG AA"
+
+sect "the HTML and plain-text parts carry the SAME VALUES, not just the same words"
+# The architectural claim is that the HTML re-derives nothing. This proves it:
+# every "label  value" row in the text part must appear, with the same value, in
+# the HTML part. A renderer that recomputed anything would drift here.
+mk_coverage 23155 23155 0 0 0 0 known
+rm -f "$TMP/captured.eml"
+drive 'RECOVERY_PACK_EMAIL_ENABLED=1' --email >/dev/null
+PYTHONIOENCODING=utf-8 python3 -I -c '
+import sys, re, html as H
+from email import message_from_binary_file
+with open(sys.argv[1], "rb") as fh:
+    m = message_from_binary_file(fh)
+t = m.get_payload()[0].get_payload(decode=True).decode("utf-8")
+h = m.get_payload()[1].get_payload(decode=True).decode("utf-8")
+# Unescape the HTML and strip tags: what remains must contain every text row.
+plain_from_html = H.unescape(re.sub(r"<[^>]+>", "", h))
+rows = [l.strip() for l in t.splitlines()
+        if re.match(r"^  \S.*\s{2,}\S", l)]
+assert len(rows) >= 10, "too few value rows to be a meaningful comparison: %d" % len(rows)
+missing = [r for r in rows if r not in plain_from_html]
+assert not missing, "rows in the text part absent from the HTML part:\n  " + "\n  ".join(missing[:6])
+print("  %d value rows identical in both parts" % len(rows))
+' "$TMP/captured.eml" || fail "the two MIME parts disagree"
+
+sect "explicit --email DOES send through the transport; previews never do"
+for m in --stdout --html --dry-run; do
+  rm -f "$TMP/captured.eml"
+  drive "" "$m" >/dev/null
+  [[ -f "$TMP/captured.eml" ]] && fail "$m reached the transport"
+done
+rm -f "$TMP/captured.eml"
+drive 'RECOVERY_PACK_EMAIL_ENABLED=1' --email >/dev/null
+[[ -f "$TMP/captured.eml" ]] || fail "--email did NOT reach the transport"
+echo "  three previews silent, --email delivered"
+
+sect "a transport FAILURE is reported, not swallowed"
+# A send that fails must not report success: the operator would believe an alert
+# had been delivered.
+out="$(drive 'RECOVERY_PACK_EMAIL_ENABLED=1
+smtp_send_message() { return 1; }' --email)"
+grep -q '^RC=0$' <<< "$out" && fail "a failed send reported success: $out"
+grep -qi 'could not be sent' <<< "$out" || fail "the failure is not named: $out"
+grep -qi 'emailed' <<< "$out" && fail "it claimed delivery after a failure: $out"
+echo "  non-zero, named, and no delivery claimed"
+
+sect "nothing can cause horizontal scroll on a phone"
+# Measured: the longest line in a critical report is 84 characters (a suggested
+# command), about 655px at 13px monospace -- wider than the 600px column. It
+# must WRAP, not scroll: truncating a command the operator has to copy would be
+# worse, and a horizontal scrollbar on a phone is the stated failure.
+out="$(drive 'checkup_collect_all() {
+  checkup_add critical "x"
+  checkup_add action "btrfs device stats /srv/data  # then investigate the device before writing any more data to it"
+}' --html)"
+grep -q 'nowrap' <<< "$out" && fail "white-space:nowrap would force horizontal scroll"
+grep -q '<pre' <<< "$out" && fail "a <pre> block scrolls horizontally; pre-wrap does not"
+[[ "$(grep -oE 'width:[0-9]{4,}px' <<< "$out" | wc -l)" == "0" ]] \
+  || fail "an element is wider than the 600px column"
+grep -q 'white-space:pre-wrap' <<< "$out" || fail "nothing lets the long command wrap"
+echo "  wraps via pre-wrap; no nowrap, no <pre>, no over-wide element"
+
+sect "client compatibility: SIMULATE what each client strips, do not grep CSS"
+# tests/fixtures/email-client-simulation.py applies each client's documented
+# transformation and requires the report to survive it. A separate file on
+# purpose: the checker needs quoting that does not survive nesting inside a
+# heredoc inside a test.
+out="$(drive 'checkup_collect_all() {
+  checkup_add critical "Btrfs CHECKSUM failures on /srv/data: corruption_errs = 3."
+  checkup_add action "btrfs device stats /srv/data"
+}' --html)"
+printf '%s' "$out" > "$TMP/client.html"
+python3 "$REPO_ROOT/tests/fixtures/email-client-simulation.py" "$TMP/client.html" \
+  || fail "the report does not survive a mail client's transformation"
+
+sect "the severity box matches the reference STRUCTURE, not just the palette"
+# Neither domum-core's HTML nor this one contains the literal word "Verdict":
+# both strip that prefix and render the severity in a bordered box. Same shape,
+# same declaration order -- that is the faithfulness claim.
+grep -q 'Verdict' <<< "$out" \
+  && fail "the HTML contains the literal 'Verdict' prefix; the reference strips it"
+grep -qE 'border:1px solid #[0-9a-f]{6};background-color:#[0-9a-f]{6};padding:10px 12px;' <<< "$out" \
+  || fail "the severity box does not match the reference structure"
+grep -qE '>[^<]*CRITICAL[^<]*</div>' <<< "$out" \
+  || fail "the box does not contain the severity as a WORD"
+echo "  bordered box, reference structure, severity as a word"
+
+sect "the argv path reaches the implementation, and report stays compatible"
+# A function that works when called directly but is unreachable through the
+# dispatcher is the defect the capabilities audit exists for. Drive `main`.
+dispatch() {  # $1.. = argv
+  (
+    export CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state" DOMUM_DATA_ROOT="$TMP/data"
+    # shellcheck disable=SC1090
+    source "$CLI" >/dev/null 2>&1
+    need_root() { :; }; ensure_dirs() { :; }; export_env_for_compose() { :; }
+    mreport_append_history() { :; }
+    checkup_collect_all() { checkup_add healthy "ok"; }
+    backup_last_success_epoch() { printf '0'; }
+    recovery_pack_state_file() { printf '%s' "$TMP/absent"; }
+    btrfs_unique_roots() { :; }; lsblk() { :; }; smartctl() { return 1; }
+    service_lifecycle_specs() { :; }; journalctl() { return 1; }
+    set +e
+    main "$@"
+    echo "RC=$?"
+  ) 2>&1
+}
+out="$(dispatch report weekly --stdout)"
+grep -q 'DOMUM-CORE-MEDIA // INFRASTRUCTURE MONITOR' <<< "$out" \
+  || fail "main report weekly does not reach the renderer: $out"
+grep -q '^RC=0$' <<< "$out" || fail "main report weekly exited non-zero: $out"
+# Backward compatibility: the pre-existing forms must still reach the library.
+out="$(dispatch report --json)"
+grep -q '"schema_version"' <<< "$out" \
+  || fail "bare 'report --json' no longer delegates to the report library: $out"
+out="$(dispatch report weekly --bogus)"
+grep -q '^RC=0$' <<< "$out" && fail "an unknown weekly flag was accepted: $out"
+grep -q 'Usage: domum-media report weekly' <<< "$out" || fail "no usage shown: $out"
+echo "  main report weekly renders; report --json still delegates; bad flag refused"
+
 echo "PASS: weekly report render smoke test"

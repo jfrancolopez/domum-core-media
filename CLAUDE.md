@@ -2337,6 +2337,149 @@ clean, and was reported accurately in every numeric respect -- 215.87 GiB,
 mischaracterised what the command does. Measuring the outcome is not the same as
 describing the mechanism, and only reading `--help` and the man page caught it.
 
+**`health-notify` ran only a SUBSET of the checks, and that silently undid the
+remedy work.** `health_notify_cmd` called the four EXTRACTED checks
+(`checkup_systemd_health`, `checkup_btrfs_health`, `checkup_disk_health`,
+`checkup_immich_offsite`) while every other check is INLINE in `checkup_cmd`'s
+310 lines. So a container going UNHEALTHY, a service down, or `/srv/data`
+filling up could appear in `checkup` and **never be mailed** -- and the remedies
+added for exactly those cases were unreachable from the notifier. I had reported
+that gap as closed, having verified the remedies existed and that `checkup`
+showed them, without verifying that the notifier RUNS those checks.
+
+`checkup_collect_all` is now the one collection, used by `checkup`,
+`health-notify` and the weekly report. A mutation reverting the notifier to the
+four-check subset must fail. This is "commands that answer the same question must
+read the same evidence" one level deeper than it had been applied: the same
+*question*, different *collections*.
+
+**The `CHECKUP_*` arrays are declared at FILE SCOPE.** `${#arr[@]}` on an unset
+array is an unbound-variable error under `set -u`, so `health_verdict` would have
+killed the shell if it were ever reached before a collector reset them. Every
+caller resets first, which is precisely why it was invisible -- the same shape as
+the unbound variable that made `checkup` print nothing at all in production.
+
+**The weekly report's plain text IS the source; the HTML wraps it.** Adapted
+from `domum-core` (`report_render_weekly*`), studied from a read-only clone.
+The HTML renderer re-derives nothing: it wraps the rendered text line by line,
+keyed on PREFIX (box drawing, `> `, `Verdict: `, `-- SECTION`) and coloured by
+the escalation GLYPH the text already carries, so the two MIME parts cannot
+disagree about a number. The line grammar is load-bearing -- changing it changes
+the HTML. `domum-media report weekly [--stdout|--html|--email|--dry-run]`;
+PREVIEW NEVER SENDS and a mutation that makes `--stdout` send must fail. See
+`docs/WEEKLY-HTML-REPORT.md`.
+
+Two things from `domum-core` deliberately NOT copied: its **POWER** section,
+which reads Raspberry Pi wattage via `vcgencmd` (no trustworthy N100 source, and
+a test requires POWER to be ABSENT), and its **missing header sanitisation** --
+`send_email_body` interpolates the subject with no CR/LF guard, a
+header-injection hole by construction even though its subject is a controlled
+verdict. `mreport_header_safe` strips CR, LF and NUL from every header value.
+
+**The verdict is four-level and SHARED with the notifier, and the subject
+derives from it.** Without that, a `--force` send on a warnings-only host
+carried the subject "healthy" over a body saying "WARNINGS": two answers to one
+question inside one email. The silence GATE is unchanged and is not part of the
+verdict -- warnings still mail nothing.
+
+**A report must do no recovery work.** No restic call, no asset-table query, no
+byte downloaded: the Immich counts come from the RECORDED coverage evidence, and
+a test asserts the renderer contains no `restic`, no
+`immich_original_inventory` and no `docker exec … psql`. Trends refuse to invent
+history -- fewer than two recorded rows says so and draws nothing, because one
+current measurement spread across eight weeks is a fabricated chart.
+
+**`email.message_from_file` corrupts a verified-correct message.** On a TEXT
+stream `get_payload(decode=True)` round-trips through `raw-unicode-escape` and
+manufactures `\uXXXX` for every box-drawing character, so a correct
+`multipart/alternative` looked broken and the box glyphs appeared lost. The
+bytes were fine -- `xxd` showed `e2 94 80` and the file contained zero literal
+`\u25` sequences. Use `message_from_binary_file`. My verification was the
+defect, not the code.
+
+**`grep -E` does not interpret `\xNN`, and three of my assertions were
+therefore VACUOUS** -- including the one asserting that NO sparkline is drawn
+without history, which could never have matched whatever the code did. Use
+ANSI-C quoting (`$'\xe2\x9c\x97'`) or a literal character when asserting on a
+glyph.
+
+**The HTML was verified against the REAL reference, by diff.** Both renderers
+were fed the same synthetic report and their output compared: normalising
+colours and text, the structure is IDENTICAL -- same tags, same nesting, same
+style shape -- and the only colour difference is one deliberate divergence.
+Comparing screenshots by eye, or checking contrast ratios alone, would not have
+established that.
+
+**The one divergence from `domum-core`'s palette is an accessibility fix.** Its
+dim (`#5f7263`) measures **3.43:1** against `#141a15`, below WCAG AA for body
+text, and it is used for the 11px footer; lifted to `#748978` (4.71:1). A test
+recomputes every text colour's ratio from the rendered HTML, so a future palette
+edit cannot silently regress contrast.
+
+**The two MIME parts are proven to carry the same VALUES, not just the same
+words.** Every `label  value` row in the text part must appear, unescaped and
+tag-stripped, in the HTML part -- 23 rows on a healthy report. That is what
+makes "the plain text is the source" an observation rather than a design
+intention.
+
+**The longest line in a critical report is 84 characters and it WRAPS.** About
+655px at 13px monospace, wider than the 600px column. `white-space:pre-wrap` on
+every body block, no `nowrap`, no `<pre>`, no element above the cap -- so no
+horizontal scroll on a phone. Wrapping beats truncation because the operator
+has to copy the command. All four conditions are pinned.
+
+**Monitoring completeness is proven through the three real commands.**
+`tests/monitoring-completeness-smoke.sh` builds ONE fixture with five genuine
+problems -- an unhealthy container, a stopped service, a filesystem at 96%, a
+four-day-old backup, and a non-zero `corruption_errs` -- and requires
+`checkup`, `health-notify` and `report weekly` to each see all five. The
+collection is deliberately NOT stubbed. The mutation reverting the notifier to
+the four-check subset loses three of the first four problems **while the
+mutant's `checkup` still sees them** -- which is exactly what made the gap
+invisible: one command looked complete while the notification was not.
+
+**Stubbing a function the caller no longer invokes is dead stubbing, and it
+makes a fixture reach the host.** Two suites stubbed the four individual checks
+after `health_notify_cmd` began collecting through `checkup_collect_all`; the
+stubs did nothing, the real collection ran against the host fixture, and the
+notifier was never silent. When a call site moves, the stubs move with it.
+
+**Client compatibility is proven by SIMULATING what each client strips, not by
+grepping CSS.** `tests/fixtures/email-client-simulation.py` applies each
+client's documented transformation and requires the report to survive it:
+Gmail removes `<head>` and `<style>` (body text must come out
+**byte-identical** -- measured 2258 characters either way -- with the cursor
+animation the only casualty, and the inline colours and `bgcolor=` fallback
+intact); Apple Mail keeps the style block and the `color-scheme` hints; the
+Outlook Word engine needs a table layout and none of the CSS it drops; and with
+ALL markup removed the findings must still be there. A CSS grep proves none of
+that.
+
+**`tests/fixtures/` holds helpers, and the CI audit now tells them from
+suites.** A helper needs no workflow step -- most cannot run standalone -- but
+excluding a directory could let one become dead, so each must be INVOKED by a
+suite the workflow does run. That is strictly stronger than requiring a step,
+and an orphan helper fails the audit.
+
+**Neither renderer puts the word "Verdict" in the HTML**, and that is
+faithfulness, not a loss: both strip the prefix and render the severity in a
+bordered box. The test asserts the box's structure and that it contains the
+severity as a WORD, because a coloured border alone is not an accessible
+signal.
+
+**A backtick in a double-quoted string is command substitution, in a test
+title as much as in a heredoc.** A `sect` heading that quoted the word *report*
+in backticks EXECUTED it, printed `command not found`, and silently deleted the
+word from the heading -- so the test's own description lied about what it
+tested. Same class as the `--help` heredoc defect this file already
+records.
+
+**The argv path is asserted, not assumed.** `main report weekly --stdout` is
+driven through the real dispatcher, alongside proof that `report --json` still
+delegates to the report library and that an unknown `weekly` flag is refused --
+a function that works when called directly but is unreachable through the
+dispatcher is the defect the capabilities audit exists for.
+
 ---
 
 ## 15. Known open safety defects
