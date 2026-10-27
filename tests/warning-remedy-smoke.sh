@@ -242,13 +242,16 @@ echo "  exactly 4, all routine"
 sect "mutation: removing the stopped-service remedy makes a dead service silent"
 MUT="$TMP/mut"
 cp "$CLI" "$MUT"
-python3 - "$CLI" "$MUT" <<'PY'
+( python3 - "$CLI" "$MUT" <<'PY'
 import io, sys
 s = io.open(sys.argv[1], encoding="utf-8").read()
-old = '''                 checkup_add action "cd $DOMUM_DIR && docker compose start $(service_compose_services "$service" | tr '\\n' ' ')  # NOT 'up -d': that recreates on the staged image" ;;'''
+old = '''                 checkup_add action "sudo domum-media compose start $(service_compose_services "$service" | tr '\\n' ' ')   # NOT 'up -d': that reconciles and would recreate on whatever the tag now resolves to" ;;'''
 assert s.count(old) == 1, "mutation target not unique: %d" % s.count(old)
 io.open(sys.argv[2], "w", encoding="utf-8").write(s.replace(old, '                 : ;;', 1))
 PY
+) || fail "the stopped-service remedy mutation could not be applied -- its
+target text changed. A mutation that does not apply proves nothing, and
+without this the suite failed later with a confusing orphan count."
 grep -q 'is not running' "$MUT" || fail "the mutant lost the warning too; it proves nothing"
 mcount="$(python3 - "$MUT" <<'PY'
 import io, sys

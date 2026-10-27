@@ -67,7 +67,10 @@ grep -q 'CRIT|systemd unit domum-media-check.service has FAILED' <<< "$out" \
   || fail "a failed domum unit must be critical: $out"
 grep -q 'WARN|systemd unit cups.service has failed' <<< "$out" \
   || fail "a failed foreign unit must be a warning: $out"
-grep -q 'ACT|.*journalctl' <<< "$out" || fail "no remedy was given: $out"
+grep -qE 'ACT\|systemctl status .*domum-media-check\.service' <<< "$out" \
+  || fail "no remedy naming the failed unit was given: $out"
+grep -q '<unit>' <<< "$out" \
+  && fail "the remedy still ships a literal <unit> placeholder: $out"
 echo "  domum unit critical, foreign unit warning, remedy named"
 
 sect "a timer's service that exited NON-ZERO is caught even when not 'failed'"

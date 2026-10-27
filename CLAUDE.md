@@ -2488,6 +2488,86 @@ a runner. The fixture now points `DOMUM_DIR` at the repository and blinds
 Every root a fixture uses must be redirected into it, and that includes the
 paths a function falls BACK to.
 
+**The first real HTML report downgraded a failed domum unit to a warning.**
+Production, 2026-10-27: it said *"systemd unit ● has failed."*
+`systemctl --failed --no-legend` still prints the leading bullet, so the
+parser's `$1` was `●` -- and because `●` does not match `domum-media*` the
+`case` fell through to the generic branch. **A FAILED domum-media unit was
+reported as a generic warning with a meaningless name**, and the real failure
+surfaced only because a separate loop reads each timer's last exit status. The
+field is now selected by looking like a unit NAME rather than by position, which
+is presentation-independent; a line with no recognisable unit is reported as
+unparseable rather than given an invented name.
+
+**`restic` exit 11 means THE REPOSITORY IS ALREADY LOCKED** -- read out of the
+binary's own exit-status table, not from memory (10 is "does not exist", 12 is
+"password is incorrect"). The project contains no `exit 11`, so a status 11 from
+`domum-media-check.service` is restic's, and it means the integrity check **never
+ran**: the repository is UNVERIFIED, not damaged.
+
+Two consequences, one easy to miss. `--weekly-retention` is the SECOND
+`ExecStart` with no `-` prefix, so a locked check also **skipped retention** for
+that week -- safe in direction, silent in cause. And the timers are only
+~45-56 minutes apart (`backup` daily 02:30 +15m, `check` Sun 03:30 +20m), so a
+transient lock converts into a whole week with no integrity check and no
+retention, **with no retry**. Measured for scale: the 2026-10-27 backup took
+**37 seconds**, so the gap is normally ample; which process held the lock on
+2026-10-25 cannot be established without the journal. See
+`docs/FIRST-REPORT-TRIAGE.md`.
+
+**A finding must name the CONTAINER, not just the logical service.** The report
+said *"immich is UNHEALTHY"* while all four immich containers were running and
+only `immich_machine_learning` was unhealthy -- the operator had no way to know
+which to look at. `service_unhealthy_members` names them;
+`service_health_state`'s single-word contract is unchanged because other callers
+depend on it.
+
+**"Up 7 of 8" counted LOGICAL SERVICES and read as missing containers.** immich
+is one service mapping to four containers, so 8 enabled services with one
+unhealthy looked like three of eleven containers being down. The report now
+states the logical count, the container count, and each health class
+separately -- `Healthcheck passing`, `No healthcheck`, `UNHEALTHY`, `Stopped`,
+`Unknown` -- because adding "healthy" to "running with no healthcheck" is the
+claim this project forbids.
+
+**A remedy must be read-only first, use the project's wrapper, and contain no
+placeholder.** The first report suggested `systemctl status <unit>` (a literal
+placeholder), bare `docker compose logs` (bypassing the layered fragments;
+`domum-media compose` is the wrapper), and `host-upgrade --force` for a merely
+PENDING reboot -- which installs packages and may reboot. The reboot remedy now
+shows `list-timers` and names the consequence that matters: every timer is
+`Persistent=true`, so a reboot runs missed jobs immediately, **including
+`snapshot prune`, which deletes**.
+
+**An exact-duplicate finding is now suppressed.** A failed unit is found both in
+`systemctl --failed` and in its timer's last exit status, and printing the
+identical text twice made the host look twice as bad as it was. Only identical
+text is dropped -- a differently-worded finding about the same thing is a wording
+problem, not something to hide.
+
+**`sed 's/#.*//'` deletes a remedy's own annotation, so a PRESENCE assertion
+must read the raw source.** Comment-stripping exists for "does not contain"
+assertions; the remedies annotate their commands after a `#`, and that text is
+operator-facing, not a code comment. Two assertions failed against correct code
+before this was separated.
+
+**A mutation's own `assert` was SWALLOWED, and the suite failed somewhere
+else.** The mutation heredoc in `warning-remedy-smoke` had no `|| fail`, so when
+its target text changed the python exited non-zero unnoticed and the suite then
+failed with a confusing *"got 4, expected 5"* orphan count -- pointing at the
+wrong thing entirely. "Assert that a mutation actually applied" is not enough if
+the assertion itself can be ignored: wrap the heredoc in a subshell with
+`|| fail` naming the cause.
+
+**A remedy must stay textually ADJACENT to its warning, because that is what
+the pairing check can see.** Emitting one `systemctl status` after the loop
+instead of one per unit moved it outside the 7-line window: the warning still
+mailed, but `warning-remedy-smoke` could no longer see the pairing and counted
+it as orphaned. Widening the window was the wrong fix -- it would have weakened
+the mutation that depends on the same window. Emitting the remedy per unit
+inside the loop restores adjacency AND is more actionable, since each failed
+unit gets a command naming only itself.
+
 ---
 
 ## 15. Known open safety defects

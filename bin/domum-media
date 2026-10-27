@@ -1124,6 +1124,35 @@ service_logged_ready_since() {  # $1 = service, $2 = UTC YYYY-MM-DDTHH:MM:SS
   return 1
 }
 
+# Which compose services of a logical service are NOT healthy, as
+# "name:state" words. Empty when they all are.
+#
+# service_health_state returns one word for the whole logical service and
+# returns early, so it cannot say WHICH container is wrong. Production,
+# 2026-10-27: the report said "immich is UNHEALTHY" when all four immich
+# containers were running and only immich_machine_learning was unhealthy -- the
+# operator had no way to know where to look. Same principle as naming the
+# actual systemd unit.
+#
+# Pure stdout: callers capture it.
+service_unhealthy_members() {  # $1 = logical service
+  local svc="$1" compose_svcs compose_svc cid status health out=""
+  compose_svcs="$(service_compose_services "$svc" || true)"
+  [[ -n "$compose_svcs" ]] || return 0
+  for compose_svc in $compose_svcs; do
+    cid="$(tracked_service_container_id "$compose_svc" 2>/dev/null || true)"
+    if [[ -z "$cid" ]]; then out="${out:+$out }$compose_svc:absent"; continue; fi
+    status="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || true)"
+    if [[ "$status" != "running" ]]; then out="${out:+$out }$compose_svc:${status:-unknown}"; continue; fi
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
+    case "$health" in
+      unhealthy) out="${out:+$out }$compose_svc:unhealthy" ;;
+      starting)  out="${out:+$out }$compose_svc:starting" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 service_health_state() {  # -> healthy | starting | unhealthy | stopped | none
   local svc="$1" compose_svcs compose_svc cid status health worst=none
 
@@ -5277,11 +5306,30 @@ CHECKUP_ACTIONS=()
 checkup_add() {
   local level="$1"
   shift
+  local text="$*" existing
+  # An EXACT duplicate is dropped. Two checks can legitimately reach the same
+  # conclusion -- a failed unit is found both in `systemctl --failed` and in its
+  # timer's last exit status -- and printing it twice makes the report look
+  # twice as bad as the host is. Only identical text is suppressed; a
+  # differently-worded finding about the same thing is a wording problem, not
+  # something to hide here.
   case "$level" in
-    critical) CHECKUP_CRITICAL+=("$*") ;;
-    warning) CHECKUP_WARNINGS+=("$*") ;;
-    healthy) CHECKUP_HEALTHY+=("$*") ;;
-    action) CHECKUP_ACTIONS+=("$*") ;;
+    critical) for existing in ${CHECKUP_CRITICAL[@]+"${CHECKUP_CRITICAL[@]}"}; do
+                [[ "$existing" == "$text" ]] && return 0
+              done
+              CHECKUP_CRITICAL+=("$text") ;;
+    warning)  for existing in ${CHECKUP_WARNINGS[@]+"${CHECKUP_WARNINGS[@]}"}; do
+                [[ "$existing" == "$text" ]] && return 0
+              done
+              CHECKUP_WARNINGS+=("$text") ;;
+    healthy)  for existing in ${CHECKUP_HEALTHY[@]+"${CHECKUP_HEALTHY[@]}"}; do
+                [[ "$existing" == "$text" ]] && return 0
+              done
+              CHECKUP_HEALTHY+=("$text") ;;
+    action)   for existing in ${CHECKUP_ACTIONS[@]+"${CHECKUP_ACTIONS[@]}"}; do
+                [[ "$existing" == "$text" ]] && return 0
+              done
+              CHECKUP_ACTIONS+=("$text") ;;
   esac
 }
 
@@ -5305,17 +5353,38 @@ checkup_add() {
 # state, and a service that failed and was later restarted is not in it, so the
 # last exit status of each timer's service is read separately.
 checkup_systemd_health() {
-  local failed unit svc status
-  failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)"
+  local failed unit svc status named=""
+  failed="$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i ~ /\.(service|timer|socket|mount|target|path|slice|scope)$/) { print $i; break }}' \
+            || true)"
   if [[ -n "$failed" ]]; then
     while IFS= read -r unit; do
       [[ -n "$unit" ]] || continue
+      named="${named:+$named }$unit"
+      # The remedy is emitted PER UNIT, inside the loop. Each failed unit gets a
+      # command naming only itself, which is more actionable than one listing
+      # all of them -- and it keeps the remedy textually ADJACENT to its
+      # warning, which is what tests/warning-remedy-smoke.sh checks. Emitting it
+      # once after the loop moved it out of that window: the warning still
+      # mailed, but the pairing check could no longer see it, and widening that
+      # window would have weakened the mutation which depends on it.
+      #
+      # `systemctl status -l` already prints recent log lines, so no separate
+      # journalctl; the timer-exit-status loop below adds one for domum units.
+      # checkup_add suppresses exact duplicates.
       case "$unit" in
-        domum-media*) checkup_add critical "systemd unit $unit has FAILED." ;;
-        *)            checkup_add warning  "systemd unit $unit has failed." ;;
+        domum-media*) checkup_add critical "systemd unit $unit has FAILED."
+                      checkup_add action "systemctl status --no-pager -l $unit   # read-only" ;;
+        *)            checkup_add warning  "systemd unit $unit has failed."
+                      checkup_add action "systemctl status --no-pager -l $unit   # read-only" ;;
       esac
     done <<< "$failed"
-    checkup_add action "systemctl status <unit> && journalctl -u <unit> -n 50"
+  elif [[ -n "$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null)" ]]; then
+    # systemctl listed something this parser could not name. Reporting nothing
+    # would be silence about a failed unit; inventing a name is what the bullet
+    # defect did.
+    checkup_add warning "systemctl reports a failed unit whose name could not be parsed."
+    checkup_add action "systemctl --failed --no-pager"
   else
     checkup_add healthy "No systemd unit is in the failed state."
   fi
@@ -6175,26 +6244,36 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
     if [[ "$mode" != "alert" ]]; then
       # --- SERVICES ----------------------------------------------------------
       mreport_hdr "SERVICES"
-      local svc enable_var state running=0 total=0 nohc=0 bad=""
+      local svc enable_var state logical=0 hc_ok=0 hc_none=0 starting=0 unhealthy=0 stopped=0 unknown=0 bad=""
       while IFS='|' read -r svc enable_var _ _ _ _ _; do
         [[ "${!enable_var:-0}" == "1" ]] || continue
-        total=$(( total + 1 ))
+        logical=$(( logical + 1 ))
         state="$(service_health_state "$svc" 2>/dev/null || echo unknown)"
         case "$state" in
-          healthy)            running=$(( running + 1 )) ;;
-          starting)           running=$(( running + 1 )) ;;
-          unhealthy|stopped)  bad="${bad:+$bad }$svc:$state" ;;
-          *)                  running=$(( running + 1 )); nohc=$(( nohc + 1 )) ;;
+          healthy)   hc_ok=$(( hc_ok + 1 )) ;;
+          starting)  starting=$(( starting + 1 )) ;;
+          unhealthy) unhealthy=$(( unhealthy + 1 ))
+                     bad="${bad:+$bad }$(service_unhealthy_members "$svc")" ;;
+          stopped)   stopped=$(( stopped + 1 )); bad="${bad:+$bad }$svc(stopped)" ;;
+          unknown)   unknown=$(( unknown + 1 )) ;;
+          *)         hc_none=$(( hc_none + 1 )) ;;
         esac
       done < <(service_lifecycle_specs)
-      printf '  %-22s %s of %s\n' "Up" "$running" "$total"
-      printf '  %-22s %s running with no healthcheck --\n' "Unverified" "$nohc"
-      printf '  %-22s RUNNING is not HEALTHY for those\n' ""
-      if [[ -n "$bad" ]]; then
-        printf '  %-22s \xe2\x9c\x97 %s\n' "Problem services" "$bad"
+      local containers
+      containers="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ' || true)"
+      printf '  %-22s %s enabled\n' "Logical services" "$logical"
+      printf '  %-22s %s (one service can be several --\n' "Containers running" "${containers:-?}"
+      printf '  %-22s immich is 4)\n' ""
+      printf '  %-22s %s\n' "Healthcheck passing" "$hc_ok"
+      (( starting == 0 )) || printf '  %-22s %s (healthcheck not passed yet)\n' "Starting" "$starting"
+      printf '  %-22s %s -- RUNNING is the whole claim\n' "No healthcheck" "$hc_none"
+      if (( unhealthy > 0 )); then
+        printf '  %-22s %s \xe2\x9c\x97 %s\n' "UNHEALTHY" "$unhealthy" "$bad"
       else
-        printf '  %-22s none\n' "Problem services"
+        printf '  %-22s 0\n' "UNHEALTHY"
       fi
+      (( stopped == 0 )) || printf '  %-22s %s \xe2\x9c\x97 %s\n' "Stopped" "$stopped" "$bad"
+      (( unknown == 0 )) || printf '  %-22s %s \xe2\x96\xb2 state unreadable\n' "Unknown" "$unknown"
       printf '\n'
 
       # --- UPDATES -----------------------------------------------------------
@@ -6689,15 +6768,15 @@ checkup_collect_all() {
       # to four containers (immich_server, immich_machine_learning,
       # immich_postgres, immich_redis), so `docker logs immich` would fail on the
       # one service where being told about a failed healthcheck matters most.
-      unhealthy) checkup_add warning "${service} is UNHEALTHY."
-                 checkup_add action "cd $DOMUM_DIR && docker compose logs --tail 50 $(service_compose_services "$service" | tr '\n' ' ')" ;;
+      unhealthy) checkup_add warning "${service} is UNHEALTHY: $(service_unhealthy_members "$service")."
+                 checkup_add action "sudo domum-media compose logs --tail 50 $(service_compose_services "$service" | tr '\n' ' ')   # read-only" ;;
       # The remedy is `compose start`, NEVER `up -d`. `up -d` reconciles and
       # would RECREATE the container on whatever its image tag now resolves to,
       # so a routine "start the service again" would silently deploy a staged
       # image. `compose start` starts the container that was stopped and
       # resolves no image reference at all.
       stopped)   checkup_add warning "${service} is not running."
-                 checkup_add action "cd $DOMUM_DIR && docker compose start $(service_compose_services "$service" | tr '\n' ' ')  # NOT 'up -d': that recreates on the staged image" ;;
+                 checkup_add action "sudo domum-media compose start $(service_compose_services "$service" | tr '\n' ' ')   # NOT 'up -d': that reconciles and would recreate on whatever the tag now resolves to" ;;
       # No healthcheck: running is the whole claim, and saying more than that is
       # the CLAUDE.md section 14 defect -- a report implying health it cannot see.
       *)         checkup_add healthy "${service} running (no healthcheck; application health unverified)." ;;
@@ -6760,7 +6839,11 @@ checkup_collect_all() {
   exited="$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l | tr -d ' ')"
   (( dangling > 0 )) && checkup_add warning "${dangling} dangling Docker images can be pruned."
   (( exited > 0 )) && checkup_add warning "${exited} containers are exited."
-  (( dangling > 0 )) && checkup_add action "sudo domum-media cleanup images --dry-run"
+  # The dry run DELETES NOTHING and prints what it protected. Saying so matters:
+  # three running images are dangling and are the only obtainable copy of their
+  # half of a recovery point, so the protection is the reason this is safe to
+  # suggest at all -- and reviewing the dry run is the whole remedy.
+  (( dangling > 0 )) && checkup_add action "sudo domum-media cleanup images --dry-run   # deletes nothing; review what it reports as protected by a recovery point before ever passing --confirm"
 
   waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
   (( waiting_count > 0 )) && checkup_add warning "${waiting_count} service update candidates are waiting."
@@ -6796,8 +6879,9 @@ checkup_collect_all() {
   (( failed_recent > 0 )) && checkup_add warning "${failed_recent} failed update events in the last 30 days."
 
   if [[ -f /var/run/reboot-required ]]; then
-    checkup_add warning "Reboot required."
-    checkup_add action "sudo domum-media host-upgrade --force"
+    checkup_add warning "Reboot required by a previous package upgrade."
+    checkup_add action "systemctl list-timers --all --no-pager   # read-only: every timer is Persistent=true, so a reboot runs MISSED jobs immediately -- including 'snapshot prune', which deletes"
+    checkup_add action "cat /opt/domum-core-media/docs/REBOOT-READINESS.md   # then reboot deliberately"
   else
     checkup_add healthy "No reboot is pending."
   fi

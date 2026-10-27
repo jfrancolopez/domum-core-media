@@ -225,4 +225,219 @@ for fn in checkup_cmd health_notify_cmd mreport_weekly_cmd; do
 done
 echo "  checkup_cmd, health_notify_cmd and mreport_weekly_cmd all collect through it"
 
+# ---------------------------------------------------------------------------
+#  Regression fixtures taken from the FIRST REAL production report,
+#  2026-10-27. Every one of these was observed, not imagined.
+# ---------------------------------------------------------------------------
+
+# `systemctl --failed --no-legend` still prints the leading bullet, so the
+# parser's $1 was the bullet character.
+BULLET_FIXTURE='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "\xe2\x97\x8f domum-media-check.service loaded failed failed domum-media: restic repository integrity check\n" ;;
+      *list-timers*)    printf "x x x x domum-media-check.service\n" ;;
+      *ExecMainStatus*) printf "11\n" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+probe_systemd() {  # $1 = cli, $2 = fixture
+  (
+    export PATH="$TMP/bin:$PATH" CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state"
+    # shellcheck disable=SC1090
+    source "$1" >/dev/null 2>&1
+    set +e
+    CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+    eval "$2"
+    checkup_systemd_health
+    (( ${#CHECKUP_CRITICAL[@]} )) && printf 'CRIT|%s\n' "${CHECKUP_CRITICAL[@]}"
+    (( ${#CHECKUP_WARNINGS[@]} )) && printf 'WARN|%s\n' "${CHECKUP_WARNINGS[@]}"
+    (( ${#CHECKUP_ACTIONS[@]} ))  && printf 'ACT|%s\n'  "${CHECKUP_ACTIONS[@]}"
+    true
+  ) 2>&1
+}
+
+sect "a failed unit is NAMED, and a domum unit is CRITICAL not a warning"
+# Production said: "systemd unit ● has failed." Two defects at once -- the name
+# was the bullet character, and because "●" does not match domum-media* the
+# case fell through to the generic branch, DOWNGRADING a failed domum unit to a
+# warning. The real failure surfaced only via a separate timer-status loop.
+out="$(probe_systemd "$CLI" "$BULLET_FIXTURE")"
+grep -q 'CRIT|systemd unit domum-media-check.service has FAILED' <<< "$out" \
+  || fail "a failed domum unit is not named and critical: $out"
+grep -qE 'WARN\|systemd unit .?.? has failed' <<< "$out" \
+  && fail "the bullet is still being read as a unit name: $out"
+grep -q '<unit>' <<< "$out" && fail "the remedy still ships an unresolved placeholder: $out"
+grep -q 'ACT|systemctl status --no-pager -l domum-media-check.service' <<< "$out" \
+  || fail "the remedy does not name the actual unit: $out"
+echo "  named, CRITICAL, and the remedy names the unit"
+
+sect "restic check status 11 is reported with the status"
+out="$(probe_systemd "$CLI" "$BULLET_FIXTURE")"
+grep -q 'CRIT|domum-media-check.service last exited non-zero (status 11)' <<< "$out" \
+  || fail "the non-zero exit status is not reported: $out"
+echo "  status 11 reported, so a failed scheduled job stays visible"
+
+sect "a failed job stays visible even when systemctl --failed no longer lists it"
+# systemctl --failed lists only units CURRENTLY failed. A weekly job that
+# failed and was later reset must still be visible through its last exit
+# status, or the finding disappears on the next boot.
+NOFAILED='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "" ;;
+      *list-timers*)    printf "x x x x domum-media-check.service\n" ;;
+      *ExecMainStatus*) printf "11\n" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+out="$(probe_systemd "$CLI" "$NOFAILED")"
+grep -q 'CRIT|domum-media-check.service last exited non-zero (status 11)' <<< "$out" \
+  || fail "with nothing CURRENTLY failed the historical failure vanished: $out"
+echo "  historical failure still reported from the last exit status"
+
+sect "a line systemctl lists but the parser cannot name is reported, not invented"
+# The alternative to the bullet bug is silence, which is worse. An unnameable
+# line must say so rather than fabricate a unit.
+WEIRD='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "?? something entirely unparseable\n" ;;
+      *list-timers*)    printf "" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+out="$(probe_systemd "$CLI" "$WEIRD")"
+grep -q 'could not be parsed' <<< "$out" \
+  || fail "an unnameable failed unit was silently dropped: $out"
+grep -qE 'CRIT\|systemd unit \?\? ' <<< "$out" && fail "it invented a unit name: $out"
+echo "  reported as unparseable; no name invented"
+
+sect "an exact duplicate finding is suppressed"
+# A failed unit is found twice -- in systemctl --failed and in its timer's exit
+# status. Printing the identical text twice makes the host look twice as bad.
+dup="$(
+  # shellcheck disable=SC1090
+  source "$CLI" >/dev/null 2>&1
+  CHECKUP_ACTIONS=()
+  checkup_add action "sudo domum-media compose logs --tail 50 immich_server immich_redis"
+  checkup_add action "sudo domum-media compose logs --tail 50 immich_server immich_redis"
+  checkup_add action "a different action"
+  printf '%s\n' "${#CHECKUP_ACTIONS[@]}"
+  printf '[%s]\n' "${CHECKUP_ACTIONS[@]}"
+)"
+[[ "$(head -1 <<< "$dup")" == "2" ]] \
+  || fail "duplicate suppression failed (expected 2 actions): $dup"
+grep -qF '[sudo domom]' <<< "$dup" && fail "an element was word-split"
+grep -qF '[sudo domum-media compose logs --tail 50 immich_server immich_redis]' <<< "$dup" \
+  || fail "a multi-word action was corrupted by the dedup loop: $dup"
+echo "  duplicate dropped, multi-word findings intact"
+
+# ---------------------------------------------------------------------------
+sect "every recommendation is safe, uses the wrapper, and has no placeholder"
+# Production's first report suggested bare `docker compose logs`, a forced host
+# upgrade for a merely-pending reboot, and `systemctl status <unit>`.
+src="$(sed -e 's/#.*//' "$CLI")"
+acts="$(grep -oE 'checkup_add action "[^"]*"' <<< "$src")"
+grep -qE 'checkup_add action "[^"]*<unit>' <<< "$acts" \
+  && fail "a remedy still contains an unresolved <unit> placeholder"
+grep -qE 'checkup_add action "(cd [^&]*&& *)?docker compose' <<< "$acts" \
+  && fail "a remedy calls bare 'docker compose'. Use the project wrapper,
+'domum-media compose', which layers the compose fragments."
+grep -qE 'checkup_add action "[^"]*host-upgrade --force' <<< "$acts" \
+  && fail "a remedy recommends 'host-upgrade --force'. That installs packages
+and may reboot -- far more than a pending-reboot finding warrants."
+grep -qE 'checkup_add action "[^"]*up -d' <<< "$acts" \
+  && fail "a remedy recommends 'up -d', which reconciles and deploys a staged image"
+grep -qE 'checkup_add action "[^"]*cleanup images --confirm' <<< "$acts" \
+  && fail "a remedy recommends cleanup with --confirm, which DELETES"
+echo "  no placeholder, no bare docker compose, no forced upgrade, no up -d, no --confirm"
+
+sect "the reboot remedy is read-only and warns about Persistent=true"
+# Read the RAW source here, not $src: the remedies annotate their commands
+# after a `#`, and the comment-stripping that protects the absence assertions
+# above would delete exactly the operator-facing text being checked.
+raw="$(cat "$CLI")"
+reboot_ctx="$(grep -A4 'Reboot required by a previous' <<< "$raw")"
+grep -q 'list-timers' <<< "$reboot_ctx" \
+  || fail "the reboot remedy does not show what would fire: $reboot_ctx"
+grep -qi 'snapshot prune' <<< "$reboot_ctx" \
+  || fail "it does not warn that a reboot runs the deleting prune job: $reboot_ctx"
+grep -q 'host-upgrade' <<< "$reboot_ctx" && fail "it still suggests a host upgrade"
+echo "  read-only, and it names the deleting job a reboot would trigger"
+
+sect "the image-cleanup remedy states that the dry run deletes nothing"
+clean_ctx="$(grep -A2 'dangling > 0' <<< "$raw")"
+grep -q 'deletes nothing' <<< "$clean_ctx" \
+  || fail "the cleanup remedy does not say the dry run is safe: $clean_ctx"
+grep -qi 'recovery point' <<< "$clean_ctx" \
+  || fail "it does not mention recovery-point protection: $clean_ctx"
+echo "  dry run named as non-destructive, protection mentioned"
+
+sect "an UNHEALTHY container is never counted as healthy"
+# Production: all 11 containers were Up and immich_machine_learning was
+# unhealthy. "Up 7 of 8" read as though three containers were missing; it was
+# counting LOGICAL SERVICES, of which immich is one mapping to four containers.
+rep="$(run_cmd "$CLI" report)"
+svc_block="$(sed -n '/── SERVICES/,/── UPDATES/p' <<< "$rep")"
+grep -qE 'Logical services +[0-9]+ enabled' <<< "$svc_block" \
+  || fail "the logical-service count is not labelled: $svc_block"
+grep -qE 'Containers running +[0-9]+' <<< "$svc_block" \
+  || fail "the container count is absent, so the denominator stays ambiguous: $svc_block"
+grep -qE 'Healthcheck passing +[0-9]+' <<< "$svc_block" \
+  || fail "healthcheck-passing is not reported separately: $svc_block"
+grep -qE 'No healthcheck +[0-9]+' <<< "$svc_block" \
+  || fail "no-healthcheck is not reported separately: $svc_block"
+grep -qE 'UNHEALTHY +[0-9]+' <<< "$svc_block" \
+  || fail "UNHEALTHY is not its own class: $svc_block"
+grep -qi 'RUNNING is the whole claim' <<< "$svc_block" \
+  || fail "it does not say running is not healthy: $svc_block"
+grep -qE 'Up +[0-9]+ of [0-9]+' <<< "$svc_block" \
+  && fail "the ambiguous 'Up N of M' line is still present: $svc_block"
+echo "  logical services, containers, and each health class reported separately"
+
+sect "the UNHEALTHY finding NAMES the container, not just the logical service"
+# Production: "immich is UNHEALTHY" while all four immich containers were
+# running and only immich_machine_learning was unhealthy. The operator had no
+# way to know which of four to look at -- the same actionability problem as a
+# systemd finding that does not name its unit.
+members="$(
+  # shellcheck disable=SC1090
+  source "$CLI" >/dev/null 2>&1
+  service_compose_services() { printf 'immich_server\nimmich_machine_learning\nimmich_postgres\nimmich_redis\n'; }
+  tracked_service_container_id() { printf 'cid-%s' "$1"; }
+  docker() {
+    case "$*" in
+      *'{{.State.Status}}'*) printf 'running\n' ;;
+      *Health*) case "$*" in
+                  *machine_learning*) printf 'unhealthy\n' ;;
+                  *) printf 'healthy\n' ;;
+                esac ;;
+    esac
+  }
+  printf '%s|%s' "$(service_unhealthy_members immich)" "$(service_health_state immich)"
+)"
+[[ "${members%%|*}" == "immich_machine_learning:unhealthy" ]] \
+  || fail "the unhealthy member is not named exactly: [${members%%|*}]"
+[[ "${members##*|}" == "unhealthy" ]] \
+  || fail "service_health_state's contract changed: [${members##*|}]"
+grep -qF 'is UNHEALTHY: $(service_unhealthy_members' "$CLI" \
+  || fail "the checkup finding does not interpolate the member names"
+echo "  names immich_machine_learning:unhealthy, and the state word is unchanged"
+
+sect "healthy members are NOT listed, so the finding stays short"
+allok="$(
+  # shellcheck disable=SC1090
+  source "$CLI" >/dev/null 2>&1
+  service_compose_services() { printf 'a\nb\nc\n'; }
+  tracked_service_container_id() { printf 'cid-%s' "$1"; }
+  docker() { case "$*" in *'{{.State.Status}}'*) printf 'running\n' ;; *Health*) printf 'healthy\n' ;; esac; }
+  printf '[%s]' "$(service_unhealthy_members x)"
+)"
+[[ "$allok" == "[]" ]] || fail "healthy members were listed: $allok"
+echo "  empty when everything is healthy"
+
 echo "PASS: monitoring completeness smoke test"
