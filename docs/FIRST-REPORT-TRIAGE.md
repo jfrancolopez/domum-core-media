@@ -37,32 +37,99 @@ integrity check never ran** on 2026-10-25; it could not take the lock.
   — it keeps *more* snapshots, not fewer — but it is a silent consequence of a
   transient lock.
 
-### The design defect: a transient condition fails the week
+### The cause, from the journal: a STALE LOCK left by the Mac
 
-| timer | schedule | observed 2026-10-25 |
-|---|---|---|
-| `domum-media-backup` | daily 02:30, `RandomizedDelaySec=15m` | started 02:40:56 |
-| `domum-media-check` | Sun 03:30, `RandomizedDelaySec=20m` | started 03:36:56 |
+```
+Oct 25 03:37:04  create exclusive lock for repository
+Oct 25 03:37:10  repo already locked, waiting up to 0s for the lock
+Oct 25 03:37:11  unable to create lock in backend: repository is already locked
+                 by PID 14058 on lamac by franco.lopez (UID 501, GID 20)
+Oct 25 03:37:11  lock was created at 2026-10-20 10:47:46 (112h49m24.776935342s ago)
+Oct 25 03:37:11  the `unlock` command can be used to remove stale locks
+```
 
-Only **56 minutes** apart, and the gap can be as little as ~45 minutes in the
-worst randomisation. A backup still holding the lock when the check starts
-produces exit 11.
+The lock was created **2026-10-20 10:47:46 from the operator's Mac** — the
+independent Hetzner recovery test — and was still present **112h49m** later. It
+is not a timer collision and not corruption.
 
-Measured for scale: the 2026-10-27 backup took **37 seconds**
-(`ExecMainStartTimestamp` 02:40:56 → `ExecMainExitTimestamp` 02:41:33), so a
-56-minute gap is normally ample. **Which lock holder was present at 03:36:56 on
-2026-10-25 cannot be established without the journal**, and the journal is
-root-only. It was either a long backup run that night or a stale lock from an
-interrupted earlier run.
+### A WRONG INFERENCE, corrected
 
-It is **not** still held: the nightly backup takes the same lock and succeeded
-at `2026-10-27T02:41:32-04:00` in 37 seconds, which a stale lock would have
-prevented. The condition was transient.
+An earlier revision of this document claimed the lock was *not* still held,
+reasoning that the nightly backup takes the same repository lock and had
+succeeded. **That was wrong**, and the error is instructive:
 
-Either way the structural point stands: **a lock collision is transient, and the
-current design converts it into a whole week with no integrity check and no
-retention, with no retry.** That is worth fixing — and fixing it is a change to
-a scheduled job, so it is an operator decision, not something to do silently.
+- `check` logs `create exclusive lock for repository` — it needs an **exclusive**
+  lock.
+- The nightly backup kept succeeding *alongside* the Mac's lock, every night
+  from 2026-10-21 to 2026-10-27.
+
+So the Mac's lock **coexists with `backup` and blocks the exclusive lock the
+check needs**. "A successful backup" proves only that no *exclusive* lock is
+held; it says nothing about the one that was. Reasoning from "the same lock"
+when two commands take different lock types produced a confident wrong answer
+about whether a problem was still live.
+
+### It recurs, and it blocks retention too
+
+Because the lock is still there, **the check fails every Sunday until it is
+removed**. And `--weekly-retention` is the second `ExecStart` with no `-`
+prefix, so it never runs — *and* `forget`/`prune` need an exclusive lock
+themselves, so they would fail anyway.
+
+Measured from the journal: retention last ran successfully on **2026-10-18**
+(removed 7 snapshots, pruned 17.044 MiB). It has not run since. That direction
+is safe — snapshots accumulate rather than disappear — but it is silent.
+
+### How the report now says this
+
+Exit 11 on `domum-media-check.service` is no longer reported as a bare
+non-zero exit, which read like possible corruption. It now reads:
+
+```
+✗ domum-media-check.service could not LOCK the repository (restic exit 11), so
+  the integrity check never ran. This is not evidence of damage -- and not
+  evidence of health either.
+  1. journalctl -u domum-media-check.service -n 30 --no-pager
+  2. a stale lock blocks every EXCLUSIVE restic operation -- the weekly check
+     AND retention -- while still allowing backups, so it recurs until removed.
+     Removing it is 'restic unlock', which needs operator approval.
+```
+
+The wording is scoped to that unit: exit 11 only means "already locked" for the
+check, and any other status or unit is still reported generically.
+
+### The remedy, which needs approval
+
+`restic unlock` removes stale locks. It is in this project's
+approval-required list, so it is **not** run automatically. The operator-facing
+form is:
+
+```
+sudo domum-media-backup --unlock cloud
+```
+
+**This is new and ships with the next deployment** — it did not exist when the
+lock was found, which is why the first version of this document offered a
+command that does not run. It is a thin wrapper, because `restic unlock` needs
+the repository credentials and only `restic_for_target` knows how to assemble
+them (password file, SFTP command, env files).
+
+**Why it is safe**, from restic's own help:
+
+> The "unlock" command removes stale locks that have been created by other
+> restic processes.
+
+Only locks restic considers **stale** are removed — a lock held by a live
+process is left alone — and restic 0.18.0 has no flag to force-remove a live
+one. So it cannot interrupt a running backup. It lists the locks before and
+after, read-only, and is on no timer.
+
+### Separately: the timers are close together
+
+`backup` daily 02:30 `+15m`, `check` Sun 03:30 `+20m` — as little as ~45
+minutes apart. That was *not* the cause here, and the 2026-10-27 backup took 37
+seconds, so the gap is normally ample. Worth knowing, not worth changing on
+this evidence.
 
 ## 2. `immich_machine_learning` is unhealthy — the photos are fine
 
@@ -130,17 +197,20 @@ it twice made the host look twice as bad as it was.
 - Backup: completed 6 h before the report.
 - Email delivery: the multipart HTML report arrived.
 
-## 5. Open, needing root or an operator decision
+## 5. Open, needing an operator decision
 
-1. **Which process held the restic lock at 03:36:56 on 2026-10-25.** Needs
-   `journalctl -u domum-media-check.service`.
-2. ~~Whether the lock is still held.~~ **Answered, and it is not.** The nightly
-   backup takes the same repository lock, and it succeeded at
-   `2026-10-27T02:41:32-04:00` in 37 seconds. A held or stale lock would have
-   failed that run too. **So the 2026-10-25 failure was transient and is not
-   currently reproducible** — no `restic list locks` and no credentials
-   required to establish it.
-3. **Restarting `immich_machine_learning`.** A container restart; deploys
-   nothing, but it is a production service action.
-4. **Re-spacing the backup and check timers**, or making the check tolerate a
-   lock. A change to a scheduled job.
+1. **Remove the stale lock.** `restic unlock`, after confirming from the journal
+   that PID 14058 on `lamac` is not a live process. Until then the weekly
+   integrity check and retention both fail every Sunday.
+2. **Nothing else.** The lock holder is identified, the condition is understood,
+   and `immich_machine_learning` was restarted and is healthy
+   (`/ping` → `200 pong`, `FailingStreak 0`).
+
+## 6. Resolved during this triage
+
+- `immich_machine_learning` restarted: `healthy`, startup completed, endpoint
+  answering. Smart search, face detection and OCR will resume; the queued jobs
+  that failed while it was down are visible in `immich_server`'s log as
+  `failed for all URLs` and Immich will retry them.
+- The lock holder identified from the journal.
+- Six reporting defects fixed, and exit 11 given its own actionable finding.

@@ -130,8 +130,8 @@ grep -n 'last_run' "$REPO_ROOT/bin/domum-media-report" | grep -qi 'heartbeat' \
 # ---------------------------------------------------------------------------
 # 4. A failed target must still abort the run (fail-fast is preserved).
 # ---------------------------------------------------------------------------
-awk '/while IFS= read -r target; do/,/done < <\(enabled_backup_targets\)/' "$REPO_ROOT/bin/domum-media-backup" \
-  | grep -q 'die "Backup failed for target' \
+loop_text="$(awk '/while IFS= read -r target; do/,/done < <\(enabled_backup_targets\)/' "$REPO_ROOT/bin/domum-media-backup")"
+grep -q 'die "Backup failed for target' <<< "$loop_text" \
   || fail "a failing target no longer aborts the backup run"
 
 # ---------------------------------------------------------------------------

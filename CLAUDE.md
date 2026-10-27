@@ -2568,6 +2568,64 @@ the mutation that depends on the same window. Emitting the remedy per unit
 inside the loop restores adjacency AND is more actionable, since each failed
 unit gets a command naming only itself.
 
+**"A successful backup proves no lock is held" was WRONG, and it was a
+confident wrong answer about whether a live problem was still live.** The
+journal named the holder: a lock created **2026-10-20 10:47:46 from the
+operator's Mac** (`PID 14058 on lamac`), still present **112h49m** later. I had
+reasoned that the nightly backup takes "the same repository lock" and had
+succeeded, therefore no lock remained.
+
+`check` logs `create exclusive lock for repository`; the nightly backup kept
+succeeding *alongside* that lock every night. So the Mac's lock **coexists with
+`backup` and blocks the exclusive lock `check` needs**. A successful backup
+proves only that no EXCLUSIVE lock is held -- it says nothing about the lock
+that was actually there. **Never reason from "the same lock" when two commands
+take different lock types**, and prefer the journal over an inference when the
+journal exists.
+
+**A stale lock recurs, and silently blocks retention as well.** The check fails
+every Sunday until the lock is removed, and `--weekly-retention` is the second
+`ExecStart` with no `-` prefix so it never runs -- and `forget`/`prune` need an
+exclusive lock themselves, so they would fail anyway. Measured from the
+journal: retention last succeeded **2026-10-18** (7 snapshots removed, 17.044
+MiB pruned) and has not run since. Snapshots accumulate, which is the safe
+direction, but nothing says so.
+
+**restic exit 11 now has its own finding, scoped to the check service.** A bare
+"exited non-zero (status 11)" reads like possible corruption. It now says the
+repository could not be LOCKED, that the check therefore **never ran**, and --
+explicitly both ways -- that this is *"not evidence of damage, and not evidence
+of health either"*. The remedy names `restic unlock` and that it needs
+approval, rather than offering a command to paste. Exit 11 from any other unit,
+and any other status, is still reported generically: 11 only means "already
+locked" for the command that takes that lock.
+
+**`domum-media-backup --unlock <target>` is the stale-lock remedy, and it
+exists because I first documented one that did not.** The triage doc offered
+`--unlock-stale`, which was never implemented -- the rule this file already
+states, broken in the one place the operator most needed a working command. It
+is a thin wrapper because `restic unlock` needs the repository credentials and
+only `restic_for_target` knows how to assemble them (password file, SFTP
+command, env files).
+
+Safe by restic's own definition, quoted from its help: *"The 'unlock' command
+removes stale locks that have been created by other restic processes."* Only
+locks restic considers STALE are removed, a live process keeps its own, and
+restic 0.18.0 has no flag to force-remove a live lock -- so it cannot interrupt
+a running backup. The wrapper lists the locks before AND after, read-only, so
+the operator sees the effect; it never passes a force flag; it refuses an
+unknown or disabled target; and it is referenced by **no systemd unit**. All
+four are tested.
+
+**The pipefail audit caught `cmd | grep -q` in the remediation command I had
+just written.** `enabled_backup_targets | grep -qxF "$target"` in
+`do_unlock_stale`: under `pipefail` a MATCH makes the left side take SIGPIPE,
+the pipeline reports 141, and a **valid** target would have been rejected --
+the "die on valid input" family, in the one command the operator needed in
+order to fix a live problem. Seventh instance. Captured first, and the refusal
+now also prints the enabled targets. The audit existing is why this was a
+two-minute fix instead of a support question.
+
 ---
 
 ## 15. Known open safety defects
@@ -2595,6 +2653,26 @@ it is actually fixed; keep the detail in `docs/`.
 - Documentation may still describe protection that production does not have
   (snapshot coverage, backup targets that are not enabled). Verify claims
   against live evidence before repeating them.
+- **`tests/pipefail-grep-audit.py` does not scan `tests/`, and the tests carry
+  the banned shape 31 times across 20 files.** Measured 2026-10-27. The audit
+  covers both CLIs, `install.sh` and `operator/*.sh` -- the production code --
+  and exempts the suites that enforce the rule. That is a blind spot in exactly
+  the place where the failure mode is worst: under `pipefail` a MATCH makes the
+  left side take SIGPIPE, the pipeline reports 141, and **an assertion silently
+  stops asserting**.
+
+  It is not theoretical. `backup-target-evidence-smoke` had
+  `awk … | grep -q 'die "Backup failed for target'`, which passed for months
+  and began failing the moment an unrelated 40-line insertion pushed awk's
+  output past the pipe buffer -- the documented intermittency, arriving as a
+  mysterious failure in a suite nobody had touched. Fixed by capturing first.
+
+  The other 30 are mostly `printf`/`echo` into `grep -q` on short strings,
+  where the left side finishes before grep exits, so they pass reliably today
+  and could invert at any time for reasons unrelated to what they test.
+  **Extending the audit to `tests/` and fixing the 31 sites is the next piece
+  of work**; it was deliberately not bundled with the reporting triage, because
+  a 31-site change and a behaviour change do not belong in one review.
 - **Media-service state and the image archives are NOT backed up off-site, and
   this is a KNOWN, ACCEPTED limitation -- not an oversight to be quietly
   fixed.** The cloud restic target is immich-only by design (three roots:
