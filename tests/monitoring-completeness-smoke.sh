@@ -273,11 +273,63 @@ grep -q 'ACT|systemctl status --no-pager -l domum-media-check.service' <<< "$out
   || fail "the remedy does not name the actual unit: $out"
 echo "  named, CRITICAL, and the remedy names the unit"
 
-sect "restic check status 11 is reported with the status"
+sect "restic exit 11 is reported as a LOCK, not as a possibly-damaged repository"
+# Production, 2026-10-25: exit 11 was a lock created on 2026-10-20 from the
+# operator's Mac and still present 112h49m later. The check NEVER RAN. Reported
+# as a bare "exited non-zero (status 11)" that reads like corruption -- the
+# wrong alarm entirely, and it hides that the remedy is `restic unlock`.
 out="$(probe_systemd "$CLI" "$BULLET_FIXTURE")"
-grep -q 'CRIT|domum-media-check.service last exited non-zero (status 11)' <<< "$out" \
-  || fail "the non-zero exit status is not reported: $out"
-echo "  status 11 reported, so a failed scheduled job stays visible"
+grep -qi 'could not LOCK the repository' <<< "$out" \
+  || fail "exit 11 is not identified as a lock: $out"
+grep -qi 'never ran' <<< "$out" \
+  || fail "it does not say the check never ran: $out"
+grep -qi 'not evidence of damage' <<< "$out" \
+  || fail "it does not rule out corruption, which is the wrong alarm to raise: $out"
+grep -qi 'not evidence of health' <<< "$out" \
+  || fail "it must not read as reassuring either -- nothing was verified: $out"
+grep -qi 'restic unlock' <<< "$out" || fail "the actual remedy is not named: $out"
+grep -qi 'approval' <<< "$out" \
+  || fail "restic unlock is an approved operation; the remedy must say so: $out"
+grep -qi 'retention' <<< "$out" \
+  || fail "it does not mention that retention is blocked too: $out"
+echo "  identified as a lock, neither damage nor health claimed, remedy named"
+
+sect "any OTHER non-zero exit is still reported generically"
+# The special case must not swallow every other failure.
+OTHER='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "" ;;
+      *list-timers*)    printf "x x x x domum-media-backup.service\n" ;;
+      *ExecMainStatus*) printf "3\n" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+out="$(probe_systemd "$CLI" "$OTHER")"
+grep -q 'CRIT|domum-media-backup.service last exited non-zero (status 3)' <<< "$out" \
+  || fail "a different failure lost its generic reporting: $out"
+grep -qi 'could not LOCK' <<< "$out" && fail "the lock wording leaked to an unrelated failure: $out"
+echo "  status 3 on another unit still reported generically"
+
+sect "exit 11 on a DIFFERENT unit is not described as a repository lock"
+WRONGUNIT='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "" ;;
+      *list-timers*)    printf "x x x x domum-media-backup.service\n" ;;
+      *ExecMainStatus*) printf "11\n" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+out="$(probe_systemd "$CLI" "$WRONGUNIT")"
+grep -qi 'could not LOCK the repository' <<< "$out" \
+  && fail "status 11 from a unit that does not run restic check was described as
+a repository lock. 11 only has that meaning for the check: $out"
+grep -q 'last exited non-zero (status 11)' <<< "$out" \
+  || fail "it should still be reported generically: $out"
+echo "  the lock wording is scoped to the check service only"
 
 sect "a failed job stays visible even when systemctl --failed no longer lists it"
 # systemctl --failed lists only units CURRENTLY failed. A weekly job that
@@ -294,9 +346,10 @@ NOFAILED='
   }
 '
 out="$(probe_systemd "$CLI" "$NOFAILED")"
-grep -q 'CRIT|domum-media-check.service last exited non-zero (status 11)' <<< "$out" \
+grep -qE 'CRIT\|domum-media-check\.service (could not LOCK|last exited non-zero)' <<< "$out" \
   || fail "with nothing CURRENTLY failed the historical failure vanished: $out"
-echo "  historical failure still reported from the last exit status"
+grep -q 'ACT|' <<< "$out" || fail "a historical failure with no remedy never mails: $out"
+echo "  historical failure still reported, and still critical, from the last exit status"
 
 sect "a line systemctl lists but the parser cannot name is reported, not invented"
 # The alternative to the bullet bug is silence, which is worse. An unnameable
@@ -439,5 +492,57 @@ allok="$(
 )"
 [[ "$allok" == "[]" ]] || fail "healthy members were listed: $allok"
 echo "  empty when everything is healthy"
+
+sect "--unlock lists locks first, removes only stale ones, and is on no timer"
+# The remediation for the production finding. restic's own help: "The 'unlock'
+# command removes stale locks that have been created by other restic
+# processes." It must therefore never be given a force flag, and must never be
+# wired to a timer.
+BK="$REPO_ROOT/bin/domum-media-backup"
+calls="$(
+  export PATH="$TMP/bin:$PATH"
+  # shellcheck disable=SC1090
+  source "$BK" >/dev/null 2>&1
+  set +e
+  log() { :; }
+  die() { echo "DIE: $*"; exit 1; }
+  enabled_backup_targets() { printf 'cloud\n'; }
+  restic_for_target() { shift; printf 'RESTIC %s\n' "$*" >&2; return 0; }
+  do_unlock_stale cloud 2>&1
+)"
+grep -q 'RESTIC list locks' <<< "$calls" \
+  || fail "it does not list the locks before unlocking: $calls"
+grep -q 'RESTIC unlock' <<< "$calls" || fail "it never calls unlock: $calls"
+[[ "$(grep -c 'RESTIC list locks' <<< "$calls")" == "2" ]] \
+  || fail "it should list locks before AND after, so the operator can see the
+effect: $calls"
+# Ordering: list, unlock, list.
+[[ "$(grep -n 'RESTIC' <<< "$calls" | head -1)" == *"list locks"* ]] \
+  || fail "the first restic call is not a read-only listing: $calls"
+echo "  lists, unlocks, lists again"
+
+sect "--unlock refuses an unknown target and never force-removes"
+out="$(
+  export PATH="$TMP/bin:$PATH"
+  # shellcheck disable=SC1090
+  source "$BK" >/dev/null 2>&1
+  set +e
+  log() { :; }
+  die() { echo "DIE: $*"; exit 1; }
+  enabled_backup_targets() { printf 'cloud\n'; }
+  restic_for_target() { return 0; }
+  do_unlock_stale nosuchtarget
+  do_unlock_stale ""
+)"
+grep -qc 'DIE:' <<< "$out" || fail "an unknown target was accepted: $out"
+grep -qi 'unknown or disabled' <<< "$out" || fail "the refusal is unclear: $out"
+src_bk="$(sed -e 's/#.*//' "$BK")"
+unlock_fn="$(awk '/^do_unlock_stale\(\) \{/,/^\}/' <<< "$src_bk")"
+grep -qE 'remove-all|--force' <<< "$unlock_fn" \
+  && fail "the wrapper passes a force flag. restic removes only STALE locks by
+default, and forcing it could interrupt a live backup."
+grep -rqE 'unlock' "$REPO_ROOT/systemd/" 2>/dev/null \
+  && fail "a systemd unit references unlock. It must stay operator-initiated."
+echo "  unknown target refused, no force flag, on no timer"
 
 echo "PASS: monitoring completeness smoke test"

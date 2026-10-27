@@ -5400,8 +5400,14 @@ checkup_systemd_health() {
     # An empty status means it has never run in this boot's journal, which is
     # not a failure; a non-zero one is.
     if [[ -n "$status" && "$status" != "0" ]]; then
-      checkup_add critical "$svc last exited non-zero (status $status)."
-      checkup_add action "journalctl -u $svc -n 50"
+      if [[ "$svc" == "domum-media-check.service" && "$status" == "11" ]]; then
+        checkup_add critical "$svc could not LOCK the repository (restic exit 11), so the integrity check never ran. This is not evidence of damage -- and not evidence of health either."
+        checkup_add action "journalctl -u $svc -n 30 --no-pager   # read-only: names the lock's host, user and age"
+        checkup_add action "a stale lock blocks every EXCLUSIVE restic operation -- the weekly check AND retention -- while still allowing backups, so it recurs until removed. Removing it is 'restic unlock', which needs operator approval: see docs/FIRST-REPORT-TRIAGE.md"
+      else
+        checkup_add critical "$svc last exited non-zero (status $status)."
+        checkup_add action "journalctl -u $svc -n 50 --no-pager   # read-only"
+      fi
     fi
   done <<< "$timers"
 }
