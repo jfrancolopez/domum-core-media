@@ -5885,6 +5885,47 @@ checkup_immich_offsite() {
   done
 }
 
+# Can this host actually TELL anyone?
+#
+# The whole notification contract is that silence means nothing needed
+# attention. That only holds if a warranted message can leave the host, and
+# `health_notify_cmd` returns 0 in THREE situations: a dry run, nothing to
+# report, and MAIL DELIVERY NOT ENABLED. The third warns to the journal -- which
+# nothing reads -- and leaves the unit GREEN.
+#
+# `RECOVERY_PACK_EMAIL_ENABLED` DEFAULTS TO 0. So with the weekly timer enabled
+# and that flag unset, every alert this host ever raises is written to a log and
+# discarded, the unit stays green, and silence becomes indistinguishable from
+# "could not tell you". That is this project's own HEALTHY-must-not-mean-
+# UNMEASURED defect, sitting in the notifier itself.
+#
+# Reported only when the configuration CONTRADICTS itself. The weekly unit
+# carries `health-notify` as its second ExecStart, so an enabled timer is the
+# host declaring that it will notify. An operator who does not want mail
+# disables the timer, and that is not a finding.
+#
+# It deliberately does NOT claim delivery works. CONFIGURED is not DELIVERED:
+# the 2026-10-25 weekly run exited 0 with a critical present, which is
+# consistent with a message having been sent AND with delivery being switched
+# off -- and the production config is 0600 root, so the two cannot be told apart
+# from an unprivileged account. That ambiguity is exactly why this check exists,
+# and why it states configuration rather than inferring delivery.
+checkup_notification_path() {
+  local notifier
+  notifier="$(systemctl is-enabled domum-media-weekly-report.timer 2>/dev/null || true)"
+  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then
+    checkup_add healthy "Mail delivery is configured, so a warranted alert has somewhere to go (configured is not the same as proven delivered)."
+    return 0
+  fi
+  if [[ "$notifier" == "enabled" ]]; then
+    checkup_add critical "The weekly notifier is ENABLED but mail delivery is NOT (RECOVERY_PACK_EMAIL_ENABLED is not 1), so every alert this host raises is written to the journal and discarded. Silence is NOT evidence of health."
+    checkup_add action "set RECOVERY_PACK_EMAIL_ENABLED=1 in $CFG_FILE, then prove it ONCE with 'domum-media health-notify --force' -- that command SENDS and needs operator approval"
+  else
+    checkup_add warning "Mail delivery is not enabled and the weekly notifier timer is not enabled either, so nothing proactively reports this host's state."
+    checkup_add action "systemctl is-enabled domum-media-weekly-report.timer   # read-only: nothing notifies until BOTH that timer and RECOVERY_PACK_EMAIL_ENABLED are on"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Tell the operator when, and only when, something needs attention.
 #
@@ -7055,6 +7096,9 @@ checkup_collect_all() {
   checkup_btrfs_health
   checkup_disk_health
   checkup_immich_offsite
+  # Whether a warranted alert can leave the host at all. Last, because it is
+  # the check that decides whether any of the above would ever be seen.
+  checkup_notification_path
 }
 
 checkup_cmd() {

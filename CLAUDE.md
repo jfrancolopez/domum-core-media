@@ -551,13 +551,31 @@ jellyfin=73, kavita=74, navidrome=68 — so that one flag would silently drop ev
 migrated service, i.e. exactly the highest-value data, and the backup would still
 report success. `tests/subvolume-detection-smoke.sh` asserts its absence.
 
-**Plex's running image is `identity,local` only.** Measured: `RepoTags: []` **and**
-`RepoDigests: []` — it is dangling, because a newer `:latest` was pulled and moved
-the tag. It survives solely because a running container references it, so the
-moment Plex is upgraded the old image becomes prunable and the recovery point's
-application half turns fragile exactly when it starts to matter. The version is
-recoverable only as a label (`1.43.2.10687-563d026ea-ls308`), which is
-compatibility information, not a retrievable reference.
+**Plex's running image WAS `identity,local` with both lists empty.** Measured
+2026-10-06: `RepoTags: []` **and** `RepoDigests: []` — dangling, because a newer
+`:latest` had been pulled and moved the tag. It survived solely because a running
+container referenced it, so the old image was prunable and the recovery point's
+application half was fragile exactly when it would start to matter.
+
+**Re-measured 2026-10-28, after the Plex upgrade: it is no longer dangling, and
+that is NOT the same as being recoverable.** Plex now runs
+`7f9a1d574958` carrying `lscr.io/linuxserver/plex:latest`, and the tag still
+resolves to the running image, so no prune would remove it and no newer Plex
+image is staged. But its `RepoDigest` **equals its image Id** —
+`sha256:7f9a1d574958…` for both — and this file already records that such a
+RepoDigest is not an independent registry reference. Measured, the equality
+holds for **all five** tagged services (plex, calibre-web, jellyfin, kavita,
+navidrome), so it is how docker reports images on this host rather than anything
+about Plex.
+
+So the honest statement is narrower than "dangling" and narrower than
+"recoverable": the local object is no longer prune-exposed, and registry
+availability is still unproven. **The `docker save` archive remains the only
+proven copy**, and the version is still recoverable only as a label
+(`1.43.2.10687-563d026ea-ls308`), which is compatibility information, not a
+retrievable reference. Reading a present RepoTag plus a present RepoDigest as
+"now recoverable" is the optimistic direction this file exists to prevent, and
+it was the first conclusion drawn before the two hashes were compared.
 
 **"I could not check it" is not "it is broken".** Plex's databases carry FTS
 virtual tables built with its own `collating` tokenizer, which only Plex's
@@ -2222,10 +2240,14 @@ counts a local snapshot as off-site coverage.
 
 The five migrated media services -- plex, jellyfin, kavita, navidrome,
 calibre-web -- are **local snapshots only**. So are the image archives, and
-that is the sharpest gap: measured 2026-10-21, THREE running images are
-dangling (plex, traefik, uptime-kuma), so for those the `docker save` archive is
-the only obtainable copy of the application half of a recovery point, and
-`/srv/data/backups/images` is not in the cloud target.
+that is the sharpest gap. Measured 2026-10-21 three running images were
+dangling; **re-measured 2026-10-28 it is TWO -- traefik and uptime-kuma** --
+because the Plex upgrade gave its image a tag. The conclusion does not change:
+no service has independent registry evidence (every tagged one's RepoDigest
+equals its image Id), so the `docker save` archive is the only PROVEN copy of
+the application half for all of them, and `/srv/data/backups/images` is not in
+the cloud target. What changed is narrow: plex's local object is no longer
+prune-exposed, while traefik's and uptime-kuma's are.
 
 **The production config is `0600 root`, so which backup targets are ENABLED
 cannot be established from the development account.** A second target `nas` is
@@ -2256,6 +2278,62 @@ a test" -- and the irony is that this is the suite that introduced
 probe-based sections now pin it, and flipping the FIXTURE's flag is required to
 make the section fail, which is what proves it reads the fixture rather than the
 machine.
+
+**MAIL DELIVERY IS PROVEN -- 2026-10-25 08:25:56 -- and the proof is an exit
+status, which took one near-miss to get right.** This file recorded that
+`health-notify` had only ever run with `--dry-run` and that `smtp_send_message`
+had never reached the server. Both were false, and the chain is entirely
+read-only state:
+
+1. `RECOVERY_PACK_EMAIL_ENABLED=1`. The off-host audit, **run as root on
+   2026-10-12**, printed `off-host delivery ENABLED`, which
+   `bin/domum-media-backup` emits only when that flag is 1 -- and the production
+   config's mtime is **2026-09-23 15:08:21**, readable without privilege, so it
+   has not changed since before that measurement.
+2. `domum-media-check.service` entered the failed state at **03:36:56** that
+   morning (exit 11), so `systemctl --failed` listed it.
+3. `domum-media-weekly-report.service` ran at **08:25:56** with
+   `Result=success`, `ExecMainStatus=0`.
+4. The binary installed then was `383f9e6`'s -- confirmed by hash,
+   `8760cfa51f3d`, exactly what the 2026-10-27 deployment reported as INSTALLED.
+5. At that revision `health_notify_cmd` collected through `checkup_collect_all`
+   and the timer exit-status loop emitted a **CRITICAL** for status 11.
+6. `health-notify` is the SECOND `ExecStart` and carries **no `-` prefix**, and
+   a failed `smtp_send_message` calls `die`.
+
+**`health_notify_cmd` returns 0 in THREE situations, not one**, and the first
+version of this conclusion checked only two of them. A dry run returns 0 (the
+unit passes no such flag); nothing-to-report returns 0 (excluded by the critical
+at step 5); and **mail delivery not enabled returns 0** after warning to the
+journal -- excluded only by step 1. Without step 1 the exit status is equally
+consistent with "sent" and with "delivery switched off", and the production
+config is `0600 root`, so an unprivileged account cannot tell them apart. Every
+zero-exit path has to be enumerated before an exit status proves anything.
+
+The claim's limits, stated: it proves the transport worked **once**, to one
+address, and it is an inference from an exit status rather than a received
+message -- sound only because the delivery failure is fatal, and it would
+collapse the moment anyone put a `-` on that `ExecStart`. The operator
+independently confirms receiving mail. Silence now means "nothing needed
+attention" rather than "nothing needed attention OR mail is broken".
+
+**The third path was a live hazard, and `checkup_notification_path` now reports
+it.** `RECOVERY_PACK_EMAIL_ENABLED` **defaults to 0**, so a host with the weekly
+timer enabled and that flag unset writes every alert it ever raises to the
+journal, discards it, and leaves the unit GREEN -- the
+HEALTHY-must-not-mean-UNMEASURED defect inside the notifier itself. The check
+fires only on the CONTRADICTION (timer enabled, delivery off), because an
+operator who does not want mail disables the timer and that is not a finding; an
+absent timer is not read as an enabled one; and when the flag IS set it reports
+the transport as **configured**, never as proven delivered. On this host it
+reports healthy, so it is a regression guard rather than a live finding.
+`tests/health-checks-smoke.sh` drives all four states; the mutation defaults the
+flag to 1 and must make a host that can deliver nothing report a clean path.
+
+**A known open defect can be closed by reading state, and leaving it open has a
+cost.** "Never proven" was the stated reason to distrust silence, and it had
+been falsified four days before anyone looked. Check an open entry against
+evidence before repeating it.
 
 **A warning with no paired action NEVER mails, and seven real problems were in
 that state.** `health_notify_cmd`'s silence gate sends only when
@@ -2766,12 +2844,14 @@ it is actually fixed; keep the detail in `docs/`.
   that also holds every snapshot and every `.premigration` copy. A local
   snapshot is not off-site protection.
 
-  It matters most for the archives: measured 2026-10-21, **three** running
-  images are dangling (`RepoTags: []` AND `RepoDigests: []`) -- plex, traefik,
-  uptime-kuma -- so for those the `docker save` archive is the only obtainable
-  copy of the application half of a recovery point. Lose the SSD and the
-  snapshot half is gone with it anyway; lose the archive alone and the data
-  survives with no application to open it.
+  It matters most for the archives. Measured 2026-10-21 three running images
+  were dangling (`RepoTags: []` AND `RepoDigests: []`); **re-measured
+  2026-10-28 it is two -- traefik and uptime-kuma** -- since the Plex upgrade
+  tagged its image. For every service the `docker save` archive is still the
+  only PROVEN copy of the application half, because no tagged image here has an
+  independent registry reference. Lose the SSD and the snapshot half is gone
+  with it anyway; lose the archive alone and the data survives with no
+  application to open it.
 
   **Do not expand the Hetzner scope without a measured, selective proposal.**
   `du -sb` on the candidate paths needs root and has not been run, and
@@ -2781,13 +2861,6 @@ it is actually fixed; keep the detail in `docs/`.
   `/srv/media`, movies, TV, downloaded books, derivatives, transcodes,
   thumbnails -- may enter the set. The design and the open measurements are in
   `docs/OFFSITE-COVERAGE-CLASSIFICATION.md`.
-- **Mail delivery has never been proven.** `health-notify` has only run with
-  `--dry-run`; `smtp_send_message` has never reached the server from this
-  command. A healthy host sends nothing, which is the contract and also why
-  delivery could stay broken indefinitely unnoticed. The approval-gated test is
-  `health-notify --force`, documented in `docs/WEEKLY-REPORT.md`. Until it has
-  run, silence means "nothing needed attention OR mail is broken".
-
 ---
 
 ## 16. Documentation boundaries
