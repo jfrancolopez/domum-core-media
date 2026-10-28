@@ -606,4 +606,150 @@ grep -q 'ACT|apt-get install -y jq' <<< "$out" || fail "no remedy for missing jq
 grep -q 'OK|SMART' <<< "$out" && fail "it claimed disk health with no way to parse it: $out"
 echo "  UNKNOWN, named, with the remedy"
 
+# ---------------------------------------------------------------------------
+#  Can this host TELL anyone? The notification contract is that silence means
+#  nothing needed attention -- which only holds if a warranted message can
+#  leave the host.
+#
+#  `health_notify_cmd` returns 0 in THREE situations: a dry run, nothing to
+#  report, and MAIL DELIVERY NOT ENABLED. The third warns to the journal and
+#  leaves the unit GREEN, and `RECOVERY_PACK_EMAIL_ENABLED` DEFAULTS TO 0. So
+#  the host could have been discarding every alert it ever raised while looking
+#  perfectly healthy -- and that is also why the 2026-10-25 weekly run's exit 0
+#  does NOT prove a message was delivered.
+# ---------------------------------------------------------------------------
+# A USABLE transport: enabled, with a host and non-empty credential files.
+# `smtp_send_message` dies on a missing host or credential file, and nothing
+# checked them until a message actually had to go out -- which is only when
+# something needed reporting, and by then the report is the thing that cannot be
+# delivered. The credentials carry distinctive values so the assertion that no
+# VALUE is ever printed has something to look for.
+MAILDIR="$TMP/secrets"
+mkdir -p "$MAILDIR"
+printf 'SMTPUSERVALUE\n' > "$MAILDIR/smtp_user"
+printf 'SMTPPASSVALUE\n' > "$MAILDIR/smtp_pass"
+: > "$MAILDIR/empty"
+MAIL_OK="
+RECOVERY_PACK_EMAIL_ENABLED=1
+RECOVERY_PACK_SMTP_HOST=smtp.example.com
+RECOVERY_PACK_SMTP_USERNAME_FILE=$MAILDIR/smtp_user
+RECOVERY_PACK_SMTP_PASSWORD_FILE=$MAILDIR/smtp_pass
+systemctl() { printf 'enabled\n'; }
+"
+
+sect "mail configured and usable: reported, and NOT claimed as proven delivery"
+out="$(probe "$MAIL_OK" checkup_notification_path)"
+grep -q 'OK|Mail delivery is configured' <<< "$out" \
+  || fail "a configured, usable transport is not reported: $out"
+grep -qi 'not the same as proven delivered' <<< "$out" \
+  || fail "configured must not read as delivered -- that is the whole distinction: $out"
+grep -q 'CRIT|' <<< "$out" && fail "a usable transport raised a critical: $out"
+echo "  reported as configured, explicitly not as delivered"
+
+sect "no credential VALUE is ever printed"
+grep -q 'SMTPUSERVALUE' <<< "$out" && fail "the username value appears in the output: $out"
+grep -q 'SMTPPASSVALUE' <<< "$out" && fail "the password value appears in the output: $out"
+echo "  values never disclosed"
+
+sect "enabled but UNUSABLE is critical: an absent or empty credential, or no host"
+# An EMPTY file is reported as well as an absent one, because smtp_send_message
+# tests `-f` and would hand an empty credential straight to the server.
+for broken in \
+  "RECOVERY_PACK_SMTP_USERNAME_FILE=$MAILDIR/nope" \
+  "RECOVERY_PACK_SMTP_PASSWORD_FILE=$MAILDIR/empty" \
+  "RECOVERY_PACK_SMTP_HOST=" ; do
+  bout="$(probe "$MAIL_OK
+$broken
+" checkup_notification_path)"
+  grep -q 'CRIT|Mail delivery is enabled but cannot work' <<< "$bout" \
+    || fail "a transport that cannot work was not reported ($broken): $bout"
+  grep -q 'ACT|' <<< "$bout" \
+    || fail "a critical with no action never mails ($broken): $bout"
+  grep -q 'OK|Mail delivery is configured' <<< "$bout" \
+    && fail "it claimed a working transport ($broken): $bout"
+done
+echo "  absent credential, EMPTY credential and missing host are each critical"
+
+sect "notifier ENABLED with delivery OFF is CRITICAL, because silence would lie"
+# The contradiction: the weekly unit carries health-notify, so an enabled timer
+# is the host declaring it will notify, while the flag says nothing can be sent.
+out="$(probe "
+RECOVERY_PACK_EMAIL_ENABLED=0
+systemctl() { printf 'enabled\n'; }
+" checkup_notification_path)"
+grep -q 'CRIT|' <<< "$out" \
+  || fail "a host that cannot deliver any alert is not critical: $out"
+grep -qi 'Silence is NOT evidence of health' <<< "$out" \
+  || fail "it does not say what the real consequence is: $out"
+grep -q 'ACT|' <<< "$out" || fail "a critical with no action never mails: $out"
+grep -qi 'RECOVERY_PACK_EMAIL_ENABLED=1' <<< "$out" \
+  || fail "the remedy does not name the setting: $out"
+grep -qi 'needs operator approval' <<< "$out" \
+  || fail "health-notify --force SENDS; the remedy must say it needs approval: $out"
+echo "  critical, consequence stated, remedy names the setting and its approval"
+
+sect "with the notifier DISABLED it is not a contradiction, so not critical"
+# An operator who does not want mail disables the timer. Reporting that as
+# critical every week is how a report gets ignored.
+out="$(probe "
+RECOVERY_PACK_EMAIL_ENABLED=0
+systemctl() { printf 'disabled\n'; return 1; }
+" checkup_notification_path)"
+grep -q 'CRIT|' <<< "$out" \
+  && fail "a deliberately disabled notifier was escalated to critical: $out"
+grep -q 'WARN|' <<< "$out" \
+  || fail "nothing proactively reports this host and that was reported as healthy: $out"
+grep -q 'ACT|' <<< "$out" || fail "a warning with no remedy never mails: $out"
+echo "  warning, not critical, and still has a remedy"
+
+sect "an UNINSTALLED timer is not read as enabled"
+# `is-enabled` prints nothing when the unit does not exist. Treating empty as
+# enabled would manufacture a critical on a host that never had the notifier.
+out="$(probe "
+RECOVERY_PACK_EMAIL_ENABLED=0
+systemctl() { return 1; }
+" checkup_notification_path)"
+grep -q 'CRIT|' <<< "$out" \
+  && fail "an absent timer was read as an enabled one: $out"
+echo "  absent timer is not a contradiction"
+
+sect "MUTATION: treating the flag's absence as enabled hides the whole defect"
+# The dangerous direction: default to "mail works" and a host discarding every
+# alert reports a clean notification path.
+cp "$CLI" "$TMP/cli.orig.notify"
+cat > "$TMP/mutate-notify.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+# Anchored on the `if` plus the comment that follows it, which is unique to
+# this function -- the bare flag test appears all over the file.
+old = """  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then
+    # Enabled is not the same as usable."""
+new = """  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-1}" == "1" ]]; then
+    # Enabled is not the same as usable."""
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP/mutate-notify.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.notify" "$CLI"; fail "the notify mutation did not apply"; }
+# A usable transport in every respect EXCEPT that the flag is unset. Unmutated
+# that is the contradiction (timer enabled, delivery off) and must be critical;
+# mutated, the unset flag defaults to 1 and the path reports clean.
+out="$(probe "$MAIL_OK
+unset RECOVERY_PACK_EMAIL_ENABLED
+" checkup_notification_path)"
+cp "$TMP/cli.orig.notify" "$CLI"
+grep -q 'OK|Mail delivery is configured' <<< "$out" \
+  || fail "the mutation changed no ANSWER -- defaulting to 1 must report the path as healthy: $out"
+grep -q 'CRIT|' <<< "$out" \
+  && fail "the mutation did not actually suppress the critical: $out"
+echo "  killed: an unset flag defaulting to enabled reports a clean path"
+
+sect "the check is in the ONE collection, so all three consumers see it"
+# A check only checkup_cmd ran is the four-check-subset defect again.
+collector="$(awk '/^checkup_collect_all\(\) \{/,/^}/' "$CLI")"
+grep -q 'checkup_notification_path' <<< "$collector" \
+  || fail "checkup_notification_path is not called by checkup_collect_all"
+echo "  collected centrally"
+
 echo "PASS: health-checks smoke test"

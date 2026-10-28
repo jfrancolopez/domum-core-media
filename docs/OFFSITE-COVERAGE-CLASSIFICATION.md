@@ -71,19 +71,39 @@ delivery off-host is by email. The whole chain rests on the age private key:
 ### The image archives are the sharpest gap
 
 A recovery point is *service + snapshot + the application that wrote it*.
-Measured 2026-10-21, **three** running images are dangling — `RepoTags: []`
-**and** `RepoDigests: []`:
+Measured 2026-10-21 **three** running images were dangling — `RepoTags: []`
+**and** `RepoDigests: []`. **Re-measured 2026-10-28 it is two**, because the
+Plex upgrade gave its image a tag:
 
-| service | running image | the tag now points elsewhere |
+| service | running image | RepoTags | RepoDigest | prune-exposed |
+|---|---|---|---|---|
+| plex | `7f9a1d574958` | `lscr.io/linuxserver/plex:latest` | **= image Id** | no, since the upgrade |
+| traefik | `9c3b91d5fb77` | **none** — tag moved to `9c2a54d87f76` | none | **yes** |
+| uptime-kuma | `a8610b3b4c38` | **none** — tag moved to `3e24e96c89ef` | none | **yes** |
+
+traefik's and uptime-kuma's images survive only because a container references
+them, so a prune would remove the application half of their recovery points.
+Plex's no longer would.
+
+**That is not the same as Plex being recoverable, and the distinction is easy to
+get backwards.** Its `RepoDigest` **equals its image Id** —
+`sha256:7f9a1d574958…` for both — which this project already records as *not* an
+independent registry reference. Measured, the equality holds for **all five**
+tagged services:
+
+| service | image Id | RepoDigest equals Id |
 |---|---|---|
-| plex | `identity,local` | yes |
-| traefik | `9c3b91d5…` | `9c2a54d87f76` |
-| uptime-kuma | `a8610b3b…` | `3e24e96c89ef` |
+| plex | `7f9a1d574958…` | yes |
+| calibre-web | `d5ad2aaf36f8…` | yes |
+| jellyfin | `438e44330078…` | yes |
+| kavita | `454f2a77ac74…` | yes |
+| navidrome | `9012939114fb…` | yes |
 
-Each survives only because a container references it. For these three the
-`docker save` archive is the **only** obtainable copy of the application half,
-and `/srv/data/backups/images` is not in the cloud target. So the snapshot half
-would survive the loss of the host and the application half would not.
+So it is a property of how docker reports images on this host, not of Plex. For
+**every** service the `docker save` archive remains the only *proven* copy of
+the application half, and `/srv/data/backups/images` is not in the cloud target.
+The snapshot half would survive the loss of the host; the application half would
+not.
 
 ## 4. The minimal optional backup — designed, NOT recommended yet
 
@@ -95,7 +115,8 @@ Shape, if the measurement supports it:
 
 - **Candidates**: `/srv/data/{plex,jellyfin,kavita,navidrome,calibre-web}` —
   application configuration and small SQLite databases — and
-  `/srv/data/backups/images`, for the three dangling images above.
+  `/srv/data/backups/images`, which holds the only proven copy of the
+  application half for every service above.
 - **Explicitly excluded, permanently**: `/srv/media` in its entirety (music,
   books), every movie and TV library, Immich derivatives (`thumbs/`, and the
   derivative `.mp4` files under `encoded-video/` but **never** the 58
