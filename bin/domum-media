@@ -948,6 +948,98 @@ backup_last_success_epoch() {
   date -d "$(head -n1 "$file")" +%s 2>/dev/null || return 1
 }
 
+# Where domum-media-backup records the EXCLUSIVE restic operations (the weekly
+# integrity check and retention).
+#
+# The default is written as the SAME expression as the one in
+# bin/domum-media-backup, deliberately, rather than derived from
+# DOMUM_STATE_ROOT here. Deriving it differently in each CLI is how the
+# recovery pack came to have a backup path that was correct only by accident:
+# move the state root and the writer and the reader would disagree, with the
+# reader silently finding nothing. tests/restic-op-evidence-smoke.sh asserts
+# the two expressions are identical.
+restic_op_evidence_dir() {
+  printf '%s' "${REPO_META_DIR:-/var/lib/domum-media/backups}"
+}
+
+# The recorded SUCCESSFUL restic operation for a target, as "epoch mode", or
+# nothing.
+#
+# A failure record returns nothing: this answers "when did this last succeed",
+# and treating a recorded failure as an answer would be the same conflation as
+# reading a recorded attempt as a result.
+restic_op_last_success() {  # $1 = target, $2 = op -> "epoch mode" or rc 1
+  local file
+  file="$(restic_op_evidence_dir)/$1-$2.env"
+  [[ -f "$file" ]] || return 1
+  (
+    unset RESULT FINISHED_TS MODE
+    # shellcheck disable=SC1090
+    . "$file" >/dev/null 2>&1 || exit 1
+    [[ "${RESULT:-}" == "success" ]] || exit 1
+    [[ -n "${FINISHED_TS:-}" ]] || exit 1
+    local epoch
+    epoch="$(date -d "$FINISHED_TS" +%s 2>/dev/null)" || exit 1
+    printf '%s %s' "$epoch" "${MODE:-unknown}"
+  )
+}
+
+# Which enabled targets have a recorded successful check NEWER than $1, and
+# which do not.
+#
+# The verdict is CONSERVATIVE: a failed scheduled run counts as superseded only
+# when EVERY enabled target has been verified since. One target passing says
+# nothing about another's repository -- the same reason an upgrade gate is
+# evaluated per service and never counted.
+#
+# Emits "superseded <target>@<iso>(<mode>) ..." or "outstanding <target> ...",
+# or "unknown" when no target could be enumerated at all. "unknown" is a third
+# answer on purpose: "no evidence was readable" is not "nothing has been
+# verified", and collapsing them is the conflation this project keeps undoing.
+restic_checks_since() {  # $1 = epoch
+  local since="$1" target row epoch mode any=0
+  local -a later=() outstanding=()
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    any=1
+    if row="$(restic_op_last_success "$target" check)"; then
+      epoch="${row%% *}"
+      mode="${row##* }"
+      if (( epoch > since )); then
+        later+=("$target@$(epoch_to_iso "$epoch")($mode)")
+        continue
+      fi
+    fi
+    outstanding+=("$target")
+  done < <(enabled_backup_targets 2>/dev/null || true)
+  (( any == 1 )) || { printf 'unknown'; return 0; }
+  if (( ${#outstanding[@]} == 0 )); then
+    printf 'superseded %s' "${later[*]}"
+  else
+    printf 'outstanding %s' "${outstanding[*]}"
+  fi
+}
+
+# What retention is recorded as having done last, for the operator-facing text.
+# Retention shares the exclusive lock with the check, so when the check is
+# blocked retention is skipped in the same run -- this states the consequence
+# with a date instead of in the abstract.
+retention_last_success_text() {
+  local target row best=0 best_target=""
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    if row="$(restic_op_last_success "$target" retention)"; then
+      row="${row%% *}"
+      if (( row > best )); then best="$row"; best_target="$target"; fi
+    fi
+  done < <(enabled_backup_targets 2>/dev/null || true)
+  if (( best > 0 )); then
+    printf 'retention last succeeded %s (%s)' "$(epoch_to_iso "$best")" "$best_target"
+  else
+    printf 'no successful retention run is recorded'
+  fi
+}
+
 verify_backup_freshness() {
   local svc="$1"
   service_backup_required "$svc" || return 0
@@ -5352,8 +5444,34 @@ checkup_add() {
 # covered the checker. `systemctl --failed` only lists units in the failed
 # state, and a service that failed and was later restarted is not in it, so the
 # last exit status of each timer's service is read separately.
+# Has the repository been verified SINCE this unit's last failed run?
+#
+# ONE implementation, consulted by both places that report the failed check
+# unit: the `systemctl --failed` loop and the per-timer exit-status loop. Two
+# copies would be two chances to tell the operator a resolved problem is
+# current, and they would disagree the moment one was edited.
+#
+# Production, 2026-10-25 -> 2026-10-28 is exactly why it exists. The scheduled
+# check exited 11 against a stale lock; the operator removed the lock and the
+# check passed twice; the unit stayed `failed` because a manual run does not
+# clear systemd's state; and `checkup` kept reporting the failure in the
+# present tense with a `restic unlock` remedy that had already been carried
+# out. The unit state is real and still worth reporting -- what was wrong was
+# the diagnosis.
+#
+# Emits the verdict word plus its evidence: "superseded ...", "outstanding ..."
+# or "unknown". A unit whose exit timestamp cannot be read is "unknown", never
+# "superseded": that direction would quietly downgrade a live failure.
+check_unit_verdict() {  # $1 = unit -> "superseded|outstanding|unknown <detail>"
+  local unit="$1" ts epoch
+  ts="$(systemctl show -p ExecMainExitTimestamp --value "$unit" 2>/dev/null || true)"
+  [[ -n "$ts" ]] || { printf 'unknown'; return 0; }
+  epoch="$(date -d "$ts" +%s 2>/dev/null)" || { printf 'unknown'; return 0; }
+  restic_checks_since "$epoch"
+}
+
 checkup_systemd_health() {
-  local failed unit svc status named=""
+  local failed unit svc status verdict named=""
   failed="$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null \
             | awk '{for (i = 1; i <= NF; i++) if ($i ~ /\.(service|timer|socket|mount|target|path|slice|scope)$/) { print $i; break }}' \
             || true)"
@@ -5373,6 +5491,20 @@ checkup_systemd_health() {
       # journalctl; the timer-exit-status loop below adds one for domum units.
       # checkup_add suppresses exact duplicates.
       case "$unit" in
+        domum-media-check.service)
+                      # The one unit for which later evidence of success can
+                      # exist, because the operator can run the same check by
+                      # hand. When it does, the unit's failed state is stale:
+                      # reported, but not as a current failure, and the remedy
+                      # is to clear the state rather than to re-fix the cause.
+                      verdict="$(check_unit_verdict "$unit")"
+                      if [[ "$verdict" == superseded* ]]; then
+                        checkup_add warning "systemd unit $unit is in the FAILED state from an earlier run, but the repository has since been verified successfully (${verdict#superseded }). The unit state is STALE, not a current failure."
+                        checkup_add action "systemctl reset-failed $unit   # clears the stale failed state only; touches no repository, no data, no container, and the next scheduled run is unaffected"
+                      else
+                        checkup_add critical "systemd unit $unit has FAILED."
+                        checkup_add action "systemctl status --no-pager -l $unit   # read-only"
+                      fi ;;
         domum-media*) checkup_add critical "systemd unit $unit has FAILED."
                       checkup_add action "systemctl status --no-pager -l $unit   # read-only" ;;
         *)            checkup_add warning  "systemd unit $unit has failed."
@@ -5401,9 +5533,25 @@ checkup_systemd_health() {
     # not a failure; a non-zero one is.
     if [[ -n "$status" && "$status" != "0" ]]; then
       if [[ "$svc" == "domum-media-check.service" && "$status" == "11" ]]; then
-        checkup_add critical "$svc could not LOCK the repository (restic exit 11), so the integrity check never ran. This is not evidence of damage -- and not evidence of health either."
-        checkup_add action "journalctl -u $svc -n 30 --no-pager   # read-only: names the lock's host, user and age"
-        checkup_add action "a stale lock blocks every EXCLUSIVE restic operation -- the weekly check AND retention -- while still allowing backups, so it recurs until removed. Removing it is 'restic unlock', which needs operator approval: see docs/FIRST-REPORT-TRIAGE.md"
+        verdict="$(check_unit_verdict "$svc")"
+        if [[ "$verdict" == superseded* ]]; then
+          # The lock is gone and the repository has been verified since. Saying
+          # "the integrity check never ran" here would be true of that run and
+          # false of now, and the `restic unlock` remedy is deliberately NOT
+          # repeated: sending the operator to an approval-gated operation they
+          # have already completed is how a report trains people to ignore it.
+          checkup_add warning "$svc exited 11 (repository already locked) on its last scheduled run, so THAT run's check never ran -- but the repository has since been verified successfully (${verdict#superseded }). No lock remains to remove."
+          checkup_add action "systemctl reset-failed $svc   # clears the stale failed state only; touches no repository, no data, no container, and the next scheduled run is unaffected"
+        else
+          checkup_add critical "$svc could not LOCK the repository (restic exit 11), so the integrity check never ran. This is not evidence of damage -- and not evidence of health either."
+          checkup_add action "journalctl -u $svc -n 30 --no-pager   # read-only: names the lock's host, user and age"
+          checkup_add action "a stale lock blocks every EXCLUSIVE restic operation -- the weekly check AND retention -- while still allowing backups, so it recurs until removed. Removing it is 'restic unlock', which needs operator approval: see docs/FIRST-REPORT-TRIAGE.md"
+          # Retention is the second ExecStart with no `-` prefix, so it never
+          # ran either. Stated with its recorded date rather than in the
+          # abstract: "retention is blocked" does not tell the operator how
+          # many weeks of snapshots have accumulated.
+          checkup_add action "$(retention_last_success_text) -- retention shares that exclusive lock, so it was skipped in the same run. Snapshots accumulate, which is the safe direction, but it does not self-correct."
+        fi
       else
         checkup_add critical "$svc last exited non-zero (status $status)."
         checkup_add action "journalctl -u $svc -n 50 --no-pager   # read-only"

@@ -331,6 +331,150 @@ grep -q 'last exited non-zero (status 11)' <<< "$out" \
   || fail "it should still be reported generically: $out"
 echo "  the lock wording is scoped to the check service only"
 
+# ---------------------------------------------------------------------------
+#  Production, 2026-10-25 -> 2026-10-28: a RESOLVED failure reported in the
+#  present tense.
+#
+#  The scheduled check exited 11 against a stale lock. The operator removed the
+#  lock on 2026-10-27 and ran the check by hand; it passed, and passed again on
+#  2026-10-28. systemd keeps a unit's failed state until the unit itself runs
+#  again, so `checkup` went on saying the integrity check "never ran" and
+#  telling the operator to perform an approval-gated `restic unlock` they had
+#  already completed. The unit state was real; the DIAGNOSIS was stale.
+# ---------------------------------------------------------------------------
+# The unit is failed with exit 11 AND reports when its main process exited, so
+# a recorded later success can be compared against it.
+LOCKED_WITH_TS='
+  systemctl() {
+    case "$*" in
+      *--failed*)                 printf "\xe2\x97\x8f domum-media-check.service loaded failed failed domum-media: restic repository integrity check\n" ;;
+      *list-timers*)              printf "x x x x domum-media-check.service\n" ;;
+      *ExecMainExitTimestamp*)    printf "Sun 2026-10-25 03:37:11 EDT\n" ;;
+      *ExecMainStatus*)           printf "11\n" ;;
+      *)                          return 1 ;;
+    esac
+  }
+  enabled_backup_targets() { printf "cloud\n"; }
+'
+EVDIR="$TMP/checkev"
+mkdir -p "$EVDIR"
+probe_systemd_ev() {  # $1 = cli, $2 = fixture -- same as probe_systemd, with an evidence dir
+  (
+    export REPO_META_DIR="$EVDIR"
+    probe_systemd "$1" "$2"
+  )
+}
+
+sect "a check verified SINCE the failed run is not reported as a current failure"
+printf 'RESULT=success\nMODE=structure\nFINISHED_TS=2026-10-28T10:51:00-0400\n' \
+  > "$EVDIR/cloud-check.env"
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+# Scoped to THAT run, the statement is accurate and worth keeping -- the run
+# really did not check anything. What must be gone is the UNSCOPED present-tense
+# form, which asserts the repository is unverified now, and the "not evidence of
+# health either" clause, which stops being true once a later check has passed.
+grep -qi 'so the integrity check never ran' <<< "$out" \
+  && fail "the unscoped present-tense claim survived a later verification: $out"
+grep -qi 'not evidence of health' <<< "$out" \
+  && fail "a verified repository is still reported as proving nothing: $out"
+grep -qi "THAT run" <<< "$out" \
+  || fail "the failure is not scoped to the run it actually belongs to: $out"
+grep -qi 'restic unlock' <<< "$out" \
+  && fail "the operator is still sent to an approval-gated remedy they completed: $out"
+grep -q 'CRIT|' <<< "$out" \
+  && fail "a resolved failure is still CRITICAL: $out"
+grep -qi 'STALE' <<< "$out" \
+  || fail "it does not say the unit state is stale: $out"
+grep -qi 'has since been verified' <<< "$out" \
+  || fail "it does not name the later successful verification: $out"
+grep -q '2026-10-28' <<< "$out" \
+  || fail "it does not date the verification that supersedes the failure: $out"
+grep -q 'ACT|systemctl reset-failed domum-media-check.service' <<< "$out" \
+  || fail "the cheap, safe remedy is not named: $out"
+# It must still MAIL: an action is what reaches the notifier, and a dirty
+# --failed state that nobody is told about stays dirty forever.
+grep -q 'ACT|' <<< "$out" || fail "a stale failed state with no action never mails: $out"
+echo "  reported as stale, dated, reset-failed offered, no unlock advice"
+
+sect "the superseding remedy is ONE line, not the same command twice"
+# Both the --failed summary and the exit-status detail report this unit, so
+# without identical wording the operator is shown the same command twice.
+n="$(grep -c 'ACT|systemctl reset-failed' <<< "$out")"
+[[ "$n" == "1" ]] || fail "the reset-failed remedy appears $n times, expected 1: $out"
+echo "  one remedy line"
+
+sect "evidence OLDER than the failed run does not supersede it"
+# The direction that matters. A check that passed BEFORE the failure says
+# nothing about the repository now, and reading it as reassurance would turn
+# the one real finding into a stale-state note.
+printf 'RESULT=success\nMODE=structure\nFINISHED_TS=2026-10-20T03:40:00-0400\n' \
+  > "$EVDIR/cloud-check.env"
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+grep -qi 'could not LOCK the repository' <<< "$out" \
+  || fail "an EARLIER check suppressed a live lock finding: $out"
+grep -q 'CRIT|' <<< "$out" || fail "a live failure was downgraded by stale evidence: $out"
+grep -qi 'restic unlock' <<< "$out" || fail "the real remedy was withheld: $out"
+echo "  an earlier check cannot excuse a later failure"
+
+sect "with NO recorded evidence the finding is unchanged"
+# This is production as it stands today: the recording does not exist yet, so
+# the report must behave exactly as it did before. A change that only reads
+# correctly once new evidence appears would have silenced the finding in the
+# meantime.
+rm -f "$EVDIR"/*-check.env
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+grep -qi 'could not LOCK the repository' <<< "$out" \
+  || fail "absent evidence changed the live finding: $out"
+grep -qi 'never ran' <<< "$out" || fail "absent evidence weakened the claim: $out"
+grep -q 'CRIT|' <<< "$out" || fail "absent evidence downgraded the severity: $out"
+echo "  no evidence means no change -- the conservative direction"
+
+sect "retention's recency is stated with the lock finding, not in the abstract"
+# Retention is the second ExecStart with no `-` prefix, so a blocked check
+# skips it in the same run. "Retention is blocked" does not tell the operator
+# how many weeks of snapshots have accumulated.
+printf 'RESULT=success\nMODE=forget-prune\nFINISHED_TS=2026-10-18T03:40:00-0400\n' \
+  > "$EVDIR/cloud-retention.env"
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+grep -q '2026-10-18' <<< "$out" \
+  || fail "the recorded retention date is not surfaced with the lock finding: $out"
+rm -f "$EVDIR"/*-retention.env
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+grep -qi 'no successful retention run is recorded' <<< "$out" \
+  || fail "absent retention evidence is not stated honestly: $out"
+echo "  dated when recorded, honest when not"
+
+sect "MUTATION: the staleness gate always open downgrades a LIVE failure"
+# The dangerous direction. If the superseded branch is taken unconditionally,
+# a repository that has genuinely never been verified since its check failed
+# reads as a stale-state note with a `reset-failed` remedy -- the report
+# agreeing that nothing is wrong, which is the one outcome worse than a false
+# alarm.
+#
+# The backup is taken BEFORE the mutation, unconditionally and on its own line.
+cp "$CLI" "$TMP/cli.orig.staleness"
+# `[[ x == * ]]` always matches, so the gate is open for every verdict. Written
+# as its own file with a quoted heredoc: expressing a mutation through nested
+# quoting is how one came to apply textually and change nothing.
+cat > "$TMP/mutate-staleness.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '[[ "$verdict" == superseded* ]]'
+assert s.count(old) == 2, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, '[[ "$verdict" == * ]]'))
+PYMUT
+( python3 -I "$TMP/mutate-staleness.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.staleness" "$CLI"; fail "the staleness mutation did not apply"; }
+rm -f "$EVDIR"/*-check.env
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+cp "$TMP/cli.orig.staleness" "$CLI"
+grep -qi 'STALE' <<< "$out" \
+  || fail "the mutation changed no ANSWER -- with the gate open a live failure must read as stale: $out"
+grep -q 'CRIT|' <<< "$out" \
+  && fail "the mutation did not actually downgrade the finding: $out"
+echo "  killed: an always-open gate reports an unverified repository as stale"
+
 sect "a failed job stays visible even when systemctl --failed no longer lists it"
 # systemctl --failed lists only units CURRENTLY failed. A weekly job that
 # failed and was later reset must still be visible through its last exit
