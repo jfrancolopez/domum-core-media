@@ -2327,8 +2327,20 @@ operator who does not want mail disables the timer and that is not a finding; an
 absent timer is not read as an enabled one; and when the flag IS set it reports
 the transport as **configured**, never as proven delivered. On this host it
 reports healthy, so it is a regression guard rather than a live finding.
-`tests/health-checks-smoke.sh` drives all four states; the mutation defaults the
-flag to 1 and must make a host that can deliver nothing report a clean path.
+**ENABLED is not USABLE, and nothing checked the credentials until a message
+had to go out.** `smtp_send_message` dies on a missing `RECOVERY_PACK_SMTP_HOST`
+or credential file, and `checkup`'s secrets loop never covered them -- so the
+first symptom would have been a failed send, which happens only when something
+needed reporting, and the one thing that cannot then be delivered is the report
+saying so. They are verified before the first real alert depends on them. An
+**empty** file is reported as well as an absent one, because
+`smtp_send_message` tests `-f` and would hand an empty credential to the server.
+Only PATHS are named, never contents.
+
+`tests/health-checks-smoke.sh` drives all four notifier states and all three
+unusable-transport states, asserts that no credential VALUE ever appears in the
+output, and the mutation defaults the flag to 1 -- it must make a host that can
+deliver nothing report a clean path.
 
 **A known open defect can be closed by reading state, and leaving it open has a
 cost.** "Never proven" was the stated reason to distrust silence, and it had

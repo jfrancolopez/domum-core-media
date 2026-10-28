@@ -5914,7 +5914,28 @@ checkup_notification_path() {
   local notifier
   notifier="$(systemctl is-enabled domum-media-weekly-report.timer 2>/dev/null || true)"
   if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then
-    checkup_add healthy "Mail delivery is configured, so a warranted alert has somewhere to go (configured is not the same as proven delivered)."
+    # Enabled is not the same as usable. `smtp_send_message` dies on a missing
+    # host or credential file, and NOTHING checked them until the moment a
+    # message had to go out -- which is only when something needed reporting,
+    # and by then the report is the thing that cannot be delivered. So they are
+    # verified here, before the first real alert depends on them.
+    #
+    # Only PATHS are named, never contents. An empty file is reported as well as
+    # an absent one: smtp_send_message tests `-f` and would pass an empty
+    # credential straight to the server.
+    local mail_unusable=""
+    [[ -n "${RECOVERY_PACK_SMTP_HOST:-}" ]] \
+      || mail_unusable="RECOVERY_PACK_SMTP_HOST is unset"
+    [[ -s "${RECOVERY_PACK_SMTP_USERNAME_FILE:-}" ]] \
+      || mail_unusable="${mail_unusable:+$mail_unusable; }${RECOVERY_PACK_SMTP_USERNAME_FILE:-<unset>} is missing or empty"
+    [[ -s "${RECOVERY_PACK_SMTP_PASSWORD_FILE:-}" ]] \
+      || mail_unusable="${mail_unusable:+$mail_unusable; }${RECOVERY_PACK_SMTP_PASSWORD_FILE:-<unset>} is missing or empty"
+    if [[ -n "$mail_unusable" ]]; then
+      checkup_add critical "Mail delivery is enabled but cannot work: $mail_unusable. Every alert would fail to send, and the one thing that cannot be delivered is the report saying so."
+      checkup_add action "restore the SMTP settings in $CFG_FILE and the credential files under $SECRETS_DIR   # then re-check with 'domum-media checkup'"
+      return 0
+    fi
+    checkup_add healthy "Mail delivery is configured and its host and credentials are present, so a warranted alert has somewhere to go (configured is not the same as proven delivered)."
     return 0
   fi
   if [[ "$notifier" == "enabled" ]]; then

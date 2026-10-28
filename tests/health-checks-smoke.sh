@@ -618,17 +618,57 @@ echo "  UNKNOWN, named, with the remedy"
 #  perfectly healthy -- and that is also why the 2026-10-25 weekly run's exit 0
 #  does NOT prove a message was delivered.
 # ---------------------------------------------------------------------------
-sect "mail configured: reported, and NOT claimed as proven delivery"
-out="$(probe "
+# A USABLE transport: enabled, with a host and non-empty credential files.
+# `smtp_send_message` dies on a missing host or credential file, and nothing
+# checked them until a message actually had to go out -- which is only when
+# something needed reporting, and by then the report is the thing that cannot be
+# delivered. The credentials carry distinctive values so the assertion that no
+# VALUE is ever printed has something to look for.
+MAILDIR="$TMP/secrets"
+mkdir -p "$MAILDIR"
+printf 'SMTPUSERVALUE\n' > "$MAILDIR/smtp_user"
+printf 'SMTPPASSVALUE\n' > "$MAILDIR/smtp_pass"
+: > "$MAILDIR/empty"
+MAIL_OK="
 RECOVERY_PACK_EMAIL_ENABLED=1
+RECOVERY_PACK_SMTP_HOST=smtp.example.com
+RECOVERY_PACK_SMTP_USERNAME_FILE=$MAILDIR/smtp_user
+RECOVERY_PACK_SMTP_PASSWORD_FILE=$MAILDIR/smtp_pass
 systemctl() { printf 'enabled\n'; }
-" checkup_notification_path)"
+"
+
+sect "mail configured and usable: reported, and NOT claimed as proven delivery"
+out="$(probe "$MAIL_OK" checkup_notification_path)"
 grep -q 'OK|Mail delivery is configured' <<< "$out" \
-  || fail "a configured transport is not reported: $out"
+  || fail "a configured, usable transport is not reported: $out"
 grep -qi 'not the same as proven delivered' <<< "$out" \
   || fail "configured must not read as delivered -- that is the whole distinction: $out"
-grep -q 'CRIT|' <<< "$out" && fail "a configured transport raised a critical: $out"
+grep -q 'CRIT|' <<< "$out" && fail "a usable transport raised a critical: $out"
 echo "  reported as configured, explicitly not as delivered"
+
+sect "no credential VALUE is ever printed"
+grep -q 'SMTPUSERVALUE' <<< "$out" && fail "the username value appears in the output: $out"
+grep -q 'SMTPPASSVALUE' <<< "$out" && fail "the password value appears in the output: $out"
+echo "  values never disclosed"
+
+sect "enabled but UNUSABLE is critical: an absent or empty credential, or no host"
+# An EMPTY file is reported as well as an absent one, because smtp_send_message
+# tests `-f` and would hand an empty credential straight to the server.
+for broken in \
+  "RECOVERY_PACK_SMTP_USERNAME_FILE=$MAILDIR/nope" \
+  "RECOVERY_PACK_SMTP_PASSWORD_FILE=$MAILDIR/empty" \
+  "RECOVERY_PACK_SMTP_HOST=" ; do
+  bout="$(probe "$MAIL_OK
+$broken
+" checkup_notification_path)"
+  grep -q 'CRIT|Mail delivery is enabled but cannot work' <<< "$bout" \
+    || fail "a transport that cannot work was not reported ($broken): $bout"
+  grep -q 'ACT|' <<< "$bout" \
+    || fail "a critical with no action never mails ($broken): $bout"
+  grep -q 'OK|Mail delivery is configured' <<< "$bout" \
+    && fail "it claimed a working transport ($broken): $bout"
+done
+echo "  absent credential, EMPTY credential and missing host are each critical"
 
 sect "notifier ENABLED with delivery OFF is CRITICAL, because silence would lie"
 # The contradiction: the weekly unit carries health-notify, so an enabled timer
@@ -681,16 +721,22 @@ cat > "$TMP/mutate-notify.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then\n    checkup_add healthy "Mail delivery is configured'
-new = '  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-1}" == "1" ]]; then\n    checkup_add healthy "Mail delivery is configured'
+# Anchored on the `if` plus the comment that follows it, which is unique to
+# this function -- the bare flag test appears all over the file.
+old = """  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]; then
+    # Enabled is not the same as usable."""
+new = """  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-1}" == "1" ]]; then
+    # Enabled is not the same as usable."""
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
 ( python3 -I "$TMP/mutate-notify.py" "$CLI" ) \
   || { cp "$TMP/cli.orig.notify" "$CLI"; fail "the notify mutation did not apply"; }
-out="$(probe "
+# A usable transport in every respect EXCEPT that the flag is unset. Unmutated
+# that is the contradiction (timer enabled, delivery off) and must be critical;
+# mutated, the unset flag defaults to 1 and the path reports clean.
+out="$(probe "$MAIL_OK
 unset RECOVERY_PACK_EMAIL_ENABLED
-systemctl() { printf 'enabled\n'; }
 " checkup_notification_path)"
 cp "$TMP/cli.orig.notify" "$CLI"
 grep -q 'OK|Mail delivery is configured' <<< "$out" \

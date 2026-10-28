@@ -266,6 +266,15 @@ contradiction: an operator who does not want mail disables the timer, and that
 is not a finding. When the flag is set it reports the transport as
 **configured**, which is deliberately not a claim that anything was delivered.
 
+It also checks that the transport is **usable**, not merely enabled.
+`smtp_send_message` dies on a missing `RECOVERY_PACK_SMTP_HOST` or credential
+file, and `checkup`'s secrets loop never covered those — so the first symptom
+would have been a failed send, which only happens when something needed
+reporting, and the one thing that could not then be delivered is the report
+saying so. An **empty** credential file is reported as well as an absent one,
+since `smtp_send_message` tests `-f` and would pass an empty value to the
+server. Only paths are named, never contents.
+
 ## Delivery — PROVEN 2026-10-25, by the weekly timer rather than by a test
 
 This section used to say no mail had ever been sent and that `health-notify` had
