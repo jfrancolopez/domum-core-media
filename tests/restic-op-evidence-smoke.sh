@@ -193,6 +193,62 @@ grep -qi 'no successful retention run is recorded' <<< "$out" \
 echo "  dated when recorded, unrecorded when not"
 
 # ---------------------------------------------------------------------------
+#  END TO END, across the two CLIs. The sections above drive the writer and the
+#  reader separately, which cannot catch them disagreeing -- and they live in
+#  DIFFERENT files, so agreeing is not automatic. This is the only section that
+#  proves what domum-media-backup writes is what domum-media reads.
+# ---------------------------------------------------------------------------
+sect "what the backup CLI writes, the main CLI reads"
+E2E="$TMP/e2e"
+mkdir -p "$E2E"
+(
+  export META="$E2E" TMPDIR_T="$TMP" CLI_BACKUP="$BACKUP_CLI" \
+         DRIVE='restic_check_for cloud; restic_forget_for cloud' RESTIC_RC=0
+  bash "$TMP/drive-writer.sh"
+) || fail "the writer failed while producing end-to-end evidence"
+
+e2e_read() {  # $1 = expression, evaluated against the writer's own directory
+  (
+    export REPO_META_DIR="$E2E"
+    # shellcheck disable=SC1090
+    source "$CLI" >/dev/null 2>&1
+    set +e
+    enabled_backup_targets() { printf 'cloud\n'; }
+    # The failed run is dated well before the evidence the writer just made.
+    systemctl() {
+      case "$*" in
+        *ExecMainExitTimestamp*) printf 'Sun 2026-10-25 03:37:11 EDT\n' ;;
+        *) return 1 ;;
+      esac
+    }
+    eval "$1"
+  ) 2>&1
+}
+
+out="$(e2e_read 'check_unit_verdict domum-media-check.service')"
+[[ "$out" == superseded* ]] \
+  || fail "the main CLI did not read the backup CLI's own check evidence: $out"
+grep -q 'structure' <<< "$out" \
+  || fail "the recorded MODE did not survive the round trip: $out"
+out="$(e2e_read 'retention_last_success_text')"
+grep -qi 'retention last succeeded' <<< "$out" \
+  || fail "the main CLI did not read the backup CLI's retention evidence: $out"
+echo "  round trip verified, including the recorded mode"
+
+sect "a FAILED check written end to end does not supersede"
+# The direction that matters: the writer records a failure, and the reader must
+# not read it as a verification.
+(
+  export META="$E2E" TMPDIR_T="$TMP" CLI_BACKUP="$BACKUP_CLI" \
+         DRIVE='restic_check_for cloud' RESTIC_RC=11
+  bash "$TMP/drive-writer.sh"
+) && fail "a failing check returned zero through the writer"
+out="$(e2e_read 'check_unit_verdict domum-media-check.service')"
+[[ "$out" == outstanding* ]] \
+  || fail "a recorded FAILURE superseded the failure it describes: $out"
+echo "  a recorded failure leaves the finding outstanding"
+
+# ---------------------------------------------------------------------------
 #  Drift guard: one default path, written identically in both CLIs.
 # ---------------------------------------------------------------------------
 sect "both CLIs default the evidence directory to the SAME path"
