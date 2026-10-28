@@ -240,7 +240,8 @@ rm -f "$FAKE_BIN/docker"
 # ---------------------------------------------------------------------------
 # 10. The backup wrapper's read-only path must not touch the backup log.
 # ---------------------------------------------------------------------------
-grep -A6 '^ensure_dirs() {' "$REPO_ROOT/bin/domum-media-backup" | grep -qE '^\s*touch ' \
+ensure_dirs_body="$(grep -A6 '^ensure_dirs() {' "$REPO_ROOT/bin/domum-media-backup" || true)"
+grep -qE '^\s*touch ' <<< "$ensure_dirs_body" \
   && fail "ensure_dirs still touches the backup log, so a read-only report mutates its mtime"
 
 # ---------------------------------------------------------------------------

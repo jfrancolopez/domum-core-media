@@ -547,7 +547,7 @@ case "$mrc" in
 died in the pipeline: $mout" ;;
   "")  fail "no exit status was captured from the mutant: $mout" ;;
 esac
-echo "  killed: with | head -20 and 2999 missing it dies in the pipeline (status"
+echo "  killed: with | head -20 and 2999 missing it dies in the pipeline (status"  # pipefail-audit: fixture -- names the mutation in a message
 echo "  $mrc, neither 1 nor 3) and the verdict is gone"
 
 sect "the FIXED form survives the same 2999-path list"

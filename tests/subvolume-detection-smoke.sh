@@ -38,8 +38,9 @@ grep -qE '^path_is_subvolume\(\)\s+\{ domum_is_subvolume' "$REPO_ROOT/bin/domum-
   || fail "path_is_subvolume is not delegating to the shared helper"
 # The report must not test subvolume-ness anywhere OUTSIDE the shared helper.
 # (The helper itself calls `btrfs subvolume show` -- that is the whole point.)
-if awk '/^# BEGIN SHARED SUBVOLUME HELPER$/,/^# END SHARED SUBVOLUME HELPER$/ {next} {print}' \
-     "$REPO_ROOT/bin/domum-media-report" | grep -q 'btrfs subvolume show'; then
+outside_helper="$(awk '/^# BEGIN SHARED SUBVOLUME HELPER$/,/^# END SHARED SUBVOLUME HELPER$/ {next} {print}' \
+                     "$REPO_ROOT/bin/domum-media-report")"
+if grep -q 'btrfs subvolume show' <<< "$outside_helper"; then
   fail "the report still has its own inline subvolume test outside the shared helper"
 fi
 

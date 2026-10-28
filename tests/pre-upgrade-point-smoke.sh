@@ -189,7 +189,8 @@ done
 # read-only inventory must not need the repository password to answer a question
 # about scheduling. Sound because the archive lives under $DOMUM_DATA_ROOT, which
 # the backup includes and no exclude covers.
-grep -vE '^\s*#' <<< "$ar" | grep -qE '(^|[;&|[:space:]])restic' \
+ar_code="$(grep -vE '^\s*#' <<< "$ar" || true)"
+grep -qE '(^|[;&|[:space:]])restic' <<< "$ar_code" \
   && fail "the inventory invokes restic; that needs secrets and this is read-only"
 # It must use the ONE parser for the marker, which already existed. Rolling its
 # own was the bug: see section 13b.
@@ -199,7 +200,7 @@ parser for the successful-backup marker"
 # Comments stripped: the explanation in that function legitimately quotes the
 # broken form, and matching the text rather than the code flagged it -- twice in
 # this same section now, once for `restic` and once for this.
-grep -vE '^\s*#' <<< "$ar" | grep -qE "tr -cd '0-9'" \
+grep -qE "tr -cd '0-9'" <<< "$ar_code" \
   && fail "the inventory digit-strips the marker again. It holds an ISO-8601
 timestamp, not an epoch, and stripping it yields an 18-digit number larger than
 any mtime -- so the comparison is always true and the check can only say yes."

@@ -151,7 +151,9 @@ d="$(dump_file)"
 modes="$(tar -tvf "$d" 2>/dev/null | grep 'acme.json')"
 grep -qE '^-rw-------' <<< "$modes" \
   || fail "the dump did not preserve acme.json's 0600 mode: $modes"
-tar -tf "$d" | grep -q 'screenshots/a.png' || fail "the dump is missing a subdirectory file"
+dump_list="$(tar -tf "$d")"
+grep -q 'screenshots/a.png' <<< "$dump_list" \
+  || fail "the dump is missing a subdirectory file"
 echo "  checksummed; acme.json kept 0600; subdirectories included"
 
 echo "== 4. the metadata records every volume AND the image =="
@@ -257,7 +259,8 @@ Restoring a private key world-readable turns a recovery into a disclosure."
 # And the replaced contents were PRESERVED, not deleted.
 aside="$(find "$ENV_DIR/data/backups/volumes" -name '*.failed-20261008-120000.tar' | head -1)"
 [ -n "$aside" ] || fail "the replaced contents were not preserved"
-tar -xOf "$aside" ./acme.json 2>/dev/null | grep -q 'ROTATED' \
+aside_acme="$(tar -xOf "$aside" ./acme.json 2>/dev/null || true)"
+grep -q 'ROTATED' <<< "$aside_acme" \
   || fail "the preserved copy does not hold what was replaced"
 echo "  restored with modes intact; replaced contents preserved at $(basename "$aside")"
 

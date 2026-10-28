@@ -156,4 +156,98 @@ python3 "$mut2" "$TMP/c" >/dev/null 2>&1 \
   && fail "the leading-pipe form should be caught with or without joining"
 echo "  killed: joining is what catches a pipe left at the end of a line"
 
+# ---------------------------------------------------------------------------
+#  The suites are scanned too. They were not, and that was a blind spot in the
+#  one place where an assertion that silently stops asserting is worst.
+# ---------------------------------------------------------------------------
+sect "the SUITES are scanned, not just the production files"
+out="$(python3 "$AUDIT" "$REPO_ROOT" 2>&1)"
+suites="$(sed -nE 's/^== scanned .* ([0-9]+) of them suites$/\1/p' <<< "$out")"
+[ -n "$suites" ] || fail "the audit does not report how many suites it scanned: $out"
+(( suites > 10 )) \
+  || fail "only $suites suite(s) were scanned; the tests/ glob is not working: $out"
+echo "  $suites suites scanned"
+
+sect "a banned pipeline IN A SUITE is rejected"
+# The whole point. Before this, a suite could carry the shape indefinitely.
+mkdir -p "$TMP/suite/bin" "$TMP/suite/operator" "$TMP/suite/tests"
+: > "$TMP/suite/bin/domum-media"; : > "$TMP/suite/bin/domum-media-backup"
+: > "$TMP/suite/bin/domum-media-report"; : > "$TMP/suite/install.sh"
+cat > "$TMP/suite/tests/x-smoke.sh" <<'EOF'
+out="$(printf 'hello\n')"
+printf '%s\n' "$out" | grep -q hello || fail "nope"
+EOF
+out="$(python3 "$AUDIT" "$TMP/suite" 2>&1)"; rc=$?
+(( rc == 1 )) || fail "a banned pipeline inside a suite was accepted: $out"
+grep -q 'x-smoke.sh' <<< "$out" || fail "the offending suite is not named: $out"
+echo "  caught, and the suite is named"
+
+sect "a QUOTED heredoc body is data, and is not scanned"
+# A suite reproducing the historical operator wrapper it must reject, or
+# feeding this very audit a fixture, legitimately contains the banned shape.
+# Demanding those be "fixed" would make a test stop describing the defect it
+# exists to catch.
+cat > "$TMP/suite/tests/x-smoke.sh" <<'EOF'
+cat > "$d/bad.sh" <<'INNER'
+domum-media storage protection plex | grep -q protected || abort "nope"
+INNER
+EOF
+out="$(python3 "$AUDIT" "$TMP/suite" 2>&1)"; rc=$?
+(( rc == 0 )) || fail "a quoted heredoc body was scanned as code: $out"
+echo "  quoted heredoc bodies are exempt"
+
+sect "an UNQUOTED heredoc body is still scanned"
+# There `$( )` IS command substitution, so its contents can execute.
+cat > "$TMP/suite/tests/x-smoke.sh" <<'EOF'
+cat > "$d/bad.sh" <<INNER
+value=$(docker ps | grep -q plex)
+INNER
+EOF
+out="$(python3 "$AUDIT" "$TMP/suite" 2>&1)"; rc=$?
+(( rc == 1 )) || fail "an UNQUOTED heredoc body was exempted; substitution runs there: $out"
+echo "  unquoted heredoc bodies are still scanned"
+
+sect "the marker exempts ONE line, and the exemption is PRINTED"
+# An allowance nobody can see is how a real defect gets a marker stuck on it.
+cat > "$TMP/suite/tests/x-smoke.sh" <<'EOF'
+printf 'docker ps | grep -q plex\n' >> "$d/fixture.sh"  # pipefail-audit: fixture
+printf 'docker ps | grep -q kavita\n' >> "$d/other.sh"
+EOF
+out="$(python3 "$AUDIT" "$TMP/suite" 2>&1)"; rc=$?
+(( rc == 1 )) || fail "the unmarked line was exempted by its neighbour's marker: $out"
+grep -q 'exempt (fixture)' <<< "$out" || fail "the exemption is not printed: $out"
+grep -q 'kavita' <<< "$out" || fail "the unmarked line was not reported: $out"
+echo "  one line each, and every exemption is visible"
+
+sect "a broken tests/ glob cannot pass as a clean tree"
+# Counted with os.listdir, deliberately NOT the glob that built TARGETS:
+# re-asking the same glob would report zero expected and zero scanned and call
+# that agreement.
+mut3="$TMP/audit-noglob.py"
+cp "$AUDIT" "$mut3"
+cat > "$TMP/mutate-noglob.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '+ sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("*.sh")))'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, '+ [])'))
+PYMUT
+( python3 -I "$TMP/mutate-noglob.py" "$mut3" ) || fail "the glob mutation did not apply"
+rm -f "$TMP/suite/tests/x-smoke.sh"
+cat > "$TMP/suite/tests/clean-smoke.sh" <<'EOF'
+out="$(printf 'hi\n')"
+grep -q hi <<< "$out" || fail "nope"
+EOF
+out="$(python3 "$mut3" "$TMP/suite" 2>&1)"; rc=$?
+(( rc == 1 )) \
+  || fail "with the suites glob removed and a suite present, the audit passed: $out"
+grep -q 'the glob broke' <<< "$out" || fail "the vacuity guard did not name the cause: $out"
+# And with no suite present at all it must NOT fire -- the fixtures above are
+# exactly that case, and requiring suites unconditionally rejected every one.
+rm -f "$TMP/suite/tests/clean-smoke.sh"
+python3 "$mut3" "$TMP/suite" >/dev/null 2>&1 \
+  || fail "an empty tests/ directory was treated as a broken glob"
+echo "  killed: a broken glob cannot read as clean, and an empty dir is not a break"
+
 echo "PASS: pipefail-grep-audit smoke test"

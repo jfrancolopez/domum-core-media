@@ -103,7 +103,7 @@ echo "  caught by the grep-the-binary rule, which needs no literal name"
 
 echo "== 5. mutation: reintroducing a prose grep is caught =="
 cp "$WRAPPER" "$TMP_DIR/m2.sh"
-printf '\ndomum-media storage protection plex | grep -q protected || abort "nope"\n' >> "$TMP_DIR/m2.sh"
+printf '\ndomum-media storage protection plex | grep -q protected || abort "nope"\n' >> "$TMP_DIR/m2.sh"  # pipefail-audit: fixture -- the prose grep this mutation must get caught for
 rc="$(run_against "$TMP_DIR/m2.sh")"
 [ "$rc" = "0" ] && fail "a reintroduced prose grep was NOT caught"
 grep -q 'prose is not a contract' "$TMP_DIR/mut.log" || fail "not reported as prose parsing"
@@ -123,7 +123,7 @@ echo "== 7. --json and capabilities piping are NOT flagged =="
 # The audit must not forbid the structured interface it is steering people to.
 cp "$WRAPPER" "$TMP_DIR/m4.sh"
 printf '\n"$CLI" cleanup images --json | jq -e ".images[0]" >/dev/null\n' >> "$TMP_DIR/m4.sh"
-printf '"$CLI" capabilities | grep -qx service-scoped-upgrade\n' >> "$TMP_DIR/m4.sh"
+printf '"$CLI" capabilities | grep -qx service-scoped-upgrade\n' >> "$TMP_DIR/m4.sh"  # pipefail-audit: fixture -- legitimate wrapper text the audit must NOT flag
 rc="$(run_against "$TMP_DIR/m4.sh")"
 [ "$rc" = "0" ] \
   || fail "the audit flagged legitimate --json/capabilities use; whoever hits that

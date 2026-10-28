@@ -124,7 +124,8 @@ jq -e '.last_run.reason != null' <<< "$out" >/dev/null \
 # ---------------------------------------------------------------------------
 # 3. The aggregate heartbeat must never be used as per-target evidence.
 # ---------------------------------------------------------------------------
-grep -n 'last_run' "$REPO_ROOT/bin/domum-media-report" | grep -qi 'heartbeat' \
+last_run_lines="$(grep -n 'last_run' "$REPO_ROOT/bin/domum-media-report" || true)"
+grep -qi 'heartbeat' <<< "$last_run_lines" \
   && fail "per-target run state must not be derived from the aggregate heartbeat"
 
 # ---------------------------------------------------------------------------
@@ -170,8 +171,8 @@ grep -q 'snapshot ab12cd34 saved' "$TMP_DIR/stream.log" \
   || fail "backup output was not streamed to the log"
 
 # The implementation must read PIPESTATUS, not the pipeline's own status.
-awk '/^restic_backup_to\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup" \
-  | grep -q 'PIPESTATUS\[0\]' \
+backup_fn="$(awk '/^restic_backup_to\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup")"
+grep -q 'PIPESTATUS\[0\]' <<< "$backup_fn" \
   || fail "restic_backup_to must read PIPESTATUS[0] so tee cannot mask a failure"
 
 # A killed run (systemd TimeoutStartSec is 18h) must not leave its capture file
