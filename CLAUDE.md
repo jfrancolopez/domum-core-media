@@ -2626,6 +2626,69 @@ order to fix a live problem. Seventh instance. Captured first, and the refusal
 now also prints the enabled targets. The audit existing is why this was a
 two-minute fix instead of a support question.
 
+**A stale FAILURE stated in the present tense is the same defect as a stale
+proof, and it told the operator to redo work they had already done.**
+Production, 2026-10-25 to 10-28: the scheduled check exited 11 against a stale
+lock; the operator removed the lock on 10-27 and the check passed, and passed
+again on 10-28 with no lock present beforehand (22 → 23 snapshots, `no errors
+were found` both times). **systemd keeps a unit's failed state until THAT unit
+runs again** -- a manual `domum-media-backup --check` does not clear it -- so
+`checkup`, driven against the real state three days later, still said the
+integrity check *"never ran"* and still sent the operator to an approval-gated
+`restic unlock`. Every word was true of the 10-25 run and false of the present,
+and it would have repeated until 2026-11-01.
+
+Nothing could have known: `do_check` and `do_weekly_retention` recorded
+**nothing**, while per-target backup runs had recorded evidence for months. Both
+now write `<target>-{check,retention}.env` beside it, 0600, with a `MODE` field
+-- because a structure check is not a read-data verification and not a restore
+test, and collapsing them would advertise a verification that never happened. **A
+manual run is recorded exactly like a scheduled one**: the operator's
+remediation has to become evidence, or the report can never see that it worked.
+
+`check_unit_verdict` is the ONE implementation, consulted by both places that
+report this unit; two copies would be two chances to call a resolved problem
+current. Rules it follows, each the safe direction:
+
+- **`superseded` requires EVERY enabled target, never one.** One repository's
+  clean check says nothing about another's -- the per-service upgrade gate's
+  reasoning.
+- **Absent evidence changes nothing.** A fix that only reads correctly once new
+  evidence appears would silence a live finding in the meantime.
+- **An unreadable timestamp is `unknown`, not `superseded`**, and a recorded
+  FAILURE is never read as a success.
+- The `restic unlock` advice is **not** repeated once superseded, and the remedy
+  becomes `systemctl reset-failed`, which touches no repository, no data and no
+  container.
+
+**The exit status is PRESERVED through the new recording.** restic exit 11 is
+the entire mechanism by which a locked repository fails the unit; swallowing it
+to make room for an evidence write would be "warn and continue" in the one place
+it must not be. Both operations capture the status, record success or failure,
+and return it unchanged.
+
+**A standalone "retention is overdue" check was deliberately NOT added.** Its
+input cannot exist until retention next runs, so deploying it would mail
+"retention status unknown" on a healthy host immediately -- a false alarm
+manufactured on purpose, in the path whose whole value is that silence means
+something. Retention recency is surfaced INSIDE the already-critical
+check-failure finding instead, with its recorded date, because "retention is
+blocked" does not say how many weeks of snapshots have accumulated.
+
+**Two findings about one unit share one remedy line.** The `--failed` summary
+and the exit-status detail both report the check service, so the remedy is
+worded IDENTICALLY in both branches and `checkup_add`'s exact-duplicate
+suppression collapses it. Differing comments on the same command showed the
+operator the same line twice.
+
+**A test asserting the absence of "never ran" was wrong, not the code.** Scoped
+to *that run* the phrase is accurate and worth keeping; what must disappear is
+the unscoped present-tense form and the "not evidence of health either" clause,
+which stops being true once a later check has passed. Before adapting a test to
+a change, ask which of the two is wrong. `tests/restic-op-evidence-smoke.sh`
+(3 mutants, all killed) and five production-shaped sections plus a gate mutation
+in `tests/monitoring-completeness-smoke.sh`. See `docs/FIRST-REPORT-TRIAGE.md`.
+
 ---
 
 ## 15. Known open safety defects

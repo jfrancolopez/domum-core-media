@@ -214,3 +214,149 @@ it twice made the host look twice as bad as it was.
   `failed for all URLs` and Immich will retry them.
 - The lock holder identified from the journal.
 - Six reporting defects fixed, and exit 11 given its own actionable finding.
+
+---
+
+## 7. Outcome, measured 2026-10-28
+
+The lock was removed and the repository verified. Both runs are the operator's,
+quoted from their terminal:
+
+| when | command | result |
+|---|---|---|
+| 2026-10-27 16:32 | `--unlock cloud` | listed 1 lock (`49249f2e…`), `successfully removed 1 locks` |
+| 2026-10-27 16:32 | `--check` | repo `c1d39ac9`, 14 index files, **22 snapshots**, `no errors were found` |
+| 2026-10-28 10:48 | `--unlock cloud` | **no locks remained** |
+| 2026-10-28 10:49 | `--check` | repo `c1d39ac9`, 15 index files, **23 snapshots**, `no errors were found` |
+
+The second pair is the one that matters: with no lock present beforehand, the
+check still passed, so the Oct 27 result was not a one-off. The snapshot count
+rising 22 → 23 is the nightly backup, which never stopped.
+
+What these two runs prove, and what they do not. `restic check` without
+`--read-data` verifies the repository's **structure** — indexes, trees, blob
+metadata, snapshot reachability. It does **not** read pack contents, so it is
+not a read-data verification and certainly not a restore test. Those are
+`--check-deep` (a subset) and `--check-cloud-deep` (everything), and the
+recovery claims that rest on actual restores are tracked separately in
+`docs/DISASTER-RECOVERY-STATUS.md`. The evidence record this triage added keeps
+the distinction in a `MODE` field for exactly that reason.
+
+### The failure survived its own cause, and the report said so in the present tense
+
+`systemd` keeps a unit's failed state until **that unit** runs again. A manual
+`domum-media-backup --check` does not clear it. So on 2026-10-28, three days
+after the lock was removed and two successful checks later, this was still live:
+
+```
+$ systemctl --failed
+● domum-media-check.service   loaded failed failed   domum-media: restic repository integrity check
+$ systemctl show -p ExecMainStatus --value domum-media-check.service
+11
+```
+
+and `checkup_systemd_health`, driven against that real state, still produced:
+
+```
+✗ domum-media-check.service could not LOCK the repository (restic exit 11), so
+  the integrity check never ran. This is not evidence of damage -- and not
+  evidence of health either.
+  ...
+  2. a stale lock blocks every EXCLUSIVE restic operation ... Removing it is
+     'restic unlock', which needs operator approval
+```
+
+Every word of that was true of the 2026-10-25 run and false of the present. The
+host was telling the operator to perform an approval-gated operation they had
+already completed twice, and giving them no way to see that their remediation
+had worked. It would have gone on saying it until the next scheduled run on
+2026-11-01.
+
+This is the project's recurring defect family — a stale proof stated as a
+present-tense claim — arriving in the opposite direction: a stale **failure**.
+The unit state was real and still worth reporting. The **diagnosis** was stale.
+
+### Why nothing could know
+
+Neither `do_check` nor `do_weekly_retention` recorded anything. The per-target
+backup run evidence (`<target>-run.env`) had existed for months; the two
+exclusive operations had no equivalent, so a successful check left no trace
+anywhere but the journal and the operator's scrollback. There was no input from
+which the report could have drawn a different conclusion.
+
+### What changed
+
+`restic_check_for` and `restic_forget_for` now record per-target evidence in
+`$REPO_META_DIR` — the same directory, ownership and `0600` mode as the existing
+run records:
+
+```
+SCHEMA_VERSION=1
+TARGET=cloud
+OPERATION=check          # or retention
+RESULT=success           # or failure
+MODE=structure           # read-data-subset | read-data | forget-prune
+STARTED_TS=…
+FINISHED_TS=…
+```
+
+A manual run is recorded exactly like a scheduled one. That is the point: the
+operator's remediation becomes evidence the report can read.
+
+`check_unit_verdict` is the one implementation of the comparison, consulted by
+both places that report this unit. It reads the unit's own
+`ExecMainExitTimestamp` and asks whether every enabled target has a recorded
+successful check newer than it:
+
+| verdict | meaning | reported as |
+|---|---|---|
+| `superseded` | **every** enabled target verified since the failed run | warning, named and dated, remedy `systemctl reset-failed` |
+| `outstanding` | at least one target has not been verified since | unchanged: critical, `restic unlock` advice stands |
+| `unknown` | no target enumerable, or the timestamp unreadable | unchanged: critical |
+
+Three properties are deliberate:
+
+- **`superseded` requires every target, never one.** One repository's clean
+  check says nothing about another's, which is the same reasoning that makes the
+  upgrade gate per-service rather than counted.
+- **Absent evidence changes nothing.** This is production as it stands today —
+  the recording is not deployed, so the finding behaves exactly as it did
+  before. A fix that only reads correctly once new evidence appears would have
+  silenced a live finding in the meantime.
+- **An unreadable timestamp is `unknown`, not `superseded`.** That direction
+  would quietly downgrade a live failure.
+
+The `restic unlock` advice is **not** repeated in the superseded case. Retention
+is now stated with its recorded date instead of in the abstract, because
+"retention is blocked" does not tell the operator how many weeks of snapshots
+have accumulated.
+
+### A standalone "retention is overdue" check was deliberately NOT added
+
+It is the obvious next step and it is wrong today. The record cannot exist
+until retention next runs, and a check that fires on an absent input would mail
+"retention status unknown" on a healthy host the moment it was deployed — a
+false alarm manufactured on purpose, in the one notification path whose value
+rests on silence meaning something. Retention recency is therefore surfaced
+*inside* the already-critical check-failure finding, where it costs no new
+alert. Once evidence exists on this host the standalone check becomes possible,
+and it can then distinguish "never recorded" from "recorded and stale".
+
+### Coverage
+
+- `tests/restic-op-evidence-smoke.sh` — the writer and reader driven, never
+  grepped: evidence recorded, `0600`, three distinct modes, restic's exit status
+  preserved both ways, a recorded failure never read as a success, `superseded`
+  requiring every target, `unknown` as its own answer, and a drift guard proving
+  both CLIs default the evidence directory to the same path. 3 mutations, all
+  killed.
+- `tests/monitoring-completeness-smoke.sh` — five production-shaped sections
+  plus a mutation: the staleness gate forced always-open must report an
+  unverified repository as stale, and does.
+
+### Still open for the operator
+
+`systemctl reset-failed domum-media-check.service` clears the stale state. It
+touches no repository, no data and no container, and the next scheduled run on
+2026-11-01 is unaffected. Leaving it alone is also fine: that run will clear it
+by succeeding.

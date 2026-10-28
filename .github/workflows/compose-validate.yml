@@ -288,6 +288,14 @@ jobs:
       - name: Monitoring completeness smoke test
         run: tests/monitoring-completeness-smoke.sh
 
+      # The exclusive restic operations -- the weekly integrity check and
+      # retention -- record durable evidence, and checkup reads it to tell a
+      # stale failure from a current one. Production, 2026-10-25 -> 10-28: a
+      # lock-blocked check was reported in the present tense for three days
+      # after the operator had removed the lock and verified the repository.
+      - name: Restic operation evidence smoke test
+        run: tests/restic-op-evidence-smoke.sh
+
       # checkup must PRODUCE a report. Silence is the one unacceptable outcome:
       # `sudo domum-media checkup` printed nothing at all in production, and a
       # blank report is indistinguishable from a healthy one.

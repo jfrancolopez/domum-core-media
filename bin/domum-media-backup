@@ -603,21 +603,98 @@ record_backup_target_run() {
   mv -f "$tmp" "$file"
 }
 
+# Durable evidence for the EXCLUSIVE restic operations -- the integrity check
+# and retention.
+#
+# Why this exists: neither recorded anything. Production, 2026-10-25,
+# `domum-media-check.service` exited 11 (repository already locked), so the
+# check never ran and `--weekly-retention` -- the second ExecStart with no `-`
+# prefix -- was skipped with it. The operator removed the stale lock on
+# 2026-10-27 and the check then passed, twice. Nothing on this host recorded
+# either success, so `checkup` went on reporting the failed unit in the present
+# tense and telling the operator to remove a lock they had already removed. A
+# stale failure stated as a current one is the same defect family as a stale
+# coverage proof stated as a present-tense claim.
+#
+# These records are what let the report distinguish "the last scheduled run
+# failed and nothing has verified the repository since" from "it failed and has
+# since been verified". A manual run is recorded exactly like a scheduled one,
+# which is the point: the operator's remediation becomes evidence.
+#
+# MODE is recorded because a structure check and a read-data verification are
+# different claims. `restic check` with no extra argument reads trees, indexes
+# and blob metadata; it does NOT read pack contents. Collapsing the two would
+# advertise a verification that never happened.
+restic_op_evidence_file() {  # $1 = target, $2 = op (check|retention)
+  printf '%s/%s-%s.env' "$REPO_META_DIR" "$1" "$2"
+}
+
+record_restic_operation() {  # $1 = target, $2 = op, $3 = result, $4 = started, $5 = mode
+  local target="$1" op="$2" result="$3" started="$4" mode="${5:-}"
+  local file tmp
+  mkdir -p "$REPO_META_DIR" || return 1
+  file="$(restic_op_evidence_file "$target" "$op")"
+  tmp="$(mktemp "$REPO_META_DIR/.${target}-${op}.env.XXXXXX")" || return 1
+  {
+    printf 'SCHEMA_VERSION=1\n'
+    printf 'TARGET=%s\n' "$target"
+    printf 'OPERATION=%s\n' "$op"
+    printf 'RESULT=%s\n' "$result"
+    printf 'MODE=%s\n' "$mode"
+    printf 'STARTED_TS=%s\n' "$started"
+    printf 'FINISHED_TS=%s\n' "$(date -Iseconds)"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
 restic_forget_for() {
-  local target="$1"
+  local target="$1" started rc=0
+  started="$(date -Iseconds)"
   log "restic forget --prune on $target"
+  # The exit status is PRESERVED. `forget --prune` needs an exclusive lock, so
+  # it fails on a locked repository exactly as the check does, and swallowing
+  # that would turn a skipped retention into a silent success. Recording a
+  # failure is deliberate: it is the only durable trace that retention did not
+  # run.
   restic_for_target "$target" forget --prune \
     --keep-daily   "$RESTIC_KEEP_DAILY" \
     --keep-weekly  "$RESTIC_KEEP_WEEKLY" \
     --keep-monthly "$RESTIC_KEEP_MONTHLY" \
-    --keep-yearly  "$RESTIC_KEEP_YEARLY"
+    --keep-yearly  "$RESTIC_KEEP_YEARLY" || rc=$?
+  if (( rc == 0 )); then
+    record_restic_operation "$target" retention success "$started" "forget-prune" \
+      || log "WARNING: could not record retention evidence for $target"
+  else
+    record_restic_operation "$target" retention failure "$started" "forget-prune" \
+      || log "WARNING: could not record retention evidence for $target"
+  fi
+  return "$rc"
 }
 
 restic_check_for() {
   local target="$1"
   shift
+  local started mode rc=0
+  started="$(date -Iseconds)"
+  # No extra argument means restic read no pack contents.
+  mode="structure"
+  case "$*" in
+    *--read-data-subset=*) mode="read-data-subset" ;;
+    *--read-data*)         mode="read-data" ;;
+  esac
   log "restic check on $target $*"
-  restic_for_target "$target" check "$@"
+  restic_for_target "$target" check "$@" || rc=$?
+  if (( rc == 0 )); then
+    record_restic_operation "$target" check success "$started" "$mode" \
+      || log "WARNING: could not record check evidence for $target"
+  else
+    record_restic_operation "$target" check failure "$started" "$mode" \
+      || log "WARNING: could not record check evidence for $target"
+  fi
+  # Preserved so a locked repository still fails the unit. restic exit 11 is
+  # what makes `checkup` able to say the check never ran.
+  return "$rc"
 }
 
 list_latest_snapshots() {
