@@ -107,7 +107,8 @@ echo "  compose start, and no up -d"
 sect "the container remedies name the COMPOSE services, not the logical one"
 # immich maps to four containers, so `docker logs immich` would fail on the one
 # service where a failed healthcheck matters most.
-grep -A3 'is UNHEALTHY' <<< "$src" | grep -q 'service_compose_services' \
+unhealthy_ctx="$(grep -A3 'is UNHEALTHY' <<< "$src" || true)"
+grep -q 'service_compose_services' <<< "$unhealthy_ctx" \
   || fail "the unhealthy remedy uses the logical name; it would fail for immich"
 grep -q 'service_compose_services' <<< "$stopped_ctx" \
   || fail "the stopped remedy uses the logical name; it would fail for immich"

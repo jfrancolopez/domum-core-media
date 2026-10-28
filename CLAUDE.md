@@ -1487,6 +1487,47 @@ inspect → reproduce → develop → test → focused commit → push branch �
   mutation-tested, because the leading-pipe shape is caught either way and
   asserting the mutation against it would have passed vacuously.
 
+  **The audit did not scan `tests/`, and the suites carried the banned shape 32
+  times across 15 files.** Measured 2026-10-28. That was a blind spot in exactly
+  the place where the failure mode is worst: an **assertion silently stops
+  asserting**, and a suite that cannot fail is indistinguishable from one that
+  passes. It was not theoretical -- `backup-target-evidence-smoke` had
+  `awk … | grep -q 'die "Backup failed for target'`, which passed for months and
+  began failing the moment an unrelated 40-line insertion pushed awk's output
+  past the pipe buffer. All 32 are now addressed and `tests/*.sh` is in scope.
+
+  **A QUOTED heredoc body is DATA and is not scanned; an UNQUOTED one still
+  is.** Nothing in `<<'EOF'` expands or executes, and the banned shape lives
+  there legitimately: a suite reproducing the historical operator wrapper it
+  must reject, the fixtures this audit feeds itself, a mutation string restoring
+  `| head -20`. Demanding those be "fixed" would make a test stop describing the
+  defect it exists to catch. In an unquoted heredoc `$( )` IS command
+  substitution -- a defect family this file already records -- so those are
+  still scanned. The limitation is stated rather than hidden: a quoted heredoc
+  body that is written out and then EXECUTED is code the audit sees as data, and
+  it was verified that no production file does that.
+
+  **The remaining three sites are string literals, exempted by an explicit
+  `# pipefail-audit: <reason>` marker, and every exemption is PRINTED.** An
+  allowance nobody can see is how a real defect gets a marker stuck on it. The
+  marker is read before comments are stripped, exempts only its own line, and
+  cannot be put inside a heredoc -- adding a comment there would change the
+  fixture.
+
+  **The vacuity guard counts the suites with `os.listdir`, deliberately NOT the
+  `glob` that built the target list.** Re-asking the same glob could not detect
+  that glob breaking: it would report zero expected and zero scanned and call
+  that agreement. An EMPTY `tests/` directory expects zero and is not a failure
+  -- requiring suites unconditionally rejected every one of the audit's own
+  single-file fixtures, including the one asserting that the capture-first fix
+  is ACCEPTED.
+
+  **Diagnostics are the same shape.** Three `| head -N >&2` lines printed hits
+  before a `fail`. These suites run without errexit so a 141 could not abort
+  them, but the shape is identical; they slice a captured variable with
+  `sed -n '1,Np' <<< "$x"`, which has no pipe -- the same fix as the lost
+  `INCOMPLETE` verdict.
+
   **A text-grep test cannot tell a fix from a regression.**
   `service-upgrade-smoke` section 2 asserted that `service_upgrade` contained
   the literal pipeline `managed_image_specs | cut … | grep -qxF "$service"` --
@@ -2716,26 +2757,6 @@ it is actually fixed; keep the detail in `docs/`.
 - Documentation may still describe protection that production does not have
   (snapshot coverage, backup targets that are not enabled). Verify claims
   against live evidence before repeating them.
-- **`tests/pipefail-grep-audit.py` does not scan `tests/`, and the tests carry
-  the banned shape 31 times across 20 files.** Measured 2026-10-27. The audit
-  covers both CLIs, `install.sh` and `operator/*.sh` -- the production code --
-  and exempts the suites that enforce the rule. That is a blind spot in exactly
-  the place where the failure mode is worst: under `pipefail` a MATCH makes the
-  left side take SIGPIPE, the pipeline reports 141, and **an assertion silently
-  stops asserting**.
-
-  It is not theoretical. `backup-target-evidence-smoke` had
-  `awk … | grep -q 'die "Backup failed for target'`, which passed for months
-  and began failing the moment an unrelated 40-line insertion pushed awk's
-  output past the pipe buffer -- the documented intermittency, arriving as a
-  mysterious failure in a suite nobody had touched. Fixed by capturing first.
-
-  The other 30 are mostly `printf`/`echo` into `grep -q` on short strings,
-  where the left side finishes before grep exits, so they pass reliably today
-  and could invert at any time for reasons unrelated to what they test.
-  **Extending the audit to `tests/` and fixing the 31 sites is the next piece
-  of work**; it was deliberately not bundled with the reporting triage, because
-  a 31-site change and a behaviour change do not belong in one review.
 - **Media-service state and the image archives are NOT backed up off-site, and
   this is a KNOWN, ACCEPTED limitation -- not an oversight to be quietly
   fixed.** The cloud restic target is immich-only by design (three roots:

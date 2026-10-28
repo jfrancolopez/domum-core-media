@@ -676,8 +676,10 @@ rc="$(run_cli rollback-upgrade plex "$point")"
 restored the data under whatever is running now -- the pairing failure."
 grep -q 'records no image identity' "$ENV_DIR/err" || fail "wrong refusal: $(out)"
 [ "$(img plex)" = "$PLEX_NEW" ] || fail "it changed the running image before refusing"
-find "$ENV_DIR/data" -maxdepth 1 -name 'plex.failed-*' | grep -q . \
-  && fail "it moved the live data aside before refusing"
+# `find | grep -q .` is the banned shape, and emptiness is a string test.
+set_aside="$(find "$ENV_DIR/data" -maxdepth 1 -name 'plex.failed-*')"
+[ -n "$set_aside" ] \
+  && fail "it moved the live data aside before refusing: $set_aside"
 echo "  refused, and nothing was moved or restarted"
 
 echo "== 21. rollback REFUSES when the snapshot itself is missing =="

@@ -246,11 +246,15 @@ grep -q -- '--internal' "$STUB_LOG" || fail "the network was not created --inter
 grep -q -- '--tmpfs /var/lib/postgresql/data' "$STUB_LOG" || fail "PGDATA was not a tmpfs"
 grep -qE 'docker run .*(-p |--publish)' "$STUB_LOG" && fail "a port was published"
 # No production path may be mounted, read-only or otherwise.
-grep -oE '\-v [^ ]+' "$STUB_LOG" | while read -r _ v; do
+# Captured first: this is the guard that keeps the disposable harness away from
+# production paths, and `| grep -q` would make a real hit read as a miss.
+prod_mounts="$(grep -oE '\-v [^ ]+' "$STUB_LOG" | while read -r _ v; do
   case "$v" in
     "$DATA"/*|"$TMP_DIR/media"/*) echo "PRODUCTION-PATH-MOUNT $v" ;;
   esac
-done | grep -q PRODUCTION-PATH-MOUNT && fail "a live data root was mounted into the test"
+done)"
+grep -q PRODUCTION-PATH-MOUNT <<< "$prod_mounts" \
+  && fail "a live data root was mounted into the test: $prod_mounts"
 grep -qE '\-v [^ ]*phasea[^ ]*/upload:' "$STUB_LOG" || fail "the scratch upload dir was not mounted"
 echo "  --internal network, tmpfs PGDATA, no port, only the scratch upload dir"
 

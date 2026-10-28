@@ -28,8 +28,22 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent
-TARGETS = ["bin/domum-media", "bin/domum-media-backup", "bin/domum-media-report",
-           "install.sh"] + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "operator").glob("*.sh"))
+TARGETS = (["bin/domum-media", "bin/domum-media-backup", "bin/domum-media-report",
+            "install.sh"]
+           + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "operator").glob("*.sh"))
+           # The suites too. They were NOT scanned, and that was a blind spot in
+           # exactly the place where the failure mode is worst: under pipefail a
+           # MATCH makes the left side take SIGPIPE, the pipeline reports 141,
+           # and an ASSERTION SILENTLY STOPS ASSERTING. Measured 2026-10-28: 32
+           # instances across 15 files.
+           #
+           # Not theoretical. `backup-target-evidence-smoke` had
+           # `awk … | grep -q 'die "Backup failed for target'`, which passed for
+           # months and began failing the moment an unrelated 40-line insertion
+           # pushed awk's output past the pipe buffer -- the documented
+           # intermittency, arriving as a mysterious failure in a suite nobody
+           # had touched.
+           + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("*.sh")))
 
 # A pipe into a consumer that STOPS EARLY. `grep -q` was the known one; the
 # same SIGPIPE mechanism applies to anything that closes its input before the
@@ -87,13 +101,65 @@ def offending(code):
         return ("| head" + m.group(1)).strip()
     return None
 
+# A QUOTED heredoc body (`<<'EOF'`, `<<"EOF"`, `<<\\EOF`) is literal data: no
+# expansion, no command substitution, nothing in it executes. The banned shape
+# appears there legitimately and often -- a suite reproducing the historical
+# operator wrapper it must reject, the fixtures this audit's own smoke test
+# feeds itself, a mutation string restoring `| head -20`. Scanning those would
+# make the audit demand that a test stop describing the defect it exists to
+# catch.
+#
+# UNQUOTED heredocs are still scanned: there `$( )` IS command substitution,
+# which is a separate defect family this project has already been bitten by
+# (a backticked `--help` example that executed and vanished).
+#
+# The limitation, stated rather than hidden: a quoted heredoc body that is
+# written to a file and later EXECUTED is code, and this audit sees it as data.
+# Verified 2026-10-28 that no production file does that -- `cat > … <<'EOF'`
+# appears in none of them. A suite that does it deliberately (writing a bad
+# wrapper to prove the wrapper audit rejects it) is the case being exempted.
+_HEREDOC = re.compile(r"<<-?\s*(['\"])?([A-Za-z_][A-Za-z0-9_]*)\1?")
+
+
+def quoted_heredoc_lines(raw):
+    """1-based line numbers inside a QUOTED heredoc body."""
+    inside = set()
+    i = 0
+    while i < len(raw):
+        line = raw[i]
+        # The delimiter word is quoted, or backslash-escaped, for a literal body.
+        m = re.search(r"<<-?\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|\"([A-Za-z_][A-Za-z0-9_]*)\"|\\([A-Za-z_][A-Za-z0-9_]*))", line)
+        if m:
+            delim = m.group(1) or m.group(2) or m.group(3)
+            j = i + 1
+            while j < len(raw) and raw[j].strip() != delim:
+                inside.add(j + 1)
+                j += 1
+            i = j + 1
+            continue
+        i += 1
+    return inside
+
+
+# The few remaining sites are not in heredocs -- the banned text sits inside an
+# ordinary string, in an `echo` describing a mutation or a `printf` writing a
+# fixture. An explicit marker is better than a heuristic that tries to decide
+# what is inside a string literal, and every exemption is PRINTED below so one
+# cannot hide a real defect.
+MARKER = re.compile(r"#\s*pipefail-audit:\s*(\S+)")
+
 bad = []
+exempt = []
 scanned = 0
+test_files_scanned = 0
 for rel in TARGETS:
     f = ROOT / rel
     if not f.exists():
         continue
+    if rel.startswith("tests/"):
+        test_files_scanned += 1
     raw = f.read_text().split("\n")
+    in_heredoc = quoted_heredoc_lines(raw)
     # A pipeline may be split across lines with a trailing backslash, and the
     # `| grep -q` half then starts the NEXT line. Both real instances found by
     # this audit had that shape, so each line is matched together with its
@@ -104,18 +170,54 @@ for rel in TARGETS:
         joined.append((i, ln, ln.rstrip().rstrip("\\") + " " + nxt.strip()
                        if ln.rstrip().endswith("\\") else ln))
     for i, ln, subject in joined:
+        if i in in_heredoc:
+            continue
+        # The marker is read BEFORE comments are stripped, or it would be gone
+        # by the time it is needed.
+        mk = MARKER.search(subject)
         # Strip comments before asserting that code does NOT contain something:
         # this audit's own explanation quotes the banned form, and so do the
         # comments that document each fix.
         code = re.sub(r"(^|\s)#.*$", "", subject)
         scanned += 1
         hit = offending(code)
-        if hit:
+        if not hit:
+            continue
+        if mk:
+            exempt.append((rel, i, mk.group(1), ln.strip()[:80]))
+        else:
             bad.append((rel, i, ln.strip()[:100]))
 
-print("== scanned %d line(s) across %d file(s)" % (scanned, len([r for r in TARGETS if (ROOT / r).exists()])))
+print("== scanned %d line(s) across %d file(s), %d of them suites"
+      % (scanned, len([r for r in TARGETS if (ROOT / r).exists()]), test_files_scanned))
+# Every exemption is printed. An allowance nobody can see is how a real defect
+# gets a marker stuck on it.
+for rel, i, why, text in exempt:
+    print("   ~~ exempt (%s) %s:%d  %s" % (why, rel, i, text))
 for rel, i, text in bad:
     print("   !! %s:%d  %s" % (rel, i, text))
 if bad:
     print("Capture first -- out=\"$(cmd)\" -- then `grep -q … <<< \"$out\"`.")
+# It must not pass vacuously. The suites are the half that was missing, so
+# finding none of them when the directory EXISTS means the glob broke, not that
+# the tree is clean.
+#
+# Conditional on the directory because this audit is also run against synthetic
+# fixture roots -- its own smoke test feeds it single-file trees -- and those
+# have no tests/ at all. Requiring suites unconditionally rejected every
+# fixture, including the one asserting the capture-first fix is ACCEPTED.
+# The count is taken INDEPENDENTLY, with os.listdir rather than the Path.glob
+# that built TARGETS. Re-asking the same glob could not detect that glob being
+# broken -- it would report zero expected and zero scanned and call that
+# agreement. An empty tests/ directory (which this audit's own fixtures create)
+# expects zero and is therefore not a failure.
+import os
+try:
+    expected_suites = len([n for n in os.listdir(str(ROOT / "tests")) if n.endswith(".sh")])
+except OSError:
+    expected_suites = 0
+if not bad and expected_suites > 0 and test_files_scanned == 0:
+    print("!! %d suite(s) exist under tests/ and none were scanned -- the glob broke"
+          % expected_suites)
+    sys.exit(1)
 sys.exit(1 if bad else 0)

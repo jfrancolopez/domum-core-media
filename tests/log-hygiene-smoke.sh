@@ -75,7 +75,8 @@ grep -q 'logrotate.d/domum-media' "$REPO_ROOT/bin/domum-media" \
   || fail "4: convergence does not install the logrotate config"
 
 # The world-readable default must not creep back in.
-grep -E 'logrotate/domum-media' "$REPO_ROOT/install.sh" | grep -q -- '-m 0644' \
+logrotate_install="$(grep -E 'logrotate/domum-media' "$REPO_ROOT/install.sh" || true)"
+grep -q -- '-m 0644' <<< "$logrotate_install" \
   || fail "4: the logrotate config itself should be installed 0644"
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,8 @@ for cli in "$REPO_ROOT/bin/domum-media" "$REPO_ROOT/bin/domum-media-backup" "$RE
   [ -r "$cli" ] || continue
   all_unquoted="$(awk '/^[[:space:]]*cat <<EOF$/{inside=1; next} inside && /^EOF$/{inside=0} inside' "$cli")"
   if [ -n "$all_unquoted" ] && grep -q '`' <<< "$all_unquoted"; then
-    grep -n '`' <<< "$all_unquoted" | head -3 >&2
+    bt_hits="$(grep -n '`' <<< "$all_unquoted" || true)"
+    sed -n '1,3p' <<< "$bt_hits" >&2
     fail "$(basename "$cli"): a backtick in an unquoted heredoc is command
 substitution. Message text would be executed and silently disappear."
   fi
@@ -110,7 +112,8 @@ substitution. Message text would be executed and silently disappear."
     inside                    { buf = buf $0 "\n" }
   ' "$cli")"
   if [ -n "$usage" ] && grep -qE '\$\(' <<< "$usage"; then
-    grep -nE '\$\(' <<< "$usage" | head -3 >&2
+    sub_hits="$(grep -nE '\$\(' <<< "$usage" || true)"
+    sed -n '1,3p' <<< "$sub_hits" >&2
     fail "$(basename "$cli"): \$( ) in the Usage heredoc. Help text is
 documentation, not a value: quote the heredoc or build that line separately."
   fi
@@ -165,7 +168,7 @@ hits="$(
                 -type f -name '*.sh' -o -type f -path '*/bin/*' 2>/dev/null | sort -u)
 )"
 if [ -n "$hits" ]; then
-  printf '%s\n' "$hits" | head -10 >&2
+  sed -n '1,10p' <<< "$hits" >&2
   fail "a backtick inside an UNQUOTED heredoc is command substitution. It runs when
 the heredoc is WRITTEN, so the words vanish and whatever they name executes.
 Quote the heredoc terminator, or write the word without backticks."

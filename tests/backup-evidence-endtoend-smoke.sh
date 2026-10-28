@@ -202,9 +202,14 @@ backup_target_include_paths() { printf "%s" "/tmp /definitely/not/here"; }')"
 [ "$(cat "$d/rc")" = "0" ] || fail "F: a run with one usable path should still succeed"
 f="$d/state/backups/cloud-run.env"
 [ "$(field "$f" RESULT)" = "success" ] || fail "F: expected success with one usable path"
-echo "$(field "$f" PATHS_MISSING)" | grep -q 'not/here' \
-  || fail "F: a skipped configured path was not recorded: $(field "$f" PATHS_MISSING)"
-echo "$(field "$f" PATHS)" | grep -q '/tmp' || fail "F: the usable path was not recorded"
+# Captured first. `cmd | grep -q` exits at the first match, the left side takes
+# SIGPIPE, and under pipefail the PIPELINE reports 141 -- so a MATCH reads as a
+# no-match and the assertion silently stops asserting.
+missing_f="$(field "$f" PATHS_MISSING)"
+grep -q 'not/here' <<< "$missing_f" \
+  || fail "F: a skipped configured path was not recorded: $missing_f"
+paths_f="$(field "$f" PATHS)"
+grep -q '/tmp' <<< "$paths_f" || fail "F: the usable path was not recorded"
 
 # ...and no usable path at all must fail rather than record an empty success.
 d="$(run_scenario no-paths '

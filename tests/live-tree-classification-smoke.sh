@@ -191,8 +191,9 @@ grep -q 'libigc.so.2$' <<< "$out" \
 $out"
 [ "$(nrec "$out")" = 0 ] || fail "dangling/absolute symlinks produced records:
 $out"
-probe "migrate_classify_live_tree $(printf '%q' "$SNAP") $(printf '%q' "$LIVE") >/dev/null; echo RC=\$?" \
-  | grep -q 'RC=0' || fail "classification failed with a dangling absolute symlink present"
+rc_out="$(probe "migrate_classify_live_tree $(printf '%q' "$SNAP") $(printf '%q' "$LIVE") >/dev/null; echo RC=\$?")"
+grep -q 'RC=0' <<< "$rc_out" \
+  || fail "classification failed with a dangling absolute symlink present: $rc_out"
 echo "  symlinks produce no records; exit 0 with a dangling /config link"
 
 echo "== 9. an UNEXPECTED new file is surfaced =="

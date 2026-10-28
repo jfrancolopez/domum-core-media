@@ -749,8 +749,11 @@ sect "mutation: reading the GLOBAL include paths brings the false claim back"
 MUTS="$TMP_DIR/mut-scope"
 cp "$REPO_ROOT/bin/domum-media-backup" "$MUTS"
 sed -i 's|^  roots="\$(dr_target_roots "\$target")"$|  roots="${BACKUP_INCLUDE_PATHS:-}"|' "$MUTS"
-grep -c 'roots="\${BACKUP_INCLUDE_PATHS:-}"' "$MUTS" | grep -qx 2 \
-  || fail "the scope mutation was not applied to both call sites"
+# `grep -c | grep -qx` is the banned shape twice over. The count is a number;
+# compare it as one.
+mut_sites="$(grep -c 'roots="\${BACKUP_INCLUDE_PATHS:-}"' "$MUTS" || true)"
+[ "$mut_sites" = 2 ] \
+  || fail "the scope mutation was not applied to both call sites (got $mut_sites)"
 mout="$(
   (
     # shellcheck disable=SC1090
