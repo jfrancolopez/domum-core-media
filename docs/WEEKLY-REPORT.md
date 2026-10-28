@@ -255,24 +255,70 @@ implementation — so there is no new dependency and no second place to get
 credentials wrong. With delivery disabled it prints the summary and says so; it
 never reports mail as delivered when it was not.
 
-## The controlled real-email test — REQUIRES OPERATOR APPROVAL
+**But "says so" meant the journal, and nothing read the journal.** With delivery
+disabled `health_notify_cmd` warns and returns **0**, so the unit stays green —
+and `RECOVERY_PACK_EMAIL_ENABLED` **defaults to 0**. A host with this timer
+enabled and that flag unset would write every alert it ever raised to a log,
+discard it, and look perfectly healthy. `checkup_notification_path` now reports
+that contradiction — timer enabled, delivery off — as CRITICAL, in
+`checkup_collect_all` so all three consumers see it. It fires only on the
+contradiction: an operator who does not want mail disables the timer, and that
+is not a finding. When the flag is set it reports the transport as
+**configured**, which is deliberately not a claim that anything was delivered.
 
-**No test mail has been sent.** `health-notify` has only ever been run with
-`--dry-run`, which stages the message, prints it, and deletes it without
-contacting the SMTP server.
+## Delivery — PROVEN 2026-10-25, by the weekly timer rather than by a test
+
+This section used to say no mail had ever been sent and that `health-notify` had
+only run with `--dry-run`. That was wrong, and the paragraph below contained the
+reason: *"neither can the weekly timer while the host is healthy."* **The host
+was not healthy.**
+
+`domum-media-check.service` entered the failed state at **2026-10-25 03:36:56**
+(restic exit 11, a stale lock). `domum-media-weekly-report.service` ran at
+**08:25:56** that morning with `Result=success`, `ExecMainStatus=0`. So:
+
+| step | established by |
+|---|---|
+| mail delivery enabled (`RECOVERY_PACK_EMAIL_ENABLED=1`) | the **root-run** off-host audit printed `off-host delivery ENABLED` on 2026-10-12, which is emitted only when the flag is 1; the config's mtime is 2026-09-23, so it had not changed |
+| a CRITICAL was present, so the silence gate could not be taken | the check unit failed five hours earlier; the then-installed binary (`383f9e6`, hash `8760cfa51f3d`) emitted a critical for a non-zero timer exit |
+| `--dry-run` was not in play | the unit's `ExecStart` passes no flag |
+| a delivery failure would have failed the unit | `health-notify` is the second `ExecStart` with no `-` prefix, and a failed `smtp_send_message` calls `die` |
+| the unit exited 0 | `ExecMainStatus=0`, `Result=success` |
+
+Every zero-exit path is accounted for, so **the message was delivered**. The
+operator independently confirms receiving mail from this host.
+
+**Enumerate every zero-exit path before an exit status proves anything.** The
+first version of this conclusion checked two of the three and would have claimed
+proof from a status equally consistent with *delivery being switched off* — and
+the production config is `0600 root`, so an unprivileged account cannot tell the
+two apart without the flag measurement above.
+
+What this does and does not establish: the transport worked **once**, to one
+address, proven by inference from an exit status. It is sound only because the
+delivery failure is fatal, and it would collapse the moment anyone put a `-` on
+that `ExecStart`. Silence now means "nothing needed attention" rather than
+"nothing needed attention OR mail is broken".
+
+### The controlled real-email test — STILL REQUIRES OPERATOR APPROVAL
+
+`--force` remains the way to re-prove delivery on demand, and it still sends a
+real message, so it still needs approval.
 
 ### Why a real send still needs proving
 
-Everything up to the transport is verified: the four checks run, the verdict is
+Everything up to the transport is verified: the checks run, the verdict is
 computed, the silence gate works in both directions (observed in production
 2026-10-21, HEALTHY → ACTION REQUIRED → HEALTHY on real state), the message is
 assembled, and the unit's `ExecStart` prefixes make a delivery failure fail the
-unit. What has **never** been exercised is `smtp_send_message` actually reaching
-the server and the mail arriving in a mailbox.
+unit.
 
-A dry run cannot prove that. Neither can the weekly timer while the host is
-healthy, because a healthy host sends nothing — which is the contract, and also
-why delivery could stay broken indefinitely without anyone noticing.
+A dry run cannot prove the transport. Neither can the weekly timer **while the
+host is healthy**, because a healthy host sends nothing — which is the contract.
+That qualifier is what made the old claim wrong: on 2026-10-25 the host was not
+healthy, the timer sent, and the send succeeded. A single real send in response
+to a real finding is better evidence than a test, because it exercises the path
+the operator actually depends on.
 
 ### The test
 
