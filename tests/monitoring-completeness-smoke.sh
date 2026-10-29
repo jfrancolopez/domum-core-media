@@ -396,6 +396,34 @@ grep -q 'ACT|systemctl reset-failed domum-media-check.service' <<< "$out" \
 grep -q 'ACT|' <<< "$out" || fail "a stale failed state with no action never mails: $out"
 echo "  reported as stale, dated, reset-failed offered, no unlock advice"
 
+sect "the superseded remedy does not claim reset-failed clears this finding"
+# MEASURED in production, 2026-10-29: `systemctl reset-failed` set
+# Result=success and emptied `systemctl --failed`, and left ExecMainStatus at
+# 11. This finding reads ExecMainStatus, so reset-failed cannot clear it -- and
+# the first version of this remedy told the operator it would. A remedy that
+# does not do what it says is the defect this repository keeps correcting.
+#
+# Mentioning reset-failed is fine; recommending it as the fix is not. So the
+# discriminator is that any line naming it must also say it does NOT clear this.
+while IFS= read -r line; do
+  case "$line" in
+    ACT*reset-failed*)
+      grep -q 'does NOT' <<< "$line" \
+        || fail "an action offers reset-failed without saying what it cannot do: $line" ;;
+  esac
+done <<< "$out"
+grep -qi 'replaced when .* next runs on schedule' <<< "$out" \
+  || fail "it does not say what actually clears the recorded exit status: $out"
+echo "  reset-failed named only as what does NOT work"
+
+sect "no remedy starts the check unit, which would run retention"
+# domum-media-check.service's SECOND ExecStart is --weekly-retention, i.e.
+# `restic forget --prune`. Offering `systemctl start` as a convenience would
+# hand the operator a manual retention run, which needs approval.
+grep -qE 'ACT\|.*systemctl (start|restart) domum-media-check' <<< "$out" \
+  && fail "a remedy starts the check unit, which runs forget --prune: $out"
+echo "  the unit is never started as a remedy"
+
 sect "the superseding remedy is ONE line, not the same command twice"
 # Both the --failed summary and the exit-status detail report this unit, so
 # without identical wording the operator is shown the same command twice.
@@ -415,6 +443,28 @@ grep -qi 'could not LOCK the repository' <<< "$out" \
 grep -q 'CRIT|' <<< "$out" || fail "a live failure was downgraded by stale evidence: $out"
 grep -qi 'restic unlock' <<< "$out" || fail "the real remedy was withheld: $out"
 echo "  an earlier check cannot excuse a later failure"
+
+sect "the live finding offers the action that can RETIRE it, before the unlock advice"
+# Production, 2026-10-29. The operator had already removed the lock and verified
+# the repository twice, and the report offered only the journal and an
+# approval-gated `restic unlock`. There was NO listed way to say the cause was
+# already fixed -- and the thing that retires the finding is a recorded
+# successful check, which is read-only.
+printf 'RESULT=success\nMODE=structure\nFINISHED_TS=2026-10-20T03:40:00-0400\n' \
+  > "$EVDIR/cloud-check.env"
+out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
+grep -q 'ACT|sudo domum-media-backup --check' <<< "$out" \
+  || fail "no action can retire a finding whose cause is already fixed: $out"
+grep -qi 'read-only' <<< "$(grep 'ACT|sudo domum-media-backup --check' <<< "$out")" \
+  || fail "the verification is not described as read-only, so it reads as risky: $out"
+# It must come BEFORE the approval-gated remedy: if the check passes, the
+# unlock advice is moot, and the cheap read-only step belongs first.
+chk="$(grep -n 'ACT|sudo domum-media-backup --check' <<< "$out" | head -1 | cut -d: -f1)"
+unl="$(grep -n "ACT|.*restic unlock" <<< "$out" | head -1 | cut -d: -f1)"
+[[ -n "$chk" && -n "$unl" ]] || fail "could not locate both actions: $out"
+(( chk < unl )) \
+  || fail "the approval-gated unlock is offered before the free read-only check: $out"
+echo "  the read-only verification is offered first"
 
 sect "with NO recorded evidence the finding is unchanged"
 # This is production as it stands today: the recording does not exist yet, so

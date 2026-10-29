@@ -2347,6 +2347,49 @@ cost.** "Never proven" was the stated reason to distrust silence, and it had
 been falsified four days before anyone looked. Check an open entry against
 evidence before repeating it.
 
+**`systemctl reset-failed` does NOT clear `ExecMainStatus`, and I recommended it
+as though it did.** Production, 2026-10-29: the operator ran it and `checkup`
+printed `No systemd unit is in the failed state` **and** the same exit-11
+critical as before. Measured immediately afterwards:
+
+```
+Result=success          <- reset-failed set this
+NRestarts=0
+ExecMainStatus=11       <- and left this, which is what the finding reads
+ExecMainExitTimestamp=Sun 2026-10-25 03:37:11 EDT
+```
+
+`checkup_systemd_health` has TWO loops on purpose -- `systemctl --failed` lists
+only what is CURRENTLY failed, so the last exit status of every domum timer's
+service is read separately, which is what made a failed-and-restarted weekly
+check visible at all. So the two findings have **different** remedies, and
+collapsing them into one wording was the error: `reset-failed` is the fix for
+the `--failed` listing and cannot touch the recorded exit status. Each now says
+what it does and what it does not, and the exit-status finding states that its
+own value is replaced when the unit next runs.
+
+**`systemctl start domum-media-check.service` must never be offered as a
+convenience.** Its SECOND `ExecStart` is `--weekly-retention`, i.e.
+`restic forget --prune`, so "just run it now" is a manual retention run, which
+needs approval. Asserted.
+
+**A finding whose cause is already fixed needs a listed way to say so.** The
+same production run offered only `journalctl` and an approval-gated
+`restic unlock` -- for a repository the operator had already unlocked and
+verified **twice**. The action that retires it is a recorded successful check,
+which is read-only, so `sudo domum-media-backup --check` is now listed FIRST,
+before the approval-gated remedy: if it passes, the unlock advice is moot, and
+exit 11 from it means the lock really is still there. Ordering is asserted,
+because a free read-only step listed after an approval-gated one is a remedy
+nobody reaches.
+
+**Only `cloud` is enabled.** Measured from the root-run `checkup` output
+2026-10-29 -- every per-target healthy line names `cloud` and none names `nas`.
+That answers the open question this file recorded (a second target `nas` is
+declared with `/srv/data` as its root, and `load_cfg` as `jfranco` falls back to
+defaults that report both enabled). So `/srv/data` is **not** already covered by
+an enabled second target, and the selective-backup proposal is still needed.
+
 **A warning with no paired action NEVER mails, and seven real problems were in
 that state.** `health_notify_cmd`'s silence gate sends only when
 `CHECKUP_CRITICAL` or `CHECKUP_ACTIONS` is non-empty, by design -- warnings
