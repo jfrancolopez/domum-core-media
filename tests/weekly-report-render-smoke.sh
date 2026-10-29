@@ -167,7 +167,20 @@ sect "a real history produces real sparklines"
 out="$(drive "" --stdout)"
 grep -qE "Data disk +$(printf '\xe2\x96')" <<< "$out" || fail "no sparkline from real history: $out"
 grep -q 'oldest -> newest' <<< "$out" || fail "the axis is not explained: $out"
-echo "  eight-point sparklines rendered from recorded rows"
+# The disk-temperature unit reached the operator as NINE LITERAL CHARACTERS:
+# production 2026-10-29 printed `Disk temp   47\xc2\xb0C`. The suffix is
+# rendered with %s, so a double-quoted "\xc2\xb0C" is never interpreted --
+# this project's own rule about \xNN not being interpreted, in a renderer
+# instead of a test. ANSI-C quoting makes the bytes real.
+#
+# Asserted with a real degree sign via printf, because `grep -E` would not
+# interpret \xNN here either.
+grep -q -- "$(printf 'Disk temp')" <<< "$out" || fail "the disk-temp trend is missing: $out"
+grep -qF -- 'xc2' <<< "$out" \
+  && fail "the degree sign is still an uninterpreted escape in the operator's report: $out"
+grep -qF -- "$(printf '\xc2\xb0C')" <<< "$out" \
+  || fail "the temperature carries no degree sign: $out"
+echo "  eight-point sparklines, and the degree sign is a real character"
 rm -f "$TMP/state/report/history.csv"
 
 # ---------------------------------------------------------------------------

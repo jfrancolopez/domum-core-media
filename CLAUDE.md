@@ -2347,6 +2347,62 @@ cost.** "Never proven" was the stated reason to distrust silence, and it had
 been falsified four days before anyone looked. Check an open entry against
 evidence before repeating it.
 
+**A RETENTION failure was reported as a BACKUP failure, and it cost the
+heartbeat.** `restic_forget_for` returns restic's status, and `do_daily_backup`
+called it unguarded under `set -e`, so a failure aborted the function **before
+`heartbeat`** -- which writes `$DOMUM_LOG_DIR/last-success`, the marker
+`checkup` reads for "Last backup completed Nh ago". A backup that had fully
+succeeded, with its own per-target evidence already recording
+`RESULT=success`, would therefore be reported as a **STALE** backup, the
+recovery-pack refresh would be skipped, and the cause would be misattributed.
+The same shape in `do_weekly_retention` let the FIRST target's failure skip
+every later target's retention.
+
+Continuing is both the accurate and the safe direction: retention is
+`forget --prune`, so not running it leaves snapshots in place, which this file
+already calls the safe direction, whereas aborting loses the heartbeat and the
+pack. It is **not** swallowed -- the run does every must-happen step and THEN
+fails the unit naming retention, and the recorded retention evidence says
+`RESULT=failure`. `tests/backup-evidence-endtoend-smoke.sh`; the mutation
+restores the unguarded call and the observable is the **heartbeat**, not the
+exit status, because the run fails either way.
+
+**Latent, not active, and the cadence is why.** `backup_target_retention`
+defaults `cloud` to **weekly** and `nas` to daily, and only `cloud` is enabled
+-- so `retention_targets daily` is EMPTY and no daily retention runs on this
+host. That is why the nightly backup survived the Mac's stale lock from
+2026-10-20 to 10-27. It goes live the moment a daily-retention target is
+enabled. Verified from systemd: backup `*-*-* 02:30` +15m, check
+`Sun *-*-* 03:30` +20m, both `Persistent=true`, and the check unit's second
+`ExecStart` is `--weekly-retention`. **Retention on this host happens only on
+Sundays, only via the check unit, and only if `--check` succeeds** -- which is
+why exit 11 on 2026-10-25 skipped it. Oct 18 -> Oct 29 is therefore exactly ONE
+missed weekly run, not a recording gap.
+
+**"No successful retention run is recorded" and "retention did not run" are
+different claims, and both were true at once.** The recording shipped
+2026-10-28; retention has not run since 2026-10-18. So the report's wording is
+literally correct and deliberately does not say retention has never happened.
+Keep them distinct: one is about the evidence, the other about the operation.
+
+**`export TZ="${TZ:-UTC}"` is for the CONTAINERS and leaks into the CLI's own
+process**, so `epoch_to_iso` renders UTC while `domum-media-backup` records
+local time -- production 2026-10-29 showed `cloud@...T15:22:34+0000` beside
+`Reconciled at ...T10:55:03-04:00` in one report. Both denote the same instant,
+so nothing is wrong, only inconsistent. **Deliberately NOT changed**: that
+`TZ=UTC` is load-bearing for the journal `--since` window, which carries a
+measured comment showing the comparison returns 1 match under `TZ=UTC` and 0
+under `TZ=America/New_York`. Changing it to tidy a timestamp would break a
+working comparison.
+
+**`\xc2\xb0C` reached the operator as nine literal characters.** The weekly
+report's trend suffix is printed with `%s`, so a double-quoted `"\xc2\xb0C"` is
+never interpreted -- production printed `Disk temp   47\xc2\xb0C`, and the HTML
+part inherited it because that renderer wraps the rendered TEXT. ANSI-C quoting
+(`$'\xc2\xb0C'`) makes the bytes real. This is the rule this file already
+records about `\xNN` not being interpreted, in a renderer rather than in a
+test, and the assertion against it must use `printf` for the same reason.
+
 **`systemctl reset-failed` does NOT clear `ExecMainStatus`, and I recommended it
 as though it did.** Production, 2026-10-29: the operator ran it and `checkup`
 printed `No systemd unit is in the failed state` **and** the same exit-11
