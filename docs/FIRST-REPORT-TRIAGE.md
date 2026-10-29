@@ -360,3 +360,103 @@ and it can then distinguish "never recorded" from "recorded and stale".
 touches no repository, no data and no container, and the next scheduled run on
 2026-11-01 is unaffected. Leaving it alone is also fine: that run will clear it
 by succeeding.
+
+---
+
+## 8. Scheduled backup and retention audit, 2026-10-29
+
+Read-only. No Restic operation was run for this audit.
+
+### The two schedules, from systemd rather than from memory
+
+| unit | `OnCalendar` | delay | `Persistent` | `ExecStart` |
+|---|---|---|---|---|
+| `domum-media-backup` | `*-*-* 02:30` | +15m | yes | `domum-media-backup` |
+| `domum-media-check` | `Sun *-*-* 03:30` | +20m | yes | `--check`, then `--weekly-retention` |
+
+`backup_target_retention` defaults **`cloud` to weekly** and `nas` to daily.
+Only `cloud` is enabled (measured from the root-run `checkup`, where every
+per-target line names `cloud` and none names `nas`). Therefore:
+
+- `retention_targets daily` is **empty** — no daily retention runs on this host;
+- retention happens **only on Sundays, only via the check unit**, and only if
+  `--check` succeeds, because `--weekly-retention` is the second `ExecStart`
+  and carries no `-` prefix.
+
+### Backup success and retention success are different events
+
+The daily run records **per-target backup evidence** (`<target>-run.env`,
+`RESULT=success`) before retention is attempted, and writes the aggregate
+heartbeat `$DOMUM_LOG_DIR/last-success` **after**. Retention records its own
+`<target>-retention.env`. So the two are separately observable — which is the
+point, and was not true before 2026-10-28.
+
+### Was 2026-10-18 a missed operation or a missing record?
+
+**Both, about different things, and the distinction matters.**
+
+- **A genuinely missed operation.** The 2026-10-25 check exited 11, so the
+  second `ExecStart` never ran and that Sunday's retention did not happen.
+  Oct 18 → Oct 29 is therefore exactly **one** missed weekly run, not a long
+  silent drift. The next opportunity is **Sun 2026-11-01 ~03:30–03:50**.
+- **A missing record.** Retention recording shipped on 2026-10-28 and retention
+  has not run since, so `no successful retention run is recorded` is literally
+  true and deliberately does not claim retention has never happened.
+
+Snapshots accumulating is the safe direction, and nothing was pruned.
+
+### Exit 11 is reported as superseded without claiming the unit succeeded
+
+Verified in the production report of 2026-10-29:
+
+> `domum-media-check.service` exited 11 (repository already locked) **on its
+> last scheduled run**, so **THAT run's** check never ran — but the repository
+> has since been verified successfully (`cloud@…(structure)`).
+
+It attributes the failure to that run, names the later verification with its
+timestamp and **mode**, and never says the unit succeeded. The separate
+`No systemd unit is in the failed state` line is a true statement about
+`systemctl --failed` after the operator's `reset-failed`, which is a different
+fact. The action states that the recorded exit status is replaced only when the
+unit next runs.
+
+### Will the next scheduled check update its recorded result?
+
+Yes, and the installed binary was checked rather than assumed: `restic_check_for`
+in `/usr/local/bin/domum-media-backup` calls `record_restic_operation` on both
+the success and failure paths and returns restic's status unchanged. The unit
+invokes `--check`, so `do_check` records once per enabled target. systemd
+replaces `ExecMainStatus` on that run independently. If `--check` succeeds,
+`--weekly-retention` then runs and records retention too.
+
+### The defect this audit found
+
+`do_daily_backup` called `restic_forget_for` unguarded under `set -e`, so a
+retention failure aborted the run **before `heartbeat`** — reporting a fully
+successful backup as a **stale** one and skipping the recovery-pack refresh.
+`do_weekly_retention` had the same shape, letting the first target's failure
+skip the rest. Latent on this host only because `retention_targets daily` is
+empty. Fixed: every target is attempted, the must-happen steps complete, and
+the run then fails naming retention.
+
+### Two things deliberately NOT changed
+
+- **`export TZ="${TZ:-UTC}"`** leaks the containers' timezone into the CLI, so
+  `epoch_to_iso` prints UTC while the backup CLI records local time. Both denote
+  the same instant. That `TZ=UTC` is load-bearing for the journal `--since`
+  window, which carries a measured comment showing 1 match under `TZ=UTC` and 0
+  under `TZ=America/New_York`. Tidying a timestamp is not worth breaking it.
+- **No standalone "retention is overdue" check.** Its input only begins existing
+  after the next retention run, so shipping it now would mail a false alarm on a
+  healthy host. It becomes possible once Nov 1 has recorded a result.
+
+### One read-only check still outstanding
+
+`cloud`'s cadence is inferred from the code **default**, because the config is
+`0600 root`. If it is overridden to `daily`, the daily retention path is live
+rather than latent. The non-secret confirmation is:
+
+```
+sudo grep -nE '^BACKUP_TARGETS=|^BACKUP_TARGET_[A-Z]+_RETENTION=' \
+  /opt/domum-core-media/config/domum-media.conf
+```

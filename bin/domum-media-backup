@@ -776,8 +776,31 @@ No backup was taken. The last-success marker has deliberately NOT been refreshed
     fi
   done < <(enabled_backup_targets)
 
+  # A RETENTION failure is not a BACKUP failure, and treating them as one
+  # inverted the report. `restic_forget_for` returns restic's status, and an
+  # unguarded call under `set -e` aborted this function HERE -- before
+  # `heartbeat`, which writes $DOMUM_LOG_DIR/last-success, the marker `checkup`
+  # reads for "Last backup completed Nh ago". So a backup that had completely
+  # succeeded, and whose own per-target evidence already said RESULT=success,
+  # would be reported as a STALE backup, and the recovery-pack refresh below
+  # would be skipped too.
+  #
+  # Continuing is the safe direction as well as the accurate one: retention is
+  # `forget --prune`, so a failure to run it leaves snapshots in place, which
+  # this project already records as the safe direction. Aborting, by contrast,
+  # loses the heartbeat and the pack refresh and misattributes the cause.
+  #
+  # It is NOT swallowed -- "warn and continue is not a safety mechanism". The
+  # run does every must-happen step and THEN fails the unit, naming retention,
+  # so systemd marks it failed, checkup reports the non-zero exit, and the
+  # recorded retention evidence says RESULT=failure. Nothing claims success
+  # that did not happen.
+  #
+  # The loop also no longer lets one target's failure skip another's retention.
+  local retention_failed=""
   while IFS= read -r target; do
-    restic_forget_for "$target"
+    restic_forget_for "$target" \
+      || retention_failed="${retention_failed:+$retention_failed }$target"
   done < <(retention_targets daily)
 
   (( ran_any == 1 )) || die "No enabled backup targets configured."
@@ -787,16 +810,28 @@ No backup was taken. The last-success marker has deliberately NOT been refreshed
     log "refresh recovery-pack"
     /usr/local/bin/domum-media recovery-pack create --no-email || log "recovery-pack refresh failed"
   fi
+  if [[ -n "$retention_failed" ]]; then
+    log "=== daily backup ok, but DAILY RETENTION FAILED ==="
+    die "The backup itself SUCCEEDED and is recorded as such; daily retention failed for: $retention_failed.
+Snapshots are retained rather than deleted, which is the safe direction. Retention needs an EXCLUSIVE
+repository lock, so the usual cause is a lock another process holds -- see docs/FIRST-REPORT-TRIAGE.md."
+  fi
   log "=== daily backup ok ==="
 }
 
 do_weekly_retention() {
-  local ran_any=0
+  local ran_any=0 failed=""
+  # Same shape as the daily loop: an unguarded call under `set -e` let the FIRST
+  # target's failure skip every later target's retention entirely. Each target
+  # is attempted, and the command then fails naming the ones that did not.
   while IFS= read -r target; do
     ran_any=1
-    restic_forget_for "$target"
+    restic_forget_for "$target" || failed="${failed:+$failed }$target"
   done < <(retention_targets weekly)
   (( ran_any == 1 )) || log "No weekly-retention targets configured."
+  [[ -z "$failed" ]] \
+    || die "Weekly retention failed for: $failed. Snapshots are retained rather than deleted,
+which is the safe direction. Retention needs an EXCLUSIVE repository lock."
 }
 
 # Remove STALE locks from a target's repository.

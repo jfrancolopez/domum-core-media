@@ -6178,7 +6178,7 @@ mreport_trends() {
     mreport_trend_line "$hist" 5 "Log errors"   ""
     mreport_trend_line "$hist" 6 "Immich orig." ""
     mreport_trend_line "$hist" 7 "Scrub age"    "d"
-    mreport_trend_line "$hist" 8 "Disk temp"    "\xc2\xb0C"
+    mreport_trend_line "$hist" 8 "Disk temp"    $'\xc2\xb0C'
     printf '  (oldest -> newest, up to 8 points)\n'
   fi
   printf '\n'

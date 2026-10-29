@@ -220,4 +220,84 @@ backup_target_include_paths() { printf "%s" "/definitely/not/here"; }')"
 [ ! -f "$d/log/last-success" ] \
   || fail "F: the heartbeat must not be written when a target had nothing to back up"
 
+# ---------------------------------------------------------------------------
+# G. A RETENTION failure is not a BACKUP failure.
+#
+# `restic_forget_for` returns restic's status, and the unguarded call under
+# `set -e` aborted do_daily_backup right there -- before `heartbeat`, which
+# writes $DOMUM_LOG_DIR/last-success, the marker `checkup` reads for "Last
+# backup completed Nh ago". So a backup that had fully succeeded, and whose own
+# per-target evidence already said RESULT=success, was reported as a STALE
+# backup, and the recovery-pack refresh was skipped as well.
+#
+# Latent rather than active on this host: `cloud` defaults to WEEKLY retention
+# and is the only enabled target, so `retention_targets daily` is empty -- which
+# is why the nightly backup survived the stale lock of 2026-10-20..27. It goes
+# live the moment any daily-retention target is enabled.
+# ---------------------------------------------------------------------------
+RETENTION_FAILS='
+retention_targets() { [ "$1" = daily ] && printf "%s\n" cloud; }
+restic_forget_for() { return 1; }'
+
+d="$(run_scenario retention-fails "$RETENTION_FAILS")"
+[ "$(cat "$d/rc")" != "0" ] \
+  || fail "G: a failed retention must still FAIL the unit -- silence is not a safety mechanism"
+# The backup's own success must be recorded and durable.
+[ "$(field "$d/state/backups/cloud-run.env" RESULT)" = "success" ] \
+  || fail "G: the backup itself succeeded and must be recorded as success"
+# And the heartbeat MUST be written: this is the whole defect.
+[ -f "$d/log/last-success" ] \
+  || fail "G: the heartbeat was skipped, so a successful backup reads as STALE -- the defect"
+grep -qi 'retention' "$d/out.txt" \
+  || fail "G: the failure does not name retention, so the cause is misattributed: $(cat "$d/out.txt")"
+grep -qi 'backup itself SUCCEEDED' "$d/out.txt" \
+  || fail "G: it does not say the backup succeeded, which is the distinction: $(cat "$d/out.txt")"
+echo "  G: retention failure fails the unit, names retention, and keeps the heartbeat"
+
+# One target's retention failure must not skip another's.
+d="$(run_scenario retention-partial '
+retention_targets() { [ "$1" = daily ] && printf "%s\n" cloud nas; }
+restic_forget_for() { printf "FORGET %s\n" "$1" >> "'"$TMP_DIR"'/forgets"; [ "$1" = cloud ] && return 1; return 0; }')"
+[ "$(cat "$d/rc")" != "0" ] || fail "G: a partial retention failure must still fail the unit"
+grep -q 'FORGET nas' "$TMP_DIR/forgets" \
+  || fail "G: cloud's failure skipped nas entirely -- one target must not abort the others"
+echo "  G: every target is attempted even after one fails"
+
+# The success path must be unaffected: no retention failure, no extra noise.
+d="$(run_scenario retention-ok '
+retention_targets() { [ "$1" = daily ] && printf "%s\n" cloud; }
+restic_forget_for() { return 0; }')"
+[ "$(cat "$d/rc")" = "0" ] \
+  || fail "G: a successful retention must not fail the run: $(cat "$d/out.txt")"
+[ -f "$d/log/last-success" ] || fail "G: the heartbeat is missing on a fully successful run"
+echo "  G: a successful retention leaves the run clean"
+
+# The mutation: restore the unguarded call. The observable is the HEARTBEAT --
+# the run fails either way, so asserting the exit status would pass against the
+# defect. Name the observable the mutation actually changes.
+MUT="$TMP_DIR/mutant-backup"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUT"
+cat > "$TMP_DIR/mutate-retention.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = """    restic_forget_for "$target" \\
+      || retention_failed="${retention_failed:+$retention_failed }$target"
+"""
+new = """    restic_forget_for "$target"
+"""
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP_DIR/mutate-retention.py" "$MUT" ) || fail "the retention mutation did not apply"
+md="$TMP_DIR/mutant-run"
+mkdir -p "$md/state/backups" "$md/log"
+printf 'REPOSITORY_ID=cloudrepo1111\n' > "$md/state/backups/cloud-repo.env"
+sed -e "s|$TMP_DIR/retention-fails|$md|g" -e "s|$REPO_ROOT/bin/domum-media-backup|$MUT|" \
+    "$TMP_DIR/retention-fails/harness.sh" > "$md/harness.sh"
+bash "$md/harness.sh" >"$md/out.txt" 2>&1
+[ ! -f "$md/log/last-success" ] \
+  || fail "the mutation changed no ANSWER -- unguarded, the heartbeat must be skipped"
+echo "  killed: unguarded, a successful backup loses its heartbeat and reads as STALE"
+
 echo "PASS: backup evidence end-to-end smoke test"
