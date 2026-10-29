@@ -375,8 +375,41 @@ Read-only. No Restic operation was run for this audit.
 | `domum-media-check` | `Sun *-*-* 03:30` | +20m | yes | `--check`, then `--weekly-retention` |
 
 `backup_target_retention` defaults **`cloud` to weekly** and `nas` to daily.
-Only `cloud` is enabled (measured from the root-run `checkup`, where every
-per-target line names `cloud` and none names `nas`). Therefore:
+
+**Which targets are ENABLED had to be re-established, because the first answer
+was an invalid inference.** It was read off the root-run `checkup`, where every
+per-target healthy line named `cloud` and none named `nas` — but those lines are
+conditional on the repository being `sftp:`, so an enabled target with a local
+or NFS repository prints nothing. Absence proved nothing, and the default makes
+it worse: `backup_target_default_enabled` returns **1** for `nas` as well as
+`cloud`, so a listed target is enabled unless explicitly disabled. Production
+does list it: `BACKUP_TARGETS="nas cloud archive"`, `nas` with daily retention.
+
+The actual evidence is the world-readable rotated log
+`/var/log/domum-media/backup.log.5.gz`:
+
+| observation | count |
+|---|---|
+| `restic backup -> cloud` | **107** (2026-06-09 → 09-26, every nightly run) |
+| `restic backup -> nas` / any mention of `nas` or `archive` | **0** |
+| `restic forget --prune on cloud` | 2 — Sundays 09-13 and 09-20 |
+
+`restic_backup_to` logs `restic backup -> $target` *after* its include-path
+check, and `check_repo_identity` runs before it, so an enabled-but-broken `nas`
+would have left either that line or an `ERROR: no configured include path`
+line. Neither exists, so `nas` never entered the loop. There is also **no
+network mount of any kind** on this host and no `/srv/nas*`.
+
+**The five states, kept apart:**
+
+| target | configured | enabled | reachable | backed up | retained |
+|---|---|---|---|---|---|
+| `cloud` | yes | yes | yes | yes, nightly | yes, Sundays (weekly) |
+| `nas` | yes, with daily retention | **no** — explicit `0` against a default of `1` | no mount exists | never | never |
+| `archive` | yes | **no** — default-disabled | n/a | never | never |
+
+`nas` is a placeholder for the UGREEN hardware that does not exist yet.
+Therefore:
 
 - `retention_targets daily` is **empty** — no daily retention runs on this host;
 - retention happens **only on Sundays, only via the check unit**, and only if
@@ -450,13 +483,30 @@ the run then fails naming retention.
   after the next retention run, so shipping it now would mail a false alarm on a
   healthy host. It becomes possible once Nov 1 has recorded a result.
 
-### One read-only check still outstanding
+### Reassessing the defect, after the configuration was established
 
-`cloud`'s cadence is inferred from the code **default**, because the config is
-`0600 root`. If it is overridden to `daily`, the daily retention path is live
-rather than latent. The non-secret confirmation is:
+| path | status | why |
+|---|---|---|
+| daily retention (`do_daily_backup`) | **unreachable** | `retention_targets daily` is empty: `nas` disabled, `cloud` weekly. The fixed loop body never executes. |
+| weekly retention (`do_weekly_retention`) | **active**, Sundays | but with exactly ONE target the deployed unguarded form and the guarded one both end in the unit failing — the fix adds a clearer message and multi-target robustness |
+| retention recording | **already deployed** | `restic_forget_for` in `c9478d7` records on both paths |
 
-```
-sudo grep -nE '^BACKUP_TARGETS=|^BACKUP_TARGET_[A-Z]+_RETENTION=' \
-  /opt/domum-core-media/config/domum-media.conf
-```
+**So deploying `dc819e8` before the next scheduled check reduces no risk.** The
+half that fixes a real misreport is on a path this configuration never takes,
+and the half on the active path is behaviourally equivalent for a single target.
+That is the opposite of what urgency feels like after finding a defect, which is
+why it is written down rather than assumed.
+
+It is still worth deploying eventually: enabling `nas` — the stated plan once
+the UGREEN hardware exists — is the single change that makes the daily path
+live, and at that moment the defect becomes active.
+
+### Coverage added
+
+`tests/backup-evidence-endtoend-smoke.sh` §F2 drives the **real**
+`enabled_backup_targets` → `retention_targets` chain against the production
+shape. Every suite had stubbed `retention_targets`, which is exactly why nothing
+caught the original guess. It pins: the production shape enables `cloud` only
+with daily empty and weekly `cloud`; an explicit `0` beats a default of `1`;
+enabling `nas` makes the daily path live, so the fix is not dead code; and a
+listed, default-disabled target appears in none of the three lists.

@@ -2369,8 +2369,19 @@ exit status, because the run fails either way.
 
 **Latent, not active, and the cadence is why.** `backup_target_retention`
 defaults `cloud` to **weekly** and `nas` to daily, and only `cloud` is enabled
--- so `retention_targets daily` is EMPTY and no daily retention runs on this
-host. That is why the nightly backup survived the Mac's stale lock from
+(proved from the backup log, not from defaults -- see above) -- so
+`retention_targets daily` is EMPTY and no daily retention runs on this host.
+**The daily loop body is therefore unreachable in this configuration**, and
+enabling `nas` is the single change that makes it live, which §F2 pins.
+
+**The WEEKLY half of that fix is behaviourally equivalent for one target.**
+`retention_targets weekly` is `cloud` alone, so the deployed unguarded form and
+the guarded one both end in the unit failing; the fix adds a clearer message and
+multi-target robustness. And `restic_forget_for` in the DEPLOYED binary already
+records retention evidence, so the next scheduled run records regardless.
+Deploying the fix ahead of that run therefore reduces **no** risk -- which is
+the honest answer to "should we deploy now", and the opposite of what urgency
+would feel like after finding a defect. That is why the nightly backup survived the Mac's stale lock from
 2026-10-20 to 10-27. It goes live the moment a daily-retention target is
 enabled. Verified from systemd: backup `*-*-* 02:30` +15m, check
 `Sun *-*-* 03:30` +20m, both `Persistent=true`, and the check unit's second
@@ -2439,12 +2450,40 @@ exit 11 from it means the lock really is still there. Ordering is asserted,
 because a free read-only step listed after an approval-gated one is a remedy
 nobody reaches.
 
-**Only `cloud` is enabled.** Measured from the root-run `checkup` output
-2026-10-29 -- every per-target healthy line names `cloud` and none names `nas`.
-That answers the open question this file recorded (a second target `nas` is
-declared with `/srv/data` as its root, and `load_cfg` as `jfranco` falls back to
-defaults that report both enabled). So `/srv/data` is **not** already covered by
-an enabled second target, and the selective-backup proposal is still needed.
+**Only `cloud` is enabled -- and the way I first "measured" that was an invalid
+inference.** I read it off the root-run `checkup` output because every
+per-target healthy line named `cloud` and none named `nas`. Those lines are
+**conditional on the repository being `sftp:`**, so an enabled target with a
+local or NFS repository prints nothing at all, and absence proved nothing. The
+operator was right to challenge it.
+
+**The default is the trap: `backup_target_default_enabled` returns 1 for `nas`
+AND for `cloud`.** A target listed in `BACKUP_TARGETS` is therefore ENABLED
+unless the configuration explicitly disables it, and production does list it:
+`BACKUP_TARGETS="nas cloud archive"` with `BACKUP_TARGET_NAS_RETENTION="daily"`.
+
+The real evidence is the **world-readable rotated log**,
+`/var/log/domum-media/backup.log.5.gz`: across **107 consecutive nightly runs**
+(2026-06-09 to 09-26) it contains `restic backup -> cloud` 107 times and
+**zero** occurrences of `nas` or `archive` in any form. `restic_backup_to` logs
+`restic backup -> $target` *after* its include-path check and
+`check_repo_identity` runs before it, so an enabled-but-broken nas would have
+left either that line or an `ERROR: no configured include path` line. Neither
+exists, so nas never entered the loop. The only two `restic forget --prune`
+lines are `on cloud`, on Sundays (09-13 and 09-20) -- the weekly path. There is
+also **no network mount of any kind** on this host and no `/srv/nas*`.
+
+So: `nas` is a configured placeholder for hardware that does not exist yet,
+explicitly disabled against a default of 1; `archive` is default-disabled with
+cadence `none`. `/srv/data` is **not** covered by an enabled second target and
+the selective-backup proposal still stands.
+
+**Distinguish configured / enabled / reachable / backed up / retained.** They
+are five different states and this file previously collapsed two of them.
+`tests/backup-evidence-endtoend-smoke.sh` §F2 now drives the REAL
+`enabled_backup_targets` -> `retention_targets` chain against the production
+shape -- every suite had stubbed `retention_targets`, which is why nothing
+caught the guess.
 
 **A warning with no paired action NEVER mails, and seven real problems were in
 that state.** `health_notify_cmd`'s silence gate sends only when

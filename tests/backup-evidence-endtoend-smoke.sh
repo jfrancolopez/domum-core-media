@@ -221,6 +221,69 @@ backup_target_include_paths() { printf "%s" "/definitely/not/here"; }')"
   || fail "F: the heartbeat must not be written when a target had nothing to back up"
 
 # ---------------------------------------------------------------------------
+# F2. EFFECTIVE target configuration: configured is not enabled, and enabled is
+#     not undergoing retention.
+#
+# Every suite stubbed `retention_targets`, so nothing drove the real
+# enabled_backup_targets -> retention_targets chain. That gap let an UNPROVEN
+# claim stand: "only cloud is enabled" was inferred from a report in which no
+# per-target line named nas -- but those lines are conditional on the
+# repository being `sftp:`, so a non-sftp enabled target prints nothing, and
+# the inference was invalid.
+#
+# The trap is the DEFAULT: backup_target_default_enabled returns 1 for `nas`
+# and for `cloud`. A target listed in BACKUP_TARGETS is therefore ENABLED
+# unless the configuration explicitly disables it, and "not mentioned" is not
+# evidence of anything.
+# ---------------------------------------------------------------------------
+targets_probe() {  # $1 = config assignments -> prints the three resolved lists
+  (
+    DOMUM_DIR="$REPO_ROOT"
+    CFG_FILE="$TMP_DIR/absent.conf"
+    SECRETS_DIR="$TMP_DIR/secrets"
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+    set +e
+    eval "$1"
+    printf 'enabled: %s\n' "$(enabled_backup_targets | tr '\n' ' ')"
+    printf 'daily:   %s\n' "$(retention_targets daily | tr '\n' ' ')"
+    printf 'weekly:  %s\n' "$(retention_targets weekly | tr '\n' ' ')"
+  ) 2>&1
+}
+
+# The production shape, as the 0600 config holds it.
+PROD_TARGETS='
+BACKUP_TARGETS="nas cloud archive"
+BACKUP_TARGET_NAS_ENABLED=0
+BACKUP_TARGET_NAS_RETENTION="daily"
+BACKUP_TARGET_CLOUD_RETENTION=weekly
+BACKUP_TARGET_ARCHIVE_RETENTION="none"'
+
+out="$(targets_probe "$PROD_TARGETS")"
+grep -q '^enabled: cloud $' <<< "$out" \
+  || fail "F2: the production shape must enable cloud ONLY: $out"
+grep -q '^daily:   $' <<< "$out" \
+  || fail "F2: no daily-retention target may be selected in the production shape: $out"
+grep -q '^weekly:  cloud $' <<< "$out" \
+  || fail "F2: cloud must be the weekly-retention target: $out"
+echo "  F2: configured nas+cloud+archive -> enabled cloud only; daily empty, weekly cloud"
+
+# An explicit 0 must beat a DEFAULT of 1. This is the whole semantic: nas is
+# listed and carries daily retention, and is inert only because of that 0.
+out="$(targets_probe "$PROD_TARGETS
+BACKUP_TARGET_NAS_ENABLED=1")"
+grep -q 'nas' <<< "$(sed -n 's/^daily:   //p' <<< "$out")" \
+  || fail "F2: with nas ENABLED its daily retention must be selected -- the fixed
+loop is reachable by configuration, not dead code: $out"
+echo "  F2: enabling nas makes the DAILY retention path live -- the fix is not dead code"
+
+# archive is default-disabled AND cadence none: it must never appear anywhere.
+out="$(targets_probe "$PROD_TARGETS")"
+grep -q 'archive' <<< "$out" \
+  && fail "F2: archive is listed but default-disabled; it must not be selected: $out"
+echo "  F2: a listed, default-disabled target is excluded from all three lists"
+
+# ---------------------------------------------------------------------------
 # G. A RETENTION failure is not a BACKUP failure.
 #
 # `restic_forget_for` returns restic's status, and the unguarded call under
