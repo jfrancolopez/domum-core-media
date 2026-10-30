@@ -216,11 +216,17 @@ That is the flood the silence gate exists to prevent."
 done
 echo "  all four routine warnings remain silent"
 
-sect "the set of non-notifying warnings is EXACTLY the four routine ones"
-# A guard against a FUTURE warning being added with no remedy. It is a source
-# scan, so it proves pairing rather than execution -- the behavioural assertions
-# above are what prove the seven real cases actually fire. Comments are stripped
-# first, because a comment quoting a warning would otherwise be counted.
+sect "EVERY warning carries a remedy -- an action or an advice, never neither"
+# This assertion used to require EXACTLY FOUR warnings with no remedy at all:
+# the routine ones, left bare because a remedy meant mail. That coupling is
+# gone -- CHECKUP_ADVICE is printed without escalating or mailing -- so the
+# contract gets stronger rather than weaker: nothing may be left
+# undiagnosable. A warning with neither is a finding the operator cannot act
+# on and the notifier cannot explain.
+#
+# Still a source scan, so it proves PAIRING; the behavioural sections above
+# prove the real cases fire. Comments are stripped first, because a comment
+# quoting a warning would otherwise be counted.
 mapfile -t orphans < <(python3 - "$CLI" <<'PY'
 import io, sys
 lines = [l.split("#")[0] if l.strip().startswith("#") else l
@@ -228,17 +234,40 @@ lines = [l.split("#")[0] if l.strip().startswith("#") else l
 for i, l in enumerate(lines):
     if "checkup_add warning" not in l or l.strip().startswith("#"):
         continue
-    if "checkup_add action" in "\n".join(lines[i+1:i+8]):
+    window = "\n".join(lines[i+1:i+8])
+    if "checkup_add action" in window or "checkup_add advice" in window:
         continue
     print(l.strip()[:80])
 PY
 )
-[[ "${#orphans[@]}" -eq 4 ]] || {
+[[ "${#orphans[@]}" -eq 0 ]] || {
   printf '  %s\n' "${orphans[@]}"
-  fail "${#orphans[@]} warnings have no remedy and therefore never mail; expected exactly 4
-routine ones. A new warning without a remedy is invisible to the notifier."
+  fail "${#orphans[@]} warning(s) carry neither an action nor an advice. Every
+warning must be diagnosable: an ACTION if the operator must act, an ADVICE if
+they may. Neither leaves a finding nobody can do anything with."
 }
-echo "  exactly 4, all routine"
+echo "  every warning is paired"
+
+sect "the ROUTINE warnings carry ADVICE, never ACTION -- that is what keeps them quiet"
+# The anti-flood contract, now expressed where it actually lives. An ACTION
+# escalates the verdict to ACTION REQUIRED and opens the silence gate; an
+# ADVICE does neither. So these four must never gain an ACTION, and the check
+# is on the CLASS rather than on the absence of a remedy.
+src_nc="$(sed 's/^[[:space:]]*#.*//' "$CLI")"
+for phrase in \
+  'service update candidates are waiting' \
+  'Immich bundle candidate is pending' \
+  'security updates are available' \
+  'general package updates are available' \
+  'dangling Docker images can be pruned' \
+  'Reboot required by a previous package upgrade' ; do
+  ctx="$(grep -A7 -- "$phrase" <<< "$src_nc" || true)"
+  grep -q "$phrase" <<< "$src_nc" || fail "the routine warning '$phrase' has vanished"
+  grep -q 'checkup_add action' <<< "$ctx" \
+    && fail "'$phrase' gained an ACTION, so routine maintenance now escalates the
+verdict and mails every week. That is the flood the split exists to prevent."
+done
+echo "  all six routine findings are advisory only"
 
 sect "mutation: removing the stopped-service remedy makes a dead service silent"
 MUT="$TMP/mut"
@@ -261,14 +290,17 @@ n = 0
 for i, l in enumerate(lines):
     if "checkup_add warning" not in l or l.strip().startswith("#"):
         continue
-    if "checkup_add action" in "\n".join(lines[i+1:i+8]):
+    window = "\n".join(lines[i+1:i+8])
+    if "checkup_add action" in window or "checkup_add advice" in window:
         continue
     n += 1
 print(n)
 PY
 )"
-[[ "$mcount" -eq 5 ]] \
-  || fail "the mutation did not create an orphan warning (got $mcount, expected 5)"
-echo "  killed: without the remedy a stopped service is one of 5 silent warnings"
+[[ "$mcount" -eq 1 ]] \
+  || fail "the mutation did not create exactly one orphan warning (got $mcount,
+expected 1). The baseline is now ZERO -- every warning is paired -- so removing
+one remedy must show up as exactly one unpaired warning."
+echo "  killed: without the remedy a stopped service becomes the only orphan"
 
 echo "PASS: warning remedy smoke test"

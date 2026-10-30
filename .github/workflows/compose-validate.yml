@@ -288,6 +288,13 @@ jobs:
       - name: Monitoring completeness smoke test
         run: tests/monitoring-completeness-smoke.sh
 
+      # The severity taxonomy: which findings wake the operator and which do
+      # not. Production, 2026-10-29: the weekly report said ACTION REQUIRED (4)
+      # on a healthy host, where the four were an optional image cleanup, two
+      # reboot-reading suggestions, and a line beginning "no action needed".
+      - name: Severity taxonomy smoke test
+        run: tests/severity-taxonomy-smoke.sh
+
       # The exclusive restic operations -- the weekly integrity check and
       # retention -- record durable evidence, and checkup reads it to tell a
       # stale failure from a current one. Production, 2026-10-25 -> 10-28: a

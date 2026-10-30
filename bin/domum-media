@@ -5394,6 +5394,20 @@ CHECKUP_CRITICAL=()
 CHECKUP_WARNINGS=()
 CHECKUP_HEALTHY=()
 CHECKUP_ACTIONS=()
+# A remedy is not a requirement, and conflating the two made the report cry
+# wolf. CHECKUP_ACTIONS was BOTH the remedy list and the escalation signal, so
+# attaching a helpful command to a routine finding promoted the whole report to
+# ACTION REQUIRED and mailed it. Production, 2026-10-29:
+# `ACTION REQUIRED (4)` where the four were an optional image cleanup, two
+# reboot-reading suggestions, and a line that literally began "no action
+# needed".
+#
+# CHECKUP_ADVICE carries remedies for findings the operator may act on at their
+# discretion. It is PRINTED, and it deliberately does not escalate the verdict
+# and does not mail. That decoupling is what finally lets the routine warnings
+# carry useful commands -- before this, giving "6 update candidates are
+# waiting" a remedy would have started mailing it every week.
+CHECKUP_ADVICE=()
 
 checkup_add() {
   local level="$1"
@@ -5418,6 +5432,10 @@ checkup_add() {
                 [[ "$existing" == "$text" ]] && return 0
               done
               CHECKUP_HEALTHY+=("$text") ;;
+    advice)   for existing in ${CHECKUP_ADVICE[@]+"${CHECKUP_ADVICE[@]}"}; do
+                [[ "$existing" == "$text" ]] && return 0
+              done
+              CHECKUP_ADVICE+=("$text") ;;
     action)   for existing in ${CHECKUP_ACTIONS[@]+"${CHECKUP_ACTIONS[@]}"}; do
                 [[ "$existing" == "$text" ]] && return 0
               done
@@ -5500,7 +5518,10 @@ checkup_systemd_health() {
                       verdict="$(check_unit_verdict "$unit")"
                       if [[ "$verdict" == superseded* ]]; then
                         checkup_add warning "systemd unit $unit is in the FAILED state from an earlier run, but the repository has since been verified successfully (${verdict#superseded }). The unit state is STALE, not a current failure."
-                        checkup_add action "systemctl reset-failed $unit   # removes it from 'systemctl --failed'; touches no repository, no data and no container. It does NOT change the recorded exit status, so a finding derived from that one remains until the unit next runs"
+                        # ADVICE: the unit state is stale, not a current
+                        # failure, so clearing it is tidying rather than
+                        # remediation.
+                        checkup_add advice "systemctl reset-failed $unit   # removes it from 'systemctl --failed'; touches no repository, no data and no container. It does NOT change the recorded exit status, so a finding derived from that one remains until the unit next runs"
                       else
                         checkup_add critical "systemd unit $unit has FAILED."
                         checkup_add action "systemctl status --no-pager -l $unit   # read-only"
@@ -5557,10 +5578,13 @@ checkup_systemd_health() {
           # pushes the remedy out of the window and the warning reads as
           # orphaned. That is how this comment came to be here rather than there.
           checkup_add warning "$svc exited 11 (repository already locked) on its last scheduled run, so THAT run's check never ran -- but the repository has since been verified successfully (${verdict#superseded }). No lock remains to remove."
-          checkup_add action "no action needed: the recorded exit status is replaced when $svc next runs on schedule. Note that 'systemctl reset-failed' does NOT clear this finding -- it resets Result and the --failed list and leaves ExecMainStatus, which is what this reads."
+          # ADVICE by construction -- it says "no action needed", and carrying
+          # that as an ACTION is what produced `ACTION REQUIRED (4)` over a
+          # resolved condition.
+          checkup_add advice "no action needed: the recorded exit status is replaced when $svc next runs on schedule. Note that 'systemctl reset-failed' does NOT clear this finding -- it resets Result and the --failed list and leaves ExecMainStatus, which is what this reads."
         else
-          checkup_add critical "$svc could not LOCK the repository (restic exit 11), so the integrity check never ran. This is not evidence of damage -- and not evidence of health either."
-          # FIRST, because it is read-only and it is the only listed action that
+          # The first action below is FIRST because it is read-only and it is
+          # the only listed one that
           # can RETIRE this finding. Production 2026-10-29: the operator had
           # already removed the lock and verified the repository twice, and the
           # report still offered only the journal and an approval-gated
@@ -5568,6 +5592,7 @@ checkup_systemd_health() {
           # recorded successful check is what downgrades this to a dated
           # warning; if it exits 11 the lock is still there and the next two
           # actions are the ones that matter.
+          checkup_add critical "$svc could not LOCK the repository (restic exit 11), so the integrity check never ran. This is not evidence of damage -- and not evidence of health either."
           checkup_add action "sudo domum-media-backup --check   # read-only verification that RECORDS its result, which is what retires this finding. Exit 11 here means the lock is still present"
           checkup_add action "journalctl -u $svc -n 30 --no-pager   # read-only: names the lock's host, user and age"
           checkup_add action "a stale lock blocks every EXCLUSIVE restic operation -- the weekly check AND retention -- while still allowing backups, so it recurs until removed. Removing it is 'restic unlock', which needs operator approval: see docs/FIRST-REPORT-TRIAGE.md"
@@ -5723,7 +5748,8 @@ checkup_btrfs_health() {
       if (( val > 0 )); then
         total=$(( total + val ))
         case "$key" in
-          *corruption_errs*) checkup_add critical "Btrfs CHECKSUM failures on $root: ${key##*.} = $val." ;;
+          *corruption_errs*) checkup_add critical "Btrfs CHECKSUM failures on $root: ${key##*.} = $val."
+                             checkup_add action "sudo btrfs device stats $root && sudo dmesg -T | grep -i btrfs   # read-only: the kernel log NAMES the affected file. Do NOT attempt a repair; data is single-profile here, so restore the named file from restic" ;;
           *)                 checkup_add critical "Btrfs device errors on $root: ${key##*.} = $val." ;;
         esac
       fi
@@ -6312,6 +6338,9 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
       (( ${#CHECKUP_CRITICAL[@]} == 0 )) || printf '  \xe2\x9c\x97 %s\n' "${CHECKUP_CRITICAL[@]}"
       (( ${#CHECKUP_WARNINGS[@]} == 0 )) || printf '  \xe2\x96\xb2 %s\n' "${CHECKUP_WARNINGS[@]}"
       printf '\n'
+      # ACTIONS only. A mail is sent because something needs attention, and
+      # padding it with optional maintenance is how the one line that matters
+      # gets lost.
       mreport_hdr "SUGGESTED ACTIONS"
       if (( ${#CHECKUP_ACTIONS[@]} == 0 )); then
         printf '  none recorded\n'
@@ -6558,6 +6587,23 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
         done
       fi
       printf '\n'
+
+      # Separate on purpose. These are things the operator MAY do; folding them
+      # into SUGGESTED ACTIONS is what made four optional suggestions read as
+      # four required ones. A new section rather than a merged list, because the
+      # HTML renderer keys on the `-- SECTION` prefix and colours by the glyph
+      # the text already carries -- so this renders in both MIME parts with no
+      # renderer change.
+      if (( ${#CHECKUP_ADVICE[@]} > 0 )); then
+        mreport_hdr "OPTIONAL MAINTENANCE"
+        printf '  nothing here needs doing this week\n'
+        local j=0 adv
+        for adv in "${CHECKUP_ADVICE[@]}"; do
+          j=$(( j + 1 )); (( j > 5 )) && break
+          printf '  - %s\n' "$adv"
+        done
+        printf '\n'
+      fi
     fi
     printf '\xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90 end of report \xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d\n'
   } > "$out"
@@ -6712,7 +6758,7 @@ mreport_weekly_cmd() {
     esac
   done
 
-  CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+  CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=(); CHECKUP_ADVICE=()
   checkup_collect_all
   mreport_append_history || warn "Could not append report history."
 
@@ -6806,7 +6852,7 @@ health_notify_cmd() {
     esac
   done
 
-  CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+  CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=(); CHECKUP_ADVICE=()
   # The same checks the operator would run by hand. One implementation: if
   # checkup and the notification could disagree, the silence would be worthless.
   # The SAME collection checkup runs. Calling only the four extracted checks
@@ -7029,11 +7075,13 @@ checkup_collect_all() {
     age_hours=$(( ($(date +%s) - last_success) / 3600 ))
     if (( age_hours > BACKUP_REQUIRED_MAX_AGE_HOURS )); then
       checkup_add critical "Last successful backup is ${age_hours}h old."
+      checkup_add action "systemctl status --no-pager -l domum-media-backup.service && sudo tail -40 $DOMUM_LOG_DIR/backup.log   # read-only: why the last run did not finish"
     else
       checkup_add healthy "Last backup completed ${age_hours}h ago."
     fi
   else
     checkup_add critical "No successful backup timestamp found."
+    checkup_add action "sudo systemctl list-timers domum-media-backup.timer && sudo tail -40 $DOMUM_LOG_DIR/backup.log   # read-only: has the nightly backup ever completed on this host?"
   fi
 
   local path pcent
@@ -7078,17 +7126,43 @@ checkup_collect_all() {
   local dangling exited waiting_count failed_recent reset_recent
   dangling="$(docker images --filter dangling=true -q 2>/dev/null | wc -l | tr -d ' ')"
   exited="$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l | tr -d ' ')"
-  (( dangling > 0 )) && checkup_add warning "${dangling} dangling Docker images can be pruned."
-  (( exited > 0 )) && checkup_add warning "${exited} containers are exited."
+  # Each warning is emitted WITH its own remedy. `exited` previously had none:
+  # it merely sat within seven lines of the cleanup-images action and read as
+  # paired, and a comment inserted between them exposed it. Accidental
+  # adjacency is not a remedy.
+  #
+  # Both are ADVICE. Reclaiming space the host is not short of, and inspecting
+  # a stopped container, are things the operator MAY do -- and an enabled
+  # service that is actually DOWN is reported separately, as an ACTION, by
+  # checkup_container_health. Escalating here would double-count it and would
+  # also fire on any disposable container left behind by a rehearsal.
+  #
   # The dry run DELETES NOTHING and prints what it protected. Saying so matters:
-  # three running images are dangling and are the only obtainable copy of their
-  # half of a recovery point, so the protection is the reason this is safe to
-  # suggest at all -- and reviewing the dry run is the whole remedy.
-  (( dangling > 0 )) && checkup_add action "sudo domum-media cleanup images --dry-run   # deletes nothing; review what it reports as protected by a recovery point before ever passing --confirm"
+  # running images are dangling and are the only obtainable copy of their half
+  # of a recovery point, so that protection is why this is safe to suggest at
+  # all -- and reviewing the dry run is the whole remedy.
+  if (( dangling > 0 )); then
+    checkup_add warning "${dangling} dangling Docker images can be pruned."
+    checkup_add advice "sudo domum-media cleanup images --dry-run   # deletes nothing; review what it reports as protected by a recovery point before ever passing --confirm"
+  fi
+  if (( exited > 0 )); then
+    checkup_add warning "${exited} containers are exited."
+    checkup_add advice "docker ps -a --filter status=exited   # read-only; an enabled service that is DOWN is reported separately as an action"
+  fi
 
   waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
-  (( waiting_count > 0 )) && checkup_add warning "${waiting_count} service update candidates are waiting."
-  [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]] && checkup_add warning "Immich bundle candidate is pending."
+  if (( waiting_count > 0 )); then
+    checkup_add warning "${waiting_count} service update candidates are waiting."
+    # A STAGED image is not a pending task: discovery never implies deployment,
+    # and the refresh timer is disabled by design. Advice, so it is actionable
+    # without mailing -- "every staged image is a warning requiring an email"
+    # is exactly the noise this split removes.
+    checkup_add advice "sudo domum-media updates list   # read-only; deploying one is 'updates apply --service <s>', which is gated and never automatic"
+  fi
+  if [[ -f "$DOMUM_STATE_ROOT/immich/bundle-candidate.env" ]]; then
+    checkup_add warning "Immich bundle candidate is pending."
+    checkup_add advice "sudo domum-media immich bundle status   # read-only; applying it needs a snapshot and operator approval"
+  fi
 
   # `|| true` and `xargs -r`, because FINDING NOTHING IS THE NORMAL ANSWER.
   #
@@ -7116,13 +7190,26 @@ checkup_collect_all() {
   reset_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -7 -print0 2>/dev/null | xargs -0 -r grep -l '^EVENT=delay_reset$' 2>/dev/null | wc -l | tr -d ' ' || true)"
   failed_recent="$(find "$(update_history_dir)" -type f -name '*.env' -mtime -30 -print0 2>/dev/null | xargs -0 -r grep -l '^RESULT=failure$' 2>/dev/null | wc -l | tr -d ' ' || true)"
   reset_recent="${reset_recent:-0}"; failed_recent="${failed_recent:-0}"
-  (( reset_recent > 0 )) && checkup_add warning "${reset_recent} delay-reset events in the last 7 days."
-  (( failed_recent > 0 )) && checkup_add warning "${failed_recent} failed update events in the last 30 days."
+  # Update-machinery HISTORY, not a current fault: both are counts of past
+  # events, so they are advisory and point at the recorded evidence rather than
+  # at a command that changes anything.
+  if (( reset_recent > 0 )); then
+    checkup_add warning "${reset_recent} delay-reset events in the last 7 days."
+    checkup_add advice "sudo grep -l '^EVENT=delay_reset$' $(update_history_dir)/*.env   # read-only: which service's update delay was reset, and when"
+  fi
+  if (( failed_recent > 0 )); then
+    checkup_add warning "${failed_recent} failed update events in the last 30 days."
+    checkup_add advice "sudo grep -l '^RESULT=failure$' $(update_history_dir)/*.env   # read-only: a past update attempt failed; nothing is retried automatically"
+  fi
 
   if [[ -f /var/run/reboot-required ]]; then
+    # ADVICE: a pending reboot carries no immediate risk, and WHEN to reboot is
+    # an operator decision this report must not nag about weekly. The
+    # consequence that matters -- Persistent=true replaying missed jobs,
+    # including a deleting prune -- is still stated.
     checkup_add warning "Reboot required by a previous package upgrade."
-    checkup_add action "systemctl list-timers --all --no-pager   # read-only: every timer is Persistent=true, so a reboot runs MISSED jobs immediately -- including 'snapshot prune', which deletes"
-    checkup_add action "cat /opt/domum-core-media/docs/REBOOT-READINESS.md   # then reboot deliberately"
+    checkup_add advice "systemctl list-timers --all --no-pager   # read-only: every timer is Persistent=true, so a reboot runs MISSED jobs immediately -- including 'snapshot prune', which deletes"
+    checkup_add advice "cat /opt/domum-core-media/docs/REBOOT-READINESS.md   # then reboot deliberately"
   else
     checkup_add healthy "No reboot is pending."
   fi
@@ -7131,8 +7218,17 @@ checkup_collect_all() {
   sim_updates="$(apt-get -s upgrade 2>/dev/null || true)"
   sim_security="$(printf '%s\n' "$sim_updates" | grep '^Inst ' | grep -ci security || true)"
   sim_general="$(printf '%s\n' "$sim_updates" | grep -c '^Inst ' || true)"
-  (( sim_security > 0 )) && checkup_add warning "${sim_security} security updates are available."
-  (( sim_general > 0 )) && checkup_add warning "${sim_general} general package updates are available."
+  if (( sim_security > 0 )); then
+    checkup_add warning "${sim_security} security updates are available."
+    # Security updates are the one package class worth naming a command for,
+    # and it is still ADVICE: host patching is scheduled by the weekly
+    # host-update timer and reboot timing is the operator's.
+    checkup_add advice "apt-get -s upgrade   # read-only simulation; the weekly host-update timer applies these"
+  fi
+  if (( sim_general > 0 )); then
+    checkup_add warning "${sim_general} general package updates are available."
+    checkup_add advice "apt-get -s upgrade   # read-only simulation; the weekly host-update timer applies these"
+  fi
 
   # Host, storage and off-site checks. Added because nothing covered failed
   # units, Btrfs error counters, scrub age, physical disk health, or whether the
@@ -7160,6 +7256,7 @@ checkup_cmd() {
   CHECKUP_WARNINGS=()
   CHECKUP_HEALTHY=()
   CHECKUP_ACTIONS=()
+  CHECKUP_ADVICE=()
 
   checkup_collect_all
 
@@ -7204,6 +7301,11 @@ checkup_cmd() {
         printf '  %d. %s\n' "$i" "$action"
         i=$(( i + 1 ))
       done
+    fi
+    if (( ${#CHECKUP_ADVICE[@]} > 0 )); then
+      echo
+      echo "Optional maintenance (nothing here needs doing):"
+      printf '  - %s\n' "${CHECKUP_ADVICE[@]}"
     fi
   fi
 
