@@ -2529,6 +2529,64 @@ are five different states and this file previously collapsed two of them.
 shape -- every suite had stubbed `retention_targets`, which is why nothing
 caught the guess.
 
+**WEAR reached the weekly report and never reached the notifier.**
+`checkup_disk_health` read only `smart_status.passed` -- the drive's own
+opinion -- while the report has shown interpretable wear since the HTML work.
+So a drive approaching end of life appeared in a document nobody is paged by
+and could never become a finding or an email. `checkup_disk_wear` closes that,
+reusing `mreport_smart_interpretable` rather than copying it, with three
+outcomes kept apart:
+
+| state | class | mails |
+|---|---|---|
+| interpretable, wear healthy | `healthy` with the figure | no |
+| interpretable, wear <= `DISK_WEAR_WARN_PERCENT` (20) | **critical** + read-only confirmation | **yes** |
+| placeholders, or no wear attribute | `advice` -- "not evidence of health" | no |
+
+Measured on this host: sda reports 99%, sdb gets the advisory because all 30
+attributes read alike after 3054 hours. The unavailable case is deliberately
+**not a warning** -- it is permanent on that drive and it holds only a
+rebuildable OS, so a weekly alert nobody can act on would train the operator to
+ignore the report -- and deliberately **not healthy**, because unavailable wear
+information is not evidence of health. The threshold cannot fire here today
+(0.52% of 600 TBW used), so it is a guard rather than a finding, which is what
+makes it compatible with the recorded decision NOT to threshold raw attributes:
+the interpretability guard is the whole safety, and the mutation that ignores it
+turns sdb's placeholders into a confident "100% of life remaining".
+
+**`DISK_WEAR_WARN_PERCENT` is defaulted AT THE USE SITE as well as in
+`load_cfg`.** A variable set only by `load_cfg` is unbound for any caller that
+has not run it, and under `set -u` that kills the shell -- the defect that once
+made `checkup` print nothing at all.
+
+**"TRENDS (WEEK BY WEEK)" was not weekly, and the scheduled job never fed it.**
+Three facts, each read from the source rather than assumed:
+
+- rows are keyed on `date -I` and deduped to that day's last run, so a row means
+  "a day the report ran";
+- `mreport_trend_line` takes the last **8 ROWS**, and nothing makes them a week
+  apart;
+- **`mreport_append_history` is called only by `mreport_weekly_cmd`.** The
+  weekly unit runs `report --write`, which dispatches to the report LIBRARY and
+  never appends -- as that function's own comment says. So the series is fed by
+  MANUAL runs only, which is exactly why production showed two points under a
+  heading promising eight weeks.
+
+The heading is now `TRENDS (LAST 8 OBSERVATIONS)` and the axis prints its real
+span, because two observations five days apart and two a month apart are
+different things and a fixed heading cannot tell them apart.
+
+**A DRY RUN appended a history row.** A preview that mutates the series the
+report then draws is the same class of side effect as a preview that sends
+mail, and this file already holds that a preview never sends. The render suite
+stubs the writer, so the test replaces that stub with a RECORDER and asserts
+whether the CALL HAPPENS -- the mode gate is what changed, not the writer.
+
+**Deliberately NOT done: pointing the weekly unit at the new report path.** It
+would make the series genuinely periodic, and it is a systemd change under a
+production freeze as well as a decision about whether the scheduled job should
+drive the new report at all. Reported, not taken.
+
 **A REMEDY IS NOT A REQUIREMENT, and conflating them made the report cry wolf.**
 Production, 2026-10-29: the weekly report said `ACTION REQUIRED (4)` on a
 healthy host. The four "actions" were an optional image cleanup, two

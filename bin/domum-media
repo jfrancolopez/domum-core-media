@@ -47,6 +47,11 @@ load_cfg() {
   fi
   BACKUP_POLICY="${BACKUP_POLICY:-STRICT}"
   BACKUP_REQUIRED_MAX_AGE_HOURS="${BACKUP_REQUIRED_MAX_AGE_HOURS:-48}"
+  # Remaining write life, as the normalised SMART attribute reports it: 100 is
+  # new and it counts down. 20 leaves a wide margin -- measured 2026-10-21 the
+  # Samsung 870 EVO is at 99 with 0.52% of its 600 TBW used, so this cannot
+  # fire here today and is a guard rather than a live finding.
+  DISK_WEAR_WARN_PERCENT="${DISK_WEAR_WARN_PERCENT:-20}"
   AUTO_ROLLBACK_ENABLED="${AUTO_ROLLBACK_ENABLED:-1}"
   RECOVERY_PACK_ENABLED="${RECOVERY_PACK_ENABLED:-1}"
   RECOVERY_PACK_ENCRYPTION="${RECOVERY_PACK_ENCRYPTION:-age}"
@@ -5872,7 +5877,55 @@ checkup_disk_health() {
       *)     checkup_add warning "SMART health for /dev/$dev is UNKNOWN: smartctl reported no verdict."
              checkup_add action "smartctl -H /dev/$dev   # run as root; an unreadable device is not a failed one" ;;
     esac
+    checkup_disk_wear "$dev"
   done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+}
+
+# WEAR, as a separate claim from the self-assessment.
+#
+# `smart_status.passed` is the drive's own opinion and nothing more. The weekly
+# report has shown interpretable wear since the HTML work, but `checkup` read
+# only `passed` -- so wear appeared in a report nobody is paged by, and a drive
+# approaching end of life could never become a finding or an email. That
+# asymmetry is the gap here, not the arithmetic.
+#
+# `mreport_smart_interpretable` is the ONE implementation of the placeholder
+# test and is reused rather than copied. Measured 2026-10-21: the KOWIN OS drive
+# reports all 30 attributes at value=100, threshold=50 -- one distinct value
+# across the whole table after 3054 hours. Deriving "0% used" from that would
+# manufacture a confident number from nothing, which is why this file already
+# records the decision NOT to threshold raw attributes.
+#
+# So the three outcomes are kept apart, and only one of them can mail:
+#
+#   interpretable, wear healthy      -> healthy, with the figure
+#   interpretable, wear low          -> ACTION: plan a replacement
+#   NOT interpretable, or no attr    -> ADVICE: measurement unavailable
+#
+# The unavailable case is deliberately NOT a warning. It is permanent on this
+# host -- that drive will never report real attributes -- and a weekly warning
+# nobody can act on is how a report gets ignored. It is also deliberately not
+# `healthy`: unavailable wear information is not evidence of health, and saying
+# so is the whole point. Advice is printed and escalates nothing.
+checkup_disk_wear() {  # $1 = device name
+  local dev="$1" wear
+  if ! mreport_smart_interpretable "$dev"; then
+    checkup_add advice "wear for /dev/$dev is NOT INTERPRETABLE -- every attribute reads alike, so the table holds vendor placeholders. That is not evidence of health, and no remaining-life figure can be derived from it."
+    return 0
+  fi
+  wear="$(smartctl -j -A "/dev/$dev" 2>/dev/null \
+          | jq -r '[.ata_smart_attributes.table[]? | select(.name|test("Wear_Leveling|Percent_Lifetime|Media_Wearout"))][0].value | if . == null then "" else tostring end' 2>/dev/null || true)"
+  if [[ ! "$wear" =~ ^[0-9]+$ ]]; then
+    checkup_add advice "/dev/$dev reports no wear attribute, so remaining life is UNMEASURED. The self-assessment above is the drive's own opinion and not a wear figure."
+    return 0
+  fi
+  # The attribute is normalised: 100 is new, and it counts DOWN.
+  if (( wear <= ${DISK_WEAR_WARN_PERCENT:-20} )); then
+    checkup_add critical "/dev/$dev reports only ${wear}% of rated write life remaining."
+    checkup_add action "smartctl -a /dev/$dev   # read-only: confirm against Total_LBAs_Written, then plan a replacement before it is urgent"
+  else
+    checkup_add healthy "/dev/$dev wear: ${wear}% of rated write life remaining."
+  fi
 }
 
 # Are the Immich originals actually protected off-site?
@@ -6187,7 +6240,16 @@ mreport_trend_line() {  # $1 = history, $2 = column, $3 = label, $4 = suffix
 mreport_trends() {
   local hist rows
   hist="$(mreport_history_file)"
-  mreport_hdr "TRENDS (WEEK BY WEEK)"
+  # NOT "week by week". Rows are keyed on `date -I`, so there is one row per DAY
+  # the report ran, deduped to the last run of that day, and the sparkline takes
+  # the last 8 ROWS. Nothing in the mechanism makes those a week apart.
+  #
+  # Measured 2026-10-30: the scheduled unit runs `report --write`, which
+  # dispatches to the report LIBRARY and never calls mreport_append_history. So
+  # this series is fed ONLY by manual `report weekly` runs -- which is exactly
+  # why production showed two points under a heading that claimed eight weeks.
+  # The span is printed so the axis can be read rather than assumed.
+  mreport_hdr "TRENDS (LAST 8 OBSERVATIONS)"
   if [[ ! -f "$hist" ]]; then
     printf '  No history recorded yet. Each report adds one\n'
     printf '  point; trends appear from the second run.\n\n'
@@ -6205,7 +6267,18 @@ mreport_trends() {
     mreport_trend_line "$hist" 6 "Immich orig." ""
     mreport_trend_line "$hist" 7 "Scrub age"    "d"
     mreport_trend_line "$hist" 8 "Disk temp"    $'\xc2\xb0C'
-    printf '  (oldest -> newest, up to 8 points)\n'
+    # The real span, read from the rows themselves. Two observations five days
+    # apart and two a month apart are different things, and a fixed heading
+    # cannot tell them apart.
+    local first_day last_day
+    first_day="$(tail -n +2 "$hist" | tail -n 8 | head -n 1 | cut -d, -f1)"
+    last_day="$(tail -n +2 "$hist" | tail -n 1 | cut -d, -f1)"
+    if [[ -n "$first_day" && -n "$last_day" && "$first_day" != "$last_day" ]]; then
+      printf '  (oldest -> newest, %s to %s; one point per day the report ran)\n' \
+        "$first_day" "$last_day"
+    else
+      printf '  (oldest -> newest; one point per day the report ran)\n'
+    fi
   fi
   printf '\n'
 }
@@ -6760,7 +6833,16 @@ mreport_weekly_cmd() {
 
   CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=(); CHECKUP_ADVICE=()
   checkup_collect_all
-  mreport_append_history || warn "Could not append report history."
+  # A DRY RUN CHANGES NOTHING -- including the recorded history. It appended a
+  # row like every other mode, so previewing the report altered the series the
+  # report then drew, and repeated previews would have distorted the trend.
+  # This project already holds that a preview never sends; writing a
+  # measurement is the same kind of side effect.
+  if [[ "$mode" == "dry" ]]; then
+    echo "[domum-media] dry run: history NOT appended"
+  else
+    mreport_append_history || warn "Could not append report history."
+  fi
 
   local text html subject
   text="$(mktemp)" || die "cannot stage the report"
