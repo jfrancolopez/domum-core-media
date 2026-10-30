@@ -157,6 +157,111 @@ grep -qi 'usage' <<< "$out" || fail "no usage shown: $out"
 echo "  usage, not a crash"
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Phase 4 was NOT model-aware, so a successful volume upgrade reported failure.
+#
+#  Two of its assertions were unconditional:
+#
+#      domum_is_subvolume "$(service_data_path "$service")"   || rc=1
+#      btrfs property get -ts "$SNAPSHOT_ROOT/$point"         || rc=1
+#
+#  For traefik and uptime-kuma both are false BY CONSTRUCTION -- there is no
+#  /srv/data/<service>, and a volume pre-upgrade point is a dump set rather
+#  than a read-only Btrfs snapshot. So the verification set rc=1 twice on a
+#  completely successful upgrade. Phases 1-3 were made model-aware when the
+#  dispatch was added and phase 4 was left behind: the same defect as
+#  assert_pre_upgrade_possible dying on docker-volume, which this project has
+#  already fixed once in this very function.
+#
+#  Driven in its own subshell with the REAL load_cfg, as the gate section is:
+#  the `drive` helper stubs load_cfg, which leaves DOMUM_LOG_DIR unbound and
+#  `set -u` kills the shell -- this suite already carries a comment about that
+#  and I walked into it anyway.
+# ---------------------------------------------------------------------------
+phase4() {  # $1 = service, $2 = model, $3 = extra stubs
+  (
+    export DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state"
+    export CFG_FILE="$TMP/domum-media.conf" VOLUME_UPGRADE_ENABLED=1
+    # shellcheck disable=SC1090
+    source "$CLI" >/dev/null 2>&1
+    need_root() { :; }
+    export_env_for_compose() { :; }
+    warn() { echo "WARN: $*"; }
+    # Everything heavy succeeds, so the ONLY thing that can fail the
+    # verification is an assertion that does not apply to this model.
+    service_state_model() { printf '%s vol\n' "$2"; }
+    is_managed_service() { return 0; }
+    managed_image_specs() { printf '%s|img\n' "$1"; }
+    service_compose_services() { printf '%s' "$1"; }
+    domum_acquire_lock() { return 0; }
+    verify_backup_freshness() { :; }
+    assert_pre_upgrade_possible() { :; }
+    service_running_images() { printf '%s sha256:new\n' "$1"; }
+    other_container_identities() { printf 'traefik id1 img1\n'; }
+    service_staged_image_changes() { printf 'STAGED %s old sha256:new\n' "$1"; }
+    create_upgrade_rollback_point() {
+      PRE_UPGRADE_POINT=pt; PRE_UPGRADE_META=mt; PRE_UPGRADE_ARCHIVE=ar; return 0; }
+    verify_upgrade_rollback_point() { return 0; }
+    compose_cmd() { return 0; }
+    wait_for_service_health() { return 0; }
+    service_health_state() { printf 'healthy'; }
+    service_ready_probe() { return 1; }
+    cleanup_images_execute() { return 0; }
+    collect_cleanup_image_ids() { printf 'sha256:unrelated\n'; }
+    record_upgrade_history() { :; }
+    # Tripwires. These two must be UNREACHABLE for a docker-volume service.
+    domum_is_subvolume() { echo "SUBVOL-ASKED" >&2; return 1; }
+    btrfs() { echo "BTRFS-ASKED" >&2; return 1; }
+    eval "$3"
+    set +e
+    model_override="$2"
+    service_state_model() { printf '%s vol\n' "$model_override"; }
+    service_upgrade "$1" 2>&1
+    echo "RC=$?"
+  ) 2>&1
+}
+
+sect "phase 4 asks a docker-volume service nothing it cannot answer"
+out="$(phase4 uptime-kuma docker-volume '')"
+grep -q 'SUBVOL-ASKED' <<< "$out" \
+  && fail "phase 4 still asserts subvolume-ness for a docker-volume service: $out"
+grep -q 'BTRFS-ASKED' <<< "$out" \
+  && fail "phase 4 still asks btrfs about a volume pre-upgrade point: $out"
+grep -qi 'docker-volume -- the dumps are checked' <<< "$out" \
+  || fail "phase 4 says nothing about how the volume point WAS verified: $out"
+grep -qi 'Upgrade INCOMPLETE' <<< "$out" \
+  && fail "a successful volume upgrade still reports INCOMPLETE -- the defect: $out"
+echo "  no subvolume or btrfs assertion, and the run is not INCOMPLETE"
+
+sect "a protected-tier service still gets BOTH storage assertions"
+# The guard must not become a blanket skip: for the snapshot tier those two
+# assertions are what prove the recovery point survived the upgrade.
+out="$(phase4 plex protected-tier '')"
+grep -q 'SUBVOL-ASKED' <<< "$out" \
+  || fail "the protected tier lost its subvolume assertion -- the guard became a
+blanket skip, so nothing would prove the recovery point survived: $out"
+echo "  protected-tier still asserted"
+
+sect "MUTATION: removing the model guard breaks the volume upgrade again"
+cp "$CLI" "$TMP/cli.orig.p4"
+cat > "$TMP/mutate-p4.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if [[ "$model" == "protected-tier" ]]; then\n    domum_is_subvolume'
+new = '  if [[ "$model" == "$model" ]]; then\n    domum_is_subvolume'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP/mutate-p4.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.p4" "$CLI"; fail "the phase-4 mutation did not apply"; }
+mout="$(phase4 uptime-kuma docker-volume '')"
+cp "$TMP/cli.orig.p4" "$CLI"
+grep -q 'SUBVOL-ASKED' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- without the guard a volume service
+must be asked whether its absent data path is a subvolume: $mout"
+echo "  killed: an always-true guard asks a volume service about subvolumes again"
+
 sect "the production gate is CLOSED by default and refuses BEFORE the lock"
 # The whole point of the gate: the path is implemented and tested, and has never
 # run against a real service. The refusal must happen before the lock is taken
