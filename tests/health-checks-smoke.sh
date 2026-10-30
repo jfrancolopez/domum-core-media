@@ -39,7 +39,7 @@ probe() {
     # shellcheck disable=SC1090
     source "$CLI" >/dev/null 2>&1
     set +e
-    CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+    CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=(); CHECKUP_ADVICE=()
     eval "$1"
     "$2"
     # Only non-empty classes are printed. `"${arr[@]:-}"` on an empty array
@@ -50,6 +50,7 @@ probe() {
     (( ${#CHECKUP_WARNINGS[@]} )) && printf 'WARN|%s\n' "${CHECKUP_WARNINGS[@]}"
     (( ${#CHECKUP_HEALTHY[@]} ))  && printf 'OK|%s\n'   "${CHECKUP_HEALTHY[@]}"
     (( ${#CHECKUP_ACTIONS[@]} ))  && printf 'ACT|%s\n'  "${CHECKUP_ACTIONS[@]}"
+    (( ${#CHECKUP_ADVICE[@]} ))   && printf 'ADV|%s\n'  "${CHECKUP_ADVICE[@]}"
     true
   ) 2>&1
 }
@@ -525,7 +526,7 @@ mout="$(
     # shellcheck disable=SC1090
     source "$MUTFA" >/dev/null 2>&1
     set +e
-    CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=()
+    CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=(); CHECKUP_ADVICE=()
     backup_target_names() { printf 'cloud\n'; }
     backup_target_enabled() { :; }
     checkup_immich_offsite
@@ -751,5 +752,115 @@ collector="$(awk '/^checkup_collect_all\(\) \{/,/^}/' "$CLI")"
 grep -q 'checkup_notification_path' <<< "$collector" \
   || fail "checkup_notification_path is not called by checkup_collect_all"
 echo "  collected centrally"
+
+# ---------------------------------------------------------------------------
+#  WEAR is a separate claim from the self-assessment, and checkup could not see
+#  it. `smart_status.passed` is the drive's own opinion; the weekly report has
+#  shown interpretable wear since the HTML work, but checkup read only `passed`
+#  -- so wear appeared in a report nobody is paged by, and a drive approaching
+#  end of life could never become a finding or an email.
+# ---------------------------------------------------------------------------
+WEAR_OK="
+  cmd_exists() { return 0; }
+  mreport_smart_interpretable() { return 0; }
+  smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[{\"name\":\"Wear_Leveling_Count\",\"value\":99}]}}'; }
+"
+
+sect "interpretable wear is reported with its figure, and does not escalate"
+# Measured on this host 2026-10-21: the Samsung 870 EVO reads 99, with 0.52% of
+# its 600 TBW used. This cannot fire today -- it is a guard, not a finding.
+out="$(probe "$WEAR_OK
+  w() { checkup_disk_wear sda; }" w)"
+grep -q 'OK|/dev/sda wear: 99% of rated write life remaining' <<< "$out" \
+  || fail "interpretable wear is not reported: $out"
+grep -qE 'CRIT\||ACT\|' <<< "$out" && fail "a healthy drive escalated: $out"
+echo "  99% reported, nothing escalated"
+
+sect "a WORN drive is CRITICAL with a read-only confirmation step"
+WEAR_LOW="${WEAR_OK//\"value\":99/\"value\":12}"
+out="$(probe "$WEAR_LOW
+  w() { checkup_disk_wear sda; }" w)"
+grep -q 'CRIT|/dev/sda reports only 12%' <<< "$out" \
+  || fail "a drive at 12% of rated life is not critical: $out"
+grep -q 'ACT|smartctl -a /dev/sda' <<< "$out" \
+  || fail "no action, so a dying drive would never mail: $out"
+grep -qi 'read-only' <<< "$out" \
+  || fail "the remedy does not say it is read-only, so it reads as risky: $out"
+echo "  12% -> CRITICAL with an action"
+
+sect "UNINTERPRETABLE attributes are ADVICE -- not healthy, and not a weekly warning"
+# The KOWIN OS drive reports all 30 attributes at value=100 after 3054 hours.
+# "Unavailable" must not read as health; it must also not nag weekly about a
+# drive that will never report real attributes and holds only a rebuildable OS.
+WEAR_PLACEHOLDER="
+  cmd_exists() { return 0; }
+  mreport_smart_interpretable() { return 1; }
+"
+out="$(probe "$WEAR_PLACEHOLDER
+  w() { checkup_disk_wear sdb; }" w)"
+grep -qi 'ADV|wear for /dev/sdb is NOT INTERPRETABLE' <<< "$out" \
+  || fail "placeholder attributes are not reported as uninterpretable: $out"
+grep -qi 'not evidence of health' <<< "$out" \
+  || fail "it does not say unavailable wear is not health -- the whole point: $out"
+grep -q 'OK|' <<< "$out" \
+  && fail "it claimed health from a table that measures nothing: $out"
+grep -qE 'WARN\||CRIT\||ACT\|' <<< "$out" \
+  && fail "a permanently unmeasurable drive produces a weekly alert: $out"
+echo "  advisory only: neither health nor noise"
+
+sect "a drive with NO wear attribute is UNMEASURED, not 100%"
+WEAR_NONE="
+  cmd_exists() { return 0; }
+  mreport_smart_interpretable() { return 0; }
+  smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[{\"name\":\"Temperature_Celsius\",\"value\":70}]}}'; }
+"
+out="$(probe "$WEAR_NONE
+  w() { checkup_disk_wear sdc; }" w)"
+grep -qi 'ADV|/dev/sdc reports no wear attribute' <<< "$out" \
+  || fail "a missing wear attribute is not reported: $out"
+grep -q 'OK|' <<< "$out" && fail "an absent attribute was read as full life: $out"
+echo "  absent attribute -> UNMEASURED"
+
+sect "the wear check is REACHED from checkup_disk_health, not just callable"
+# A function nothing calls is the three-dead-primitives defect. Driven, not
+# grepped: the tripwire fires only if the real code path calls it.
+REACHED="
+  cmd_exists() { return 0; }
+  lsblk() { printf 'sda disk\n'; }
+  smartctl() { printf '%s' '{\"exit_status\":0,\"smart_status\":{\"passed\":true}}'; }
+  checkup_disk_wear() { checkup_add healthy \"WEAR-CHECK-REACHED \$1\"; }
+"
+out="$(probe "$REACHED" checkup_disk_health)"
+grep -q 'OK|WEAR-CHECK-REACHED sda' <<< "$out" \
+  || fail "checkup_disk_health never calls the wear check, so it is dead code: $out"
+echo "  reached for each disk"
+
+sect "MUTATION: treating uninterpretable attributes as a wear figure"
+# The dangerous direction and the reason this file records NOT thresholding raw
+# attributes: a drive reporting placeholders would read as a confident healthy.
+cp "$CLI" "$TMP/cli.orig.wear"
+cat > "$TMP/mutate-wear.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if ! mreport_smart_interpretable "$dev"; then'
+new = '  if false; then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP/mutate-wear.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.wear" "$CLI"; fail "the wear mutation did not apply"; }
+WEAR_MUT="
+  cmd_exists() { return 0; }
+  mreport_smart_interpretable() { return 1; }
+  smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[{\"name\":\"Wear_Leveling_Count\",\"value\":100}]}}'; }
+"
+mout="$(probe "$WEAR_MUT
+  w() { checkup_disk_wear sdb; }" w)"
+cp "$TMP/cli.orig.wear" "$CLI"
+grep -q 'OK|/dev/sdb wear: 100%' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- ignoring the interpretability guard
+must turn a placeholder table into a confident '100% remaining': $mout"
+echo "  killed: without the guard, placeholders report as 100% of life remaining"
 
 echo "PASS: health-checks smoke test"

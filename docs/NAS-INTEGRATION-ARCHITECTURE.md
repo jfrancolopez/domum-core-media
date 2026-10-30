@@ -205,9 +205,14 @@ mounted, listed so the sequence is not improvised later.
 | 5 | **Extend `dr-status` backup scope to name the NAS tier explicitly** | The report already states whether the replaceable tier is inside the backup set. A new tier must appear there by name, or "what goes off-site" stops being a complete answer. |
 | 6 | **Decide and record the NAS's own redundancy** | "Reacquirable" must be *true*. If the NAS ends up holding the only copy of anything irreplaceable it is a protected tier, and this architecture does not apply to it. |
 
+| 7 | **Deploy the retention-failure fix before the `nas` backup TARGET is enabled** | Measured 2026-10-30: `nas` is already declared in `BACKUP_TARGETS` with `BACKUP_TARGET_NAS_RETENTION="daily"`, and `backup_target_default_enabled` returns **1** for it — it is inert only because the configuration sets `ENABLED=0`. Enabling it is therefore the single change that makes `retention_targets daily` non-empty for the first time, and until the fix in `dc819e8` is deployed a retention failure on that target aborts `do_daily_backup` **before `heartbeat`**, so a fully successful nightly backup would be reported as a STALE one and the recovery-pack refresh would be skipped. `tests/backup-evidence-endtoend-smoke.sh` §F2 pins that relationship. |
+
 Items 1 and 3 are testable today without any NAS present, against a fixture
 mount that is deliberately absent. Items 2, 4 and 5 need the mount path decided
-but not mounted. Item 6 is a question for the operator, not code.
+but not mounted. Item 6 is a question for the operator, not code. **Item 7 is a
+deployment, and it is the only one of the seven that is already written and
+merged** — it sits undeployed on `main`, which is fine until the day the target
+is switched on.
 
 ---
 

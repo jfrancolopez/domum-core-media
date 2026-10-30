@@ -113,7 +113,7 @@ echo "  HEALTHY / WARNINGS / ACTION REQUIRED / CRITICAL, each with its own glyph
 
 sect "the report carries the sections the operator asked for"
 out="$(drive "" --stdout)"
-for s in "IMMICH & DISASTER RECOVERY" BACKUPS SYSTEM "TRENDS (WEEK BY WEEK)" \
+for s in "IMMICH & DISASTER RECOVERY" BACKUPS SYSTEM "TRENDS (LAST 8 OBSERVATIONS)" \
          "DRIVE HEALTH" SERVICES UPDATES "LOG ERRORS (7 DAYS)" FINDINGS "SUGGESTED ACTIONS"; do
   grep -qF "$s" <<< "$out" || fail "section missing: $s"
 done
@@ -151,6 +151,57 @@ out="$(drive "" --stdout)"
 grep -q 'NOT in that scope' <<< "$out" || fail "the scope limitation is missing: $out"
 grep -qi 'media-service state' <<< "$out" || fail "it does not name what is uncovered: $out"
 echo "  the five services and the image archives are named as uncovered"
+
+sect "the trends heading does not claim weekly sampling"
+# Production, 2026-10-30: the section said TRENDS (WEEK BY WEEK) over two
+# points. Rows are keyed on `date -I`, so there is one row per DAY the report
+# ran, deduped to that day's last run, and the sparkline takes the last 8 ROWS.
+# Nothing in the mechanism makes them a week apart -- and the scheduled unit
+# runs `report --write`, which dispatches to the report LIBRARY and never
+# appends history, so the series is fed only by manual runs.
+out="$(drive "" --stdout)"
+grep -q 'WEEK BY WEEK' <<< "$out" \
+  && fail "the heading still claims weekly sampling, which the collection
+mechanism does not provide: $out"
+grep -q 'TRENDS (LAST 8 OBSERVATIONS)' <<< "$out" \
+  || fail "the trends section is missing or renamed unexpectedly: $out"
+echo "  heading states observations, not weeks"
+
+sect "the trend axis prints its real date span"
+{ echo 'date,disk_data_pct,mem_pct,containers_running,journal_errors,immich_originals,scrub_age_days,disk_temp_c'
+  echo '2026-10-25,24,22,11,3,23265,4,47'
+  echo '2026-10-30,24,23,11,3,23265,9,47'
+} > "$TMP/state/report/history.csv"
+out="$(drive "" --stdout)"
+grep -q '2026-10-25 to 2026-10-30' <<< "$out" \
+  || fail "the axis does not state the span it actually covers, so two points
+five days apart read the same as two a month apart: $out"
+grep -qi 'one point per day the report ran' <<< "$out" \
+  || fail "the axis does not say what a point IS: $out"
+echo "  span and point meaning both stated"
+rm -f "$TMP/state/report/history.csv"
+
+sect "a DRY RUN does not append history, and a normal run does"
+# A preview that mutates the series the report draws is the same class of side
+# effect as a preview that sends mail, and --dry-run appended a row like every
+# other mode.
+#
+# This suite stubs mreport_append_history so renders cannot write state, so the
+# assertion is on whether the CALL HAPPENS: the stub is replaced by a recorder.
+# That tests the mode gate, which is what changed, rather than the writer.
+REC="$TMP/append-called"
+APPEND_RECORDER='mreport_append_history() { echo called >> "'"$REC"'"; }'
+rm -f "$REC"
+drive "$APPEND_RECORDER" --dry-run >/dev/null 2>&1
+[[ ! -f "$REC" ]] \
+  || fail "a dry run called the history writer $(wc -l < "$REC") time(s)"
+drive "$APPEND_RECORDER" --stdout >/dev/null 2>&1
+[[ -f "$REC" ]] \
+  || fail "a normal run no longer appends history, so trends could never grow"
+[[ "$(wc -l < "$REC")" == "1" ]] \
+  || fail "expected exactly one append, got $(wc -l < "$REC")"
+rm -f "$REC"
+echo "  dry run: 0 appends; normal run: exactly 1"
 
 sect "trends refuse to invent history from one measurement"
 out="$(drive "" --stdout)"
