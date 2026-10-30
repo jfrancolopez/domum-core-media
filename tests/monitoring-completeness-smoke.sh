@@ -254,6 +254,7 @@ probe_systemd() {  # $1 = cli, $2 = fixture
     (( ${#CHECKUP_CRITICAL[@]} )) && printf 'CRIT|%s\n' "${CHECKUP_CRITICAL[@]}"
     (( ${#CHECKUP_WARNINGS[@]} )) && printf 'WARN|%s\n' "${CHECKUP_WARNINGS[@]}"
     (( ${#CHECKUP_ACTIONS[@]} ))  && printf 'ACT|%s\n'  "${CHECKUP_ACTIONS[@]}"
+    (( ${#CHECKUP_ADVICE[@]} ))   && printf 'ADV|%s\n'  "${CHECKUP_ADVICE[@]}"
     true
   ) 2>&1
 }
@@ -389,11 +390,22 @@ grep -qi 'has since been verified' <<< "$out" \
   || fail "it does not name the later successful verification: $out"
 grep -q '2026-10-28' <<< "$out" \
   || fail "it does not date the verification that supersedes the failure: $out"
-grep -q 'ACT|systemctl reset-failed domum-media-check.service' <<< "$out" \
-  || fail "the cheap, safe remedy is not named: $out"
-# It must still MAIL: an action is what reaches the notifier, and a dirty
-# --failed state that nobody is told about stays dirty forever.
-grep -q 'ACT|' <<< "$out" || fail "a stale failed state with no action never mails: $out"
+# ADVICE, not ACTION: clearing a stale unit state is tidying, not remediation,
+# and routing it through ACTIONS is what promoted a resolved condition to
+# `ACTION REQUIRED`. It must still be NAMED -- an advisory that says nothing is
+# no better than silence.
+grep -q 'ADV|systemctl reset-failed domum-media-check.service' <<< "$out" \
+  || fail "the cheap, safe remedy is not named as advice: $out"
+grep -q 'ACT|' <<< "$out" \
+  && fail "a resolved condition still escalates to an ACTION: $out"
+# It must NOT mail, and it must still be VISIBLE. Under the old model a remedy
+# and an escalation were the same thing, so keeping this finding visible meant
+# mailing it -- about a condition the operator had already fixed. The finding
+# now stays in `checkup` and the weekly report and wakes nobody.
+grep -q 'WARN|' <<< "$out" \
+  || fail "the stale state is not reported at all, which is worse than noise: $out"
+grep -q 'ADV|' <<< "$out" \
+  || fail "it is reported with no remedy of any class, so nobody can clear it: $out"
 echo "  reported as stale, dated, reset-failed offered, no unlock advice"
 
 sect "the superseded remedy does not claim reset-failed clears this finding"
@@ -427,7 +439,7 @@ echo "  the unit is never started as a remedy"
 sect "the superseding remedy is ONE line, not the same command twice"
 # Both the --failed summary and the exit-status detail report this unit, so
 # without identical wording the operator is shown the same command twice.
-n="$(grep -c 'ACT|systemctl reset-failed' <<< "$out")"
+n="$(grep -c '|systemctl reset-failed' <<< "$out")"
 [[ "$n" == "1" ]] || fail "the reset-failed remedy appears $n times, expected 1: $out"
 echo "  one remedy line"
 

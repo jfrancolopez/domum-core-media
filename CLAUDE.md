@@ -2485,6 +2485,78 @@ are five different states and this file previously collapsed two of them.
 shape -- every suite had stubbed `retention_targets`, which is why nothing
 caught the guess.
 
+**A REMEDY IS NOT A REQUIREMENT, and conflating them made the report cry wolf.**
+Production, 2026-10-29: the weekly report said `ACTION REQUIRED (4)` on a
+healthy host. The four "actions" were an optional image cleanup, two
+suggestions to read about rebooting, and a line that literally began
+`no action needed`. Nothing needed doing.
+
+The cause was structural. `CHECKUP_ACTIONS` was **both** the remedy list and
+the escalation signal -- `health_verdict` reads it and so does the notifier's
+silence gate -- so attaching a helpful command to a routine finding promoted the
+whole report to ACTION REQUIRED and mailed it. The symmetric half was worse: the
+four routine warnings had been left deliberately **remedy-less** to keep them
+quiet, which made the quiet findings also the undiagnosable ones.
+
+`CHECKUP_ADVICE` splits the two. The classes and what each one DOES:
+
+| class | meaning | verdict | mails |
+|---|---|---|---|
+| `healthy` | measured good | — | no |
+| `advice` | a remedy the operator MAY apply | — | **no** |
+| `warning` | worth knowing | `WARNINGS` | no |
+| `action` | the operator MUST act | `ACTION REQUIRED` | **yes** |
+| `critical` | failure, or protection that cannot be verified | `CRITICAL` | **yes** |
+
+Driven against the exact production finding set, the verdict becomes
+`WARNINGS (6)` with **0 actions** -- so the silence gate holds and nothing is
+mailed. Reclassified as advisory: the image cleanup, both reboot suggestions,
+`reset-failed` on a superseded unit, and the `no action needed` line.
+
+**The split is what finally let the routine warnings carry commands.** Before
+it, giving "6 update candidates are waiting" a remedy would have started mailing
+it weekly. All six routine findings now have a read-only advisory, and the
+pairing contract got STRONGER rather than weaker: `warning-remedy-smoke` used to
+require EXACTLY FOUR warnings with no remedy at all, and now requires **zero** --
+every warning must carry an action or an advice, because a warning with neither
+is a finding nobody can act on.
+
+**It also found a warning that was only paired by ACCIDENTAL ADJACENCY.**
+`N containers are exited` had no remedy of its own; it merely sat within seven
+lines of the cleanup-images action, and inserting a comment exposed it. The
+same window caught the reboot pair twice. **A comment between a warning and its
+remedy pushes the remedy out of the pairing window** -- put the explanation
+ABOVE the pair. That is now three occurrences of this one mistake.
+
+**A CRITICAL with no remedy is worse than a warning with none**, and the backup
+criticals had none: `Last successful backup is Nh old` and
+`No successful backup timestamp found` -- the two findings that say the
+photographs may be unprotected -- offered no command at all. Both now name a
+read-only diagnosis, as does a Btrfs checksum failure, whose remedy says to read
+the kernel log (which NAMES the file) and explicitly **not** to attempt a
+repair, because data is single-profile here. The config-validation criticals
+(`DOMUM_DOMAIN is empty`) are deliberately left bare: they name the exact
+variable, which IS the remedy.
+
+**An ALERT mail carries ACTIONS only.** Advisories are omitted from it
+deliberately: a message sent because something needs attention must not be
+padded with things that do not. They appear in `checkup` and in the full weekly
+report under `OPTIONAL MAINTENANCE`, introduced by "nothing here needs doing
+this week".
+
+`tests/severity-taxonomy-smoke.sh` drives fifteen scenarios through REAL check
+functions and then through the real `health_verdict` and the real silence gate --
+healthy, routine maintenance, staged images, pending reboot, superseded restic
+lock, current lock failure, corruption, backup gap, pending originals,
+window-unknown originals, absent evidence, unreadable disk, failed disk. The
+routine-maintenance case is asserted as a **DELTA** (turning maintenance on must
+add warnings and advice and **zero** actions), because the aggregate collector
+runs every check and a fixture cannot satisfy them all -- pinning the whole
+verdict would mean asserting fixture artefacts. The delta is also required to be
+non-empty, so it cannot pass by measuring nothing. The mutation folds advice
+back into actions and must make a quiet host mail again; it adds 6 spurious
+actions.
+
 **A warning with no paired action NEVER mails, and seven real problems were in
 that state.** `health_notify_cmd`'s silence gate sends only when
 `CHECKUP_CRITICAL` or `CHECKUP_ACTIONS` is non-empty, by design -- warnings
