@@ -10655,24 +10655,61 @@ rollback instructions in $meta."
     warn "$service did not become healthy within 180s (state: $(service_health_state "$service"))."
     rc=1
   fi
+
+  # READINESS, stated as what it is.
+  #
+  # `service_is_healthy` accepts `none` -- a running container with no
+  # healthcheck -- so the health line above can read reassuringly for a service
+  # whose application was never asked anything. traefik is exactly that: no
+  # container healthcheck, no readiness probe, and deliberately no declared log
+  # pattern, because its providers start asynchronously and no line proves
+  # readiness. An upgrade must not let a started container stand in for a
+  # working one.
+  local ready_evidence=""
   if service_ready_probe "$service" >/dev/null 2>&1; then
     local waited=0
     while (( waited < 180 )); do service_probe_ready "$service" && break; sleep 5; waited=$(( waited + 5 )); done
     if service_probe_ready "$service"; then
+      ready_evidence="answered its own endpoint"
       echo "  application     : answered its endpoint, version $(service_probe_version "$service" 2>/dev/null)"
     else
       warn "$service never answered its own endpoint after the upgrade."
       rc=1
     fi
   fi
+  # Nothing asked the application anything. Say so rather than letting a
+  # started container read as a working one -- that substitution is the defect
+  # this project refuses to make elsewhere, and it must not appear in the one
+  # place an upgrade is being declared successful.
+  if [[ -z "$ready_evidence" && "$(service_health_state "$service")" == "none" ]]; then
+    echo "  readiness       : UNPROVEN -- no container healthcheck, no readiness probe and no declared log pattern. RUNNING is the whole claim."
+  fi
 
-  # The pre-upgrade artefacts must still be exactly as created.
-  domum_is_subvolume "$(service_data_path "$service")" \
-    && echo "  storage         : still a Btrfs subvolume" \
-    || { warn "$(service_data_path "$service") is no longer a subvolume"; rc=1; }
-  [[ "$(btrfs property get -ts "$DOMUM_SNAPSHOT_ROOT/$point" 2>/dev/null | tr -d ' ')" == "ro=true" ]] \
-    && echo "  pre-upgrade snap: $point still read-only" \
-    || { warn "$point is not read-only any more"; rc=1; }
+  # The pre-upgrade artefacts must still be exactly as created -- and WHICH
+  # artefacts those are depends on the state model.
+  #
+  # These two assertions were unconditional, and for a docker-volume service
+  # both are false by construction: traefik and uptime-kuma have no
+  # /srv/data/<service> and their pre-upgrade point is a dump set, not a
+  # read-only Btrfs snapshot. So a perfectly successful volume upgrade set
+  # rc=1 twice and reported failure. That is the same defect as
+  # assert_pre_upgrade_possible dying on docker-volume: phases 1-3 were made
+  # model-aware and phase 4 was left behind, so the volume path could not
+  # succeed even with the gate open.
+  #
+  # verify_upgrade_rollback_point below is already model-aware and is what
+  # checks the volume dumps and the image archive, so the volume case loses no
+  # coverage by skipping assertions that do not apply to it.
+  if [[ "$model" == "protected-tier" ]]; then
+    domum_is_subvolume "$(service_data_path "$service")" \
+      && echo "  storage         : still a Btrfs subvolume" \
+      || { warn "$(service_data_path "$service") is no longer a subvolume"; rc=1; }
+    [[ "$(btrfs property get -ts "$DOMUM_SNAPSHOT_ROOT/$point" 2>/dev/null | tr -d ' ')" == "ro=true" ]] \
+      && echo "  pre-upgrade snap: $point still read-only" \
+      || { warn "$point is not read-only any more"; rc=1; }
+  else
+    echo "  storage         : $model -- the dumps are checked by the recovery-point verifier below"
+  fi
   verify_upgrade_rollback_point "$point" "$model" >/dev/null \
     && echo "  recovery point  : still verifies" \
     || { warn "the pre-upgrade recovery point no longer verifies"; rc=1; }

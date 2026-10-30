@@ -2172,6 +2172,50 @@ subvolume. The orchestration is now dispatched on the DECLARED state model --
 than guessed, because restoring a subvolume snapshot over a Docker volume would
 report success having restored nothing.
 
+**PHASE 4 WAS NOT MODEL-AWARE, so a successful volume upgrade reported
+failure.** Two of its assertions were unconditional:
+
+```
+domum_is_subvolume "$(service_data_path "$service")"   || rc=1
+btrfs property get -ts "$DOMUM_SNAPSHOT_ROOT/$point"   || rc=1
+```
+
+For `traefik` and `uptime-kuma` both are false **by construction** -- there is
+no `/srv/data/<service>`, and a volume pre-upgrade point is a dump set, not a
+read-only Btrfs snapshot. So the verification set `rc=1` twice on an upgrade
+that had gone perfectly, and reported `Upgrade INCOMPLETE`. **The volume path
+could not succeed even with the gate open.** Phases 1-3 were made model-aware
+when the dispatch was added and phase 4 was left behind -- the same defect as
+`assert_pre_upgrade_possible` dying on `docker-volume`, in the same function,
+one phase later. `verify_upgrade_rollback_point` is already model-aware and is
+what checks the dumps and the archive, so the volume case loses no coverage.
+
+**The guard must not become a blanket skip**, and that direction is asserted
+too: for the protected tier those two assertions are what prove the recovery
+point survived the upgrade.
+
+**`service_is_healthy` accepts `none`, so a started container read as a working
+one.** Phase 4 printed `health: none` for a service whose application was never
+asked anything -- traefik exactly: no container healthcheck, no readiness probe,
+and deliberately no declared log pattern. It now says
+`readiness: UNPROVEN -- no container healthcheck, no readiness probe and no
+declared log pattern. RUNNING is the whole claim.`
+
+**I also wired the declared readiness log pattern into phase 4 and had to
+revert it.** `service_logged_ready_since` exists and only the MIGRATION path
+used it, so an upgrade had weaker readiness evidence than a migration of the
+same service -- a real gap. But phase 4 runs IMMEDIATELY after `up -d` with no
+wait, so a service whose readiness line lags by seconds was reported as having
+failed, and escalating on absence changes the success criteria for the four
+services that declare a pattern. Driving the real argv path caught it; reading
+the diff had not. It needs a bounded wait and its own tests, and half of it is
+worse than none. Recorded as a candidate rather than shipped.
+
+**I referenced `$restart_boundary` before defining it.** Under `set -u` that
+kills the function -- the `service_upgrade` calling-an-undefined-helper family
+again, in the same function, caught because the integration suite enters through
+the real argv instead of reading the source.
+
 **I then wrote the gate in the wrong place and my own dispatch was still dead
 code.** `assert_pre_upgrade_possible` runs near the top of `service_upgrade` and
 **dies** on `docker-volume` ("there is no pre-upgrade recovery point for this
