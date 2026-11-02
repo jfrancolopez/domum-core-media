@@ -6937,11 +6937,19 @@ mreport_weekly_cmd() {
 health_summary_text() {  # stdout: the operator-facing summary
   local n_crit="${#CHECKUP_CRITICAL[@]}" n_warn="${#CHECKUP_WARNINGS[@]}"
   local n_act="${#CHECKUP_ACTIONS[@]}" n_ok="${#CHECKUP_HEALTHY[@]}"
+  # ONE verdict, from health_verdict. This function used to carry its own
+  # ladder -- CRITICAL / ACTION REQUIRED / ATTENTION / HEALTHY -- which agreed
+  # with health_verdict on three rungs and diverged on the fourth. Production,
+  # 2026-11-02: the first real run after deployment printed `VERDICT: ATTENTION`
+  # in the body under a subject of `domum-media: WARNINGS (6)`. Two answers to
+  # one question in one message.
+  #
+  # This project already recorded that defect and fixed the SUBJECT to derive
+  # from health_verdict; the body kept its own copy, so the disagreement simply
+  # changed direction. Two numbers that must agree are one number, and that
+  # applies to a word just as much.
   local verdict
-  if (( n_crit > 0 )); then verdict="CRITICAL"
-  elif (( n_act > 0 )); then verdict="ACTION REQUIRED"
-  elif (( n_warn > 0 )); then verdict="ATTENTION"
-  else verdict="HEALTHY"; fi
+  verdict="$(health_verdict)"
 
   printf 'DOMUM-CORE-MEDIA health summary\n'
   printf '%s\n\n' "$(date -Iseconds)"
@@ -7009,15 +7017,33 @@ health_notify_cmd() {
   # weekly report uses too, so the two can never disagree.
   subject="domum-media: $(health_verdict)"
 
+  # Would a REAL run send anything? The dry branch used to return before the
+  # silence gate below, so it always said "no mail was sent (subject would be
+  # X)" -- which reads as "a real run WOULD send, with this subject". On a host
+  # whose gate holds, a real run sends NOTHING and there is no subject at all.
+  # Production, 2026-11-02: exactly that, on a warnings-only host.
+  #
+  # A preview must describe the action it is previewing. The gate's condition is
+  # evaluated here rather than duplicated: critical or action opens it, and
+  # --force bypasses it.
+  local would_send=0
+  if (( ${#CHECKUP_CRITICAL[@]} > 0 || ${#CHECKUP_ACTIONS[@]} > 0 || force == 1 )); then
+    would_send=1
+  fi
   if (( dry == 1 )); then
     cat "$body"
-    printf -- '--- dry run: no mail was sent (subject would be: %s) ---\n' "$subject"
+    if (( would_send == 1 )); then
+      printf -- '--- dry run: nothing was sent. A real run WOULD send -- subject: %s ---\n' "$subject"
+    else
+      printf -- '--- dry run: nothing was sent, and a real run would send NOTHING either: no critical finding and no required action, so the silence gate holds ---\n'
+    fi
     rm -f "$body"
     return 0
   fi
 
-  # Silence IS the healthy signal.
-  if (( ${#CHECKUP_CRITICAL[@]} == 0 && ${#CHECKUP_ACTIONS[@]} == 0 && force == 0 )); then
+  # Silence IS the healthy signal. Same decision the dry run reported, so a
+  # preview cannot disagree with the run it previews.
+  if (( would_send == 0 )); then
     echo "[domum-media] health-notify: nothing needs attention; no mail sent"
     rm -f "$body"
     return 0

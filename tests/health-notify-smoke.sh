@@ -109,9 +109,71 @@ echo "  sends on demand, and says it is healthy"
 sect "--dry-run prints the summary and sends nothing"
 out="$(run_notify 'checkup_collect_all() { checkup_add critical x; }' --dry-run)"
 sent && fail "--dry-run sent mail: $out"
-grep -q 'dry run: no mail was sent' <<< "$out" || fail "it does not say it was a dry run: $out"
+grep -qi 'dry run' <<< "$out" || fail "it does not say it was a dry run: $out"
 grep -q 'VERDICT: CRITICAL' <<< "$out" || fail "the verdict is missing: $out"
 echo "  nothing sent, and the verdict is still stated"
+
+sect "--dry-run says whether a REAL run would send, and consults the GATE"
+# Production, 2026-11-02, the first real run after deployment: on a host with
+# six warnings and zero actions the dry run printed
+#   "no mail was sent (subject would be: domum-media: WARNINGS (6))"
+# which reads as "a real run WOULD send, with this subject". It would not: the
+# silence gate holds, nothing is sent, and there is no subject at all. The dry
+# branch returned BEFORE the gate, so it could not know.
+#
+# A preview must describe the action it is previewing.
+out="$(run_notify 'checkup_collect_all() { checkup_add warning "routine"; checkup_add advice "look"; }' --dry-run)"
+sent && fail "--dry-run sent mail: $out"
+grep -qi 'would send NOTHING' <<< "$out" \
+  || fail "with the gate holding, the dry run does not say a real run would be
+silent -- which is the question a dry run exists to answer: $out"
+grep -qi 'subject would be' <<< "$out" \
+  && fail "it still names a subject for a message that would never be sent: $out"
+grep -qi 'silence gate holds' <<< "$out" \
+  || fail "it does not say WHY nothing would be sent: $out"
+echo "  gate holds -> 'would send NOTHING', and no subject is invented"
+
+# ...and the other direction: with an action, a real run WOULD send.
+out="$(run_notify 'checkup_collect_all() { checkup_add warning w; checkup_add action "do the thing"; }' --dry-run)"
+sent && fail "--dry-run sent mail: $out"
+grep -qi 'WOULD send -- subject:' <<< "$out" \
+  || fail "with an action present the dry run must say a real run would send: $out"
+grep -q 'ACTION REQUIRED' <<< "$out" \
+  || fail "the subject it names does not carry the verdict: $out"
+echo "  gate opens -> 'WOULD send', with the subject named"
+
+sect "the body verdict and the subject are ONE verdict"
+# Production, 2026-11-02: the body said `VERDICT: ATTENTION` under a subject of
+# `domum-media: WARNINGS (6)`. health_summary_text carried its own ladder which
+# agreed with health_verdict on three rungs and diverged on the fourth. This
+# project had already fixed the SUBJECT to derive from health_verdict; the body
+# kept a copy, so the disagreement only changed direction.
+out="$(run_notify 'checkup_collect_all() { checkup_add warning a; checkup_add warning b; checkup_add advice x; }' --dry-run)"
+grep -q 'VERDICT: WARNINGS (2)' <<< "$out" \
+  || fail "the body does not use the shared verdict: $out"
+grep -qi 'ATTENTION' <<< "$out" \
+  && fail "the body still uses its own private verdict word: $out"
+echo "  one ladder, one word"
+
+sect "MUTATION: a private verdict ladder in the body disagrees with the subject"
+cp "$CLI" "$TMP/cli.orig.verdict"
+cat > "$TMP/mutate-verdict.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  local verdict\n  verdict="$(health_verdict)"'
+new = '  local verdict\n  if (( n_warn > 0 )); then verdict="ATTENTION"; else verdict="HEALTHY"; fi'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP/mutate-verdict.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.verdict" "$CLI"; fail "the verdict mutation did not apply"; }
+mout="$(run_notify 'checkup_collect_all() { checkup_add warning a; checkup_add warning b; checkup_add advice x; }' --dry-run)"
+cp "$TMP/cli.orig.verdict" "$CLI"
+grep -qi 'VERDICT: ATTENTION' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- a private ladder must bring the
+disagreeing word back: $mout"
+echo "  killed: a private ladder reintroduces two answers to one question"
 
 sect "delivery NOT enabled is never reported as delivered"
 out="$(
@@ -172,11 +234,14 @@ cp "$CLI" "$MUT"
 python3 - "$MUT" <<'PYM'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-a = '''  if (( ${#CHECKUP_CRITICAL[@]} == 0 && ${#CHECKUP_ACTIONS[@]} == 0 && force == 0 )); then'''
-assert s.count(a) == 1, "the silence gate moved; update this mutation"
-p.write_text(s.replace(a, '''  if false; then''', 1))
+a = '''  local would_send=0
+  if (( ${#CHECKUP_CRITICAL[@]} > 0 || ${#CHECKUP_ACTIONS[@]} > 0 || force == 1 )); then
+    would_send=1
+  fi'''
+assert s.count(a) == 1, "the silence decision moved; update this mutation"
+p.write_text(s.replace(a, '''  local would_send=1''', 1))
 PYM
-grep -q '^  if false; then' "$MUT" || fail "the silence mutation was not applied"
+grep -q '^  local would_send=1$' "$MUT" || fail "the silence mutation was not applied"
 mout="$(
   (
     export PATH="$TMP/bin:$PATH" DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state"

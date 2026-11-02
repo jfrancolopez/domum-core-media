@@ -2550,6 +2550,39 @@ when no successful backup run is recorded**. The remedy says `metadata only`,
 because a remedy that reads as expensive does not get run. The mutation drops
 the comparison and a four-run-old proof must read as current.
 
+**A DRY RUN THAT DOES NOT CONSULT THE GATE DESCRIBES THE WRONG ACTION.**
+Production, 2026-11-02, the first real run after deploying the severity split:
+on a host with six warnings and zero actions `health-notify --dry-run` printed
+`no mail was sent (subject would be: domum-media: WARNINGS (6))`. That reads as
+"a real run WOULD send, with this subject". It would not -- the silence gate
+holds, nothing is sent, and there is no subject at all. The dry branch
+`return`ed BEFORE the gate, so it could not know.
+
+A preview must describe the action it is previewing, which is the same rule as
+`PREVIEW NEVER SENDS` and as the deployment dry run that must not speak in the
+indicative. The gate's decision is now computed ONCE into `would_send` and both
+the preview and the run read it, so a preview cannot disagree with the run it
+previews. With the gate holding it says a real run would send **NOTHING** and
+why; with an action present it says it WOULD send and names the subject. The
+existing silence mutation was re-anchored onto `would_send`, because forcing
+that decision open is the same defect in the new shape.
+
+**`VERDICT: ATTENTION` under a subject of `WARNINGS (6)` -- two answers to one
+question, again.** `health_summary_text` carried its own verdict ladder
+(`CRITICAL` / `ACTION REQUIRED` / **`ATTENTION`** / `HEALTHY`) which agreed with
+`health_verdict` on three rungs and diverged on the fourth. This file already
+records that defect and the fix applied to the SUBJECT; the body kept a private
+copy, so the disagreement merely changed direction. One ladder now --
+`health_summary_text` calls `health_verdict` -- and the mutation reintroduces a
+private one and must bring the disagreeing word back. **Two numbers that must
+agree are one number, and that applies to a WORD just as much.**
+
+**Both were found by running the deployed code on the real host, not by
+fixtures.** Every fixture prediction for this deployment held exactly -- the
+verdict, the advisory section, the degree sign, the trend heading and span, the
+wear lines, and the coverage-freshness verdict. These two were in the one place
+a fixture had not looked: the preview's own description of itself.
+
 **Suppressing `du`'s stderr turned a measurement into a lower bound I could not
 tell apart from one.** Jellyfin and Kavita were recorded as `>=489 KiB` and
 `>=5.8 MiB` and labelled partial, because `config/` is owned `911:911` and
