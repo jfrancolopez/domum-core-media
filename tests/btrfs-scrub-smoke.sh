@@ -174,9 +174,9 @@ python3 - "$CLI" "$MUT" <<'PY'
 import io, sys
 src, dst = sys.argv[1], sys.argv[2]
 s = io.open(src, encoding="utf-8").read()
-old = 'btrfs scrub start -B ${limit:+--limit "$limit"} "$root" || rc=$?'
+old = 'scrub_out="$(btrfs scrub start -B ${limit:+--limit "$limit"} "$root" 2>&1)" || rc=$?'
 assert s.count(old) == 1, "mutation target not unique: %d" % s.count(old)
-s = s.replace(old, 'btrfs scrub start ${limit:+--limit "$limit"} "$root" || rc=$?', 1)
+s = s.replace(old, 'scrub_out="$(btrfs scrub start ${limit:+--limit "$limit"} "$root" 2>&1)" || rc=$?', 1)
 io.open(dst, "w", encoding="utf-8").write(s)
 PY
 grep -q 'btrfs scrub start \${limit' "$MUT" || fail "the -B mutation was not applied; it proves nothing"
@@ -195,6 +195,101 @@ mout="$(
 )"
 grep -qE -- '-B' <<< "$mout" && fail "the mutant still passed -B: $mout"
 echo "  killed: without -B the invocation does not block ($mout)"
+
+# ---------------------------------------------------------------------------
+sect "a scrub ALREADY RUNNING is SKIPPED, and does not fail the unit"
+# btrfs refuses to start a second scrub on the same filesystem, so without this
+# the error landed in the generic branch, reported "scrub FAILED", and failed
+# the oneshot unit -- which `checkup_systemd_health` reports as CRITICAL and
+# `health-notify` mails. The monthly timer firing while a manual scrub is still
+# going is an entirely normal condition, and mailing a critical for it is the
+# false-alarm defect this project keeps correcting.
+RUNNING='btrfs() { printf "%s\n" "$*" >> "$BTRFS_LOG"; case "$1 $2" in "scrub status") printf "UUID:             abc\nScrub started:    Mon Oct 20 03:00:00 2026\nStatus:           running\n" ;; "scrub start") return 0 ;; esac; }'
+out="$(drive "$RUNNING" 'storage_scrub_start')"
+grep -q 'SKIPPED' <<< "$out" || fail "a running scrub was not reported as skipped: $out"
+grep -q '^RC=0$' <<< "$out" || fail "an already-running scrub must not fail the unit: $out"
+n="$(grep -c '^scrub start -B' <<< "$out" || true)"
+[[ "$n" == "0" ]] \
+  || fail "it started a second scrub on a filesystem already being scrubbed ($n): $out"
+echo "  skipped, no second scrub started, exit 0"
+
+sect "the SUMMARY must not say 'clean' about a filesystem it skipped"
+# HEALTHY must not mean UNMEASURED: a skipped filesystem makes no claim, and
+# the summary narrows rather than hiding the skip.
+grep -q 'already running' <<< "$out" || fail "the summary does not say what was skipped: $out"
+grep -qE 'scrubbed 1 filesystem\(s\); worst result' <<< "$out" \
+  && fail "it reported a plain 'scrubbed N' summary for a run that scrubbed
+nothing -- that reads as a clean pass: $out"
+grep -q 'make no claim here' <<< "$out" \
+  || fail "the summary does not state that the skipped filesystem is unproven: $out"
+echo "  the skip is counted and the claim narrowed"
+
+sect "a scrub that STARTS between the check and the call is still skipped"
+# The status check closes the common case; btrfs's own refusal closes the race.
+# Anything NEITHER recognises stays a failure, because an unrecognised error
+# genuinely may be one.
+RACE='btrfs() { printf "%s\n" "$*" >> "$BTRFS_LOG"; case "$1 $2" in "scrub status") printf "UUID: abc\nStatus:           finished\n" ;; "scrub start") printf "ERROR: scrub is already running\n" >&2; return 1 ;; esac; }'
+out="$(drive "$RACE" 'storage_scrub_start')"
+grep -q 'SKIPPED' <<< "$out" || fail "btrfs's own 'already running' error was not recognised: $out"
+grep -q '^RC=0$' <<< "$out" || fail "the race case must not fail the unit: $out"
+echo "  recognised from btrfs's own error, exit 0"
+
+sect "an UNRECOGNISED failure is still a failure"
+OTHER='btrfs() { printf "%s\n" "$*" >> "$BTRFS_LOG"; case "$1 $2" in "scrub status") printf "UUID: abc\nStatus:           finished\n" ;; "scrub start") printf "ERROR: cannot open device\n" >&2; return 1 ;; esac; }'
+out="$(drive "$OTHER" 'storage_scrub_start')"
+grep -q 'scrub FAILED' <<< "$out" \
+  || fail "an unrecognised error was not reported as a failure -- the skip must
+not become a blanket excuse for any non-zero exit: $out"
+grep -q '^RC=1$' <<< "$out" || fail "an unrecognised failure must exit 1: $out"
+grep -q 'SKIPPED' <<< "$out" && fail "it called an unrecognised error a skip: $out"
+echo "  reported as a failure, exit 1"
+
+sect "an UNREADABLE scrub status is not read as 'not running'"
+# `btrfs scrub status` needs privilege. If it cannot be read the status check
+# must abstain, leaving btrfs's own refusal as the control -- not assume the
+# filesystem is idle and then report a confident failure.
+[[ "$(drive 'btrfs() { return 1; }' "btrfs_scrub_running '$TMP/data'")" == *unknown* ]] \
+  || fail "an unreadable scrub status did not report 'unknown'"
+[[ "$(drive "$RUNNING" "btrfs_scrub_running '$TMP/data'")" == *running* ]] \
+  || fail "a running scrub was not detected from the Status field"
+[[ "$(drive "$CLEAN" "btrfs_scrub_running '$TMP/data'")" == *no* ]] \
+  || fail "a finished/never-run scrub was not reported as not running"
+# The older wording this host actually prints for a never-scrubbed filesystem.
+NOSTATS='btrfs() { case "$1 $2" in "scrub status") printf "no stats available\n" ;; esac; }'
+[[ "$(drive "$NOSTATS" "btrfs_scrub_running '$TMP/data'")" == *no* ]] \
+  || fail "'no stats available' -- a filesystem never scrubbed -- was not read as not running"
+echo "  unknown / running / no, and the no-stats wording handled"
+
+sect "MUTATION: without the running check it starts a second scrub"
+MUT2="$TMP/mut-dup"
+cp "$CLI" "$MUT2"
+cat > "$TMP/mutdup.py" <<'PYMUT'
+import io, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = io.open(src, encoding="utf-8").read()
+old = '    if [[ "$(btrfs_scrub_running "$root")" == "running" ]]; then'
+new = '    if [[ "$root" != "$root" ]]; then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(dst, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP/mutdup.py" "$CLI" "$MUT2" ) || fail "the duplicate-run mutation did not apply"
+mout="$(
+  export DOMUM_DATA_ROOT="$TMP/data" DOMUM_SNAPSHOT_ROOT="$TMP/snapshots" BTRFS_LOG="$TMP/mutdup.log"
+  : > "$BTRFS_LOG"
+  # shellcheck disable=SC1090
+  source "$MUT2" >/dev/null 2>&1
+  need_root() { :; }; load_cfg() { :; }
+  stat() { case "$*" in *-f*%T*) printf 'btrfs\n' ;; *) command stat "$@" ;; esac; }
+  findmnt() { printf 'FS-A\n'; }
+  btrfs() { printf '%s\n' "$*" >> "$BTRFS_LOG"; case "$1 $2" in "scrub status") printf "UUID: abc\nStatus:           running\n" ;; "scrub start") return 0 ;; esac; }
+  set +e
+  storage_scrub_start >/dev/null 2>&1
+  grep -c '^scrub start -B' "$BTRFS_LOG" || true
+)"
+[[ "$mout" == "1" ]] \
+  || fail "the mutation changed no ANSWER -- with the running check neutralised a
+scrub must actually be started on a filesystem already being scrubbed (got '$mout')"
+echo "  killed: without the check, a second scrub is started"
 
 sect "the scrub does NOT claim to be read-only, because it is not"
 # The implementation does not pass -r, and btrfs-scrub(8) says a read-write
@@ -251,7 +346,10 @@ inv="$(grep 'btrfs scrub start' <<< "$code" | grep -- '-B' | tr -s ' ' | sed 's/
 [[ "$(wc -l <<< "$inv")" == "1" ]] \
   || fail "expected exactly one executed invocation, got:
 $inv"
-grep -qE '^btrfs scrub start -B' <<< "$inv" || fail "the invocation lost -B: $inv"
+# NOT anchored at column 0: the invocation's output is captured into a variable
+# so an "already running" error can be recognised, so the line begins with the
+# assignment. What matters is that -B is an argument of `scrub start` itself.
+grep -qE 'btrfs scrub start -B( |$)' <<< "$inv" || fail "the invocation lost -B: $inv"
 grep -qE '(^| )-r( |$)' <<< "$inv" \
   && fail "the invocation now passes -r, so it IS read-only and every message is
 wrong in the other direction: $inv"

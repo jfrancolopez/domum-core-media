@@ -332,6 +332,47 @@ a digest proves the bytes arrived, not that they are a usable database: $out"
 grep -q 'not a sound database after restore' <<< "$out" || fail "it does not say what is wrong: $out"
 echo "  digest matched, the database did not, and the restore failed"
 
+sect "the restore report states the CAPTURE MODE, not only the digests"
+# A digest proves the bytes restored are the bytes captured. It says nothing
+# about whether those bytes were a consistent point in time, and jellyfin's and
+# kavita's databases are BOTH WAL-mode (measured from the SQLite header, bytes
+# 18/19) with no sqlite3 in their image or on the host -- so their captures are
+# copies taken while the service may be writing. A restore report that omits
+# the mode reads as strong for an unproven capture as for a consistent one.
+build_jellyfin
+rm -rf "$TMP/out/capm" "$TMP/out/scratchm"
+probe '' "service_state_capture jellyfin '$TMP/out/capm'" >/dev/null
+out="$(probe '' "service_state_restore '$TMP/out/capm' '$TMP/out/scratchm'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the restore did not succeed: $out"
+grep -q 'capture mode: UNPROVEN' <<< "$out" \
+  || fail "jellyfin's restore does not say its capture mode was unproven: $out"
+grep -qi 'while the service could be writing' <<< "$out" \
+  || fail "it does not say WHY unproven means what it means: $out"
+echo "  UNPROVEN stated, with the reason"
+
+sect "a CONSISTENT capture says so, so the unproven wording is not boilerplate"
+# Without this, 'capture mode: UNPROVEN' could be printed unconditionally and
+# the assertion above would pass against a report that cannot tell the two
+# apart.
+sed -i 's/^CAPTURE_MODE=unproven$/CAPTURE_MODE=consistent/' "$TMP/out/capm/MANIFEST"
+rm -rf "$TMP/out/scratchc"
+out="$(probe '' "service_state_restore '$TMP/out/capm' '$TMP/out/scratchc'; echo RC=\$?")"
+grep -q 'capture mode: consistent' <<< "$out" || fail "a consistent capture is not reported as one: $out"
+grep -q 'UNPROVEN' <<< "$out" && fail "it printed UNPROVEN for a consistent capture: $out"
+echo "  consistent reported distinctly"
+
+sect "a mode key that was NEVER WRITTEN must not read as the reassuring value"
+# The metadata-key family: a key the writer never emitted matches nothing and
+# yields an empty string, which must become 'unknown', never 'consistent'.
+sed -i '/^CAPTURE_MODE=/d' "$TMP/out/capm/MANIFEST"
+rm -rf "$TMP/out/scratchu"
+out="$(probe '' "service_state_restore '$TMP/out/capm' '$TMP/out/scratchu'; echo RC=\$?")"
+grep -q 'consistency is unknown' <<< "$out" \
+  || fail "an absent CAPTURE_MODE did not read as unknown: $out"
+grep -q 'capture mode: consistent' <<< "$out" \
+  && fail "an absent key read as consistent, which is the metadata-key defect: $out"
+echo "  absent key reads as unknown"
+
 # ---------------------------------------------------------------------------
 sect "STRICT MODE: the capture survives production's own shell options"
 # A test that relaxes production's shell options is not a test of production.

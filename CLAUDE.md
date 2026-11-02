@@ -2166,6 +2166,55 @@ application-visible mutation, and a 7-26 minute job holding the global lock
 could make the nightly backup fail to acquire it, trading a detection pass for a
 missed backup.
 
+**A SCRUB ALREADY RUNNING IS NOT A FAILURE, and the generic branch would have
+mailed a critical for an entirely normal condition.** btrfs refuses to start a
+second scrub on the same filesystem, so `btrfs scrub start` returns non-zero and
+landed in `*)` -- `scrub FAILED on $root`, `worst=1`, a failed oneshot unit,
+which `checkup_systemd_health` reports as CRITICAL and `health-notify` mails.
+The monthly timer firing while a manual scrub is still going, or while the
+previous month's has not finished, would do exactly that.
+
+Asked two ways on purpose. `btrfs_scrub_running` reads the `Status:` field
+(btrfs-progs v6.14 prints `running|finished|aborted|interrupted`, and
+`no stats available` for a filesystem never scrubbed), which avoids depending on
+the wording of an error; btrfs's own `already running` message is the authority
+and closes the race between asking and starting. **Anything neither recognises
+stays a failure** -- an unrecognised error genuinely may be one, and that is the
+conservative direction, asserted in its own section.
+
+`btrfs scrub status` needs privilege, so an unreadable status is `unknown` and
+is **never** read as "not running": the status check abstains and btrfs's
+refusal remains the control. Reading it as idle would produce a confident
+failure from a check that could not see.
+
+**The summary narrows its claim rather than hiding the skip.** A skipped
+filesystem makes no claim, so the plain `scrubbed N filesystem(s)` line is
+replaced by one stating how many were scrubbed and how many were already
+running, plus an explicit line that the skipped ones are unproven here. HEALTHY
+must not mean UNMEASURED, and `0 scrubbed` reported as "clean" would be exactly
+that.
+
+**My own change broke two existing assertions, and one of them was right to
+break.** Capturing the invocation's output moved `btrfs scrub start` off column
+0, so the `-B` mutation's anchor no longer matched (the mutation reported "not
+unique: 0" rather than silently passing, which is why that rule exists) and the
+`^btrfs scrub start -B` assertion failed against correct code. The anchor was
+updated; the assertion is now `btrfs scrub start -B( |$)`, which still asserts
+`-B` is an argument of `scrub start` itself without depending on what precedes
+it on the line.
+
+**A RESTORE must state the CAPTURE MODE, because a digest is not a consistency
+claim.** A digest proves the restored bytes are the captured bytes; it says
+nothing about whether those bytes were a consistent point in time. jellyfin's
+and kavita's databases are both WAL-mode with no sqlite3 anywhere, so their
+captures are copies taken while the service may be writing -- and a restore
+report that omitted the mode read as strong for an `unproven` capture as for a
+consistent one. The mode is printed with its reason, a consistent capture is
+reported distinctly (so the unproven wording cannot be boilerplate), and an
+absent `CAPTURE_MODE` reads as `unknown` rather than the reassuring value --
+the metadata-key family, defaulted in the accessor and driven by a test with
+the key deleted.
+
 **A scrub that found corruption must leave a FAILED unit.** `ExecStart` carries
 no `-` prefix, so exit 3 fails `domum-media-btrfs-scrub.service`, which
 `checkup_systemd_health` reports as CRITICAL and `health-notify` mails. The

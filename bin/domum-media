@@ -8803,9 +8803,13 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   [[ -n "$dir" && -n "$target" ]] || { warn "service_state_restore needs a capture directory and a target"; return 1; }
   [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
 
-  local service live rtarget rlive
+  local service live rtarget rlive cap_mode
   service="$(sed -nE "s/^SERVICE=(.*)$/\1/p" "$manifest" | head -1)"
   [[ -n "$service" ]] || { warn "the manifest does not name a service"; return 1; }
+  # Read, not defaulted: a key the writer never emitted must not read as the
+  # reassuring value. An old or hand-made manifest says `unrecorded`.
+  cap_mode="$(sed -nE "s/^CAPTURE_MODE=(.*)$/\1/p" "$manifest" | head -1)"
+  cap_mode="${cap_mode:-unrecorded}"
 
   # The refusal is on resolved paths, because a symlink or a '..' would
   # otherwise walk straight into the live tree.
@@ -8883,6 +8887,22 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   else
     echo "[domum-media] restored $ok item(s) for $service into $rtarget, all matching their recorded digests"
     echo "[domum-media] restored databases: $sqlite_ok checked sound, $sqlite_skipped not checked"
+    # The digests prove the bytes are the bytes that were captured. They say
+    # nothing about whether those bytes were a consistent snapshot of a running
+    # application, and a restore report that omits the capture mode reads as
+    # strong for an `unproven` capture as for a consistent one.
+    case "$cap_mode" in
+      consistent)
+        echo "[domum-media] capture mode: consistent -- each database was taken with its own"
+        echo "              application's sqlite3 '.backup' and integrity-checked there." ;;
+      unproven)
+        echo "[domum-media] capture mode: UNPROVEN -- $service ships no sqlite3 and this host has"
+        echo "              none, so its database was COPIED while the service could be writing."
+        echo "              The bytes restored are the bytes captured; whether they were a"
+        echo "              consistent point in time is not established." ;;
+      *)
+        echo "[domum-media] capture mode: $cap_mode -- not recorded, so consistency is unknown." ;;
+    esac
     echo "[domum-media] this proves the CAPTURE restores. It is not a proof that $service runs against it."
   fi
   return "$rc"
@@ -11701,13 +11721,38 @@ storage_scrub_status() {
 #   1  a scrub could not be performed
 #   3  UNCORRECTABLE errors were found -- btrfs-scrub(8)'s own meaning, kept
 #
+btrfs_scrub_running() {  # $1 = btrfs root -> "running" | "no" | "unknown"
+  # btrfs-progs v6.14 prints a `Status:` field (running|finished|aborted|
+  # interrupted) and "no stats available" for a filesystem that has never been
+  # scrubbed. `btrfs scrub status` needs privilege, so an unreadable status is
+  # reported as `unknown` and must never be read as "not running" -- the caller
+  # then relies on btrfs's own refusal instead.
+  local out st
+  out="$(btrfs scrub status "$1" 2>/dev/null || true)"
+  [[ -n "$out" ]] || { printf 'unknown'; return 0; }
+  st="$(sed -nE 's/^[[:space:]]*Status:[[:space:]]*([A-Za-z]+).*/\1/p' <<< "$out" | head -1)"
+  case "${st,,}" in
+    running)  printf 'running' ;;
+    finished|aborted|interrupted) printf 'no' ;;
+    "")
+      # Older wordings carry no Status field. "no stats available" means a
+      # scrub has never run, so it is certainly not running now; a line saying
+      # a scrub is running for some duration means it is.
+      if grep -qiE 'scrub (started at .*, )?running' <<< "$out"; then printf 'running'
+      elif grep -qi 'no stats available' <<< "$out"; then printf 'no'
+      else printf 'unknown'; fi ;;
+    *) printf 'unknown' ;;
+  esac
+  return 0
+}
+
 # `-B` is not optional. Without it `btrfs scrub start` returns immediately and
 # a oneshot unit would report success before reading a single block -- green
 # because it did not wait.
 storage_scrub_start() {
   need_root
   load_cfg
-  local limit="" root fsid rc worst=0 n=0 est
+  local limit="" root fsid rc worst=0 n=0 skipped=0 est scrub_out
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --limit) [[ -n "${2:-}" ]] || die "--limit needs a size, e.g. --limit 150M"
@@ -11735,9 +11780,36 @@ storage_scrub_start() {
       echo "  The profiles could not be read, so which half is repairable here is"
       echo "  UNKNOWN; see docs/BTRFS-SCRUB-PLAN.md for the measured layout."
     fi
+    # A scrub ALREADY RUNNING is not a failure, and treating it as one would
+    # mail a false alarm for an entirely normal condition: the monthly timer
+    # firing while a manual scrub is still going, or while the previous run has
+    # not finished. btrfs refuses to start a second scrub on the same
+    # filesystem, so without this the generic branch below would report
+    # "scrub FAILED" and fail the unit, which `checkup_systemd_health` reports
+    # as CRITICAL.
+    #
+    # Asked two ways on purpose. The STATUS field is the clean signal and
+    # avoids depending on the wording of an error; the error text is the
+    # authority and closes the race between asking and starting. Anything
+    # neither recognises stays a failure -- an unrecognised error genuinely may
+    # be one, and that is the conservative direction.
+    if [[ "$(btrfs_scrub_running "$root")" == "running" ]]; then
+      echo "  result          : SKIPPED -- a scrub is already running on this filesystem."
+      echo "                    Not started again: btrfs scrubs one filesystem at a"
+      echo "                    time, and corruption IS being looked for right now."
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
     rc=0
+    scrub_out=""
     # shellcheck disable=SC2086
-    btrfs scrub start -B ${limit:+--limit "$limit"} "$root" || rc=$?
+    scrub_out="$(btrfs scrub start -B ${limit:+--limit "$limit"} "$root" 2>&1)" || rc=$?
+    [[ -n "$scrub_out" ]] && printf '%s\n' "$scrub_out" | sed 's/^/    /'
+    if (( rc != 0 )) && grep -qiE 'scrub (is )?already running|already in progress' <<< "$scrub_out"; then
+      echo "  result          : SKIPPED -- a scrub started between the check and this call."
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
     case "$rc" in
       0) echo "  result          : clean -- every allocated extent matched its checksum" ;;
       3) echo "  result          : UNCORRECTABLE ERRORS FOUND on $root"
@@ -11758,7 +11830,17 @@ storage_scrub_start() {
     esac
   done < <(btrfs_unique_roots)
   (( n > 0 )) || die "No Btrfs filesystem found among the configured roots."
-  echo "[domum-media] scrubbed $n filesystem(s); worst result $worst"
+  # The summary must not say "clean" about a filesystem it skipped. A scrub
+  # that was already running is reported, counted, and deliberately does NOT
+  # fail the unit -- but the claim is narrowed rather than the skip hidden,
+  # because HEALTHY must not mean UNMEASURED.
+  if (( skipped > 0 )); then
+    echo "[domum-media] $n filesystem(s) considered: $(( n - skipped )) scrubbed, $skipped already running; worst result $worst"
+    echo "[domum-media] the skipped filesystem(s) make no claim here. 'storage scrub status'"
+    echo "              reports the running scrub's own result when it finishes."
+  else
+    echo "[domum-media] scrubbed $n filesystem(s); worst result $worst"
+  fi
   return "$worst"
 }
 
