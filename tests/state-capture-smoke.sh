@@ -29,7 +29,15 @@ build_jellyfin() {
   mkdir -p "$TMP/data/jellyfin/config/data/data" \
            "$TMP/data/jellyfin/config/.aspnet/DataProtection-Keys" \
            "$TMP/data/jellyfin/config/log"
-  printf 'SQLite format 3\000library-rows' > "$TMP/data/jellyfin/config/data/data/jellyfin.db"
+  # A REAL database, not a file that merely starts with the magic: the restore
+  # opens what it restored, so a stub would fail for the wrong reason.
+  python3 - "$TMP/data/jellyfin/config/data/data/jellyfin.db" <<'MKDB'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table t(id integer primary key, v text)")
+con.execute("insert into t values (1,'library-rows')")
+con.commit(); con.close()
+MKDB
   for x in system encoding network database; do
     printf '<%s/>\n' "$x" > "$TMP/data/jellyfin/config/$x.xml"
   done
@@ -48,7 +56,10 @@ probe() {  # $1 = extra stubs, $2 = expression
     source "$CLI" >/dev/null 2>&1
     set +e
     warn() { echo "WARN: $*"; }
-    cmd_exists() { [[ "$1" != docker ]]; }
+    # Hide ONLY docker. A stub that claimed every tool exists would send
+    # domum_sqlite_check down its sqlite3 branch on a host that has none, and
+    # the resulting "command not found" would read as a corrupt database.
+    cmd_exists() { case "$1" in docker) return 1 ;; *) command -v -- "$1" >/dev/null 2>&1 ;; esac; }
     tracked_service_container_id_any() { return 1; }
     eval "$1"
     eval "$2"
@@ -196,6 +207,158 @@ grep -q 'RC=1' <<< "$out" || fail "a capture with no state directory did not ref
 [[ ! -d "$TMP/out/jf5" ]] || fail "it created a destination for a capture it could not make"
 echo "  refuses, and leaves no empty capture behind"
 
+sect "a captured FILE's mode is checked too, not only its contents"
+# plex's Preferences.xml holds the server token. A file item's digest is over
+# its contents, so the mode is recorded and compared separately.
+build_jellyfin
+rm -rf "$TMP/out/fm"
+probe '' "service_state_capture jellyfin '$TMP/out/fm'" >/dev/null
+grep -qE '^ITEM=file\|config/system\.xml\|file-copy\|[0-9]+\|[0-7]{3,4}\|[0-9a-f]{64}$' "$TMP/out/fm/MANIFEST" \
+  || fail "a file item does not record its mode: $(grep '^ITEM=file' "$TMP/out/fm/MANIFEST")"
+chmod 0666 "$TMP/out/fm/files/config_system.xml"
+out="$(probe '' "service_state_verify '$TMP/out/fm'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "widening a captured file's mode was not detected: $out"
+grep -q 'but was captured as' <<< "$out" || fail "it does not say what changed: $out"
+echo "  mode recorded per item, and a widened one fails verification"
+
+sect "a stored-name COLLISION is refused, never silently overwritten"
+# The stored name folds '/' and ' ' to '_', and plex's declared paths contain
+# spaces -- so two declared paths CAN map to one name. Capture must refuse.
+build_jellyfin
+mkdir -p "$TMP/data/jellyfin/config/a"
+printf 'one\n' > "$TMP/data/jellyfin/config/a/b"
+printf 'two\n' > "$TMP/data/jellyfin/config/a b"
+rm -rf "$TMP/out/col"
+out="$(probe 'service_essential_state() { printf "file|config/a/b\nfile|config/a b\n"; }' \
+  "service_state_capture jellyfin '$TMP/out/col'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" \
+  || fail "two items mapping to one stored name was accepted -- one would have
+overwritten the other and both digests would read the same file: $out"
+grep -q 'COLLISION' "$TMP/out/col/MANIFEST" || fail "the collision is not recorded: $(cat "$TMP/out/col/MANIFEST")"
+echo "  refused, and recorded as a collision"
+
+# ---------------------------------------------------------------------------
+sect "a restore REFUSES to write into the service's live state"
+build_jellyfin
+rm -rf "$TMP/out/cap"
+probe '' "service_state_capture jellyfin '$TMP/out/cap'" >/dev/null
+for bad_target in "$TMP/data/jellyfin" "$TMP/data/jellyfin/config/restored" "$TMP/data/jellyfin/../jellyfin/x"; do
+  out="$(probe '' "service_state_restore '$TMP/out/cap' '$bad_target'; echo RC=\$?")"
+  grep -q 'RC=1' <<< "$out" \
+    || fail "a restore into '$bad_target' was allowed -- writing into live state is a
+production mutation wearing a verification's clothes: $out"
+  grep -q 'REFUSING' <<< "$out" || fail "it does not say it is refusing: $out"
+done
+# And the live tree is untouched by the refusals.
+[[ -f "$TMP/data/jellyfin/config/system.xml" ]] || fail "the refusal damaged the live tree"
+[[ ! -d "$TMP/data/jellyfin/config/restored" ]] || fail "the refusal created a directory in live state"
+echo "  the live root, a path inside it, and a '..' path all refused"
+
+sect "a NON-EMPTY target is refused"
+mkdir -p "$TMP/out/busy"; printf 'pre-existing\n' > "$TMP/out/busy/already-here"
+out="$(probe '' "service_state_restore '$TMP/out/cap' '$TMP/out/busy'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a restore into a non-empty directory was allowed: $out"
+[[ "$(cat "$TMP/out/busy/already-here")" == "pre-existing" ]] || fail "it overwrote existing content"
+echo "  refused, and the existing content is intact"
+
+sect "a restore puts every item back at its declared path and PROVES the digests"
+rm -rf "$TMP/out/scratch"
+out="$(probe '' "service_state_restore '$TMP/out/cap' '$TMP/out/scratch'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "a sound capture did not restore: $out"
+for rel in 'config/data/data/jellyfin.db' 'config/system.xml' 'config/.aspnet/DataProtection-Keys/key-a.xml'; do
+  [[ -e "$TMP/out/scratch/$rel" ]] || fail "$rel was not restored to its declared path"
+done
+[[ "$(stat -c '%a' "$TMP/out/scratch/config/.aspnet/DataProtection-Keys/key-a.xml")" == "600" ]] \
+  || fail "the DataProtection key came back with a widened mode"
+cmp -s "$TMP/data/jellyfin/config/system.xml" "$TMP/out/scratch/config/system.xml" \
+  || fail "the restored file does not match the original"
+grep -q 'all matching their recorded digests' <<< "$out" || fail "it does not state the proof: $out"
+echo "  every item back at its declared path, bytes and modes intact"
+
+sect "the restore states its own LIMIT -- a capture is not a running service"
+grep -qi 'not a proof that' <<< "$out" \
+  || fail "the restore claims more than it proved. A restored capture says the
+BYTES came back; nothing here shows jellyfin runs against them: $out"
+echo "  the claim stops where the evidence does"
+
+sect "a DAMAGED capture is refused before anything is written"
+rm -rf "$TMP/out/scratch2"
+cp -a "$TMP/out/cap" "$TMP/out/cap-bad"
+printf 'rot\n' >> "$TMP/out/cap-bad/files/config_system.xml"
+out="$(probe '' "service_state_restore '$TMP/out/cap-bad' '$TMP/out/scratch2'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a capture that does not verify was restored anyway: $out"
+[[ ! -d "$TMP/out/scratch2" ]] || fail "it created a target for a restore it refused"
+echo "  refused on verification, and nothing was written"
+
+sect "an INCOMPLETE capture is refused"
+build_jellyfin
+rm -f "$TMP/data/jellyfin/config/network.xml"
+rm -rf "$TMP/out/cap-inc" "$TMP/out/scratch3"
+probe '' "service_state_capture jellyfin '$TMP/out/cap-inc'" >/dev/null 2>&1
+out="$(probe '' "service_state_restore '$TMP/out/cap-inc' '$TMP/out/scratch3'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "an incomplete capture was restored as though whole: $out"
+echo "  refused"
+
+sect "a restored DATABASE is asked whether it is sound"
+build_jellyfin
+rm -rf "$TMP/out/cap-db" "$TMP/out/scratch4"
+probe '' "service_state_capture jellyfin '$TMP/out/cap-db'" >/dev/null
+out="$(probe '' "service_state_restore '$TMP/out/cap-db' '$TMP/out/scratch4'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "a sound database did not restore: $out"
+grep -q 'restored databases: 1 checked sound' <<< "$out" \
+  || fail "the restored database was not integrity-checked: $out"
+echo "  checked sound by the host's own sqlite"
+
+sect "a CORRUPT database fails the restore, even though its digest matches"
+# The capture's digest is of the bytes that were captured; if those bytes are a
+# broken database the digest matches perfectly. Only opening it finds out.
+build_jellyfin
+python3 - "$TMP/data/jellyfin/config/data/data/jellyfin.db" <<'MKBAD'
+import sys
+# Corrupt page content, leaving the header magic intact so the file is still
+# recognised as SQLite and integrity_check actually runs.
+p = sys.argv[1]
+d = bytearray(open(p,'rb').read())
+for i in range(100, min(len(d), 400)):
+    d[i] = 0xFF
+open(p,'wb').write(bytes(d))
+MKBAD
+rm -rf "$TMP/out/cap-bad-db" "$TMP/out/scratch5"
+probe '' "service_state_capture jellyfin '$TMP/out/cap-bad-db'" >/dev/null
+out="$(probe '' "service_state_restore '$TMP/out/cap-bad-db' '$TMP/out/scratch5'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" \
+  || fail "a corrupt database restored with a matching digest and reported success --
+a digest proves the bytes arrived, not that they are a usable database: $out"
+grep -q 'not a sound database after restore' <<< "$out" || fail "it does not say what is wrong: $out"
+echo "  digest matched, the database did not, and the restore failed"
+
+# ---------------------------------------------------------------------------
+sect "STRICT MODE: the capture survives production's own shell options"
+# A test that relaxes production's shell options is not a test of production.
+# `probe` runs `set +e`, so an abort under `set -euo pipefail` cannot show
+# there -- and the digest helpers are pipelines, exactly the shape that has
+# aborted this project's functions before. Drive it in its own bash process.
+build_jellyfin
+rm -rf "$TMP/out/strict"
+cat > "$TMP/strict.sh" <<STRICT
+set -euo pipefail
+export PATH="$TMP/bin:\$PATH"
+export DOMUM_DATA_ROOT="$TMP/data"
+DOMUM_DIR=$(printf '%q' "$REPO_ROOT")
+CFG_FILE="$TMP/absent.conf"
+source $(printf '%q' "$CLI") >/dev/null 2>&1
+tracked_service_container_id_any() { return 1; }
+service_state_capture jellyfin "$TMP/out/strict"
+service_state_verify "$TMP/out/strict"
+service_state_restore "$TMP/out/strict" "$TMP/out/strict-restored"
+echo STRICT-OK
+STRICT
+out="$(bash "$TMP/strict.sh" 2>&1)" || true
+grep -q 'STRICT-OK' <<< "$out" \
+  || fail "the capture/verify/restore chain aborts under 'set -euo pipefail',
+which is what production runs: $out"
+echo "  capture, verify and restore all complete under set -euo pipefail"
+
 # ---------------------------------------------------------------------------
 sect "MUTATION: accepting a missing item makes a partial capture look COMPLETE"
 build_jellyfin
@@ -247,5 +410,59 @@ cp "$TMP/cli.orig2" "$CLI"
   || fail "the mutation changed no ANSWER -- declaring every service consistent
 must make jellyfin, which has no sqlite3 anywhere, claim consistency: $m2"
 echo "  killed: a service with no sqlite3 would claim a consistent capture"
+
+sect "MUTATION: without the overlap guard a restore writes into LIVE state"
+build_jellyfin
+rm -rf "$TMP/out/cap-m3"
+probe '' "service_state_capture jellyfin '$TMP/out/cap-m3'" >/dev/null
+cp "$CLI" "$TMP/cli.orig3"
+cat > "$TMP/mutate3.py" <<'PYMUT3'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if [[ "$rtarget" == "$rlive" || "$rtarget" == "$rlive"/* || "$rlive" == "$rtarget"/* ]]; then'
+new = '  if [[ "$rtarget" == "$rtarget/cannot-hold" ]]; then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT3
+( python3 -I "$TMP/mutate3.py" "$CLI" ) || { cp "$TMP/cli.orig3" "$CLI"; fail "the third mutation did not apply"; }
+# An EMPTY path inside the live tree: the non-empty guard cannot catch this
+# one, so the overlap guard is the only thing standing in the way.
+mout="$(probe '' "service_state_restore '$TMP/out/cap-m3' '$TMP/data/jellyfin/config/restored'; echo RC=\$?")"
+wrote=0; [[ -e "$TMP/data/jellyfin/config/restored/config/system.xml" ]] && wrote=1
+cp "$TMP/cli.orig3" "$CLI"
+rm -rf "$TMP/data/jellyfin/config/restored"
+[[ "$wrote" == "1" ]] \
+  || fail "the mutation changed no ANSWER -- with the overlap comparison
+neutralised, a restore into the live tree must actually write there: $mout"
+echo "  killed: without the guard, a restore writes inside the live state tree"
+
+sect "MUTATION: without the verify gate it writes before knowing the capture is sound"
+build_jellyfin
+rm -rf "$TMP/out/cap-m4" "$TMP/out/scratch-m4"
+probe '' "service_state_capture jellyfin '$TMP/out/cap-m4'" >/dev/null
+printf 'rot\n' >> "$TMP/out/cap-m4/files/config_system.xml"
+cp "$CLI" "$TMP/cli.orig4"
+cat > "$TMP/mutate4.py" <<'PYMUT4'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  service_state_verify "$dir" >/dev/null 2>&1 || {'
+new = '  true || {'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT4
+( python3 -I "$TMP/mutate4.py" "$CLI" ) || { cp "$TMP/cli.orig4" "$CLI"; fail "the fourth mutation did not apply"; }
+mout="$(probe '' "service_state_restore '$TMP/out/cap-m4' '$TMP/out/scratch-m4'; echo RC=\$?")"
+created=0; [[ -d "$TMP/out/scratch-m4" ]] && created=1
+cp "$TMP/cli.orig4" "$CLI"
+[[ "$created" == "1" ]] \
+  || fail "the mutation changed no ANSWER -- without the gate, a damaged capture
+must get as far as creating its target: $mout"
+# The per-item digest comparison is the second layer and must still catch it.
+grep -q 'RC=1' <<< "$mout" \
+  || fail "a damaged capture restored and reported SUCCESS even with the
+per-item digest comparison in place: $mout"
+echo "  killed: the refusal-before-writing is gone; the per-item digest still catches it"
 
 echo "ALL STATE-CAPTURE CHECKS PASSED"

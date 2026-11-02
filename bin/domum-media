@@ -8766,6 +8766,128 @@ service_sqlite_backup() {  # $1 = service, $2 = host db path, $3 = dest file
 # recovery point is service + state + the application that wrote it. State
 # restored under a different application version is the pairing failure this
 # project already documents for Kavita and Uptime Kuma.
+state_item_stored_name() {  # $1 = declared relative path -> the name used under files/
+  # Lossy by construction: plex's declared paths contain spaces, so '/' and ' '
+  # both fold to '_'. The capture therefore REFUSES a collision rather than
+  # letting one item silently overwrite another and both digests read one file.
+  printf '%s' "$1" | tr '/ ' '__'
+}
+
+state_item_digest() {  # $1 = path -> sha256 over contents AND modes
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    # Over the sorted file list, their contents, and the mode of every entry
+    # including the directory itself -- so a widened permission changes it.
+    # Jellyfin's DataProtection-Keys are 0600 and they decrypt its stored
+    # secrets; a restore that widened them would be a disclosure, and a
+    # contents-only digest would verify clean.
+    { ( cd "$p" || exit 1
+        find . -type f -print0 | sort -z | xargs -0 -r sha256sum
+        find . -printf '%m %p\n' | sort ) 2>/dev/null || true; } \
+      | sha256sum | cut -d' ' -f1
+  else
+    { sha256sum "$p" 2>/dev/null || true; } | cut -d' ' -f1
+  fi
+}
+
+state_item_mode() {  # $1 = path -> octal mode, or empty
+  stat -c '%a' "$1" 2>/dev/null || true
+}
+
+service_state_restore() {  # $1 = capture directory, $2 = scratch target
+  # Restores a capture into a target the operator names. It NEVER writes into
+  # the live state tree: restoring over a running service's state would be a
+  # production mutation disguised as a verification, and the whole point of a
+  # restore test is that it can be run freely.
+  local dir="$1" target="$2" manifest="$1/MANIFEST"
+  [[ -n "$dir" && -n "$target" ]] || { warn "service_state_restore needs a capture directory and a target"; return 1; }
+  [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
+
+  local service live rtarget rlive
+  service="$(sed -nE "s/^SERVICE=(.*)$/\1/p" "$manifest" | head -1)"
+  [[ -n "$service" ]] || { warn "the manifest does not name a service"; return 1; }
+
+  # The refusal is on resolved paths, because a symlink or a '..' would
+  # otherwise walk straight into the live tree.
+  rtarget="$(realpath -m -- "$target" 2>/dev/null || printf '%s' "$target")"
+  live="$(service_data_path "$service")"
+  rlive="$(realpath -m -- "$live" 2>/dev/null || printf '%s' "$live")"
+  if [[ "$rtarget" == "$rlive" || "$rtarget" == "$rlive"/* || "$rlive" == "$rtarget"/* ]]; then
+    warn "REFUSING: $rtarget overlaps $service's live state at $rlive."
+    warn "A restore writes into its target. Name a scratch directory instead."
+    return 1
+  fi
+  if [[ -e "$rtarget" ]] && [[ -n "$(ls -A -- "$rtarget" 2>/dev/null || true)" ]]; then
+    warn "REFUSING: $rtarget is not empty. A restore into existing content cannot"
+    warn "be told apart from the content that was already there."
+    return 1
+  fi
+
+  # A capture that does not verify must not be restored: restoring damaged
+  # bytes and then reporting success is how a museum piece passes for a
+  # recovery point.
+  service_state_verify "$dir" >/dev/null 2>&1 || {
+    warn "REFUSING: the capture at $dir does not verify. Run 'storage verify-state $dir'."
+    return 1
+  }
+
+  install -d -m 0700 -- "$rtarget" || return 1
+
+  local line kind rel itemmode sz fmode sum out dst now nowmode rc=0 ok=0 bad=0 sqlite_ok=0 sqlite_skipped=0
+  while IFS= read -r line; do
+    [[ "$line" == ITEM=* ]] || continue
+    IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
+    case "$itemmode" in MISSING|FAILED|COLLISION) continue ;; esac
+    out="$dir/files/$(state_item_stored_name "$rel")"
+    dst="$rtarget/$rel"
+    install -d -m 0700 -- "$(dirname -- "$dst")" || { bad=$(( bad + 1 )); continue; }
+    # -a, so a 0600 key does not come back readable by anyone else.
+    cp -a -- "$out" "$dst" 2>/dev/null || {
+      warn "$rel could not be restored"; bad=$(( bad + 1 )); continue; }
+
+    # The proof is that the RESTORED path carries the recorded digest. A copy
+    # that reported success is not evidence that the bytes arrived.
+    now="$(state_item_digest "$dst")"
+    if [[ "$now" != "$sum" ]]; then
+      warn "$rel restored but does not match its recorded digest"; bad=$(( bad + 1 )); continue
+    fi
+    nowmode="$(state_item_mode "$dst")"
+    if [[ -n "$fmode" && "$nowmode" != "$fmode" ]]; then
+      warn "$rel restored as mode $nowmode, captured as $fmode"; bad=$(( bad + 1 )); continue
+    fi
+    ok=$(( ok + 1 ))
+
+    # And a restored database is asked whether it is sound, by the application's
+    # own SQLite where there is one. "I could not check it" is reported as
+    # exactly that, never as a pass.
+    if [[ "$kind" == "sqlite" ]]; then
+      local chk
+      chk="$(domum_sqlite_check "$dst" 2>/dev/null || true)"
+      case "$chk" in
+        ok) sqlite_ok=$(( sqlite_ok + 1 )) ;;
+        # "I could not check it" is not "it is broken". An extension this
+        # SQLite lacks, no SQLite at all, and a database that could not even be
+        # opened are all failures of the CHECK, not of the database -- the
+        # defect that once reported plex's two sound databases as a failed
+        # recovery point.
+        unsupported:*|unchecked|""|*"command not found"*|*"unable to open"*|*"cannot open"*)
+          sqlite_skipped=$(( sqlite_skipped + 1 )) ;;
+        *) warn "$rel is not a sound database after restore: $chk"; bad=$(( bad + 1 )); ok=$(( ok - 1 )) ;;
+      esac
+    fi
+  done < "$manifest"
+
+  if (( bad > 0 )); then
+    warn "state restore FAILED for $service: $ok item(s) restored and verified, $bad not"
+    rc=1
+  else
+    echo "[domum-media] restored $ok item(s) for $service into $rtarget, all matching their recorded digests"
+    echo "[domum-media] restored databases: $sqlite_ok checked sound, $sqlite_skipped not checked"
+    echo "[domum-media] this proves the CAPTURE restores. It is not a proof that $service runs against it."
+  fi
+  return "$rc"
+}
+
 service_state_capture() {  # $1 = service, $2 = destination directory
   local service="$1" dest="$2"
   [[ -n "$service" && -n "$dest" ]] || { warn "service_state_capture needs a service and a destination"; return 1; }
@@ -8785,7 +8907,7 @@ service_state_capture() {  # $1 = service, $2 = destination directory
   chmod 0600 "$manifest" 2>/dev/null || true
 
   {
-    printf 'SCHEMA_VERSION=1\n'
+    printf 'SCHEMA_VERSION=2\n'
     printf 'SERVICE=%s\n' "$service"
     printf 'CAPTURED_AT=%s\n' "$(date -Iseconds)"
     printf 'STATE_ROOT=%s\n' "$root"
@@ -8793,12 +8915,17 @@ service_state_capture() {  # $1 = service, $2 = destination directory
     printf 'IMAGE_ID=%s\n' "${img:-unknown}"
   } >> "$manifest"
 
-  local kind rel src out sz sum itemmode
+  local kind rel src out sz sum itemmode fmode
   while IFS='|' read -r kind rel; do
     [[ -n "$kind" && -n "$rel" ]] || continue
     items=$(( items + 1 ))
     src="$root/$rel"
-    out="$dest/files/$(printf '%s' "$rel" | tr '/ ' '__')"
+    out="$dest/files/$(state_item_stored_name "$rel")"
+    if [[ -e "$out" ]]; then
+      printf 'ITEM=%s|%s|COLLISION|||\n' "$kind" "$rel" >> "$manifest"
+      warn "two declared items map to the same stored name ($out); refusing to overwrite"
+      bad=$(( bad + 1 )); continue
+    fi
     itemmode=""
     case "$kind" in
       sqlite)
@@ -8838,14 +8965,12 @@ service_state_capture() {  # $1 = service, $2 = destination directory
     esac
     if [[ -d "$out" ]]; then
       sz="$(du -sb "$out" 2>/dev/null | cut -f1)"
-      # A directory's digest is over its sorted file list and contents, so a
-      # changed permission or a missing file changes it.
-      sum="$( (cd "$out" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum; find . -printf '%m %p\n' | sort) 2>/dev/null | sha256sum | cut -d' ' -f1)"
     else
       sz="$(stat -c %s "$out" 2>/dev/null || echo 0)"
-      sum="$(sha256sum "$out" 2>/dev/null | cut -d' ' -f1)"
     fi
-    printf 'ITEM=%s|%s|%s|%s|%s\n' "$kind" "$rel" "$itemmode" "${sz:-0}" "${sum:-}" >> "$manifest"
+    sum="$(state_item_digest "$out")"
+    fmode="$(state_item_mode "$out")"
+    printf 'ITEM=%s|%s|%s|%s|%s|%s\n' "$kind" "$rel" "$itemmode" "${sz:-0}" "${fmode:-}" "${sum:-}" >> "$manifest"
   done < <(service_essential_state "$service")
 
   if (( bad > 0 )); then
@@ -8865,25 +8990,29 @@ service_state_capture() {  # $1 = service, $2 = destination directory
 # Separate from the capture on purpose: a checksum written and never re-read
 # proves nothing, and this is what a restore should run first.
 service_state_verify() {  # $1 = capture directory
-  local dir="$1" manifest="$1/MANIFEST" line kind rel itemmode sz sum out now rc=0 ok=0 bad=0
+  local dir="$1" manifest="$1/MANIFEST" line kind rel itemmode sz fmode sum out now nowmode rc=0 ok=0 bad=0
   [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
   while IFS= read -r line; do
     [[ "$line" == ITEM=* ]] || continue
-    IFS='|' read -r kind rel itemmode sz sum <<< "${line#ITEM=}"
-    if [[ "$itemmode" == "MISSING" || "$itemmode" == "FAILED" ]]; then
-      warn "$rel was never captured ($itemmode)"; bad=$(( bad + 1 )); continue
-    fi
-    out="$dir/files/$(printf '%s' "$rel" | tr '/ ' '__')"
+    IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
+    case "$itemmode" in
+      MISSING|FAILED|COLLISION)
+        warn "$rel was never captured ($itemmode)"; bad=$(( bad + 1 )); continue ;;
+    esac
+    out="$dir/files/$(state_item_stored_name "$rel")"
     if [[ ! -e "$out" ]]; then
       warn "$rel is named by the manifest but absent from the capture"; bad=$(( bad + 1 )); continue
     fi
-    if [[ -d "$out" ]]; then
-      now="$( (cd "$out" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum; find . -printf '%m %p\n' | sort) 2>/dev/null | sha256sum | cut -d' ' -f1)"
-    else
-      now="$(sha256sum "$out" 2>/dev/null | cut -d' ' -f1)"
-    fi
+    now="$(state_item_digest "$out")"
     if [[ "$now" != "$sum" ]]; then
       warn "$rel does not match its recorded digest"; bad=$(( bad + 1 )); continue
+    fi
+    # A file item's digest is over its CONTENTS, so the mode is checked
+    # separately: plex's Preferences.xml holds the server token, and a
+    # recovery that widened it would be a disclosure.
+    nowmode="$(state_item_mode "$out")"
+    if [[ -n "$fmode" && "$nowmode" != "$fmode" ]]; then
+      warn "$rel is mode $nowmode but was captured as $fmode"; bad=$(( bad + 1 )); continue
     fi
     ok=$(( ok + 1 ))
   done < "$manifest"
@@ -11608,6 +11737,15 @@ storage_cmd() {
       # written and never read back proves nothing.
       load_cfg
       service_state_verify "${1:-}" ;;
+    restore-state)
+      shift
+      # Restore a capture into a SCRATCH directory the caller names, then prove
+      # the restored bytes carry the recorded digests. It refuses a target that
+      # overlaps the service's live state, and refuses a non-empty target --
+      # a restore that writes over live state is a production mutation wearing
+      # a verification's clothes.
+      load_cfg
+      service_state_restore "${1:-}" "${2:-}" ;;
       pre-upgrade-point)
         shift
         # Deploys nothing: stop, prove quiescence, snapshot, archive the EXACT
@@ -11636,7 +11774,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir>|verify-state <dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir>|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
   esac
 }
 

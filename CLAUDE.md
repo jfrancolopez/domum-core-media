@@ -3328,6 +3328,59 @@ verification to fail.
 point.** This file already holds that a recovery point is service + snapshot +
 the application that wrote it. A capture is the snapshot half.
 
+**A RESTORE never writes into live state, and the refusal is on RESOLVED
+paths.** `service_state_restore` takes a scratch target and refuses it when it
+equals, contains or sits inside `service_data_path`, because a symlink or a
+`..` would otherwise walk straight into the running service's tree -- a
+production mutation wearing a verification's clothes. It also refuses a
+non-empty target (restored content could not be told from what was already
+there) and refuses a capture that does not verify. The mutation that
+neutralises the overlap comparison must make a restore actually write inside
+the live tree.
+
+**The proof is the RESTORED bytes, not the copy's exit status.** Every item's
+digest and mode are recomputed after it lands, and a restored database is
+opened: a digest proves the bytes arrived, not that they are a usable
+database. Measured in the suite -- a database corrupted before capture
+restores with a perfectly matching digest and must still fail. And the restore
+states its own limit: it proves the CAPTURE restores, never that the service
+runs against it.
+
+**"I could not check it" is not "it is broken" -- and I wrote that defect into
+the new restore.** Its first classification sent anything that was not `ok` or
+`unsupported:` to "not a sound database", so on a host with no sqlite3 a
+`command not found` read as corruption. The same family that once reported
+plex's two sound databases as a failed recovery point. A tool failure, an
+unopenable file and an absent SQLite are all `not checked`.
+
+**A test stub must hide exactly what it means to hide.** The fixture's
+`cmd_exists() { [[ "$1" != docker ]]; }` claimed EVERY other tool exists, which
+sent `domum_sqlite_check` down its `sqlite3` branch on a host that has none.
+It now hides docker and defers to `command -v` for everything else.
+
+**A fixture database must be a database.** The jellyfin fixture wrote
+`SQLite format 3\000library-rows` -- enough to look like one and not enough to
+open -- so the restore's integrity check failed for the wrong reason and looked
+like a code defect. It builds a real one with `sqlite3` now.
+
+**The stored filename folds `/` and ` ` to `_`, so a COLLISION is possible and
+is refused.** Plex's declared paths contain spaces, so `a/b` and `a b` map to
+one name; without the guard one item would silently overwrite the other and
+both recorded digests would read the same file. The capture records
+`COLLISION` and fails closed.
+
+**A file item's digest covers CONTENTS, so its MODE is recorded and compared
+separately.** Plex's `Preferences.xml` holds the server token. A directory
+item's digest already covers modes, which is what protects jellyfin's 0600
+DataProtection keys; a file item had no such cover until the mode field was
+added (`SCHEMA_VERSION=2`).
+
+**The suite's `probe` runs `set +e`, so it cannot see an abort under
+production's options.** The digest helpers are pipelines -- exactly the shape
+that has aborted this project's functions before -- so one section drives
+capture, verify and restore in their own `set -euo pipefail` bash process. A
+test that relaxes production's shell options is not a test of production.
+
 **Eighth instance of `cmd | grep -q` under pipefail**, four sites in one
 sitting: three in the new suite and one I had added to
 `sqlite-unsupported-smoke.sh` the session before, where a service that DOES
