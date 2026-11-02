@@ -34,7 +34,6 @@ designed. **No implementation exists** — verified 2026-11-03, there is no
 | P1.6 | disposable-fixture tests + mutations | **done** — `tests/state-capture-smoke.sh`, wired into CI; 2 mutants, both killed. A `docker` stub that exits non-zero is on PATH, so reaching the real daemon fails rather than quietly succeeding |
 | P1.8 | jellyfin/kavita are WAL-mode with no sqlite3 anywhere -- a quiesced capture (stop, copy, start under the operation lock) is the only way to make their mode `consistent` | open — measured 2026-11-02 from the file header; a read-only open fails with `attempt to write a readonly database`, so no cleverer read closes it |
 | P1.9 | surface `CAPTURE_MODE` in the restore report | **done** — printed with its reason; a consistent capture reports distinctly so the unproven wording cannot be boilerplate, and an absent key reads `unknown`, never the reassuring value |
-| P4.5 | scrub duplicate-run protection | **done** — `btrfs_scrub_running` plus btrfs's own `already running` error; a skip does not fail the unit, the summary narrows its claim rather than saying `clean`, an unreadable status is `unknown` and never `not running`, and an unrecognised error stays a failure. 1 mutant, killed |
 | P1.7 | activate a production backup target for it | **BLOCKED** — operator decision; needs the archive size (P2.1) for the cost figure |
 
 ### Measured capture capability, 2026-11-03
@@ -101,7 +100,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 | P4.2 | per-filesystem dedup so one filesystem is scrubbed once | **done** — `btrfs_unique_roots`, both directions tested |
 | P4.3 | exit status contract (`0`/`1`/`3`) and a failed scrub failing the unit | **done** |
 | P4.4 | SMART wear reaching the notifier | **done** (`b8a36e6`) |
-| P4.5 | duplicate-run protection *while a scrub is already running* | open — verify `btrfs scrub start` behaviour on a busy filesystem is handled |
+| P4.5 | duplicate-run protection *while a scrub is already running* | **done** — measured: `btrfs scrub start` on a busy filesystem returns non-zero and landed in the generic branch, so it reported `scrub FAILED`, failed the unit, and would have mailed a CRITICAL for an entirely normal condition. `btrfs_scrub_running` reads the `Status:` field and btrfs's own `already running` error closes the race; a skip does not fail the unit; the summary narrows its claim instead of saying `clean`; an unreadable status is `unknown`, never `not running`; an unrecognised error stays a failure. 1 mutant, killed |
 | P4.6 | install/enable the timer, run a scrub | **BLOCKED** — operator decision |
 
 ---
@@ -112,7 +111,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 |---|---|---|
 | P5.1 | credential-custody review + checklist | **done** — `docs/RECOVERY-KEY-CUSTODY.md` |
 | P5.2 | off-site copy of the restic password / age key | **BLOCKED** — operator action, and the single highest remaining risk |
-| P5.3 | fresh-host restore runbook validated end to end | open |
+| P5.3 | fresh-host restore runbook validated end to end | **corrected, NOT validated** — `docs/disaster-recovery.md` now opens with a per-step proven/never-executed table and four stale claims are fixed: it offered **`nas` as the primary restore example** (a target with zero snapshots across 107 nightly runs and no mount on this host), said service-level Btrfs rollback is unavailable (five services have been subvolumes since 2026-09-25), said no guided PostgreSQL import exists (`verify-db-restore` is proven), and never mentioned that the cloud target is immich-only — so a fresh host comes up with the photo library and five media services as fresh installs. End-to-end validation needs a second machine (P5.5) |
 | P5.4 | hidden recovery dependencies enumerated (pgvecto.rs, Jellyfin DataProtection-Keys, image identity) | **done** — `docs/HIDDEN-RECOVERY-DEPENDENCIES.md`, 12 entries, each citing the measurement and the document holding it. 8 are closed in code and still listed, because each was closed *after* giving the wrong answer first |
 | P5.5 | full Immich restore | **BLOCKED** — needs the UGREEN hardware; never claim it without doing it |
 

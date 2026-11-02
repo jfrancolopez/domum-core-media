@@ -3517,6 +3517,55 @@ Write the capture-first form the first time.
 
 ---
 
+**THE DISASTER-RECOVERY RUNBOOK OFFERED `nas` AS ITS PRIMARY RESTORE EXAMPLE.**
+`docs/disaster-recovery.md` is the one document read while the host is gone, and
+step 4 said *"Restore from your preferred backup target. Example (NAS):"*
+followed by `--restore latest / --repo nas`. Measured: across 107 consecutive
+nightly runs the rotated log contains `restic backup -> cloud` 107 times and
+**zero** occurrences of `nas` in any form, there is no network mount on this
+host, and no `/srv/nas*` exists. The first command an operator would copy under
+pressure points at a repository that was never written. `cloud` is now the
+example, with `--snapshots` given as the way to check a target has one at all.
+
+Three more stale claims in the same document, each pointing the wrong way:
+
+- *"Service-level Btrfs rollback is not currently available on production
+  because service paths are ordinary directories"* -- false since 2026-09-25;
+  **five** services are subvolumes with proof snapshots. It then told the
+  operator to recreate "only the existing top-level layout", which happens to
+  be right for a fresh host but for the wrong reason. The corrected text says
+  why: a restic restore writes files, not subvolumes, so a recovered host
+  legitimately has directories and `storage migrate-subvolume` is a separate
+  gated operation not to be improvised under recovery pressure.
+- *"The current CLI does not provide a guided PostgreSQL import command"* --
+  stale. `verify-db-restore` imports into a disposable instance under
+  `ON_ERROR_STOP=1` and has been proven against the real dump. There is still
+  no guided import into PRODUCTION, which is the distinction the text now
+  draws.
+- **It never said the cloud target is immich-only.** The most important fact
+  about a fresh-host recovery was absent: restoring from `cloud` brings back the
+  photo library, the validated dump and the recovery pack, and the five media
+  services come up as **fresh installs**. That is now a table, with the
+  consequence spelled out per path.
+
+**A runbook states which of its own steps have been executed.** The document
+read as validated and none of it had been run end to end. It now opens with a
+per-step table -- proven / partly proven / never executed, each with its
+evidence -- and says plainly that the step never taken is putting any of it on a
+different machine. `tests/documented-commands-audit.py` checks the commands
+exist in the CLI (100 now), which is the weaker half: it cannot see whether a
+procedure has ever been performed.
+
+**A fact that appears twice: I updated the wrong copy.** `backlog/QUEUE.md` had
+P4.5 in its P4 table and I had earlier appended a second P4.5 row to the P1
+table; marking the work done, I edited my own duplicate and left the original
+reading `open`. This file already records that changing one of two copies is
+worse than changing neither, because the remaining copy now has a neighbour
+vouching for it. The duplicate is removed and the original row carries the
+result.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

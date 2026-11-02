@@ -6,6 +6,36 @@ Recovery is driven by three artefacts:
 - restic backup
 - encrypted recovery pack
 
+## What of this is PROVEN, step by step
+
+**No fresh host has ever been recovered.** This runbook has never been executed
+end to end, and the parts that have been proven were proven in isolation, on
+this host, against disposable targets. Read the table before relying on any
+step; a runbook that reads as validated when it is not is the defect this
+project exists to correct.
+
+| step | status | evidence |
+|---|---|---|
+| 1 bootstrap | **never executed** | `install.sh` is in CI (`bash -n`, shellcheck) but has never run on a bare machine |
+| 2 decrypt the pack | **partly proven** | 37 packs existed 2026-10-12, newest 0 days old, off-host delivery enabled, pack correctly **not** inside the backup needed to open it. The age private key is held by the operator and is **not** on this host, so the decrypt itself is unproven — and 37 copies are 37 unopenable files without it |
+| 3 scratch restore | **proven** | the Immich dump restores from the repository and revalidates (`verify-restore`); a 12-file sample of originals restores and compares byte-for-byte, accumulating across runs |
+| 4 restore to `/` | **never executed** | nothing has written a snapshot back to production paths |
+| database import | **proven, disposable only** | `verify-db-restore`, 2026-10-11: 23,033 assets into 61 tables under `ON_ERROR_STOP=1`, in a `--network none` tmpfs instance |
+| Immich opens it | **proven** | `immich-phase-a`, 2026-10-11: migrations ran, `No schema drift detected`, a recovered user authenticated, counts matched per media type |
+| Immich serves originals | **proven for 8 of 23,033** | `immich-phase-b`, 2026-10-12: 8 restored originals served with **bytes identical**, across jpeg/heic/png/raw/video and a live-photo pair |
+| 5-6 configure, init, apply | **never executed on a recovered host** | these are the normal production commands; nothing has run them against restored state |
+| 7 validate | **partly** | `checkup` runs here routinely; it has never been run against a recovery |
+| whole-library restore | **never executed** | ~130 GiB. Nothing on this host is `FULL RECOVERY VERIFIED`, and this runbook does not make it so |
+
+So the honest summary: **the backup is proven readable, the database is proven
+importable, and the application is proven able to open and serve what was
+restored — on this machine.** The step that has never been taken is putting all
+of it on a different machine.
+
+The five recovery levels and what each requires:
+`UNKNOWN < CONFIGURED < BACKED UP < RESTORE TESTED < FULL RECOVERY VERIFIED`
+(`domum-media-backup dr-status`).
+
 ## 1. Bootstrap the host
 
 ```bash
@@ -57,38 +87,101 @@ inspection command. Keep all application containers stopped while it runs.
 Do not restore live PostgreSQL files as a substitute for the validated
 `immich-postgres.dump.sql.gz`.
 
-Restore from your preferred backup target. Example (NAS):
+**Only `cloud` has snapshots. Measured, 2026-11-02.** `BACKUP_TARGETS` lists
+`nas cloud archive`, and `backup_target_default_enabled` returns 1 for `nas` —
+so `nas` reads as enabled from the defaults alone. It is not: across **107
+consecutive nightly runs** the rotated backup log contains `restic backup ->
+cloud` 107 times and **zero** occurrences of `nas` or `archive` in any form,
+there is no network mount of any kind on this host, and no `/srv/nas*` exists.
+`nas` is a placeholder for hardware that does not exist; `archive` has cadence
+`none`.
 
-```bash
-sudo /usr/local/bin/domum-media-backup --restore latest / --repo nas
-```
-
-Or from cloud:
+During a recovery, restore from `cloud`:
 
 ```bash
 sudo /usr/local/bin/domum-media-backup --restore latest / --repo cloud
 ```
 
-Or archive:
+Before trusting any other target, check that it has a snapshot at all:
 
 ```bash
-sudo /usr/local/bin/domum-media-backup --restore latest / --repo archive
+sudo /usr/local/bin/domum-media-backup --snapshots      # latest per target
 ```
 
-**Note**: Restic backups are encrypted. You need the correct `RESTIC_PASSWORD_FILE` from the recovery pack to restore. The password is saved in `secrets/restic_password_<target>` on the recovered host.
+A target with no snapshot is not a fallback. Offering `nas` as the primary
+example is how a recovery stalls on a repository that was never written.
 
-The cloud profile contains the Immich library, validated dump staging, and
-encrypted recovery pack; it does not contain every path below `/srv/data`.
-Other targets may have different include profiles.
+**Note**: Restic backups are encrypted. You need the correct
+`RESTIC_PASSWORD_FILE` from the recovery pack to restore. The password is saved
+in `secrets/restic_password_<target>` on the recovered host.
 
-The current CLI does not provide a guided PostgreSQL import command. The P0
-scratch drill proves that the dump restores byte-for-byte and passes structural
-validation, but a rehearsed import remains separate work. Do not start Immich
-against an empty or inconsistent database.
+### What the cloud target does NOT contain
 
-Service-level Btrfs rollback is not currently available on production because
-service paths are ordinary directories. Recreate only the existing top-level
-Btrfs layout; do not improvise a service-directory migration during recovery.
+This is the most important thing to know before starting, and it decides what
+the recovered host will be missing. The cloud target is **immich-only by
+design** — three roots:
+
+```
+/srv/data/immich/library
+/srv/data/immich/backup-staging
+<state root>/recovery-pack
+```
+
+So a fresh-host restore from `cloud` brings back **the photo library, the
+validated PostgreSQL dump and the recovery pack, and nothing else**. In
+particular these are **NOT COVERED**:
+
+| not in the cloud target | consequence on a fresh host |
+|---|---|
+| `/srv/data/{plex,jellyfin,kavita,navidrome,calibre-web}` | all five media services come up as **fresh installs** — no libraries, no users, no watch state |
+| `/srv/data/backups/images` (the exact-image archives) | the recorded image identity for every recovery point is unobtainable |
+| `/srv/media` | deliberate: replaceable/reacquirable media |
+
+That is a KNOWN, ACCEPTED limitation, not an oversight. It also means **the
+five services' state exists on exactly one device** — the SSD that also holds
+every snapshot and every `.premigration` copy — so losing that device loses it.
+`domum-media storage capture-state` exists to capture the 8.90 MiB that
+matters, and **no backup target includes those captures yet**; activating one
+is an operator decision.
+
+Read `docs/HIDDEN-RECOVERY-DEPENDENCIES.md` before step 4. It lists the twelve
+things a recovery needs that no backup list mentions — among them the six
+13-byte `.immich` markers without which Immich's microservices worker dies, the
+deprecated `pgvecto.rs` extension the dump requires, and jellyfin's 0600
+DataProtection keys.
+
+### Btrfs layout on the recovered host
+
+**FIVE services are real Btrfs subvolumes in production** — jellyfin
+(2026-09-25), kavita and navidrome (2026-09-29), plex (2026-10-06) and
+calibre-web (2026-10-09) — each with a verified read-only proof snapshot. A
+fresh host restored from a backup has **ordinary directories**, because a
+restic restore writes files, not subvolumes.
+
+Recreate the top-level Btrfs layout (`/srv/data`, `/srv/snapshots`). Do **not**
+improvise a service-directory migration during recovery:
+`storage migrate-subvolume` is a separate, gated operation with its own proof
+and `.premigration` retention, and running it under recovery pressure is how a
+migration goes wrong. Per-service snapshot protection will read DEGRADED until
+it is done deliberately, and that is the correct report.
+
+### The PostgreSQL dump
+
+There is no guided import into **production**. There is a proven import into a
+**disposable** instance, and it is how to establish that the dump is usable
+before Immich is allowed near it:
+
+```bash
+sudo /usr/local/bin/domum-media-backup verify-db-restore cloud
+```
+
+Measured 2026-10-11 against the real dump: 20 s, exit 0, zero stderr, 23,033
+assets into 61 tables, under `ON_ERROR_STOP=1`. It uses the image production
+uses, read from `docker inspect`, because the dump declares
+`CREATE EXTENSION vectors WITH SCHEMA vectors` and only `pgvecto-rs` provides
+it. It is `--network none`, tmpfs PGDATA, no bind mount, removed by a trap.
+
+Do not start Immich against an empty or inconsistent database.
 
 ## 5. Sync local config/state
 
