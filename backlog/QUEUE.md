@@ -27,11 +27,11 @@ designed. **No implementation exists** — verified 2026-11-03, there is no
 | # | item | status |
 |---|---|---|
 | P1.1 | declare navidrome's in-image sqlite3 | **done** — ships 3.45.3, was undeclared; its db is WAL-mode with a live 20,632-byte `-wal`, so a file copy is torn |
-| P1.2 | declare per-service essential state (what to capture) | open |
-| P1.3 | `service_state_capture` — SQLite-consistent where possible, reusing the `.backup` pattern | open |
-| P1.4 | capture manifest: sha256, sizes, image identity, capture mode | open |
+| P1.2 | declare per-service essential state (what to capture) | **done** — `service_essential_state`; `sqlite`/`file`/`dir` kinds, and the big regenerable trees (plex `Drivers/` 230.6 MiB, navidrome `cache/` 95.4 MiB, kavita `backups/` 3.5 MB) are deliberately excluded |
+| P1.3 | `service_state_capture` — SQLite-consistent where possible, reusing the `.backup` pattern | **done** — `.backup` + `integrity_check` run INSIDE the container for the three services that ship sqlite3; jellyfin/kavita are recorded `unproven`, never claimed consistent |
+| P1.4 | capture manifest: sha256, sizes, image identity, capture mode | **done** — `MANIFEST` carries `CAPTURE_MODE`, `IMAGE_ID` and a digest per item; `service_state_verify` re-reads them, and a missing declared item is `RESULT=INCOMPLETE` with exit 1 |
 | P1.5 | restore into a scratch target, never over live state | open |
-| P1.6 | disposable-fixture tests + mutations | open |
+| P1.6 | disposable-fixture tests + mutations | **done** — `tests/state-capture-smoke.sh`, wired into CI; 2 mutants, both killed. A `docker` stub that exits non-zero is on PATH, so reaching the real daemon fails rather than quietly succeeding |
 | P1.7 | activate a production backup target for it | **BLOCKED** — operator decision; needs the archive size (P2.1) for the cost figure |
 
 ### Measured capture capability, 2026-11-03

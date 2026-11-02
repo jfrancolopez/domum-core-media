@@ -3286,6 +3286,55 @@ a change, ask which of the two is wrong. `tests/restic-op-evidence-smoke.sh`
 (3 mutants, all killed) and five production-shaped sections plus a gate mutation
 in `tests/monitoring-completeness-smoke.sh`. See `docs/FIRST-REPORT-TRIAGE.md`.
 
+**A SELECTIVE capture pays 2.5% of the bytes for the whole recovery, and that
+ratio is why it is selective.** Measured 2026-11-02 across the five migrated
+services: 352.28 MiB of state directories, of which **8.90 MiB is
+irreplaceable**. Plex's `Drivers/` is 230.6 MiB and is downloaded on demand;
+navidrome's `cache/` is 95.4 MiB of transcodes; kavita's `backups/` is 3.5 MB,
+**3.1x the database it backs up**. So `service_essential_state` DECLARES what
+is essential per service rather than taking the tree, and the regenerable
+subtrees are excluded by name with the measurement beside them. Tests assert
+both directions -- the declarations must cover the databases, the configuration
+and jellyfin's `.aspnet/DataProtection-Keys`, and must NOT cover
+`Drivers`/`cache`/`backups`/`logs`.
+
+**Nothing is captured off-site yet. `storage capture-state` writes to a
+directory the operator names, and no backup target includes it.** Activating
+coverage is an operator decision that needs the archive size first.
+
+**A capture missing a declared item is NOT a backup, so it fails closed.**
+`service_state_capture` records `RESULT=INCOMPLETE`, names the missing item in
+the manifest, exits 1, and `service_state_verify` then refuses the capture
+outright. The mutation that accepts a missing item must make a partial capture
+read `COMPLETE` -- which is the "warn and continue" failure in the one place
+where the operator would discover it during a recovery.
+
+**`CAPTURE_MODE` is `consistent` only where the APPLICATION ships an sqlite3.**
+Measured: plex (`Plex SQLite` 3.39.4), navidrome (3.45.3) and calibre-web
+(3.45.1) have one; **jellyfin and kavita have none, and neither does the
+host**, so their captures are recorded `unproven` and never claimed otherwise.
+`.backup` and `integrity_check` run INSIDE the container, which is the only
+SQLite that can read plex's `collating` FTS tables. navidrome's database is
+WAL-mode with a live 20,632-byte `-wal`, so a plain file copy there is torn --
+which is why the declaration was added.
+
+**The capture digests DIRECTORIES including their MODES.** Jellyfin's
+DataProtection keys are 0600 and they decrypt its stored secrets; a restore
+that widened them would be a disclosure, and a digest over contents alone
+would verify clean. A test widens a captured key to 0644 and requires
+verification to fail.
+
+**The manifest records `IMAGE_ID`, because state alone is not a recovery
+point.** This file already holds that a recovery point is service + snapshot +
+the application that wrote it. A capture is the snapshot half.
+
+**Eighth instance of `cmd | grep -q` under pipefail**, four sites in one
+sitting: three in the new suite and one I had added to
+`sqlite-unsupported-smoke.sh` the session before, where a service that DOES
+declare an sqlite binary would have read as declaring none -- an assertion
+silently inverted. `tests/pipefail-grep-audit.py` found all four in seconds.
+Write the capture-first form the first time.
+
 ---
 
 ## 15. Known open safety defects
