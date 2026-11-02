@@ -178,12 +178,26 @@ echo "== 9. a service that ships its own sqlite3 declares it =="
 # its live app.db reports integrity_check -> ok, journal_mode -> delete,
 # 21 tables, 2 users. Plex ships its own because the host's cannot load its
 # private `collating` FTS tokenizer.
-for pair in "plex:/usr/lib/plexmediaserver/Plex SQLite" "calibre-web:/usr/bin/sqlite3"; do
+for pair in "plex:/usr/lib/plexmediaserver/Plex SQLite" "calibre-web:/usr/bin/sqlite3" \
+            "navidrome:/usr/bin/sqlite3" "uptime-kuma:/usr/bin/sqlite3"; do
   svc="${pair%%:*}"; want="${pair#*:}"
   got="$(probe "service_sqlite_binary $svc")"
   [ "$got" = "$want" ] || fail "service_sqlite_binary $svc gave '$got', expected '$want'"
 done
-echo "  plex and calibre-web each declare their own sqlite"
+echo "  plex, calibre-web, navidrome and uptime-kuma each declare their own sqlite"
+
+# And the two that genuinely have none must stay UNDECLARED. Measured
+# 2026-11-03 by exec'ing the running containers: neither jellyfin nor kavita
+# has an sqlite3 at /usr/bin, /bin or /usr/local/bin, and the host has none
+# either. Declaring a path that does not exist would turn "not checked" into a
+# check that always fails -- worse than admitting it cannot be done.
+for svc in jellyfin kavita; do
+  out="$(probe "service_sqlite_binary $svc >/dev/null; echo RC=\$?")"
+  grep -q 'RC=1' <<< "$out" \
+    || fail "$svc declares an sqlite binary, but neither its image nor the host
+has one -- that would make its integrity check fail rather than abstain"
+done
+echo "  jellyfin and kavita correctly declare none"
 
 echo "== 10. a service with a readiness signal declares it =="
 # An upgrade that cannot tell whether the application came back is weaker than
