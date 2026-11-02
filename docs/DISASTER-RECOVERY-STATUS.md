@@ -4,6 +4,11 @@ Measured 2026-10-09 by read-only inspection. `domum-media-backup dr-status`
 reports this from recorded evidence; this document explains the levels and
 records what could not be determined without root.
 
+**See also `docs/HIDDEN-RECOVERY-DEPENDENCIES.md`** — the things a recovery
+needs that no backup list mentions, each one discovered by doing something
+rather than by reading a scope, and several of them only after a
+reasonable-looking check had already given the wrong answer.
+
 ---
 
 ## 0. Production result, 2026-10-11
