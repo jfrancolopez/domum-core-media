@@ -8574,6 +8574,18 @@ service_sqlite_binary() {  # $1 = service -> path INSIDE its container
     # journal_mode -> delete (so no WAL hazard, unlike Plex and Uptime Kuma),
     # 21 tables, 2 users.
     calibre-web) printf '/usr/bin/sqlite3' ;;
+    # navidrome ships sqlite3 3.45.3 at /usr/bin/sqlite3 (measured 2026-11-03
+    # by exec'ing the running container). Nothing was using it -- the same gap
+    # calibre-web and uptime-kuma each had. It matters more here than for
+    # calibre-web: navidrome.db is in WAL MODE with a live 20,632-byte `-wal`
+    # and a `-shm` present, so a file copy of it is TORN, and only `.backup`
+    # through this binary produces a consistent one.
+    navidrome) printf '/usr/bin/sqlite3' ;;
+    # jellyfin and kavita were measured in the same pass and ship NO sqlite3 at
+    # /usr/bin, /bin or /usr/local/bin -- and there is none on the host either.
+    # They stay undeclared deliberately: a declaration pointing at a path that
+    # does not exist turns `unsupported: not checked` into a check that always
+    # FAILS, which is worse than admitting it cannot be done.
     # uptime-kuma ships sqlite3 3.40.1 at /usr/bin/sqlite3 (measured in
     # louislam/uptime-kuma:2). Without this declaration a volume recovery point
     # reports kuma.db as `unsupported: not checked` -- honest, because there is
