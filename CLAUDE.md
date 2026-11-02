@@ -2550,6 +2550,31 @@ when no successful backup run is recorded**. The remedy says `metadata only`,
 because a remedy that reads as expensive does not get run. The mutation drops
 the comparison and a four-run-old proof must read as current.
 
+**Suppressing `du`'s stderr turned a measurement into a lower bound I could not
+tell apart from one.** Jellyfin and Kavita were recorded as `>=489 KiB` and
+`>=5.8 MiB` and labelled partial, because `config/` is owned `911:911` and
+`root:root`. Both are `drwxr-xr-x`, so `du` can traverse them -- and re-run
+2026-11-02 with **stderr left visible** it emitted no permission errors at all.
+Checking stderr is what distinguishes the two; `2>/dev/null` made a complete
+walk indistinguishable from a blocked one.
+
+Measured: jellyfin **490.5 KiB** total with ~469 KiB irreplaceable
+(`jellyfin.db` 466,944 plus `system.xml` and the two
+`.aspnet/DataProtection-Keys` that decrypt stored secrets); kavita **5.83 MiB**
+with ~1.13 MiB irreplaceable (`kavita.db` 1,114,112). **Kavita's own
+`backups/` is 3,497,442 bytes -- 3.1x the database it backs up, and the largest
+single item in its tree** -- so taking it off-site would pay three times over
+for the same data.
+
+All five services: **8.90 MiB of irreplaceable state against 352.28 MiB of
+directories, 2.5%**, driven almost entirely by Plex's 230.6 MiB of regenerable
+`Drivers/`. Jellyfin and calibre-web are small enough that selection buys
+nothing -- take them whole. Only `/srv/data/backups/images` remains unmeasured
+(`root 0750`), and it is the one figure that could change the recommendation: a
+`docker save` of a media image runs to hundreds of MiB, so the archives could
+be two orders of magnitude larger than everything else combined. See
+`docs/SELECTIVE-STATE-PROTECTION.md`.
+
 **My own fix then overclaimed in the ALARMING direction, which is the same
 defect pointing the other way.** The staleness note said newer originals were
 `UNVERIFIED, not covered` -- and "not covered" asserts they are **not backed
