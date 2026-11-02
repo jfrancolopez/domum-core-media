@@ -654,6 +654,34 @@ asserted, not assumed: staging must precede the stop (the running image has to
 be recorded while it is observably running) and binding must precede the restart
 (once the application runs again it can mutate the state the point describes).
 
+**JELLYFIN AND KAVITA ARE BOTH IN WAL MODE, and they are the two services
+with no sqlite3 anywhere.** Measured 2026-11-02 from the SQLite file header
+(bytes 18/19, a pure read -- no open, no lock, no privilege):
+
+```
+jellyfin/config/data/data/jellyfin.db   write=2 read=2  -> WAL
+kavita/config/kavita.db                 write=2 read=2  -> WAL
+navidrome/navidrome.db                  write=2 read=2  -> WAL
+calibre-web/config/app.db               write=1 read=1  -> rollback journal
+```
+
+No `-wal` or `-shm` file exists for either right now, which is why an earlier
+measurement read them as not-WAL: in WAL mode those files are removed when the
+last connection closes, while `journal_mode` persists in the header. **Absence
+of a `-wal` is not evidence of a non-WAL database.**
+
+A read-only open of both fails with `attempt to write a readonly database` --
+the classic WAL symptom, because SQLite must create the `-shm`. So the host's
+python3 sqlite3 (3.46.1, with the `.backup()` online-backup API available)
+cannot currently be used to give them a consistent capture either.
+
+The consequence is sharper than the capture mode first suggested: their
+`file-copy-unproven` captures are copies of **WAL-mode** databases taken while
+the service may be writing, which is torn rather than merely crash-consistent.
+`CAPTURE_MODE=unproven` is therefore the correct and honest word, and closing
+it needs either a quiesce (stop, copy, start under the operation lock) or a
+writable `-shm`, not a cleverer read.
+
 **AN ARCHIVE CAN STATE ITS OWN IDENTITY WITHOUT BEING LOADED, and
 `verify-archive` was admitting it could not.** It proved the FILE was intact
 and said so honestly -- *"that is not the same as the identity it restores:
