@@ -6501,7 +6501,8 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
         if [[ -n "$c_snap" && -n "$run_snap" && "$c_snap" != "$run_snap" ]]; then
           printf '  %-22s \xe2\x96\xb2 STALE -- newest backup is %s\n' "  proof is about" "$run_snap"
           printf '  %-22s the figures above describe %s only; anything\n' "" "$c_snap"
-          printf '  %-22s ingested since is UNVERIFIED, not covered\n' ""
+          printf '  %-22s ingested since is NOT RECONCILED -- it may already\n' ""
+          printf '  %-22s be in the newer snapshot, but nothing has checked\n' ""
           printf '  %-22s domum-media-backup verify-snapshot-coverage %s   # metadata only\n' "  re-reconcile" "$target"
         else
           printf '  %-22s yes -- the newest successful backup\n' "  proof is current"

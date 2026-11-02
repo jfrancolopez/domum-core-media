@@ -2550,6 +2550,48 @@ when no successful backup run is recorded**. The remedy says `metadata only`,
 because a remedy that reads as expensive does not get run. The mutation drops
 the comparison and a four-run-old proof must read as current.
 
+**My own fix then overclaimed in the ALARMING direction, which is the same
+defect pointing the other way.** The staleness note said newer originals were
+`UNVERIFIED, not covered` -- and "not covered" asserts they are **not backed
+up**, which the evidence does not establish: they are very likely already in
+the newer snapshots and nothing has RECONCILED them. The four claims must stay
+distinct, and the absence of a re-observation is not evidence of absence. It
+now says `NOT RECONCILED -- it may already be in the newer snapshot, but
+nothing has checked`, and the test asserts BOTH directions: the note must say
+that, and must not contain `not covered`, `not protected`, `not backed up` or
+`not in the backup`. The operator caught this.
+
+**The comparison reads the cloud BACKUP snapshot, traced rather than assumed.**
+`SNAPSHOT_ID` in `<target>-run.env` comes from
+`sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p'` over restic's own
+**backup** output and is written only when `RESULT=success`; retention writes a
+separate `<target>-retention.env`. The report's target is
+`${REPORT_COVERAGE_TARGET:-cloud}` and both the coverage read and the run read
+use that one variable, so it cannot compare one target's proof against
+another's backup, nor against a retention timestamp.
+
+**The two timestamps in the Nov 2 report measured different things, and both
+were true.** `Last backup 8h ago` is the aggregate heartbeat
+`$DOMUM_LOG_DIR/last-success`, touched at the END of a successful nightly run.
+`Reconciled at 2026-10-29T10:55:03-04:00` is when `verify-snapshot-coverage`
+last reconciled the asset table against a snapshot's file list -- about
+`fb948da5`, the 10-29 02:31 backup. Neither contradicted the other; what was
+missing was any statement that the coverage figures described a snapshot four
+runs old.
+
+**Debian's kernel changelog is ONE cumulative entry and cannot establish a
+per-version CVE delta.** `/usr/share/doc/linux-image-6.12.113+deb13-amd64/changelog.gz`
+names **1,532** CVEs across the whole 6.12.x series, and the
+`New upstream stable update` block lists every `ChangeLog-6.12.*` without
+delimiting them -- so extracting "the top stanza" yields 70,894 lines and the
+same 1,532 CVEs. What local metadata DOES establish: `linux-image-amd64
+6.12.113-1` is installed, its archive is `trixie-security`, and the entry is
+`urgency=high`, so Debian classes it a security update; and the running kernel
+is **6.12.111**, so whatever 6.12.112 and 6.12.113 changed is not in effect.
+**Never claim a specific vulnerability is fixed, or that any is exploitable
+here, from this file.** A newer installed kernel establishes only that the
+running one predates it.
+
 **A fixture must redirect `REPO_META_DIR`** -- it defaults to
 `/var/lib/domum-media/backups`, a host path. Unredirected, the new check reads
 production, and on this host fails for permissions, which would have made the

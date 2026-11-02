@@ -624,8 +624,17 @@ runev 78e40ef8 '2026-11-01T02:36:57-05:00'
 out="$(drive "" --stdout)"
 grep -q 'STALE -- newest backup is 78e40ef8' <<< "$out" \
   || fail "a reconciliation older than the newest backup is not flagged: $out"
-grep -qi 'ingested since is UNVERIFIED' <<< "$out" \
-  || fail "it does not say what the figures do NOT cover: $out"
+grep -qi 'NOT RECONCILED' <<< "$out" \
+  || fail "it does not say what has not been re-observed: $out"
+grep -qi 'may already' <<< "$out" \
+  || fail "it does not say the newer originals are probably already in the
+snapshot, so the note reads as lost data: $out"
+for overclaim in 'not covered' 'not protected' 'not backed up' 'not in the backup'; do
+  grep -qi -- "$overclaim" <<< "$out" \
+    && fail "the staleness note claims '$overclaim', which the evidence does not
+support -- the absence of a reconciliation is not evidence that a photograph is
+missing. That is the same overclaim this fix removes, pointing the other way: $out"
+done
 grep -q 'fb948da5' <<< "$out" \
   || fail "it does not name the snapshot the figures actually describe: $out"
 grep -qi 'metadata only' <<< "$out" \
