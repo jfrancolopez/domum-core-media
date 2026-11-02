@@ -151,6 +151,12 @@ jobs:
       - name: SQLite unsupported classification smoke test
         run: tests/sqlite-unsupported-smoke.sh
 
+      # The selective state capture takes 8.90 MiB of the five migrated
+      # services' 352.28 MiB, so it must fail closed: a capture missing a
+      # declared item is not a backup.
+      - name: Selective state capture smoke test
+        run: tests/state-capture-smoke.sh
+
       # `cleanup images` must not delete an image a container uses, nor one a
       # recovery point pairs with.
       - name: Cleanup image protection smoke test

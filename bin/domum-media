@@ -8603,6 +8603,428 @@ service_sqlite_binary() {  # $1 = service -> path INSIDE its container
 # afterwards. Needs a RUNNING container, so it is a fallback, not the primary
 # path: during the pre-cutover verify the service is deliberately stopped and the
 # honest answer there remains "not checked".
+# ---------------------------------------------------------------------------
+#  Selective capture of media-service state.
+#
+#  Measured 2026-10-30/11-03 (docs/SELECTIVE-STATE-PROTECTION.md): the five
+#  migrated services hold 352.28 MiB of directories and 8.90 MiB of
+#  irreplaceable state -- 2.5%. Plex's `Drivers/` alone is 230.6 MiB and is
+#  downloaded on demand. So a selective set is the whole point; copying the
+#  directories would pay 40x for the same recovery.
+#
+#  None of this activates a backup. It captures to a directory the caller
+#  names, writes a manifest, and verifies it. Whether that directory is ever
+#  sent off-site is an operator decision.
+# ---------------------------------------------------------------------------
+
+# The container's view of a host path, read from its mount table.
+#
+# Derived, never assumed: measured 2026-11-03, kavita's state is mounted at
+# `/kavita/config` while plex, jellyfin and calibre-web use `/config` and
+# navidrome uses `/data`. A hardcoded `/config` would have silently pointed at
+# nothing for two of the five, and `sqlite3 .backup` against a path that does
+# not exist fails in a way that looks like a broken database.
+#
+# The LONGEST matching bind source wins, because several mounts can nest (plex
+# has /srv/media and /srv/media/.cache/plex-transcode).
+service_container_path() {  # $1 = service, $2 = host path -> container path
+  local service="$1" host="$2" cid rows src dest best_src="" best_dest=""
+  cmd_exists docker || return 1
+  cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
+  [[ -n "$cid" ]] || return 1
+  rows="$(docker inspect "$cid" \
+    --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}{{end}}' \
+    2>/dev/null || true)"
+  [[ -n "$rows" ]] || return 1
+  while IFS='|' read -r src dest; do
+    [[ -n "$src" && -n "$dest" ]] || continue
+    [[ "$host" == "$src" || "$host" == "$src"/* ]] || continue
+    (( ${#src} > ${#best_src} )) && { best_src="$src"; best_dest="$dest"; }
+  done <<< "$rows"
+  [[ -n "$best_src" ]] || return 1
+  if [[ "$host" == "$best_src" ]]; then
+    printf '%s' "$best_dest"
+  else
+    printf '%s%s' "$best_dest" "${host#"$best_src"}"
+  fi
+}
+
+# What is worth capturing, per service: `kind|path-relative-to-service_data_path`.
+#
+# kind is one of:
+#   sqlite  a database -- captured with `.backup` when the service ships an
+#           sqlite3, because a file copy of a live WAL database is TORN
+#   file    a single file, copied preserving mode
+#   dir     a directory, copied preserving modes
+#
+# Everything NOT listed here is regenerable and deliberately excluded. The
+# measured exclusions that matter: plex `Drivers/` (230.6 MiB) and `Logs/`,
+# navidrome `cache/` (95.4 MiB), kavita `backups/` (3.5 MB -- 3.1x the database
+# it backs up, and its own dated dumps), kavita `logs/` and `cache-long/`,
+# jellyfin `log/`.
+service_essential_state() {  # $1 = service
+  local pms='config/Library/Application Support/Plex Media Server'
+  case "$1" in
+    plex)
+      printf 'sqlite|%s/Plug-in Support/Databases/com.plexapp.plugins.library.db\n' "$pms"
+      printf 'sqlite|%s/Plug-in Support/Databases/com.plexapp.plugins.library.blobs.db\n' "$pms"
+      # Preferences.xml holds the SERVER TOKEN. Without it a restored Plex is a
+      # new server identity and every client must re-pair -- 422 bytes that
+      # decide whether a restore is the same server or a different one.
+      printf 'file|%s/Preferences.xml\n' "$pms"
+      ;;
+    navidrome)
+      printf 'sqlite|navidrome.db\n'
+      ;;
+    jellyfin)
+      printf 'sqlite|config/data/data/jellyfin.db\n'
+      printf 'file|config/system.xml\n'
+      printf 'file|config/encoding.xml\n'
+      printf 'file|config/network.xml\n'
+      printf 'file|config/database.xml\n'
+      # The DataProtection keys decrypt everything Jellyfin has stored
+      # encrypted. 2 KB, trivially overlooked, and a capture built from "the
+      # database" alone would miss them.
+      printf 'dir|config/.aspnet/DataProtection-Keys\n'
+      ;;
+    kavita)
+      printf 'sqlite|config/kavita.db\n'
+      printf 'dir|config/templates\n'
+      ;;
+    calibre-web)
+      printf 'sqlite|config/app.db\n'
+      printf 'file|config/gdrive.db\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# How consistent a capture of this service's databases can be.
+#
+#   consistent  the service ships an sqlite3, so `.backup` walks the committed
+#               state including the WAL without stopping anything
+#   unproven    no sqlite3 in the image and none on the host, so the only
+#               option is a file copy. Measured 2026-11-03: jellyfin and kavita
+#               show no `-wal` and no `-shm`, which SUGGESTS they are not in
+#               WAL mode -- but SQLite removes the `-wal` when the last
+#               connection closes and an absent `-shm` only means no WAL
+#               connection is open RIGHT NOW. Without a binary that can run
+#               `PRAGMA journal_mode` that cannot be established, so the
+#               capture says unproven rather than claiming consistency.
+service_state_capture_mode() {  # $1 = service
+  if service_sqlite_binary "$1" >/dev/null 2>&1; then
+    printf 'consistent'
+  else
+    printf 'unproven'
+  fi
+}
+
+# A consistent copy of one live SQLite database, via the service's own binary.
+#
+# `.backup` takes a read lock and walks the committed state including the WAL,
+# so it does not stop the service. The dump is written inside the container,
+# integrity-checked THERE before anything trusts it, and only then copied out:
+# an unvalidated dump is not evidence. Same shape as uptime_kuma_dump, which
+# proved the pattern against a live WAL database on this host.
+#
+# argv is passed directly to docker exec with no shell, so Plex's
+# space-containing `/usr/lib/plexmediaserver/Plex SQLite` needs no quoting.
+service_sqlite_backup() {  # $1 = service, $2 = host db path, $3 = dest file
+  local service="$1" hostdb="$2" dest="$3" bin cid cpath tmp check
+  bin="$(service_sqlite_binary "$service" 2>/dev/null)" || return 1
+  cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
+  [[ -n "$cid" ]] || return 1
+  [[ "$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null)" == "running" ]] || return 1
+  cpath="$(service_container_path "$service" "$hostdb")" || return 1
+  tmp="/tmp/.domum-state-capture.$$.db"
+  docker exec "$cid" rm -f "$tmp" >/dev/null 2>&1 || true
+  docker exec "$cid" "$bin" "$cpath" ".backup $tmp" >/dev/null 2>&1 || {
+    docker exec "$cid" rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  }
+  check="$(docker exec "$cid" "$bin" "$tmp" 'PRAGMA integrity_check;' 2>/dev/null | head -1 || true)"
+  if [[ "$check" != "ok" ]]; then
+    docker exec "$cid" rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  fi
+  docker cp "$cid:$tmp" "$dest" >/dev/null 2>&1 || {
+    docker exec "$cid" rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  }
+  docker exec "$cid" rm -f "$tmp" >/dev/null 2>&1 || true
+  [[ -s "$dest" ]]
+}
+
+# Capture one service's essential state into a directory, with a manifest.
+#
+# Fails CLOSED. A declared item that is missing, or a database that could not
+# be captured, makes the whole capture INCOMPLETE -- a partial capture
+# presented as a backup is the defect this project keeps correcting, and a
+# recovery built on one would discover the gap at the worst moment.
+#
+# The manifest records the IMAGE IDENTITY as well as the files, because a
+# recovery point is service + state + the application that wrote it. State
+# restored under a different application version is the pairing failure this
+# project already documents for Kavita and Uptime Kuma.
+state_item_stored_name() {  # $1 = declared relative path -> the name used under files/
+  # Lossy by construction: plex's declared paths contain spaces, so '/' and ' '
+  # both fold to '_'. The capture therefore REFUSES a collision rather than
+  # letting one item silently overwrite another and both digests read one file.
+  printf '%s' "$1" | tr '/ ' '__'
+}
+
+state_item_digest() {  # $1 = path -> sha256 over contents AND modes
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    # Over the sorted file list, their contents, and the mode of every entry
+    # including the directory itself -- so a widened permission changes it.
+    # Jellyfin's DataProtection-Keys are 0600 and they decrypt its stored
+    # secrets; a restore that widened them would be a disclosure, and a
+    # contents-only digest would verify clean.
+    { ( cd "$p" || exit 1
+        find . -type f -print0 | sort -z | xargs -0 -r sha256sum
+        find . -printf '%m %p\n' | sort ) 2>/dev/null || true; } \
+      | sha256sum | cut -d' ' -f1
+  else
+    { sha256sum "$p" 2>/dev/null || true; } | cut -d' ' -f1
+  fi
+}
+
+state_item_mode() {  # $1 = path -> octal mode, or empty
+  stat -c '%a' "$1" 2>/dev/null || true
+}
+
+service_state_restore() {  # $1 = capture directory, $2 = scratch target
+  # Restores a capture into a target the operator names. It NEVER writes into
+  # the live state tree: restoring over a running service's state would be a
+  # production mutation disguised as a verification, and the whole point of a
+  # restore test is that it can be run freely.
+  local dir="$1" target="$2" manifest="$1/MANIFEST"
+  [[ -n "$dir" && -n "$target" ]] || { warn "service_state_restore needs a capture directory and a target"; return 1; }
+  [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
+
+  local service live rtarget rlive
+  service="$(sed -nE "s/^SERVICE=(.*)$/\1/p" "$manifest" | head -1)"
+  [[ -n "$service" ]] || { warn "the manifest does not name a service"; return 1; }
+
+  # The refusal is on resolved paths, because a symlink or a '..' would
+  # otherwise walk straight into the live tree.
+  rtarget="$(realpath -m -- "$target" 2>/dev/null || printf '%s' "$target")"
+  live="$(service_data_path "$service")"
+  rlive="$(realpath -m -- "$live" 2>/dev/null || printf '%s' "$live")"
+  if [[ "$rtarget" == "$rlive" || "$rtarget" == "$rlive"/* || "$rlive" == "$rtarget"/* ]]; then
+    warn "REFUSING: $rtarget overlaps $service's live state at $rlive."
+    warn "A restore writes into its target. Name a scratch directory instead."
+    return 1
+  fi
+  if [[ -e "$rtarget" ]] && [[ -n "$(ls -A -- "$rtarget" 2>/dev/null || true)" ]]; then
+    warn "REFUSING: $rtarget is not empty. A restore into existing content cannot"
+    warn "be told apart from the content that was already there."
+    return 1
+  fi
+
+  # A capture that does not verify must not be restored: restoring damaged
+  # bytes and then reporting success is how a museum piece passes for a
+  # recovery point.
+  service_state_verify "$dir" >/dev/null 2>&1 || {
+    warn "REFUSING: the capture at $dir does not verify. Run 'storage verify-state $dir'."
+    return 1
+  }
+
+  install -d -m 0700 -- "$rtarget" || return 1
+
+  local line kind rel itemmode sz fmode sum out dst now nowmode rc=0 ok=0 bad=0 sqlite_ok=0 sqlite_skipped=0
+  while IFS= read -r line; do
+    [[ "$line" == ITEM=* ]] || continue
+    IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
+    case "$itemmode" in MISSING|FAILED|COLLISION) continue ;; esac
+    out="$dir/files/$(state_item_stored_name "$rel")"
+    dst="$rtarget/$rel"
+    install -d -m 0700 -- "$(dirname -- "$dst")" || { bad=$(( bad + 1 )); continue; }
+    # -a, so a 0600 key does not come back readable by anyone else.
+    cp -a -- "$out" "$dst" 2>/dev/null || {
+      warn "$rel could not be restored"; bad=$(( bad + 1 )); continue; }
+
+    # The proof is that the RESTORED path carries the recorded digest. A copy
+    # that reported success is not evidence that the bytes arrived.
+    now="$(state_item_digest "$dst")"
+    if [[ "$now" != "$sum" ]]; then
+      warn "$rel restored but does not match its recorded digest"; bad=$(( bad + 1 )); continue
+    fi
+    nowmode="$(state_item_mode "$dst")"
+    if [[ -n "$fmode" && "$nowmode" != "$fmode" ]]; then
+      warn "$rel restored as mode $nowmode, captured as $fmode"; bad=$(( bad + 1 )); continue
+    fi
+    ok=$(( ok + 1 ))
+
+    # And a restored database is asked whether it is sound, by the application's
+    # own SQLite where there is one. "I could not check it" is reported as
+    # exactly that, never as a pass.
+    if [[ "$kind" == "sqlite" ]]; then
+      local chk
+      chk="$(domum_sqlite_check "$dst" 2>/dev/null || true)"
+      case "$chk" in
+        ok) sqlite_ok=$(( sqlite_ok + 1 )) ;;
+        # "I could not check it" is not "it is broken". An extension this
+        # SQLite lacks, no SQLite at all, and a database that could not even be
+        # opened are all failures of the CHECK, not of the database -- the
+        # defect that once reported plex's two sound databases as a failed
+        # recovery point.
+        unsupported:*|unchecked|""|*"command not found"*|*"unable to open"*|*"cannot open"*)
+          sqlite_skipped=$(( sqlite_skipped + 1 )) ;;
+        *) warn "$rel is not a sound database after restore: $chk"; bad=$(( bad + 1 )); ok=$(( ok - 1 )) ;;
+      esac
+    fi
+  done < "$manifest"
+
+  if (( bad > 0 )); then
+    warn "state restore FAILED for $service: $ok item(s) restored and verified, $bad not"
+    rc=1
+  else
+    echo "[domum-media] restored $ok item(s) for $service into $rtarget, all matching their recorded digests"
+    echo "[domum-media] restored databases: $sqlite_ok checked sound, $sqlite_skipped not checked"
+    echo "[domum-media] this proves the CAPTURE restores. It is not a proof that $service runs against it."
+  fi
+  return "$rc"
+}
+
+service_state_capture() {  # $1 = service, $2 = destination directory
+  local service="$1" dest="$2"
+  [[ -n "$service" && -n "$dest" ]] || { warn "service_state_capture needs a service and a destination"; return 1; }
+  service_essential_state "$service" >/dev/null 2>&1 \
+    || { warn "$service declares no essential state"; return 1; }
+
+  local root mode img cid manifest rc=0 items=0 bad=0
+  root="$(service_data_path "$service")"
+  [[ -d "$root" ]] || { warn "$service has no state directory at $root"; return 1; }
+  mode="$(service_state_capture_mode "$service")"
+  cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
+  img="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
+
+  install -d -m 0700 "$dest/files" || return 1
+  manifest="$dest/MANIFEST"
+  : > "$manifest" || return 1
+  chmod 0600 "$manifest" 2>/dev/null || true
+
+  {
+    printf 'SCHEMA_VERSION=2\n'
+    printf 'SERVICE=%s\n' "$service"
+    printf 'CAPTURED_AT=%s\n' "$(date -Iseconds)"
+    printf 'STATE_ROOT=%s\n' "$root"
+    printf 'CAPTURE_MODE=%s\n' "$mode"
+    printf 'IMAGE_ID=%s\n' "${img:-unknown}"
+  } >> "$manifest"
+
+  local kind rel src out sz sum itemmode fmode
+  while IFS='|' read -r kind rel; do
+    [[ -n "$kind" && -n "$rel" ]] || continue
+    items=$(( items + 1 ))
+    src="$root/$rel"
+    out="$dest/files/$(state_item_stored_name "$rel")"
+    if [[ -e "$out" ]]; then
+      printf 'ITEM=%s|%s|COLLISION|||\n' "$kind" "$rel" >> "$manifest"
+      warn "two declared items map to the same stored name ($out); refusing to overwrite"
+      bad=$(( bad + 1 )); continue
+    fi
+    itemmode=""
+    case "$kind" in
+      sqlite)
+        if [[ ! -f "$src" ]]; then
+          printf 'ITEM=%s|%s|MISSING||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
+        fi
+        if [[ "$mode" == "consistent" ]] && service_sqlite_backup "$service" "$src" "$out"; then
+          itemmode="sqlite-backup"
+        elif cp -p -- "$src" "$out" 2>/dev/null; then
+          # A copy of a database the service may be writing. Recorded as what
+          # it is: this is the only option when no sqlite3 exists anywhere.
+          itemmode="file-copy-unproven"
+        else
+          printf 'ITEM=%s|%s|FAILED||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
+        fi
+        ;;
+      file)
+        if [[ ! -f "$src" ]]; then
+          printf 'ITEM=%s|%s|MISSING||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
+        fi
+        cp -p -- "$src" "$out" 2>/dev/null || {
+          printf 'ITEM=%s|%s|FAILED||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue; }
+        itemmode="file-copy"
+        ;;
+      dir)
+        if [[ ! -d "$src" ]]; then
+          printf 'ITEM=%s|%s|MISSING||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
+        fi
+        # -a preserves modes: jellyfin's DataProtection-Keys and any 0600
+        # secret must not come back world-readable. A restore that widens a
+        # permission turns a recovery into a disclosure.
+        cp -a -- "$src" "$out" 2>/dev/null || {
+          printf 'ITEM=%s|%s|FAILED||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue; }
+        itemmode="dir-copy"
+        ;;
+      *) continue ;;
+    esac
+    if [[ -d "$out" ]]; then
+      sz="$(du -sb "$out" 2>/dev/null | cut -f1)"
+    else
+      sz="$(stat -c %s "$out" 2>/dev/null || echo 0)"
+    fi
+    sum="$(state_item_digest "$out")"
+    fmode="$(state_item_mode "$out")"
+    printf 'ITEM=%s|%s|%s|%s|%s|%s\n' "$kind" "$rel" "$itemmode" "${sz:-0}" "${fmode:-}" "${sum:-}" >> "$manifest"
+  done < <(service_essential_state "$service")
+
+  if (( bad > 0 )); then
+    printf 'RESULT=INCOMPLETE\n' >> "$manifest"
+    warn "$service state capture is INCOMPLETE: $bad of $items declared item(s) could not be captured."
+    warn "A partial capture is not a backup. See $manifest."
+    rc=1
+  else
+    printf 'RESULT=COMPLETE\n' >> "$manifest"
+  fi
+  printf 'ITEMS=%s\n' "$items" >> "$manifest"
+  return "$rc"
+}
+
+# Re-verify a capture against its own manifest.
+#
+# Separate from the capture on purpose: a checksum written and never re-read
+# proves nothing, and this is what a restore should run first.
+service_state_verify() {  # $1 = capture directory
+  local dir="$1" manifest="$1/MANIFEST" line kind rel itemmode sz fmode sum out now nowmode rc=0 ok=0 bad=0
+  [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
+  while IFS= read -r line; do
+    [[ "$line" == ITEM=* ]] || continue
+    IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
+    case "$itemmode" in
+      MISSING|FAILED|COLLISION)
+        warn "$rel was never captured ($itemmode)"; bad=$(( bad + 1 )); continue ;;
+    esac
+    out="$dir/files/$(state_item_stored_name "$rel")"
+    if [[ ! -e "$out" ]]; then
+      warn "$rel is named by the manifest but absent from the capture"; bad=$(( bad + 1 )); continue
+    fi
+    now="$(state_item_digest "$out")"
+    if [[ "$now" != "$sum" ]]; then
+      warn "$rel does not match its recorded digest"; bad=$(( bad + 1 )); continue
+    fi
+    # A file item's digest is over its CONTENTS, so the mode is checked
+    # separately: plex's Preferences.xml holds the server token, and a
+    # recovery that widened it would be a disclosure.
+    nowmode="$(state_item_mode "$out")"
+    if [[ -n "$fmode" && "$nowmode" != "$fmode" ]]; then
+      warn "$rel is mode $nowmode but was captured as $fmode"; bad=$(( bad + 1 )); continue
+    fi
+    ok=$(( ok + 1 ))
+  done < "$manifest"
+  if (( bad > 0 )); then
+    warn "capture verification FAILED: $ok intact, $bad not"
+    rc=1
+  else
+    echo "[domum-media] capture verified: $ok item(s) match their recorded digests"
+  fi
+  return "$rc"
+}
+
 domum_sqlite_check_via_container() {  # $1 = service, $2 = local copy
   local service="$1" db="$2" bin cid dest ic fk
   bin="$(service_sqlite_binary "$service" 2>/dev/null)" || return 1
@@ -11296,6 +11718,34 @@ storage_cmd() {
       # directory, so an operator can ask months later what a point is paired with.
       load_cfg
       storage_verify_recovery "${1:-}" "${2:-}" "${3:-}" ;;
+    capture-state)
+      shift
+      # Capture one service's ESSENTIAL state into a directory the caller names.
+      # Measured: 8.90 MiB across the five migrated services, against 352.28 MiB
+      # of directories. Databases are captured with `.backup` through the
+      # service's own sqlite3 where one exists, because a file copy of a live
+      # WAL database is torn.
+      #
+      # This ACTIVATES NOTHING. It writes to the given directory and stops;
+      # whether that directory is ever sent off-site is an operator decision,
+      # and no backup target, include path or exclusion is touched.
+      load_cfg
+      service_state_capture "${1:-}" "${2:-}" ;;
+    verify-state)
+      shift
+      # Re-verify a capture against its own manifest. Read-only. A checksum
+      # written and never read back proves nothing.
+      load_cfg
+      service_state_verify "${1:-}" ;;
+    restore-state)
+      shift
+      # Restore a capture into a SCRATCH directory the caller names, then prove
+      # the restored bytes carry the recorded digests. It refuses a target that
+      # overlaps the service's live state, and refuses a non-empty target --
+      # a restore that writes over live state is a production mutation wearing
+      # a verification's clothes.
+      load_cfg
+      service_state_restore "${1:-}" "${2:-}" ;;
       pre-upgrade-point)
         shift
         # Deploys nothing: stop, prove quiescence, snapshot, archive the EXACT
@@ -11324,7 +11774,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir>|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
   esac
 }
 
