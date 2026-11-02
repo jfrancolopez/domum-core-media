@@ -654,6 +654,56 @@ asserted, not assumed: staging must precede the stop (the running image has to
 be recorded while it is observably running) and binding must precede the restart
 (once the application runs again it can mutate the state the point describes).
 
+**AN ARCHIVE CAN STATE ITS OWN IDENTITY WITHOUT BEING LOADED, and
+`verify-archive` was admitting it could not.** It proved the FILE was intact
+and said so honestly -- *"that is not the same as the identity it restores:
+`docker load` is what proves the image id, and loading is a mutation, so it is
+not done here."* True, and it left the one claim that matters unproven: the
+`docker save` archive is the only PROVEN copy of the application half of every
+recovery point on this host.
+
+Measured 2026-11-02, this host (containerd image store, overlayfs), by saving
+a real image to a disposable file:
+
+```
+docker image inspect -f '{{.Id}}' busybox:latest
+  sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+index.json  manifests[0].digest
+  sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e   <- EQUAL
+blobs/sha256/fd7dc98638c8...  9,535 bytes, sha256 of its own bytes
+  fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e          <- EQUAL
+```
+
+So the proof is content-addressing: **a blob inside the archive whose digest
+equals the recorded image id**. `domum_archive_identity` is that one test, and
+it is store-independent -- under the classic image store the Id is the CONFIG
+blob's digest, written as `<hex>.json` at the archive root, and the same test
+finds it there. This does NOT contradict the existing rule that the archive's
+config-blob digest does not equal the image Id here; it is why the test looks
+for the object NAMED by the id rather than assuming which object that is.
+
+Four verdicts, and three of them are not a pass: `verified`, `corrupt` (the
+object is present under that digest but no longer hashes to it, so the archive
+would not restore that image), `absent` (the archive holds a DIFFERENT image --
+the pairing failure), and `undetermined` (unreadable, unrecognised, or no
+recorded id). The mutation that treats an unreadable archive as verified must
+make a missing file read as proven.
+
+**Identity and the file checksum are different claims and neither subsumes the
+other.** Corrupting a LAYER blob leaves the manifest blob intact, so identity
+still verifies while the recorded sha256 of the file does not. Both are
+reported. And the report still states what remains unproven: containing the
+right image is not evidence that the application STARTS.
+
+**`tar` matches member names literally and fails when ANY listed member is
+absent.** `docker save` writes `blobs/sha256/x`; a tar created with
+`tar -cf out .` writes `./blobs/sha256/x`, so the first synthetic fixture read
+as `undetermined` against correct code. And `tar -tf a.tar -- index.json
+./index.json` exits non-zero because one of the two is missing, which turned a
+present-metadata test into a negative. Each spelling is asked for on its own.
+`--occurrence=1` stops tar at the member instead of reading to the end of a
+250 MB archive.
+
 **A `docker save` archive preserves image identity, and its checksum does not
 prove that.** Measured: `docker load` of an archive saved by image ID reported
 `Loaded image ID: sha256:fd7dc98638c8…`, byte-identical. But the archive's

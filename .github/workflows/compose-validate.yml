@@ -157,6 +157,12 @@ jobs:
       - name: Selective state capture smoke test
         run: tests/state-capture-smoke.sh
 
+      # An archive must state its own identity read-only: `docker load` proves
+      # it and is a mutation, so a verification that needs it cannot be run
+      # freely.
+      - name: Archive identity smoke test
+        run: tests/archive-identity-smoke.sh
+
       # `cleanup images` must not delete an image a container uses, nor one a
       # recovery point pairs with.
       - name: Cleanup image protection smoke test
