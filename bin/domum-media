@@ -10630,6 +10630,58 @@ other_container_identities() {  # $1 = service being upgraded
 # image ID (Id is the manifest digest), so a matching .sha256 proves only that
 # the FILE is unchanged. `docker load` is what proves identity, and a load is a
 # mutation, so this reports what it verified and what it did not.
+domum_archive_identity() {  # $1 = archive, $2 = recorded image id -> a verdict word
+  # Answers "does this archive contain the image the recovery point names?"
+  # WITHOUT loading it, because `docker load` is a mutation and a verification
+  # that mutates cannot be run freely.
+  #
+  # Measured 2026-11-02, this host (containerd image store, overlayfs): an
+  # archive written by `docker save <image-id>` carries
+  #
+  #   index.json  manifests[0].digest == the image Id
+  #   blobs/sha256/<that hex>  whose own sha256 == the digest, 9,535 bytes
+  #
+  # So the proof is content-addressing: a blob inside the archive whose digest
+  # equals the recorded image id. That is store-independent -- under the
+  # classic store the Id is the CONFIG blob's digest instead, and the same test
+  # finds it there. It is NOT the archive's own file checksum, which proves only
+  # that the file is intact, and it is NOT a `docker load`, which proves the
+  # identity and changes the image store.
+  local arch="$1" want="$2" hex blob got
+  [[ -r "$arch" && -n "$want" ]] || { printf 'undetermined'; return 0; }
+  case "$want" in sha256:*) hex="${want#sha256:}" ;; *) hex="$want" ;; esac
+  [[ "$hex" =~ ^[0-9a-f]{64}$ ]] || { printf 'undetermined'; return 0; }
+
+  # --occurrence=1 so tar stops at the member instead of reading to the end of
+  # a 250 MB archive.
+  # Both member spellings: `docker save` writes `blobs/sha256/x`, while a tar
+  # created with `tar -cf out .` writes `./blobs/sha256/x`, and tar matches
+  # member names literally.
+  for blob in "blobs/sha256/$hex" "./blobs/sha256/$hex" "$hex.json" "./$hex.json"; do
+    got="$( { tar -xOf "$arch" --occurrence=1 -- "$blob" 2>/dev/null || true; } | sha256sum | cut -d' ' -f1)"
+    # An absent member yields the sha256 of the empty string, which cannot be
+    # the digest of a manifest or a config, so no special case is needed --
+    # but it IS compared, so a corrupt blob is distinguishable from a missing
+    # one by the explicit presence test below.
+    if [[ "$got" == "$hex" ]]; then printf 'verified'; return 0; fi
+    if tar -tf "$arch" --occurrence=1 -- "$blob" >/dev/null 2>&1; then
+      printf 'corrupt'; return 0
+    fi
+  done
+  # The archive is readable and does not contain that object at all. Either it
+  # is an archive of a different image, or a format this does not understand.
+  # tar exits non-zero when ANY listed member is missing, even if another
+  # matched, so each spelling is asked for on its own.
+  local meta
+  for meta in index.json ./index.json manifest.json ./manifest.json; do
+    if tar -tf "$arch" --occurrence=1 -- "$meta" >/dev/null 2>&1; then
+      printf 'absent'; return 0
+    fi
+  done
+  printf 'undetermined'
+  return 0
+}
+
 storage_verify_archive() {  # $1 = recovery point
   need_root
   load_cfg
@@ -10670,9 +10722,30 @@ storage_verify_archive() {  # $1 = recovery point
     return 1
   fi
   echo "  archive sha256  : matches ($got_sha)"
-  echo "  -> the FILE is intact. That is not the same as the identity it restores:"
-  echo "     'docker load' is what proves the image id, and loading is a mutation,"
-  echo "     so it is not done here. The rollback path does it and then compares."
+  case "$(domum_archive_identity "$arch" "$img")" in
+    verified)
+      echo "  archive holds   : the image id this point names, proven by content-addressing"
+      echo "  -> the FILE is intact AND it contains the object '$img' names. What is"
+      echo "     still unproven is that 'docker load' succeeds and that the loaded"
+      echo "     application RUNS -- loading is a mutation, so it is not done here."
+      ;;
+    corrupt)
+      echo "  archive holds   : CORRUPT -- the object named '$img' is present but its"
+      echo "                    own digest does not match, so this archive would not"
+      echo "                    restore that image"
+      return 1
+      ;;
+    absent)
+      echo "  archive holds   : a DIFFERENT image -- '$img' is not in this archive"
+      echo "  -> the file is intact and pairs with the wrong application."
+      return 1
+      ;;
+    *)
+      echo "  archive holds   : UNDETERMINED -- the archive's own metadata could not be"
+      echo "                    read, so identity is unproven. 'docker load' is what"
+      echo "                    would settle it, and loading is a mutation."
+      ;;
+  esac
   [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1 \
     && echo "  local object    : present today (a load would be a no-op)" \
     || echo "  local object    : absent -- a rollback would load it from this archive"
@@ -11044,6 +11117,16 @@ storage_archives() {
       else
         echo "  checksum        : nothing recorded to compare against"
       fi
+      # The checksum proves the FILE is intact; it says nothing about which
+      # image the file restores. Measured 2026-11-02: an archive written by
+      # `docker save <id>` contains a blob whose own digest IS that id, so the
+      # pairing can be proven read-only, without `docker load`.
+      case "$(domum_archive_identity "$f" "$img")" in
+        verified)     echo "  holds its image : yes -- proven by content-addressing, no load needed" ;;
+        corrupt)      echo "  holds its image : CORRUPT -- the object is present but its digest does not match" ;;
+        absent)       echo "  holds its image : NO -- this archive does not contain ${img:-the recorded image}" ;;
+        *)            echo "  holds its image : UNDETERMINED -- the archive's metadata could not be read" ;;
+      esac
       if [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1; then
         echo "  local object    : present (a rollback would not need this archive)"
       else

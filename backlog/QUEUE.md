@@ -32,6 +32,9 @@ designed. **No implementation exists** — verified 2026-11-03, there is no
 | P1.4 | capture manifest: sha256, sizes, image identity, capture mode | **done** — `MANIFEST` carries `CAPTURE_MODE`, `IMAGE_ID` and a digest per item; `service_state_verify` re-reads them, and a missing declared item is `RESULT=INCOMPLETE` with exit 1 |
 | P1.5 | restore into a scratch target, never over live state | **done** — `service_state_restore` + `storage restore-state`. Refuses a target that overlaps the live state root (resolved paths, so a symlink or `..` cannot walk in), refuses a non-empty target, refuses a capture that does not verify, re-proves every restored item's digest and mode, and integrity-checks restored databases. 4 mutants, all killed |
 | P1.6 | disposable-fixture tests + mutations | **done** — `tests/state-capture-smoke.sh`, wired into CI; 2 mutants, both killed. A `docker` stub that exits non-zero is on PATH, so reaching the real daemon fails rather than quietly succeeding |
+| P1.8 | jellyfin/kavita are WAL-mode with no sqlite3 anywhere -- a quiesced capture (stop, copy, start under the operation lock) is the only way to make their mode `consistent` | open — measured 2026-11-02 from the file header; a read-only open fails with `attempt to write a readonly database`, so no cleverer read closes it |
+| P1.9 | surface `CAPTURE_MODE` in the restore report (an `unproven` restore currently reads as strong as a consistent one) | open — patch written, not applied |
+| P4.5 | scrub duplicate-run protection: `btrfs scrub start` on a filesystem already being scrubbed returns non-zero and lands in the generic FAILED branch, which fails the unit and mails a false alarm for a normal condition | open — patch written, not applied: pre-check `Status:` from `btrfs scrub status`, plus recognise btrfs's own "already running" error to close the race; anything neither recognises stays a failure |
 | P1.7 | activate a production backup target for it | **BLOCKED** — operator decision; needs the archive size (P2.1) for the cost figure |
 
 ### Measured capture capability, 2026-11-03
@@ -62,9 +65,9 @@ they do not have would turn "not checked" into a check that always fails.
 | # | item | status |
 |---|---|---|
 | P2.1 | measure `/srv/data/backups/images` | **BLOCKED** — `root 0750`. Unblock: `sudo du -sb /srv/data/backups/images && sudo ls -l /srv/data/backups/images` |
-| P2.2 | identify which archives a *still-valid* recovery point names | partially blocked — `cleanup images --json` computes it but reads `/var/lib/domum-media` (root) |
+| P2.2 | identify which archives a *still-valid* recovery point names | **done in code** — `storage archives` names the point per archive and now also says whether the archive actually holds that image. Still needs root to run against production |
 | P2.3 | off-site preservation + retention procedure for archives | open — designable now, depends on P2.1 only for the cost figure |
-| P2.4 | restore-from-archive procedure, proven on a disposable image | open |
+| P2.4 | restore-from-archive procedure, proven on a disposable image | **partly done** — `domum_archive_identity` proves, read-only, that an archive contains the image its recovery point names (content-addressing; measured against a real `docker save` archive). Reported by `verify-archive` and by the `archives` inventory. What remains is proving a loaded image RUNS, which needs a disposable container |
 
 Measured 2026-10-28 and still true: **traefik and uptime-kuma run images with
 `RepoTags: []` and `RepoDigests: []`**, and every tagged image's `RepoDigest`
@@ -110,7 +113,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 | P5.1 | credential-custody review + checklist | **done** — `docs/RECOVERY-KEY-CUSTODY.md` |
 | P5.2 | off-site copy of the restic password / age key | **BLOCKED** — operator action, and the single highest remaining risk |
 | P5.3 | fresh-host restore runbook validated end to end | open |
-| P5.4 | hidden recovery dependencies enumerated (pgvecto.rs, Jellyfin DataProtection-Keys, image identity) | open |
+| P5.4 | hidden recovery dependencies enumerated (pgvecto.rs, Jellyfin DataProtection-Keys, image identity) | **done** — `docs/HIDDEN-RECOVERY-DEPENDENCIES.md`, 12 entries, each citing the measurement and the document holding it. 8 are closed in code and still listed, because each was closed *after* giving the wrong answer first |
 | P5.5 | full Immich restore | **BLOCKED** — needs the UGREEN hardware; never claim it without doing it |
 
 ---

@@ -672,3 +672,100 @@ which is exactly why the migration wrapper feature-gates on the *installed*
 binary, and why a documented command only becomes safe advice once the revision
 carrying it has been deployed. The rule that covers the other half is in
 `CLAUDE.md` §9, and it is a rule because it cannot be a test.
+
+## An archive can prove its own identity without being loaded
+
+Measured 2026-11-02.
+
+`storage verify-archive` proved an archive's **file checksum** and said, in its
+own output, that this was not the same as the identity it restores:
+
+```
+-> the FILE is intact. That is not the same as the identity it restores:
+   'docker load' is what proves the image id, and loading is a mutation,
+   so it is not done here. The rollback path does it and then compares.
+```
+
+Every word of that was true, and it left the claim that matters unproven. On
+this host no tagged image has an independent registry reference — every one's
+`RepoDigest` equals its image `Id` — and traefik's and uptime-kuma's running
+images are dangling outright (`RepoTags: []` **and** `RepoDigests: []`). So the
+`docker save` archive is the only *proven* copy of the application half of
+every recovery point here, and the only thing proven about it was that the file
+had not rotted.
+
+### What the archive actually contains
+
+Saved a real image to a disposable file and read its structure. Nothing was
+loaded and nothing in the image store changed:
+
+```
+$ docker image inspect -f '{{.Id}}' busybox:latest
+sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+
+$ docker save -o bb.tar sha256:fd7dc98638c8…   # 2,249,728 bytes
+
+$ cat index.json
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+ "manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json",
+   "digest":"sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e",
+   "size":9535, ...}]}
+
+$ sha256sum blobs/sha256/fd7dc98638c8…       # 9,535 bytes
+fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+```
+
+The image `Id`, the digest `index.json` names, and the sha256 of the blob's own
+bytes are **the same value**. That is content-addressing, and it means the
+pairing question is answerable read-only:
+
+> does this archive contain a blob whose digest equals the image id the
+> recovery point records?
+
+`domum_archive_identity` is that one test. It is store-independent on purpose:
+under the classic image store the `Id` is the **config** blob's digest, written
+as `<hex>.json` at the archive root, and the same test finds it there. This
+does not contradict the earlier measurement that the archive's config-blob
+digest is *not* the image `Id` on this host — it is precisely why the test looks
+for the object the id **names** rather than assuming which object that is.
+
+### Four verdicts, three of which are not a pass
+
+| verdict | meaning |
+|---|---|
+| `verified` | a blob whose digest equals the recorded image id is present and hashes to it |
+| `corrupt` | that object is present under that digest but no longer hashes to it — the archive would **not** restore that image |
+| `absent` | the archive is readable and holds a **different** image — the pairing failure |
+| `undetermined` | unreadable, unrecognised, or no recorded id. Never a pass |
+
+`verify-archive` and the `storage archives` inventory both report it, so the
+inventory now answers "which archives actually hold the image their recovery
+point names" rather than only "which files are intact".
+
+### What is still unproven, and stays unproven
+
+Containing the right image is not evidence that the application **starts**.
+`docker load` is what proves the identity *loads*, and a disposable container
+is what would prove it *runs*; both are mutations, so neither happens in a
+verification. The report says so in its own words rather than letting a
+content-addressed match read as recoverability.
+
+### Identity and the file checksum are different claims
+
+Neither subsumes the other. Corrupting a **layer** blob leaves the manifest
+blob intact, so identity still verifies while the recorded sha256 of the file
+does not; corrupting the manifest blob does the reverse. Both are reported, and
+the suite drives exactly that case.
+
+### Two `tar` behaviours that made a correct check look broken
+
+- **Member names match literally.** `docker save` writes `blobs/sha256/x`,
+  while a tar created with `tar -cf out .` writes `./blobs/sha256/x`. The first
+  synthetic fixture therefore read `undetermined` against correct code. Both
+  spellings are tried.
+- **`tar` fails when ANY listed member is absent**, even if another matched, so
+  `tar -tf a.tar -- index.json ./index.json` exits non-zero and turned a
+  present-metadata test into a negative. Each spelling is asked for on its own.
+
+`--occurrence=1` makes tar stop at the member rather than read to the end of a
+250 MB archive.
