@@ -1,6 +1,6 @@
 # Selective off-site protection for media-service state
 
-**Status: PHASE A measured in part, PHASE B designed, NOTHING ENABLED.**
+**Status: PHASE A measured, PHASE B IMPLEMENTED and tested, NOTHING ENABLED.**
 No backup target, include path, exclusion or schedule is changed by this
 document.
 
@@ -117,7 +117,7 @@ taking whole directories.
 Jellyfin and calibre-web are small enough that selection buys nothing — take
 them whole. Kavita's one exclusion that matters is its own `backups/`.
 
-## Phase B — recovery design
+## Phase B — recovery design (the reasoning)
 
 ### The compatibility chain
 
@@ -193,6 +193,117 @@ This matters most for the images with no registry copy at all. Measured
 `RepoDigests: []`, so for those two the archive is the only obtainable copy in
 existence.
 
+## Phase B — IMPLEMENTED, 2026-11-02 (nothing enabled)
+
+The capture, its verification and its restore exist and are in CI. **No backup
+target, include path, exclusion or schedule is touched**: the destination is a
+directory the operator names, and that is where it stops.
+
+```
+domum-media storage capture-state <service> <dir>
+domum-media storage verify-state  <dir>
+domum-media storage restore-state <capture-dir> <scratch-dir>
+```
+
+### What is declared, and verified present in production
+
+`service_essential_state <service>` emits `kind|relpath` lines, where kind is
+`sqlite`, `file` or `dir`. Checked read-only against production on 2026-11-02 —
+**all fifteen declared paths exist**, so a real capture would be `COMPLETE` for
+all five services:
+
+| service | declared |
+|---|---|
+| plex | `…/Plug-in Support/Databases/com.plexapp.plugins.library.db`, `…library.blobs.db`, `…/Preferences.xml` |
+| navidrome | `navidrome.db` |
+| jellyfin | `config/data/data/jellyfin.db`, `system.xml`, `encoding.xml`, `network.xml`, `database.xml`, `config/.aspnet/DataProtection-Keys` |
+| kavita | `config/kavita.db`, `config/templates` |
+| calibre-web | `config/app.db`, `config/gdrive.db` |
+
+Excluded by name, with the measurement beside each: plex `Drivers/`
+(230.6 MiB, downloaded on demand) and `Logs/`, navidrome `cache/` (95.4 MiB of
+transcodes), kavita `backups/` (3.5 MB — **3.1× the database it backs up**) and
+`logs/`, jellyfin `log/`. Tests assert both directions, so a future
+declaration cannot quietly grow a regenerable subtree.
+
+`service_container_path` derives the container path from the longest-matching
+bind `Source` rather than assuming `/config`. **kavita's is `/kavita/config`**,
+unlike the other four — assuming would have sent its `.backup` to a path that
+does not exist in its container.
+
+### Consistency is claimed only where it can be proven
+
+`CAPTURE_MODE` is `consistent` only where the *image* ships an sqlite3:
+
+| service | sqlite3 | mode |
+|---|---|---|
+| plex | `/usr/lib/plexmediaserver/Plex SQLite` 3.39.4 | `consistent` |
+| navidrome | `/usr/bin/sqlite3` 3.45.3 | `consistent` |
+| calibre-web | `/usr/bin/sqlite3` 3.45.1 | `consistent` |
+| jellyfin | **none** | `unproven` |
+| kavita | **none** | `unproven` |
+| *the host* | **none** | — |
+
+`.backup` and `PRAGMA integrity_check` run **inside the container**, which for
+plex is the only SQLite that can read its `collating` FTS tables. For jellyfin
+and kavita the capture falls back to a file copy and records
+`file-copy-unproven`; it is never described as consistent. Neither has a `-wal`
+on its database today, so the exposure is small — but the mode says what was
+actually done rather than what was hoped.
+
+### The manifest
+
+```
+SCHEMA_VERSION=2
+SERVICE=<name>
+CAPTURED_AT=<iso8601>
+STATE_ROOT=<path>
+CAPTURE_MODE=consistent|unproven
+IMAGE_ID=sha256:…|unknown
+ITEM=<kind>|<relpath>|<itemmode>|<bytes>|<octal mode>|<sha256>
+RESULT=COMPLETE|INCOMPLETE
+ITEMS=<n>
+```
+
+`IMAGE_ID` is recorded because a recovery point is state **+** the application
+that wrote it; a capture is the state half.
+
+A `dir` item's digest covers its sorted file list, those files' contents, and
+the **mode of every entry including the directory itself** — jellyfin's
+DataProtection keys are 0600 and they decrypt its stored secrets, so a restore
+that widened them would be a disclosure while a contents-only digest verified
+clean. A `file` item's digest covers contents only, so its mode is recorded
+separately and compared (plex's `Preferences.xml` holds the server token).
+
+### Fail-closed
+
+A declared item that is missing, that could not be copied, or whose stored name
+**collides** with another item's records `RESULT=INCOMPLETE`, names the item,
+and exits 1. `verify-state` then refuses the capture outright. A partial
+capture presented as a backup is the defect this project keeps correcting.
+
+The collision case is real rather than defensive: the stored filename folds
+`/` and ` ` to `_`, and plex's declared paths contain spaces, so `a/b` and
+`a b` map to one name. Without the guard one item would have silently
+overwritten the other and both recorded digests would have read the same file.
+
+### Restore
+
+`restore-state` never writes into live state. It refuses a target that equals,
+contains or sits inside `service_data_path` — on **resolved** paths, because a
+symlink or a `..` would otherwise walk straight into the running service's
+tree — refuses a non-empty target, and refuses a capture that does not verify.
+
+The proof is the restored bytes, not the copy's exit status: every item's
+digest and mode are recomputed after it lands, and a restored database is
+*opened*. Demonstrated in the suite — a database corrupted before capture
+restores with a perfectly matching digest and still fails, because a digest
+proves the bytes arrived, not that they are a usable database. "I could not
+check it" is reported as not-checked, never as a pass.
+
+The report states its own limit: **it proves the capture restores. It is not
+evidence that the service runs against it.**
+
 ## Phase C — cost and risk
 
 **Not yet quantifiable, and deliberately not guessed.** The two services that
@@ -211,9 +322,20 @@ displace or slow the Immich paths, and no replaceable bulk media enters the set.
 
 ## Phase D — rehearsal
 
-Not yet performed. It must use disposable fixtures and a scratch restore
-location, never live application state, and a synthetic fixture must never be
-presented as proof of production recovery.
+`tests/state-capture-smoke.sh`, in CI. 4 mutants, all killed, including the
+overlap guard — with its comparison neutralised a restore must actually write
+inside the live tree, which is what proves the guard is load-bearing.
+
+A `docker` stub that exits non-zero is on `PATH`, so a code path that tried to
+reach the real daemon fails rather than quietly succeeding. One section drives
+capture, verify and restore in their own `set -euo pipefail` process, because
+the suite's probe runs `set +e` and could not otherwise see an abort under the
+options production actually uses.
+
+**Still not done**: a rehearsal that starts a real disposable container against
+a restored capture. That is the only thing that would turn "the bytes come
+back" into "the application runs against them", and it is the same distinction
+the five Immich recovery levels exist to keep apart.
 
 ## The one measurement still needed
 
