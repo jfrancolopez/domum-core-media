@@ -2529,6 +2529,127 @@ are five different states and this file previously collapsed two of them.
 shape -- every suite had stubbed `retention_targets`, which is why nothing
 caught the guess.
 
+**THE WEEKLY REPORT PRESENTED A STALE COVERAGE PROOF AS CURRENT.** Production,
+2026-11-02: the Immich block read `Immich originals 23265`,
+`In off-site snapshot 23265 of 23265`, `Missing none` -- every figure taken
+from the reconciliation RECORDED on 2026-10-29 against snapshot `fb948da5`,
+with `78e40ef8` (11-01) newer and 10-30, 10-31 and 11-02 in between. **Any
+original ingested since 10-29 was neither counted nor reported as unknown**,
+and the block read as a present-tense claim about complete coverage.
+
+`dr-status` already had this corrected -- it names both snapshots and says the
+present position is UNKNOWN. The weekly report was built later and reproduced
+the presentation WITHOUT the staleness test, which is the
+"commands that answer the same question must read the same evidence" rule one
+level up: the same question, different honesty.
+
+`backup_run_last_success` reads the per-target run evidence (a local file --
+a report must do no recovery work) and the block now has three answers: STALE
+naming both snapshots and what the figures do not cover, current, or **UNKNOWN
+when no successful backup run is recorded**. The remedy says `metadata only`,
+because a remedy that reads as expensive does not get run. The mutation drops
+the comparison and a four-run-old proof must read as current.
+
+**Suppressing `du`'s stderr turned a measurement into a lower bound I could not
+tell apart from one.** Jellyfin and Kavita were recorded as `>=489 KiB` and
+`>=5.8 MiB` and labelled partial, because `config/` is owned `911:911` and
+`root:root`. Both are `drwxr-xr-x`, so `du` can traverse them -- and re-run
+2026-11-02 with **stderr left visible** it emitted no permission errors at all.
+Checking stderr is what distinguishes the two; `2>/dev/null` made a complete
+walk indistinguishable from a blocked one.
+
+Measured: jellyfin **490.5 KiB** total with ~469 KiB irreplaceable
+(`jellyfin.db` 466,944 plus `system.xml` and the two
+`.aspnet/DataProtection-Keys` that decrypt stored secrets); kavita **5.83 MiB**
+with ~1.13 MiB irreplaceable (`kavita.db` 1,114,112). **Kavita's own
+`backups/` is 3,497,442 bytes -- 3.1x the database it backs up, and the largest
+single item in its tree** -- so taking it off-site would pay three times over
+for the same data.
+
+All five services: **8.90 MiB of irreplaceable state against 352.28 MiB of
+directories, 2.5%**, driven almost entirely by Plex's 230.6 MiB of regenerable
+`Drivers/`. Jellyfin and calibre-web are small enough that selection buys
+nothing -- take them whole. Only `/srv/data/backups/images` remains unmeasured
+(`root 0750`), and it is the one figure that could change the recommendation: a
+`docker save` of a media image runs to hundreds of MiB, so the archives could
+be two orders of magnitude larger than everything else combined. See
+`docs/SELECTIVE-STATE-PROTECTION.md`.
+
+**My own fix then overclaimed in the ALARMING direction, which is the same
+defect pointing the other way.** The staleness note said newer originals were
+`UNVERIFIED, not covered` -- and "not covered" asserts they are **not backed
+up**, which the evidence does not establish: they are very likely already in
+the newer snapshots and nothing has RECONCILED them. The four claims must stay
+distinct, and the absence of a re-observation is not evidence of absence. It
+now says `NOT RECONCILED -- it may already be in the newer snapshot, but
+nothing has checked`, and the test asserts BOTH directions: the note must say
+that, and must not contain `not covered`, `not protected`, `not backed up` or
+`not in the backup`. The operator caught this.
+
+**The comparison reads the cloud BACKUP snapshot, traced rather than assumed.**
+`SNAPSHOT_ID` in `<target>-run.env` comes from
+`sed -n 's/.*snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p'` over restic's own
+**backup** output and is written only when `RESULT=success`; retention writes a
+separate `<target>-retention.env`. The report's target is
+`${REPORT_COVERAGE_TARGET:-cloud}` and both the coverage read and the run read
+use that one variable, so it cannot compare one target's proof against
+another's backup, nor against a retention timestamp.
+
+**The two timestamps in the Nov 2 report measured different things, and both
+were true.** `Last backup 8h ago` is the aggregate heartbeat
+`$DOMUM_LOG_DIR/last-success`, touched at the END of a successful nightly run.
+`Reconciled at 2026-10-29T10:55:03-04:00` is when `verify-snapshot-coverage`
+last reconciled the asset table against a snapshot's file list -- about
+`fb948da5`, the 10-29 02:31 backup. Neither contradicted the other; what was
+missing was any statement that the coverage figures described a snapshot four
+runs old.
+
+**Debian's kernel changelog is ONE cumulative entry and cannot establish a
+per-version CVE delta.** `/usr/share/doc/linux-image-6.12.113+deb13-amd64/changelog.gz`
+names **1,532** CVEs across the whole 6.12.x series, and the
+`New upstream stable update` block lists every `ChangeLog-6.12.*` without
+delimiting them -- so extracting "the top stanza" yields 70,894 lines and the
+same 1,532 CVEs. What local metadata DOES establish: `linux-image-amd64
+6.12.113-1` is installed, its archive is `trixie-security`, and the entry is
+`urgency=high`, so Debian classes it a security update; and the running kernel
+is **6.12.111**, so whatever 6.12.112 and 6.12.113 changed is not in effect.
+**Never claim a specific vulnerability is fixed, or that any is exploitable
+here, from this file.** A newer installed kernel establishes only that the
+running one predates it.
+
+**A fixture must redirect `REPO_META_DIR`** -- it defaults to
+`/var/lib/domum-media/backups`, a host path. Unredirected, the new check reads
+production, and on this host fails for permissions, which would have made the
+assertion pass for the wrong reason.
+
+**I hit the `[[ … && false ]]` trap that this file already documents.** The
+mutation was written `&& false` inside `[[ ]]`, where the bare word is a
+non-empty STRING rather than the command, so it applied textually and changed
+nothing. The prescribed form -- mutating the comparison into `"$a" != "$a"` --
+is prescribed precisely because it has no such ambiguity.
+
+**2026-11-01 scheduled run: both operations succeeded, and the exit-11 finding
+cleared for the right reason.** `Main PID … status=0/SUCCESS`; retention ran at
+03:32:40 -05:00 and forgot 14 snapshots, pruning 588 blobs / 168.105 MiB,
+leaving 243802 blobs / 207.503 GiB. The 10-18 -> 11-01 retention gap is closed.
+The check's own output was truncated by the operator's `-n 120`, but it is
+proved structurally: `--check` is the FIRST unprefixed `ExecStart`, so retention
+could not have started had it failed, and `Result=success` on a oneshot requires
+every unprefixed `ExecStart` to succeed. The finding disappeared because the
+unit RAN AGAIN and replaced `ExecMainStatus`, not because anything suppressed
+it.
+
+**The "5 security updates" are the least urgent pending items.** Measured
+2026-11-02: they are one source package -- vim, vim-common, vim-tiny,
+vim-runtime, xxd -- not referenced by any unit or by this project's code, with
+no vim process running, and containers use their own image userland, so the
+exposure is an operator opening a malicious file. `tzdata` 2026c->2026f is not
+security, and DST ended correctly under 2026c. The genuinely security-relevant
+change is `linux-image-6.12.113`, already installed against a running 6.12.111,
+and it appears in the report only as `Reboot required`. **Urgency classification
+was deliberately NOT added**: apt's metadata is not a reliable severity source,
+and a confident wrong severity is worse than none.
+
 **WEAR reached the weekly report and never reached the notifier.**
 `checkup_disk_health` read only `smart_status.passed` -- the drive's own
 opinion -- while the report has shown interpretable wear since the HTML work.

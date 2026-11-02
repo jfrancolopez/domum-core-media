@@ -989,6 +989,30 @@ restic_op_last_success() {  # $1 = target, $2 = op -> "epoch mode" or rc 1
   )
 }
 
+# The last SUCCESSFUL backup run for a target, as "snapshot_id epoch", or
+# nothing. Written by record_backup_target_run in domum-media-backup.
+#
+# Needed because the weekly report drew every Immich coverage figure from the
+# recorded reconciliation and never compared it against the latest backup, so a
+# proof taken on an older snapshot was presented in the present tense. Reading
+# the run evidence costs nothing -- it is a local file, and a report must do no
+# recovery work.
+backup_run_last_success() {  # $1 = target -> "snapshot epoch" or rc 1
+  local file
+  file="$(restic_op_evidence_dir)/$1-run.env"
+  [[ -f "$file" ]] || return 1
+  (
+    unset RESULT FINISHED_TS SNAPSHOT_ID
+    # shellcheck disable=SC1090
+    . "$file" >/dev/null 2>&1 || exit 1
+    [[ "${RESULT:-}" == "success" ]] || exit 1
+    [[ -n "${SNAPSHOT_ID:-}" && -n "${FINISHED_TS:-}" ]] || exit 1
+    local epoch
+    epoch="$(date -d "$FINISHED_TS" +%s 2>/dev/null)" || exit 1
+    printf '%s %s' "$SNAPSHOT_ID" "$epoch"
+  )
+}
+
 # Which enabled targets have a recorded successful check NEWER than $1, and
 # which do not.
 #
@@ -6460,6 +6484,32 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
       fi
       printf '  %-22s %s\n' "Reconciled snapshot" "${c_snap:-unknown}"
       printf '  %-22s %s\n' "Reconciled at" "${c_when:-unknown}"
+      # IS THAT PROOF ABOUT THE CURRENT BACKUP? Every figure above comes from
+      # the recorded reconciliation, so on its own the block reads as a
+      # present-tense claim about a snapshot that may be several runs old.
+      # Production, 2026-11-02: it reported "23265 of 23265, missing none" from
+      # a proof taken on 2026-10-29, with four newer backups since -- so any
+      # original added in between was neither counted nor reported as unknown.
+      #
+      # This project already fixed the same overclaim in dr-status; the weekly
+      # report was built later and reproduced the presentation without the
+      # staleness test. Commands that answer the same question must read the
+      # same evidence.
+      local run_row run_snap
+      if run_row="$(backup_run_last_success "$target" 2>/dev/null)"; then
+        run_snap="${run_row%% *}"
+        if [[ -n "$c_snap" && -n "$run_snap" && "$c_snap" != "$run_snap" ]]; then
+          printf '  %-22s \xe2\x96\xb2 STALE -- newest backup is %s\n' "  proof is about" "$run_snap"
+          printf '  %-22s the figures above describe %s only; anything\n' "" "$c_snap"
+          printf '  %-22s ingested since is NOT RECONCILED -- it may already\n' ""
+          printf '  %-22s be in the newer snapshot, but nothing has checked\n' ""
+          printf '  %-22s domum-media-backup verify-snapshot-coverage %s   # metadata only\n' "  re-reconcile" "$target"
+        else
+          printf '  %-22s yes -- the newest successful backup\n' "  proof is current"
+        fi
+      else
+        printf '  %-22s UNKNOWN -- no successful backup run recorded\n' "  proof is current"
+      fi
     fi
     local n_sample n_large
     n_sample="$(mreport_history_count "${target}-sample-verified.jsonl")"

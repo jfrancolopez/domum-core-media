@@ -50,6 +50,7 @@ drive() {
   local extra="$1"; shift
   (
     export CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state" DOMUM_DATA_ROOT="$TMP/data"
+    export REPO_META_DIR="$TMP/meta"
     export CAPTURE="$TMP/captured.eml"
     # shellcheck disable=SC1090
     source "$CLI" >/dev/null 2>&1
@@ -567,6 +568,7 @@ sect "the argv path reaches the implementation, and report stays compatible"
 dispatch() {  # $1.. = argv
   (
     export CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state" DOMUM_DATA_ROOT="$TMP/data"
+    export REPO_META_DIR="$TMP/meta"
     export DOMUM_DIR="$REPO_ROOT" REPORT_LIB_DEFAULT="$TMP/no-such-lib"
     # shellcheck disable=SC1090
     source "$CLI" >/dev/null 2>&1
@@ -594,5 +596,95 @@ out="$(dispatch report weekly --bogus)"
 grep -q '^RC=0$' <<< "$out" && fail "an unknown weekly flag was accepted: $out"
 grep -q 'Usage: domum-media report weekly' <<< "$out" || fail "no usage shown: $out"
 echo "  main report weekly renders; report --json still delegates; bad flag refused"
+
+# ---------------------------------------------------------------------------
+#  Is the coverage proof about the CURRENT backup?
+#
+#  Production, 2026-11-02: the section reported "Immich originals 23265 / In
+#  off-site snapshot 23265 of 23265 / Missing none" from a reconciliation taken
+#  on 2026-10-29 against snapshot fb948da5 -- with four newer backups since. So
+#  anything ingested in between was neither counted nor reported as unknown,
+#  and a proof about an older snapshot read as a present-tense claim.
+#
+#  dr-status already had this corrected; the weekly report was built later and
+#  reproduced the presentation without the staleness test.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/meta" "$TMP/state/restore-verification"
+cov() {  # write the recorded reconciliation
+  printf '{"originals":23265,"in_snapshot":23265,"missing_from_snapshot":0,"snapshot_id":"%s","recorded_at":"2026-10-29T10:55:03-04:00"}' \
+    "$1" > "$TMP/state/restore-verification/cloud-snapshot-coverage.json"
+}
+runev() {  # write the last successful backup run
+  printf 'RESULT=success\nSNAPSHOT_ID=%s\nFINISHED_TS=%s\n' "$1" "$2" > "$TMP/meta/cloud-run.env"
+}
+
+sect "a proof taken on an OLDER snapshot is reported as STALE"
+cov fb948da5
+runev 78e40ef8 '2026-11-01T02:36:57-05:00'
+out="$(drive "" --stdout)"
+grep -q 'STALE -- newest backup is 78e40ef8' <<< "$out" \
+  || fail "a reconciliation older than the newest backup is not flagged: $out"
+grep -qi 'NOT RECONCILED' <<< "$out" \
+  || fail "it does not say what has not been re-observed: $out"
+grep -qi 'may already' <<< "$out" \
+  || fail "it does not say the newer originals are probably already in the
+snapshot, so the note reads as lost data: $out"
+for overclaim in 'not covered' 'not protected' 'not backed up' 'not in the backup'; do
+  grep -qi -- "$overclaim" <<< "$out" \
+    && fail "the staleness note claims '$overclaim', which the evidence does not
+support -- the absence of a reconciliation is not evidence that a photograph is
+missing. That is the same overclaim this fix removes, pointing the other way: $out"
+done
+grep -q 'fb948da5' <<< "$out" \
+  || fail "it does not name the snapshot the figures actually describe: $out"
+grep -qi 'metadata only' <<< "$out" \
+  || fail "the re-reconcile remedy does not say it downloads nothing, so it
+reads as expensive and will not get run: $out"
+echo "  stale, both snapshots named, remedy stated as free"
+
+sect "a proof taken on the NEWEST snapshot is reported as current"
+cov fb948da5
+runev fb948da5 '2026-10-29T02:31:11-04:00'
+out="$(drive "" --stdout)"
+grep -qi 'proof is current' <<< "$out" \
+  || fail "a current proof is not confirmed as current: $out"
+grep -q 'STALE' <<< "$out" \
+  && fail "a current proof was flagged stale: $out"
+echo "  confirmed current, not flagged"
+
+sect "no recorded backup run is UNKNOWN, never 'current'"
+# The third answer. Absent run evidence must not be read as agreement.
+cov fb948da5
+rm -f "$TMP/meta/cloud-run.env"
+out="$(drive "" --stdout)"
+grep -qi 'UNKNOWN -- no successful backup run recorded' <<< "$out" \
+  || fail "absent run evidence is not reported as unknown: $out"
+grep -q 'STALE' <<< "$out" && fail "absent evidence was reported as stale: $out"
+echo "  unknown is its own answer"
+
+sect "MUTATION: dropping the comparison restores the present-tense claim"
+cov fb948da5
+runev 78e40ef8 '2026-11-01T02:36:57-05:00'
+cp "$CLI" "$TMP/cli.orig.stale"
+cat > "$TMP/mutate-stale.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = 'if [[ -n "$c_snap" && -n "$run_snap" && "$c_snap" != "$run_snap" ]]; then'
+new = 'if [[ -n "$c_snap" && -n "$run_snap" && "$c_snap" != "$c_snap" ]]; then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP/mutate-stale.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.stale" "$CLI"; fail "the staleness mutation did not apply"; }
+mout="$(drive "" --stdout)"
+cp "$TMP/cli.orig.stale" "$CLI"
+grep -q 'STALE' <<< "$mout" \
+  && fail "the mutation changed no ANSWER -- without the comparison a proof four
+backups old must read as current: $mout"
+grep -qi 'proof is current' <<< "$mout" \
+  || fail "the mutant did not take the 'current' branch: $mout"
+echo "  killed: without the comparison a four-run-old proof reads as current"
+rm -f "$TMP/state/restore-verification/cloud-snapshot-coverage.json" "$TMP/meta/cloud-run.env"
 
 echo "PASS: weekly report render smoke test"
