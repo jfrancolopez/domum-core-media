@@ -110,7 +110,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 | P5.1 | credential-custody review + checklist | **done** — `docs/RECOVERY-KEY-CUSTODY.md` |
 | P5.2 | off-site copy of the restic password / age key | **BLOCKED** — operator action, and the single highest remaining risk |
 | P5.3 | fresh-host restore runbook validated end to end | open |
-| P5.4 | hidden recovery dependencies enumerated (pgvecto.rs, Jellyfin DataProtection-Keys, image identity) | open |
+| P5.4 | hidden recovery dependencies enumerated (pgvecto.rs, Jellyfin DataProtection-Keys, image identity) | **done** — `docs/HIDDEN-RECOVERY-DEPENDENCIES.md`, 12 entries, each citing the measurement and the document holding it. 8 are closed in code and still listed, because each was closed *after* giving the wrong answer first |
 | P5.5 | full Immich restore | **BLOCKED** — needs the UGREEN hardware; never claim it without doing it |
 
 ---
