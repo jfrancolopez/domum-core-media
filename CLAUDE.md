@@ -2529,6 +2529,60 @@ are five different states and this file previously collapsed two of them.
 shape -- every suite had stubbed `retention_targets`, which is why nothing
 caught the guess.
 
+**THE WEEKLY REPORT PRESENTED A STALE COVERAGE PROOF AS CURRENT.** Production,
+2026-11-02: the Immich block read `Immich originals 23265`,
+`In off-site snapshot 23265 of 23265`, `Missing none` -- every figure taken
+from the reconciliation RECORDED on 2026-10-29 against snapshot `fb948da5`,
+with `78e40ef8` (11-01) newer and 10-30, 10-31 and 11-02 in between. **Any
+original ingested since 10-29 was neither counted nor reported as unknown**,
+and the block read as a present-tense claim about complete coverage.
+
+`dr-status` already had this corrected -- it names both snapshots and says the
+present position is UNKNOWN. The weekly report was built later and reproduced
+the presentation WITHOUT the staleness test, which is the
+"commands that answer the same question must read the same evidence" rule one
+level up: the same question, different honesty.
+
+`backup_run_last_success` reads the per-target run evidence (a local file --
+a report must do no recovery work) and the block now has three answers: STALE
+naming both snapshots and what the figures do not cover, current, or **UNKNOWN
+when no successful backup run is recorded**. The remedy says `metadata only`,
+because a remedy that reads as expensive does not get run. The mutation drops
+the comparison and a four-run-old proof must read as current.
+
+**A fixture must redirect `REPO_META_DIR`** -- it defaults to
+`/var/lib/domum-media/backups`, a host path. Unredirected, the new check reads
+production, and on this host fails for permissions, which would have made the
+assertion pass for the wrong reason.
+
+**I hit the `[[ … && false ]]` trap that this file already documents.** The
+mutation was written `&& false` inside `[[ ]]`, where the bare word is a
+non-empty STRING rather than the command, so it applied textually and changed
+nothing. The prescribed form -- mutating the comparison into `"$a" != "$a"` --
+is prescribed precisely because it has no such ambiguity.
+
+**2026-11-01 scheduled run: both operations succeeded, and the exit-11 finding
+cleared for the right reason.** `Main PID … status=0/SUCCESS`; retention ran at
+03:32:40 -05:00 and forgot 14 snapshots, pruning 588 blobs / 168.105 MiB,
+leaving 243802 blobs / 207.503 GiB. The 10-18 -> 11-01 retention gap is closed.
+The check's own output was truncated by the operator's `-n 120`, but it is
+proved structurally: `--check` is the FIRST unprefixed `ExecStart`, so retention
+could not have started had it failed, and `Result=success` on a oneshot requires
+every unprefixed `ExecStart` to succeed. The finding disappeared because the
+unit RAN AGAIN and replaced `ExecMainStatus`, not because anything suppressed
+it.
+
+**The "5 security updates" are the least urgent pending items.** Measured
+2026-11-02: they are one source package -- vim, vim-common, vim-tiny,
+vim-runtime, xxd -- not referenced by any unit or by this project's code, with
+no vim process running, and containers use their own image userland, so the
+exposure is an operator opening a malicious file. `tzdata` 2026c->2026f is not
+security, and DST ended correctly under 2026c. The genuinely security-relevant
+change is `linux-image-6.12.113`, already installed against a running 6.12.111,
+and it appears in the report only as `Reboot required`. **Urgency classification
+was deliberately NOT added**: apt's metadata is not a reliable severity source,
+and a confident wrong severity is worse than none.
+
 **WEAR reached the weekly report and never reached the notifier.**
 `checkup_disk_health` read only `smart_status.passed` -- the drive's own
 opinion -- while the report has shown interpretable wear since the HTML work.
