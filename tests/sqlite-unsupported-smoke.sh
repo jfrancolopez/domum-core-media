@@ -192,7 +192,8 @@ echo "  plex, calibre-web, navidrome and uptime-kuma each declare their own sqli
 # either. Declaring a path that does not exist would turn "not checked" into a
 # check that always fails -- worse than admitting it cannot be done.
 for svc in jellyfin kavita; do
-  probe "service_sqlite_binary $svc >/dev/null; echo RC=\$?" | grep -q 'RC=1' \
+  out="$(probe "service_sqlite_binary $svc >/dev/null; echo RC=\$?")"
+  grep -q 'RC=1' <<< "$out" \
     || fail "$svc declares an sqlite binary, but neither its image nor the host
 has one -- that would make its integrity check fail rather than abstain"
 done
