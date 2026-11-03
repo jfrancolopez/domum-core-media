@@ -2166,6 +2166,55 @@ application-visible mutation, and a 7-26 minute job holding the global lock
 could make the nightly backup fail to acquire it, trading a detection pass for a
 missed backup.
 
+**A SCRUB ALREADY RUNNING IS NOT A FAILURE, and the generic branch would have
+mailed a critical for an entirely normal condition.** btrfs refuses to start a
+second scrub on the same filesystem, so `btrfs scrub start` returns non-zero and
+landed in `*)` -- `scrub FAILED on $root`, `worst=1`, a failed oneshot unit,
+which `checkup_systemd_health` reports as CRITICAL and `health-notify` mails.
+The monthly timer firing while a manual scrub is still going, or while the
+previous month's has not finished, would do exactly that.
+
+Asked two ways on purpose. `btrfs_scrub_running` reads the `Status:` field
+(btrfs-progs v6.14 prints `running|finished|aborted|interrupted`, and
+`no stats available` for a filesystem never scrubbed), which avoids depending on
+the wording of an error; btrfs's own `already running` message is the authority
+and closes the race between asking and starting. **Anything neither recognises
+stays a failure** -- an unrecognised error genuinely may be one, and that is the
+conservative direction, asserted in its own section.
+
+`btrfs scrub status` needs privilege, so an unreadable status is `unknown` and
+is **never** read as "not running": the status check abstains and btrfs's
+refusal remains the control. Reading it as idle would produce a confident
+failure from a check that could not see.
+
+**The summary narrows its claim rather than hiding the skip.** A skipped
+filesystem makes no claim, so the plain `scrubbed N filesystem(s)` line is
+replaced by one stating how many were scrubbed and how many were already
+running, plus an explicit line that the skipped ones are unproven here. HEALTHY
+must not mean UNMEASURED, and `0 scrubbed` reported as "clean" would be exactly
+that.
+
+**My own change broke two existing assertions, and one of them was right to
+break.** Capturing the invocation's output moved `btrfs scrub start` off column
+0, so the `-B` mutation's anchor no longer matched (the mutation reported "not
+unique: 0" rather than silently passing, which is why that rule exists) and the
+`^btrfs scrub start -B` assertion failed against correct code. The anchor was
+updated; the assertion is now `btrfs scrub start -B( |$)`, which still asserts
+`-B` is an argument of `scrub start` itself without depending on what precedes
+it on the line.
+
+**A RESTORE must state the CAPTURE MODE, because a digest is not a consistency
+claim.** A digest proves the restored bytes are the captured bytes; it says
+nothing about whether those bytes were a consistent point in time. jellyfin's
+and kavita's databases are both WAL-mode with no sqlite3 anywhere, so their
+captures are copies taken while the service may be writing -- and a restore
+report that omitted the mode read as strong for an `unproven` capture as for a
+consistent one. The mode is printed with its reason, a consistent capture is
+reported distinctly (so the unproven wording cannot be boilerplate), and an
+absent `CAPTURE_MODE` reads as `unknown` rather than the reassuring value --
+the metadata-key family, defaulted in the accessor and driven by a test with
+the key deleted.
+
 **A scrub that found corruption must leave a FAILED unit.** `ExecStart` carries
 no `-` prefix, so exit 3 fails `domum-media-btrfs-scrub.service`, which
 `checkup_systemd_health` reports as CRITICAL and `health-notify` mails. The
@@ -3465,6 +3514,379 @@ sitting: three in the new suite and one I had added to
 declare an sqlite binary would have read as declaring none -- an assertion
 silently inverted. `tests/pipefail-grep-audit.py` found all four in seconds.
 Write the capture-first form the first time.
+
+---
+
+**THE DISASTER-RECOVERY RUNBOOK OFFERED `nas` AS ITS PRIMARY RESTORE EXAMPLE.**
+`docs/disaster-recovery.md` is the one document read while the host is gone, and
+step 4 said *"Restore from your preferred backup target. Example (NAS):"*
+followed by `--restore latest / --repo nas`. Measured: across 107 consecutive
+nightly runs the rotated log contains `restic backup -> cloud` 107 times and
+**zero** occurrences of `nas` in any form, there is no network mount on this
+host, and no `/srv/nas*` exists. The first command an operator would copy under
+pressure points at a repository that was never written. `cloud` is now the
+example, with `--snapshots` given as the way to check a target has one at all.
+
+Three more stale claims in the same document, each pointing the wrong way:
+
+- *"Service-level Btrfs rollback is not currently available on production
+  because service paths are ordinary directories"* -- false since 2026-09-25;
+  **five** services are subvolumes with proof snapshots. It then told the
+  operator to recreate "only the existing top-level layout", which happens to
+  be right for a fresh host but for the wrong reason. The corrected text says
+  why: a restic restore writes files, not subvolumes, so a recovered host
+  legitimately has directories and `storage migrate-subvolume` is a separate
+  gated operation not to be improvised under recovery pressure.
+- *"The current CLI does not provide a guided PostgreSQL import command"* --
+  stale. `verify-db-restore` imports into a disposable instance under
+  `ON_ERROR_STOP=1` and has been proven against the real dump. There is still
+  no guided import into PRODUCTION, which is the distinction the text now
+  draws.
+- **It never said the cloud target is immich-only.** The most important fact
+  about a fresh-host recovery was absent: restoring from `cloud` brings back the
+  photo library, the validated dump and the recovery pack, and the five media
+  services come up as **fresh installs**. That is now a table, with the
+  consequence spelled out per path.
+
+**A runbook states which of its own steps have been executed.** The document
+read as validated and none of it had been run end to end. It now opens with a
+per-step table -- proven / partly proven / never executed, each with its
+evidence -- and says plainly that the step never taken is putting any of it on a
+different machine. `tests/documented-commands-audit.py` checks the commands
+exist in the CLI (100 now), which is the weaker half: it cannot see whether a
+procedure has ever been performed.
+
+**A fact that appears twice: I updated the wrong copy.** `backlog/QUEUE.md` had
+P4.5 in its P4 table and I had earlier appended a second P4.5 row to the P1
+table; marking the work done, I edited my own duplicate and left the original
+reading `open`. This file already records that changing one of two copies is
+worse than changing neither, because the remaining copy now has a neighbour
+vouching for it. The duplicate is removed and the original row carries the
+result.
+
+---
+
+**THREE MORE `set -euo pipefail` ABORTS, where the PRODUCER may legitimately
+find nothing.** The recorded family is "when a function's failure is EXPECTED
+and handled, capture it with `|| true`"; these are three sites where it was
+not, found by sweeping both CLIs with comments stripped and then **reproducing
+each one standalone** before changing anything:
+
+- **the nightly dump.** `pg_cid="$(docker ps --filter … -q 2>/dev/null | head -1)"`
+  in `quiesce_immich_postgres`. An unreachable daemon makes `docker ps` exit
+  non-zero, so the assignment failed and `set -e` killed the function **before**
+  the `if [[ -n "$pg_cid" ]]` branch written to report the database as absent.
+  The backup's highest-value stage, aborting instead of degrading.
+- **`dr_immich_summary`.** Three `find "$lib/<subtree>" … 2>/dev/null | awk …`
+  byte sums. `find` on a missing directory exits 1 and `2>/dev/null` hides the
+  message, not the status -- so the report died part-way. The `${th_b:-0}`
+  defaults a few lines below were already written on the assumption that an
+  empty value is survivable, which is the tell. It aborts exactly where it is
+  needed most: a freshly restored host, where the derivative subtrees have not
+  been rebuilt.
+- **phase B's live-photo selection.**
+  `lp_img="$(grep '^livephoto image|' <<< "$sel_lines" | cut -d'|' -f2 | head -1)"`.
+  A user with no live photo is the normal case, and grep finding nothing killed
+  the function before its own `if [[ -n "$lp_img" ]]`. Measured: exit 1, and the
+  `if` is never reached. It also carried the stop-early shape, so it is sliced
+  with `sed -n '1p'` now and nothing can take SIGPIPE.
+
+**An audit for this family is NOT shipped, deliberately.** `find` and `grep`
+inside `$( )` are everywhere and most instances are genuinely guaranteed to
+match, so a naive rule would cry wolf -- which this file already says is how an
+audit gets switched off. A narrow form (a `find` over a PATH with no `|| true`
+and no `[[ -d ]]` guard) looks tractable and needs its own mutation testing
+before it can be trusted; it is queued rather than rushed.
+
+**My own sweep read comments as code, for the fourth recorded time.** Grepping
+for a boolean read through `jq`'s `//` flagged `.smart_status.passed // empty`
+three times -- all three being the COMMENT that documents that exact defect and
+its measured outputs. The shipped code uses `| tostring`. Strip comments first,
+including when the thing being audited is this file's own history.
+
+---
+
+**I put a backtick in a comment INSIDE AN UNQUOTED HEREDOC, and two
+independent controls caught it.** The comment explaining why the call must not
+be short-circuited was written inside `<<STRICT`, so the backticked words were
+command substitution: bash tried to run them when the heredoc was WRITTEN, the
+words vanished from the generated script, and shellcheck reported `SC1070
+Parsing stopped here`. `tests/log-hygiene-smoke.sh`'s repository-wide scan also
+catches it -- verified by reintroducing one backtick and watching the suite go
+from 0 to 1 -- so it was not a blind spot; I had simply run shellcheck first.
+This is the second recorded instance of this family in a test rather than in
+help text. No backticks in a heredoc comment.
+
+**My own strict-mode harness defeated itself with `|| true`.** The test for
+"does this function abort under production's shell options" called it as
+`do_dr_status 2>&1 || true`, and bash suppresses errexit for a function invoked
+as part of an `&&`/`||` list -- the trap this file already records. The mutant
+therefore ran to completion and the test "failed" against code that was right.
+The call is bare now, and the OUTER `bash … || true` is what keeps the suite
+alive.
+
+**And the observable was wrong in a second way: `do_dr_status` legitimately
+returns non-zero.** It exits non-zero when the weakest tier is UNKNOWN, which
+is the normal state of this host, so a marker echoed after the call could never
+run even on a healthy report. The observable is the OUTPUT -- an abort inside
+TRUNCATES the report, so the assertions read for the regenerable-data block and
+the final `WEAKEST TIER` line. Name the observable the mutation actually
+changes, and check it is reachable at all on a passing run.
+
+**`git rebase --onto origin/main <tip>~1` drops the commit before the tip.**
+`--onto X Y` replays `Y..HEAD`, so passing the second-newest commit as the
+upstream silently excluded the newer of my two commits -- and the conflict it
+then raised showed the OLD rows, which is what gave it away. The upstream is
+the last commit that LANDED upstream, not an offset from the local tip. Nothing
+was lost: `git rebase --abort` restored the branch, and the patch scripts made
+re-applying the working-tree edits deterministic.
+
+---
+
+**THE DECLARED READINESS LINE IS NOW CONSULTED BY THE UPGRADE, BOUNDED AND
+DELIBERATELY ASYMMETRIC.** `service_logged_ready_since` existed and only the
+MIGRATION path used it, so an upgrade had **weaker** readiness evidence than a
+migration of the same service. The first attempt at closing that gap was
+reverted, and the reason governs the design: phase 4 runs immediately after
+`up -d`, so a line that lags by seconds read as a FAILURE, and escalating on
+absence changes the success criteria for the four services that declare a
+pattern.
+
+So finding the line STRENGTHENS the claim and not finding it is REPORTED and
+never sets `rc`. The wait is `UPGRADE_READY_LOG_WAIT`, default 60 s in 5 s
+steps, and it makes **one attempt before any sleep** -- so a wait of 0 means
+"look once, do not sleep", which is what lets a test drive both outcomes
+without a minute of real time per run. The fixture sets it to 0.
+
+**The boundary is captured BEFORE the deploy**, so a readiness line from the
+previous start can never be accepted as evidence of this one. It is defined at
+the top of phase 3 rather than inside phase 4 because referencing
+`$restart_boundary` before defining it once killed this function under
+`set -u` -- and the test asserts the ORDER (boundary < deploy < readiness read)
+rather than trusting it.
+
+**The UNPROVEN sentence is BUILT from what is actually absent.** The fixed
+wording said "no container healthcheck, no readiness probe and no declared log
+pattern", which would be **false** for a service that declares a pattern and
+stayed silent -- a report describing something it is not, in the one place an
+upgrade is being declared successful. It now distinguishes "no readiness probe"
+from "a readiness probe that did not answer", and "no declared log pattern"
+from "a declared log pattern that did not appear". A test asserts the false
+form does not appear.
+
+**`missing` is an ARRAY name elsewhere in this file**, and my first version
+used it as a string local -- SC2178/SC2128, the pair this project has already
+paid two CI failures for. shellcheck reported it in seconds, exactly as §9
+promises. Renamed `ready_missing`.
+
+**`EXTRA_STUB` is a per-section stub hook in the integration fixture**,
+appended LAST so a section can override any stub above it. Without it a section
+cannot change one behaviour without duplicating the whole fixture, which is how
+a suite ends up with two fixtures that drift apart.
+
+---
+
+**A QUIESCED CAPTURE EXISTS FOR THE TWO SERVICES THAT CANNOT HAVE A CONSISTENT
+ONE ANY OTHER WAY, and it is the only capture path that causes downtime.**
+jellyfin.db and kavita.db are both WAL-mode and neither their images nor this
+host has an sqlite3, so their ordinary captures are copies of a WAL database
+taken while the service may be writing.
+`storage capture-state <service> <dir> --quiesce` stops the service, PROVES it
+quiescent with `migrate_assert_quiesced`, copies, and starts the same container
+again with **`compose start`** -- never `up -d`, which reconciles and would turn
+a capture into an unreviewed deployment of whatever the tag now resolves to.
+`service_state_capture_quiesced` is in `PRESERVING` in
+`tests/reconcile-boundary-audit.py`, so that is enforced rather than intended.
+
+`QUIESCED_CAPTURE_ENABLED` defaults to 0 and **the refusal happens before the
+lock and before any stop** -- a closed gate that still causes downtime is not a
+closed gate, the same reasoning as `VOLUME_UPGRADE_ENABLED`. The mutation
+neutralises the comparison and must make an unset flag actually stop the
+service.
+
+Rules it follows, each already recorded: quiescence is PROVED rather than
+assumed (a refusal restarts the service and captures nothing); runtime state is
+preserved, so a service that was stopped is captured without being started;
+and the mode is a PARAMETER of `service_state_capture`, not an environment
+variable, so it cannot be set by accident -- the caller that passes `quiesced`
+is the one that took the lock and proved quiescence. A quiesced copy is
+recorded `file-copy-quiesced` and the restore reports it as the strongest mode.
+
+**I invented `domum_release_lock`, and the function-definition audit caught
+it.** There is no release function: `domum_acquire_lock` holds the lock through
+a file descriptor for the life of the process, it is re-entrant, and
+`storage_pre_upgrade_point` does not release it either. Three calls to a
+function that does not exist -- the `service_upgrade` undefined-helper family,
+and `bash -n` cannot see it.
+
+**My test STUBBED that invented function**, which is why the calls looked fine
+while the suite passed: a stub of a function the CLI does not have makes the
+fixture agree with the mistake. The ordering assertion now covers lock < stop <
+start only, and additionally asserts that nothing in the CLI calls a release at
+all.
+
+**And that new assertion flagged its own explanatory comment** -- the comment
+naming `domum_release_lock` to document the mistake. Comments are stripped
+first. That is the rule this project records, broken in the assertion written
+to enforce it, which is now its fifth recorded occurrence.
+
+---
+
+**`tests/find-abort-audit.py` -- `find` inside a command substitution must not
+be able to abort the shell.** This was queued as "deliberately not shipped yet"
+on the grounds that it would cry wolf. Measured instead of assumed: across the
+three CLIs there are **18** command substitutions containing a `find`, and only
+**three** lacked a guard. All three were real, and one of them mattered:
+
+```
+checkup:  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" … | wc -l | tr -d ' ')"
+```
+
+`image-updates` does not exist until `ensure_dirs` has run, `find` then exits
+1, and `2>/dev/null` hides the message and not the status -- so under pipefail
+the assignment fails and `set -e` kills `checkup`. The report prints only after
+every check has completed, so that produces a **BLANK report**, which is
+indistinguishable from a healthy one. **That is the exact shape that blanked
+the report in production once already**, with a `grep` instead of a `find`, and
+it was still live in a second place. Reproduced standalone: exit 1, and the
+line after it never runs.
+
+**`| wc -l` does not save it.** pipefail takes the rightmost non-zero status,
+so `find /absent | wc -l` is a failed pipeline even though `wc` succeeded and
+printed `0`. The fix is `|| true`, which leaves the `0` and fixes only the
+status.
+
+Scope, stated in the audit rather than left implicit: `bin/*` only, because the
+operator wrappers verify their paths far earlier than any window this could
+inspect; continuations are joined, because two of the pipefail audit's findings
+were invisible to a line-at-a-time search; a QUOTED heredoc body is data; and
+an explicit `# find-audit: <reason>` marker exempts **its own line only** and
+is PRINTED. A marker on the preceding line deliberately does NOT exempt -- it
+would drift away from the line it vouches for, the same problem as a comment
+between a warning and its remedy, and the smoke test asserts that direction.
+
+**It is deliberately NOT a guard-detection audit.** Recognising `[[ -d "$x" ]]`
+before a `find "$x/y"` is fragile and the guard is often many lines away;
+requiring `|| true` unconditionally is simpler and strictly safer, because it
+costs nothing where the path is guaranteed.
+
+`tests/find-abort-audit-smoke.sh` drives the audit against fixtures in both
+directions, including that it **accepts the fix it prescribes** -- an audit
+that rejected its own remedy would be switched off -- and that it cannot pass
+vacuously. Reporting the problems BEFORE the vacuity guard was a correction: a
+stale target list produces zero matches AND a problem, and the first version
+printed "matched no find" while hiding "the target list is stale", which is the
+actionable half.
+
+---
+
+**`tests/` IS NOW SHELLCHECKED, at `--severity=error` only.** A backtick in a
+double-quoted message is command substitution: it executes when the string is
+built and silently deletes the words it wraps. That happened **twice in one
+session** -- once in a heredoc comment and once in a `fail` message -- and
+nothing in CI could see either, because `log-hygiene-smoke` covers backticks in
+unquoted HEREDOCS and the shellcheck step covered only `bin/`, `install.sh` and
+`operator/`.
+
+Error level and not warning level, deliberately: `SC1090` (cannot follow a
+non-constant source) is legitimate and unavoidable in a test harness, so
+`--severity=warning` would flood and the step would get switched off. What
+error level catches is PARSE failures, which is exactly the gap. All suites
+pass it today.
+
+**A prose comment must not BEGIN with the word `shellcheck`**, or it is parsed
+as a directive -- `SC1072`/`SC1073`. One such comment existed, in the suite
+that exists to police exactly this family of quoting mistakes. Reworded rather
+than exempted.
+
+---
+
+**FOUR CLAIMS ABOUT AN ARCHIVE, and none implies the one above it.** Measured
+2026-11-02 against a disposable `busybox` archive: `FILE INTACT` (the
+`.sha256`) < `HOLDS THE IMAGE` (a blob whose digest equals the recorded id --
+read-only) < `LOADS TO THAT IMAGE` (`docker load` reports the same id --
+mutates the image store) < `THE IMAGE RUNS` (a disposable container started
+from the image ID, not a tag, on `--network none`). All four held.
+
+**Loading an archive of an image the store ALREADY HOLDS is a no-op**, which is
+what makes the third claim safe to measure: the id is content-addressed, so a
+load cannot replace a different image with this one. The local id was
+unchanged across the load, verified.
+
+**The limit is the point of separating them.** This proves the MECHANISM and
+proves nothing about the project's own archives, which live under `root 0750`
+and have never been loaded or run -- a fixture-backed probe is not production
+evidence, and `busybox` is a fixture. It also proves nothing about a recovered
+SERVICE: an image that runs is not a service that works, which needs the image,
+its state, its configuration and its dependencies together. So for the real
+archives, the first two claims are checkable today without privilege and
+without mutation, and the last two are proven for the mechanism and unproven
+for those specific files.
+
+---
+
+**P3.4 -- a rehearsal against REAL disposable volumes -- REQUIRES ROOT, and
+that was measured rather than assumed.** The half fixtures cannot establish is
+`dump_volume_to_file` / `restore_volume_from_file`, and both `tar -C` the
+volume's host mountpoint from
+`docker volume inspect --format '{{.Mountpoint}}'`. Measured 2026-11-02:
+`/var/lib/docker` is `drwx--x--- root root`, so **no** volume mountpoint is
+readable unprivileged -- verified against a volume created for the probe and
+removed afterwards, so it is not an artefact of production ownership.
+
+**The isolation itself is sound and was checked BEFORE anything else.**
+`storage_volume_pre_upgrade_point` resolves volumes from `docker inspect` of
+the running container, so the compose PROJECT is the boundary: production is
+`domum-media_*` and a `domum-rehearsal` project yields `domum-rehearsal_*`,
+both of which were verified free. A rehearsal must assert, before anything
+mutating, that every resolved volume name carries the disposable prefix and
+that none exists yet -- the "every root a fixture uses must be redirected into
+it, and asserted to be" rule applied to Docker objects instead of filesystem
+paths.
+
+**A rootless variant was considered and REJECTED, twice over.** A volume can be
+read without host root by mounting it into a helper container; that would let
+the rehearsal run unprivileged and would not be driving the production
+primitives, so it would prove something adjacent -- a fixture-backed probe is
+not production evidence, and a helper container reading the volume is a
+fixture. Changing the production code to use a helper container was rejected
+too: the CLI already runs as root in production so it buys nothing there, and
+it would change the semantics of a RESTORE path -- `--numeric-owner`, xattrs
+and ACLs behave differently inside a container's user namespace, and
+`acme.json`'s mode 0600 is exactly what must not change. A restore path is the
+worst place to trade correctness for testability.
+
+See `docs/VOLUME-UPGRADE-REHEARSAL.md` for the six things the rehearsal would
+prove and the shape it should take.
+
+---
+
+**THE UNBOUND-CONFIG-VARIABLE FAMILY DOES NOT WARRANT AN AUDIT, and that was
+measured rather than assumed.** `DISK_WEAR_WARN_PERCENT` had to be defaulted at
+its use site because a variable set only by `load_cfg` is unbound for a caller
+that has not run it, and under `set -u` that kills the shell -- the defect that
+once made `checkup` print nothing at all. The obvious next step is an audit for
+the whole family. Measured 2026-11-02, it would be noise:
+
+- `load_cfg` assigns **26** config variables, and **14** of them are read
+  somewhere outside it with no `${VAR:-}` default, across **160+ sites**.
+  `DOMUM_DATA_ROOT` alone has 54. A blanket rule would reject almost every
+  path in the CLI.
+- the production path is **structurally safe**: all **24** arms of `main`'s
+  dispatcher delegate to a handler, and the handlers call `load_cfg` before
+  reading anything. `load_cfg` is not called in the dispatcher, which is why a
+  check at that level reads as "none of them do" and proves nothing.
+- the one recorded failure was a **FIXTURE** stubbing `load_cfg`, and **20
+  suites stub it deliberately** -- they set the roots as environment variables
+  instead. Forbidding the stub would reject all twenty.
+
+So the correct scope is the fix already applied: a fixture that needs every
+default applied runs the REAL `load_cfg` against a real config, as
+`checkup-produces-output-smoke` now does, and a use site that a caller can
+reach without `load_cfg` carries its own default. Neither is a rule a scanner
+can usefully enforce. Recorded so the question is settled rather than
+re-derived: "we looked and decided no" is worth as much as an audit, and an
+audit that cries wolf is one somebody switches off.
 
 ---
 

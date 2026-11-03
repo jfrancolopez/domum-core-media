@@ -376,8 +376,16 @@ run_cli() {  # $@ = argv for domum-media
     printf 'wait_for_service_health() { return 0; }\n'
     printf 'service_health_state() { printf healthy; }\n'
     printf 'service_ready_probe() { return 1; }\n'
+    # The readiness-log wait is BOUNDED and its bound is overridable, so the
+    # fixture looks once and never sleeps. Without this every run of this suite
+    # would spend a minute per upgrade waiting for a line a stub cannot emit.
+    printf 'UPGRADE_READY_LOG_WAIT=0\n'
     printf 'verify_backup_freshness() { return 0; }\n'
     printf 'domum_sqlite_check() { printf "ok"; }\n'
+    # A per-section stub hook. Appended LAST so a section can override any stub
+    # above it; without it a section cannot change one behaviour without
+    # duplicating the whole fixture.
+    [[ -n "${EXTRA_STUB:-}" ]] && printf '%s\n' "$EXTRA_STUB"
     printf 'main'
     printf ' %q' "${argv[@]}"
     printf '\n'
@@ -735,6 +743,10 @@ make_installed_cli() {
     printf 'wait_for_service_health() { return 0; }\n'
     printf 'service_health_state() { printf healthy; }\n'
     printf 'service_ready_probe() { return 1; }\n'
+    # The readiness-log wait is BOUNDED and its bound is overridable, so the
+    # fixture looks once and never sleeps. Without this every run of this suite
+    # would spend a minute per upgrade waiting for a line a stub cannot emit.
+    printf 'UPGRADE_READY_LOG_WAIT=0\n'
     printf 'verify_backup_freshness() { return 0; }\n'
     printf 'main "$@"\n'
   } > "$ENV_DIR/inst/domum-media"
@@ -960,4 +972,76 @@ echo "  caught by the wrapper even with the CLI's own check blinded"
 fi
 
 echo
+echo "== N. the DECLARED readiness line is consulted, with a BOUNDED wait =="
+# service_logged_ready_since already existed and only the MIGRATION path used
+# it, so an upgrade had WEAKER readiness evidence than a migration of the same
+# service. The first attempt at closing that gap was reverted because phase 4
+# runs immediately after `up -d`, so a line that lags by seconds read as a
+# FAILURE. Driving the real argv is what caught that; reading the diff had not.
+#
+# So the design is deliberately asymmetric and both halves are asserted here.
+setup
+rc="$(UPGRADE_READY_LOG_WAIT=0 \
+      EXTRA_STUB='service_logged_ready_since() { return 0; }' \
+      run_cli updates apply --service plex)"
+[ "$rc" = "0" ] || fail "the upgrade failed when the readiness line WAS logged: $(out)"
+grep -q 'readiness (log) : LOGGED since the restart' "$ENV_DIR/out" \
+  || fail "a logged readiness line was not reported as evidence: $(out)"
+grep -q 'readiness       : UNPROVEN' "$ENV_DIR/out" \
+  && fail "readiness was called UNPROVEN although the declared line was found: $(out)"
+echo "  found: reported as evidence, and not called unproven"
+
+echo "== N+1. a SILENT readiness line is reported and is NOT a failure =="
+# Escalating on absence would change the success criteria for the four services
+# that declare a pattern, which is why the first version was reverted.
+setup
+rc="$(UPGRADE_READY_LOG_WAIT=0 \
+      EXTRA_STUB='service_logged_ready_since() { return 1; }' \
+      run_cli updates apply --service plex)"
+[ "$rc" = "0" ] \
+  || fail "a readiness line that did not appear FAILED the upgrade (rc=$rc). That is
+the regression this design exists to avoid -- the line may simply lag: $(out)"
+grep -q 'readiness (log) : NOT logged within' "$ENV_DIR/out" \
+  || fail "the absent readiness line was not reported at all: $(out)"
+grep -q 'Reported, NOT a failure' "$ENV_DIR/out" \
+  || fail "it does not say that absence is not a failure: $(out)"
+echo "  absent: reported, exit 0, and said to be not a failure"
+
+echo "== N+2. the boundary is taken BEFORE the restart, not after =="
+# A readiness line from the PREVIOUS start must never be accepted as evidence
+# of this one, so the timestamp has to be captured before `up -d`. Asserted on
+# the order of the real argv/call log, not on the source text.
+fn="$(awk '/^service_upgrade\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media" | sed 's/#.*//')"
+b_line="$(grep -n 'restart_boundary="\$(date' <<< "$fn" | head -1 | cut -d: -f1)"
+d_line="$(grep -n 'compose_cmd up -d' <<< "$fn" | head -1 | cut -d: -f1)"
+u_line="$(grep -n 'service_logged_ready_since' <<< "$fn" | head -1 | cut -d: -f1)"
+[ -n "$b_line" ] && [ -n "$d_line" ] && [ -n "$u_line" ] \
+  || fail "could not locate the boundary, the deploy and the readiness read"
+[ "$b_line" -lt "$d_line" ] \
+  || fail "the boundary is taken at relative line $b_line, AFTER the deploy at $d_line --
+a readiness line from the previous start would be accepted as evidence of this one"
+[ "$u_line" -gt "$d_line" ] \
+  || fail "the readiness read at $u_line precedes the deploy at $d_line"
+echo "  boundary at $b_line, deploy at $d_line, readiness read at $u_line"
+
+echo "== N+3. the UNPROVEN message names what is ACTUALLY absent =="
+# A fixed sentence saying "no declared log pattern" would be FALSE for a
+# service that declares one and stayed silent. A report describing something it
+# is not is the defect this project exists to correct, so the sentence is built
+# from what is actually missing.
+setup
+rc="$(UPGRADE_READY_LOG_WAIT=0 \
+      EXTRA_STUB='service_logged_ready_since() { return 1; }
+service_health_state() { printf none; }' \
+      run_cli updates apply --service plex)"
+grep -q 'readiness       : UNPROVEN' "$ENV_DIR/out" \
+  || fail "with no healthcheck, no probe and a silent pattern, readiness must be
+reported UNPROVEN: $(out)"
+grep -q 'a declared log pattern that did not appear' "$ENV_DIR/out" \
+  || fail "the UNPROVEN message does not say the declared pattern was silent: $(out)"
+grep -q 'no declared log pattern' "$ENV_DIR/out" \
+  && fail "it claims there is no declared log pattern for a service that HAS one --
+the report describing something it is not: $(out)"
+echo "  the sentence is built from what is actually absent"
+
 echo "PASS: service upgrade integration smoke"

@@ -4254,7 +4254,7 @@ status_counts() {
   if [[ -d "$media_root" ]]; then
     for subdir in movies tv music books photos; do
       [[ -d "$media_root/$subdir" ]] || continue
-      printf '%s files: %s\n' "$subdir" "$(find "$media_root/$subdir" -type f 2>/dev/null | wc -l)"
+      printf '%s files: %s\n' "$subdir" "$(find "$media_root/$subdir" -type f 2>/dev/null | wc -l || true)"
     done
   fi
 }
@@ -7308,7 +7308,14 @@ checkup_collect_all() {
     checkup_add advice "docker ps -a --filter status=exited   # read-only; an enabled service that is DOWN is reported separately as an action"
   fi
 
-  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
+  # `|| true` is load-bearing: image-updates does not exist until ensure_dirs
+  # has run, `find` then exits 1, and `2>/dev/null` hides the message and not
+  # the status -- so under pipefail this assignment would fail and `set -e`
+  # would kill checkup. The report prints only after every check completes, so
+  # that produces a BLANK report, which is indistinguishable from a healthy
+  # one. `wc` still prints 0, so the count is right; only the status needed
+  # fixing. Same shape as the grep that blanked the report in production.
+  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ' || true)"
   if (( waiting_count > 0 )); then
     checkup_add warning "${waiting_count} service update candidates are waiting."
     # A STAGED image is not a pending task: discovery never implies deployment,
@@ -8341,7 +8348,7 @@ The application did not shut down cleanly. Investigate before migrating."
 migrate_measure() {
   local path="$1"
   printf '%s %s' \
-    "$(find "$path" -type f 2>/dev/null | wc -l)" \
+    "$(find "$path" -type f 2>/dev/null | wc -l || true)" \
     "$(du -sb --apparent-size "$path" 2>/dev/null | awk '{print $1}')"
 }
 
@@ -8794,6 +8801,96 @@ state_item_mode() {  # $1 = path -> octal mode, or empty
   stat -c '%a' "$1" 2>/dev/null || true
 }
 
+service_state_capture_quiesced() {  # $1 = service, $2 = destination directory
+  # The strongest capture available for a service whose image ships no sqlite3:
+  # stop it, PROVE it is quiescent, copy, start the same container again.
+  #
+  # Measured 2026-11-02 from the SQLite file header: jellyfin.db and kavita.db
+  # are BOTH WAL-mode, and neither their images nor this host has an sqlite3 --
+  # so their ordinary captures are `unproven`, i.e. copies of a WAL database
+  # taken while the service may be writing. A quiesce is the only way to make
+  # them consistent, and it is the only capture path that causes DOWNTIME.
+  local service="$1" dest="$2"
+  [[ -n "$service" && -n "$dest" ]] \
+    || { warn "service_state_capture_quiesced needs a service and a destination"; return 1; }
+
+  # The gate refuses BEFORE the lock and BEFORE any stop. A closed gate that
+  # still causes downtime is not a closed gate -- the same reasoning as
+  # VOLUME_UPGRADE_ENABLED.
+  if (( ${QUIESCED_CAPTURE_ENABLED:-0} != 1 )); then
+    warn "REFUSING: a quiesced capture STOPS $service, and QUIESCED_CAPTURE_ENABLED is not 1."
+    warn "Nothing was locked and nothing was stopped. This path has only ever run against"
+    warn "fixtures; set QUIESCED_CAPTURE_ENABLED=1 deliberately to use it in production."
+    return 1
+  fi
+
+  local path compose_svcs runtime_before started=0 rc=0
+  path="$(service_data_path "$service")"
+  [[ -d "$path" ]] || { warn "$service has no state directory at $path"; return 1; }
+  service_essential_state "$service" >/dev/null 2>&1 \
+    || { warn "$service declares no essential state"; return 1; }
+
+  domum_acquire_lock "capture-state $service" 0 \
+    || { warn "Another domum-media operation holds the lock: $(domum_lock_holder)"; return 1; }
+
+  compose_svcs="$(service_compose_services "$service" 2>/dev/null || true)"
+  runtime_before="$(service_runtime_state "$service" 2>/dev/null || printf 'unknown')"
+  echo "[domum-media] quiesced capture of $service (runtime before: $runtime_before)"
+
+  # Restart with `compose start`, which starts the container that was stopped and
+  # therefore resolves NO image reference. NOT recreating: `up -d` reconciles and
+  # would deploy whatever the tag now points at, turning a capture into an
+  # unreviewed deployment.
+  capture_restart() {
+    (( started == 1 )) || return 0
+    [[ -n "$compose_svcs" ]] || return 0
+    # shellcheck disable=SC2086
+    compose_cmd start $compose_svcs >/dev/null 2>&1 && return 0
+    warn "Could not restart $compose_svcs with \`compose start\`."
+    warn "NOT recreating: that resolves the image tag and could deploy a staged image."
+    warn "$service is DOWN. The capture, if any, is in $dest."
+    return 1
+  }
+
+  if [[ "$runtime_before" == "running" && -n "$compose_svcs" ]]; then
+    # shellcheck disable=SC2086
+    compose_cmd stop $compose_svcs \
+      || { warn "Could not stop $compose_svcs; nothing was captured"; return 1; }
+    started=1
+  fi
+
+  # Consistent, or refuse. Without this the quiesced mode would be a claim about
+  # the stop rather than about the bytes.
+  if ! migrate_assert_quiesced "$path"; then
+    capture_restart
+    warn "REFUSING: $path is not quiesced after the stop. Nothing was captured."
+    return 1
+  fi
+  echo "  quiesced        : no open handles, no non-empty WAL, no hot journal"
+
+  service_state_capture "$service" "$dest" quiesced || rc=1
+
+  capture_restart || rc=1
+
+  # A capture must preserve runtime state: running before -> running after.
+  local runtime_after
+  runtime_after="$(service_runtime_state "$service" 2>/dev/null || printf 'unknown')"
+  if [[ "$runtime_after" != "$runtime_before" ]]; then
+    warn "Runtime state CHANGED across the capture: $runtime_before -> $runtime_after."
+    rc=1
+  else
+    echo "  runtime         : $runtime_after (unchanged)"
+  fi
+  # There is deliberately NO release call: `domum_acquire_lock` holds the lock
+  # through a file descriptor for the life of the process and nothing in this
+  # CLI releases it early -- `storage_pre_upgrade_point` does not either. It is
+  # also re-entrant, so a caller that already holds it is unaffected. Inventing
+  # a `domum_release_lock` is exactly what the function-definition audit caught
+  # here: it does not exist.
+  (( rc == 0 )) && echo "[domum-media] quiesced capture complete: $dest"
+  return "$rc"
+}
+
 service_state_restore() {  # $1 = capture directory, $2 = scratch target
   # Restores a capture into a target the operator names. It NEVER writes into
   # the live state tree: restoring over a running service's state would be a
@@ -8803,9 +8900,13 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   [[ -n "$dir" && -n "$target" ]] || { warn "service_state_restore needs a capture directory and a target"; return 1; }
   [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
 
-  local service live rtarget rlive
+  local service live rtarget rlive cap_mode
   service="$(sed -nE "s/^SERVICE=(.*)$/\1/p" "$manifest" | head -1)"
   [[ -n "$service" ]] || { warn "the manifest does not name a service"; return 1; }
+  # Read, not defaulted: a key the writer never emitted must not read as the
+  # reassuring value. An old or hand-made manifest says `unrecorded`.
+  cap_mode="$(sed -nE "s/^CAPTURE_MODE=(.*)$/\1/p" "$manifest" | head -1)"
+  cap_mode="${cap_mode:-unrecorded}"
 
   # The refusal is on resolved paths, because a symlink or a '..' would
   # otherwise walk straight into the live tree.
@@ -8883,13 +8984,34 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   else
     echo "[domum-media] restored $ok item(s) for $service into $rtarget, all matching their recorded digests"
     echo "[domum-media] restored databases: $sqlite_ok checked sound, $sqlite_skipped not checked"
+    # The digests prove the bytes are the bytes that were captured. They say
+    # nothing about whether those bytes were a consistent snapshot of a running
+    # application, and a restore report that omits the capture mode reads as
+    # strong for an `unproven` capture as for a consistent one.
+    case "$cap_mode" in
+      consistent)
+        echo "[domum-media] capture mode: consistent -- each database was taken with its own"
+        echo "              application's sqlite3 '.backup' and integrity-checked there." ;;
+      unproven)
+        echo "[domum-media] capture mode: UNPROVEN -- $service ships no sqlite3 and this host has"
+        echo "              none, so its database was COPIED while the service could be writing."
+        echo "              The bytes restored are the bytes captured; whether they were a"
+        echo "              consistent point in time is not established." ;;
+      quiesced)
+        echo "[domum-media] capture mode: quiesced -- the service was STOPPED and proved"
+        echo "              quiescent (no open handles, no non-empty WAL, no hot journal)"
+        echo "              before a byte was read, so the copy is a consistent point in"
+        echo "              time. This is the strongest capture mode." ;;
+      *)
+        echo "[domum-media] capture mode: $cap_mode -- not recorded, so consistency is unknown." ;;
+    esac
     echo "[domum-media] this proves the CAPTURE restores. It is not a proof that $service runs against it."
   fi
   return "$rc"
 }
 
-service_state_capture() {  # $1 = service, $2 = destination directory
-  local service="$1" dest="$2"
+service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode override
+  local service="$1" dest="$2" mode_override="${3:-}"
   [[ -n "$service" && -n "$dest" ]] || { warn "service_state_capture needs a service and a destination"; return 1; }
   service_essential_state "$service" >/dev/null 2>&1 \
     || { warn "$service declares no essential state"; return 1; }
@@ -8897,7 +9019,13 @@ service_state_capture() {  # $1 = service, $2 = destination directory
   local root mode img cid manifest rc=0 items=0 bad=0
   root="$(service_data_path "$service")"
   [[ -d "$root" ]] || { warn "$service has no state directory at $root"; return 1; }
-  mode="$(service_state_capture_mode "$service")"
+  # The override exists for the QUIESCED path, where the service is stopped: a
+  # plain copy is then consistent BY CONSTRUCTION, and `.backup` through the
+  # container is impossible because the container is not running. It is a
+  # parameter rather than an environment variable so it cannot be set by
+  # accident, and the caller that passes it is the one that took the lock and
+  # proved quiescence.
+  mode="${mode_override:-$(service_state_capture_mode "$service")}"
   cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
   img="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
 
@@ -8932,7 +9060,11 @@ service_state_capture() {  # $1 = service, $2 = destination directory
         if [[ ! -f "$src" ]]; then
           printf 'ITEM=%s|%s|MISSING||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
         fi
-        if [[ "$mode" == "consistent" ]] && service_sqlite_backup "$service" "$src" "$out"; then
+        if [[ "$mode" == "quiesced" ]] && cp -p -- "$src" "$out" 2>/dev/null; then
+          # Nothing is writing: the service is stopped and quiescence was proved
+          # before this ran, so the bytes are a consistent point in time.
+          itemmode="file-copy-quiesced"
+        elif [[ "$mode" == "consistent" ]] && service_sqlite_backup "$service" "$src" "$out"; then
           itemmode="sqlite-backup"
         elif cp -p -- "$src" "$out" 2>/dev/null; then
           # A copy of a database the service may be writing. Recorded as what
@@ -11294,6 +11426,12 @@ The staged image was NOT deployed."
     || die "The pre-upgrade recovery point did not verify. The staged image was NOT deployed."
 
   # ---- phase 3: deploy ONLY this service -------------------------------------
+  # The readiness-log boundary is taken BEFORE the restart, so a line from the
+  # PREVIOUS start can never be accepted as evidence of this one. Defined here
+  # rather than inside phase 4 on purpose: referencing this variable before
+  # defining it once killed the function under `set -u`.
+  local restart_boundary
+  restart_boundary="$(date -u +%Y-%m-%dT%H:%M:%S)"
   echo "[domum-media] phase 3/4: deploying $target_image to $compose_svcs only"
   # shellcheck disable=SC2086
   compose_cmd up -d $compose_svcs \
@@ -11352,12 +11490,63 @@ rollback instructions in $meta."
       rc=1
     fi
   fi
+  # A DECLARED readiness line, with a BOUNDED WAIT.
+  #
+  # service_logged_ready_since already existed and only the MIGRATION path used
+  # it, so an upgrade had weaker readiness evidence than a migration of the same
+  # service. The first attempt at closing that gap was reverted, for a reason
+  # that governs the design here: phase 4 runs immediately after `up -d`, so a
+  # service whose readiness line lags by seconds was reported as having FAILED.
+  #
+  # So this is deliberately asymmetric. Finding the line STRENGTHENS the claim;
+  # not finding it is REPORTED and never sets rc. Escalating on absence would
+  # change the success criteria for the four services that declare a pattern,
+  # and half of that change is worse than none.
+  local ready_log_state="none"
+  if service_ready_log_pattern "$service" >/dev/null 2>&1; then
+    # Always ONE attempt, then wait only if it is still absent -- so a wait of 0
+    # means "look once and do not sleep", which is what lets a test drive both
+    # outcomes without a minute of real time per run.
+    local lwaited=0 lwait="${UPGRADE_READY_LOG_WAIT:-60}"
+    while :; do
+      if service_logged_ready_since "$service" "$restart_boundary"; then
+        ready_log_state="logged"; break
+      fi
+      (( lwaited >= lwait )) && break
+      sleep 5; lwaited=$(( lwaited + 5 ))
+    done
+    if [[ "$ready_log_state" == "logged" ]]; then
+      ready_evidence="${ready_evidence:+$ready_evidence; }logged its declared readiness line"
+      echo "  readiness (log) : LOGGED since the restart: \"$(service_ready_log_pattern "$service")\""
+    else
+      ready_log_state="silent"
+      echo "  readiness (log) : NOT logged within ${lwait}s of the restart."
+      echo "                    Reported, NOT a failure: the line may simply lag, and"
+      echo "                    escalating on absence would change the success criteria."
+    fi
+  fi
+
   # Nothing asked the application anything. Say so rather than letting a
   # started container read as a working one -- that substitution is the defect
   # this project refuses to make elsewhere, and it must not appear in the one
   # place an upgrade is being declared successful.
+  #
+  # The message is BUILT from what is actually absent. A fixed sentence saying
+  # "no declared log pattern" would be false for a service that declares one and
+  # stayed silent -- a report describing something it is not, which is the
+  # defect this whole file exists to correct.
   if [[ -z "$ready_evidence" && "$(service_health_state "$service")" == "none" ]]; then
-    echo "  readiness       : UNPROVEN -- no container healthcheck, no readiness probe and no declared log pattern. RUNNING is the whole claim."
+    local ready_missing="no container healthcheck"
+    if service_ready_probe "$service" >/dev/null 2>&1; then
+      ready_missing="$ready_missing, a readiness probe that did not answer"
+    else
+      ready_missing="$ready_missing, no readiness probe"
+    fi
+    case "$ready_log_state" in
+      silent) ready_missing="$ready_missing, and a declared log pattern that did not appear" ;;
+      *)      ready_missing="$ready_missing and no declared log pattern" ;;
+    esac
+    echo "  readiness       : UNPROVEN -- $ready_missing. RUNNING is the whole claim."
   fi
 
   # The pre-upgrade artefacts must still be exactly as created -- and WHICH
@@ -11701,13 +11890,38 @@ storage_scrub_status() {
 #   1  a scrub could not be performed
 #   3  UNCORRECTABLE errors were found -- btrfs-scrub(8)'s own meaning, kept
 #
+btrfs_scrub_running() {  # $1 = btrfs root -> "running" | "no" | "unknown"
+  # btrfs-progs v6.14 prints a `Status:` field (running|finished|aborted|
+  # interrupted) and "no stats available" for a filesystem that has never been
+  # scrubbed. `btrfs scrub status` needs privilege, so an unreadable status is
+  # reported as `unknown` and must never be read as "not running" -- the caller
+  # then relies on btrfs's own refusal instead.
+  local out st
+  out="$(btrfs scrub status "$1" 2>/dev/null || true)"
+  [[ -n "$out" ]] || { printf 'unknown'; return 0; }
+  st="$(sed -nE 's/^[[:space:]]*Status:[[:space:]]*([A-Za-z]+).*/\1/p' <<< "$out" | head -1)"
+  case "${st,,}" in
+    running)  printf 'running' ;;
+    finished|aborted|interrupted) printf 'no' ;;
+    "")
+      # Older wordings carry no Status field. "no stats available" means a
+      # scrub has never run, so it is certainly not running now; a line saying
+      # a scrub is running for some duration means it is.
+      if grep -qiE 'scrub (started at .*, )?running' <<< "$out"; then printf 'running'
+      elif grep -qi 'no stats available' <<< "$out"; then printf 'no'
+      else printf 'unknown'; fi ;;
+    *) printf 'unknown' ;;
+  esac
+  return 0
+}
+
 # `-B` is not optional. Without it `btrfs scrub start` returns immediately and
 # a oneshot unit would report success before reading a single block -- green
 # because it did not wait.
 storage_scrub_start() {
   need_root
   load_cfg
-  local limit="" root fsid rc worst=0 n=0 est
+  local limit="" root fsid rc worst=0 n=0 skipped=0 est scrub_out
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --limit) [[ -n "${2:-}" ]] || die "--limit needs a size, e.g. --limit 150M"
@@ -11735,9 +11949,36 @@ storage_scrub_start() {
       echo "  The profiles could not be read, so which half is repairable here is"
       echo "  UNKNOWN; see docs/BTRFS-SCRUB-PLAN.md for the measured layout."
     fi
+    # A scrub ALREADY RUNNING is not a failure, and treating it as one would
+    # mail a false alarm for an entirely normal condition: the monthly timer
+    # firing while a manual scrub is still going, or while the previous run has
+    # not finished. btrfs refuses to start a second scrub on the same
+    # filesystem, so without this the generic branch below would report
+    # "scrub FAILED" and fail the unit, which `checkup_systemd_health` reports
+    # as CRITICAL.
+    #
+    # Asked two ways on purpose. The STATUS field is the clean signal and
+    # avoids depending on the wording of an error; the error text is the
+    # authority and closes the race between asking and starting. Anything
+    # neither recognises stays a failure -- an unrecognised error genuinely may
+    # be one, and that is the conservative direction.
+    if [[ "$(btrfs_scrub_running "$root")" == "running" ]]; then
+      echo "  result          : SKIPPED -- a scrub is already running on this filesystem."
+      echo "                    Not started again: btrfs scrubs one filesystem at a"
+      echo "                    time, and corruption IS being looked for right now."
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
     rc=0
+    scrub_out=""
     # shellcheck disable=SC2086
-    btrfs scrub start -B ${limit:+--limit "$limit"} "$root" || rc=$?
+    scrub_out="$(btrfs scrub start -B ${limit:+--limit "$limit"} "$root" 2>&1)" || rc=$?
+    [[ -n "$scrub_out" ]] && printf '%s\n' "$scrub_out" | sed 's/^/    /'
+    if (( rc != 0 )) && grep -qiE 'scrub (is )?already running|already in progress' <<< "$scrub_out"; then
+      echo "  result          : SKIPPED -- a scrub started between the check and this call."
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
     case "$rc" in
       0) echo "  result          : clean -- every allocated extent matched its checksum" ;;
       3) echo "  result          : UNCORRECTABLE ERRORS FOUND on $root"
@@ -11758,7 +11999,17 @@ storage_scrub_start() {
     esac
   done < <(btrfs_unique_roots)
   (( n > 0 )) || die "No Btrfs filesystem found among the configured roots."
-  echo "[domum-media] scrubbed $n filesystem(s); worst result $worst"
+  # The summary must not say "clean" about a filesystem it skipped. A scrub
+  # that was already running is reported, counted, and deliberately does NOT
+  # fail the unit -- but the claim is narrowed rather than the skip hidden,
+  # because HEALTHY must not mean UNMEASURED.
+  if (( skipped > 0 )); then
+    echo "[domum-media] $n filesystem(s) considered: $(( n - skipped )) scrubbed, $skipped already running; worst result $worst"
+    echo "[domum-media] the skipped filesystem(s) make no claim here. 'storage scrub status'"
+    echo "              reports the running scrub's own result when it finishes."
+  else
+    echo "[domum-media] scrubbed $n filesystem(s); worst result $worst"
+  fi
   return "$worst"
 }
 
@@ -11812,8 +12063,16 @@ storage_cmd() {
       # This ACTIVATES NOTHING. It writes to the given directory and stops;
       # whether that directory is ever sent off-site is an operator decision,
       # and no backup target, include path or exclusion is touched.
+      # --quiesce STOPS the service, proves it quiescent, copies, and starts the
+      # same container again with `compose start`. It is the only capture path
+      # that causes downtime, so it is gated on QUIESCED_CAPTURE_ENABLED and
+      # refuses before the lock and before any stop.
       load_cfg
-      service_state_capture "${1:-}" "${2:-}" ;;
+      if [[ "${3:-}" == "--quiesce" ]]; then
+        service_state_capture_quiesced "${1:-}" "${2:-}"
+      else
+        service_state_capture "${1:-}" "${2:-}"
+      fi ;;
     verify-state)
       shift
       # Re-verify a capture against its own manifest. Read-only. A checksum
@@ -11857,7 +12116,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir>|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir> [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
   esac
 }
 

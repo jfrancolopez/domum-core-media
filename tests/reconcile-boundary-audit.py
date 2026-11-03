@@ -49,6 +49,11 @@ PRESERVING = {
     # newer application, which would migrate it -- during the operation meant to
     # undo exactly that.
     "restore_snapshot_for_service",
+    # A quiesced capture stops a service only to read its bytes. Recreating
+    # would deploy whatever the tag now resolves to, turning a capture into an
+    # unreviewed deployment -- the worst possible place for one, because the
+    # whole point is that nothing about the service changes.
+    "service_state_capture_quiesced",
 }
 DEPLOYING = {
     "refresh_images",         # the update path; gated on backup age, health, snapshot

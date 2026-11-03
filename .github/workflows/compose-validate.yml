@@ -22,6 +22,21 @@ jobs:
         # /etc/os-release, intentional subshell-scoped exports) are advisory.
         run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh
 
+      # The suites are shellchecked at severity=error only: SC1090 (cannot
+      # follow a non-constant source) is legitimate and unavoidable in a test
+      # harness, so --severity=warning would flood and get switched off. What
+      # error-level catches is PARSE failures, and that is exactly what was
+      # missing -- a backtick in a double-quoted message is command
+      # substitution, it executes when the string is built, and it silently
+      # deletes the words it wraps. That happened twice in one session and
+      # nothing in CI could see it: log-hygiene-smoke covers backticks in
+      # unquoted HEREDOCS, not in ordinary strings.
+      #
+      # A prose comment must not BEGIN with the word shellcheck, or it is
+      # parsed as a directive (SC1072/SC1073). One such comment existed.
+      - name: shellcheck the test suites (parse errors only)
+        run: shellcheck --severity=error tests/*.sh
+
       - name: Immich secret propagation smoke test
         run: tests/immich-secret-propagation-smoke.sh
 
@@ -252,6 +267,18 @@ jobs:
       # production containers and the PostgreSQL dump footer check.
       - name: Pipefail grep audit
         run: python3 tests/pipefail-grep-audit.py
+
+      # `find` on a path that need not exist exits 1, and 2>/dev/null hides the
+      # message, not the status -- so under pipefail the assignment fails and
+      # `set -e` kills the function, usually before the branch written for an
+      # empty result.
+      - name: Find abort audit
+        run: python3 tests/find-abort-audit.py
+
+      # The audit driven against fixtures, including that it ACCEPTS the fix it
+      # prescribes -- an audit that rejected its own remedy gets switched off.
+      - name: Find abort audit smoke test
+        run: tests/find-abort-audit-smoke.sh
 
       - name: Pipefail grep audit smoke test
         run: tests/pipefail-grep-audit-smoke.sh

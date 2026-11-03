@@ -388,6 +388,33 @@ grep -q 'APPLICATION STARTUP VERIFIED' <<< "$pb" && fail "it used the Phase A cl
 grep -q 'FULL RECOVERY VERIFIED' <<< "$pb" && fail "it used the words FULL RECOVERY VERIFIED"
 echo "  3 of 23033, byte-compared, including the live-photo video"
 
+sect "a user with NO live photo does not abort the selection"
+# `lp_img="$(grep '^livephoto image|' <<< "$sel_lines" | cut … | head -1)"` was
+# unguarded. A user with no live photo is the NORMAL case, and grep finding
+# nothing made the assignment fail; under `set -euo pipefail` that killed the
+# function before its own `if [[ -n "$lp_img" ]]`, which exists precisely to
+# handle the empty case. Reproduced standalone before fixing: exit 1, and the
+# `if` is never reached.
+#
+# `run_pa` applies `set +e` BEFORE evaluating the setup string, so passing
+# strict options there restores production's behaviour. Without that the abort
+# cannot show in this suite at all -- a test that relaxes production's shell
+# options is not a test of production.
+cat > "$TMP_DIR/selection-nolp" <<EOF
+photo jpeg|asset-0001|/usr/src/app/upload/upload/aa/bb/one.jpeg|10
+EOF
+nolp="$(run_pa 'export STUB_SELECTION="$TMP_DIR/selection-nolp"; set -euo pipefail' --serve)"
+grep -q 'EXITCODE=' <<< "$nolp" \
+  || fail "a selection with no live-photo line aborted the function under strict
+options -- the subshell died before it could report an exit code at all: $nolp"
+grep -q 'EXITCODE=0' <<< "$nolp" \
+  || fail "a user with no live photo should still serve its originals: $nolp"
+grep -qE 'photo jpeg +match' <<< "$nolp" \
+  || fail "the ordinary original was not served once no live photo was present: $nolp"
+grep -q 'livephoto' <<< "$nolp" \
+  && fail "it reported a live-photo asset for a selection that had none: $nolp"
+echo "  no live photo: still serves, still exits 0, claims no live-photo asset"
+
 sect "the live-photo RELATIONSHIP is followed, not assumed"
 # 7,432 images link to 7,428 distinct hidden videos on the real library, so the
 # relationship is not 1:1 and the video must be fetched via livePhotoVideoId.
