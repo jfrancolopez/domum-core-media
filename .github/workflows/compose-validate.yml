@@ -264,6 +264,12 @@ jobs:
       - name: Critical-finding pairing audit
         run: python3 tests/lib-critical-pairing-audit.py
 
+      - name: Backup evidence key audit
+        run: python3 tests/backup-evidence-keys-audit.py
+
+      - name: Backup evidence key audit smoke test
+        run: tests/backup-evidence-keys-audit-smoke.sh
+
       - name: Reconcile boundary audit
         run: python3 tests/reconcile-boundary-audit.py
 
