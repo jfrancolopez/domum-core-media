@@ -769,3 +769,54 @@ the suite drives exactly that case.
 
 `--occurrence=1` makes tar stop at the member rather than read to the end of a
 250 MB archive.
+
+### Four claims about an archive, measured 2026-11-02
+
+Each is weaker than the next, and none implies the one above it. All four were
+established against a **disposable archive of `busybox`** — see the limit at
+the end, which is the point of writing them down separately.
+
+| claim | what proves it | mutates? |
+|---|---|---|
+| **FILE INTACT** | the `.sha256` beside the archive | no |
+| **HOLDS THE IMAGE** | a blob inside the archive whose digest equals the recorded image id (`domum_archive_identity`) | no |
+| **LOADS TO THAT IMAGE** | `docker load` reports `Loaded image ID:` equal to the record | **yes** — the image store |
+| **THE IMAGE RUNS** | a disposable container started from the image **ID**, not a tag | **yes** — a container |
+
+Measured:
+
+```
+$ docker image inspect -f '{{.Id}}' busybox:latest
+sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+
+$ docker load -i bb.tar
+Loaded image ID: sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+
+$ docker image inspect -f '{{.Id}}' busybox:latest      # unchanged: a no-op
+sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+
+$ docker run --rm --network none sha256:fd7dc98638c8… /bin/sh -c 'echo RAN-OK; id -u'
+RAN-OK
+0
+```
+
+Loading an archive of an image the store **already holds is a no-op**, which is
+what makes this safe to measure at all: the id is content-addressed, so a load
+cannot replace a different image with this one.
+
+**The limit, stated rather than implied.** This proves the MECHANISM — that a
+`docker save` archive loads back to the recorded identity and that the loaded
+image runs. It proves **nothing about the project's own archives**, which live
+in `/srv/data/backups/images` under `root 0750` and have never been loaded or
+run. A fixture-backed probe is not production evidence, and `busybox` is a
+fixture.
+
+It also proves nothing about a recovered **service**: an image that runs is not
+a service that works. That needs the image, its state, its configuration and
+its dependencies together, which is what a pre-upgrade recovery point is for
+and what `rollback_upgrade` exercises.
+
+So the honest position for the project's archives remains: FILE INTACT and
+HOLDS THE IMAGE are checkable today without privilege and without mutation;
+LOADS TO THAT IMAGE and THE IMAGE RUNS are proven for the mechanism and
+unproven for those specific files.

@@ -3801,6 +3801,30 @@ than exempted.
 
 ---
 
+**FOUR CLAIMS ABOUT AN ARCHIVE, and none implies the one above it.** Measured
+2026-11-02 against a disposable `busybox` archive: `FILE INTACT` (the
+`.sha256`) < `HOLDS THE IMAGE` (a blob whose digest equals the recorded id --
+read-only) < `LOADS TO THAT IMAGE` (`docker load` reports the same id --
+mutates the image store) < `THE IMAGE RUNS` (a disposable container started
+from the image ID, not a tag, on `--network none`). All four held.
+
+**Loading an archive of an image the store ALREADY HOLDS is a no-op**, which is
+what makes the third claim safe to measure: the id is content-addressed, so a
+load cannot replace a different image with this one. The local id was
+unchanged across the load, verified.
+
+**The limit is the point of separating them.** This proves the MECHANISM and
+proves nothing about the project's own archives, which live under `root 0750`
+and have never been loaded or run -- a fixture-backed probe is not production
+evidence, and `busybox` is a fixture. It also proves nothing about a recovered
+SERVICE: an image that runs is not a service that works, which needs the image,
+its state, its configuration and its dependencies together. So for the real
+archives, the first two claims are checkable today without privilege and
+without mutation, and the last two are proven for the mechanism and unproven
+for those specific files.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
