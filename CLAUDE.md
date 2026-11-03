@@ -4154,6 +4154,47 @@ the directory listing versus the archive size.
 
 ---
 
+**"COULD NOT READ IT" AND "IT READS ALIKE" ARE DIFFERENT FINDINGS, and the
+wear check collapsed them.** `mreport_smart_interpretable` returned 1 both for
+an attribute table with one distinct value (genuine vendor placeholders) and
+for **no table at all**, and `checkup_disk_wear` then asserted the placeholder
+cause. Run unprivileged against this host, `smartctl` returns
+`Permission denied` with an empty table -- so **/dev/sda, whose attributes ARE
+interpretable as root (0.52% of its 600 TBW used), was reported as holding
+"vendor placeholders"**. A check that names the wrong cause is the defect this
+file exists to correct, in the check written to avoid exactly that.
+
+Three states now: `0` interpretable, `1` placeholders, `2` could not be read.
+Both non-zero values stay falsy, so every existing `if ! f` caller is
+unaffected. The unreadable advice says it needs root and that unknown is not
+evidence of health either -- it does not borrow the placeholder wording.
+
+**It was found by running the real checks against the real host, unprivileged.**
+Every fixture stubs `mreport_smart_interpretable` or feeds it a populated
+table, so no suite could see the empty-table path; the host could. That is the
+second finding this session that only appeared outside a fixture -- the first
+was Jellyfin's 0600 DataProtection key.
+
+**What the same run CONFIRMED, which is why it was worth doing:** a permission
+failure reports `UNKNOWN: smartctl reported no verdict` as a WARNING and
+**zero CRITICAL**. That is the recorded defect -- a permission failure once
+reported "did NOT pass" and told the operator to replace a healthy disk -- and
+it is fixed and now verified against the real host rather than against a
+fixture.
+
+**The scrub timer justified `Persistent=true` with the wrong reason.** Its
+comment said a missed run at boot is "harmless" because "unlike `snapshot
+prune` this job deletes nothing". True, and not the same claim: a default scrub
+is READ-WRITE and repairs a corrupt metadata block from its DUP copy, and
+Metadata and System here are DUP. The real mitigations are the ones now
+recorded -- `RandomizedDelaySec=20m` keeps it off the boot critical path, and
+`--limit 150M` makes it **~25 minutes** of throttled I/O rather than the
+measured 7m14s at full rate. `systemd-analyze calendar` confirms the schedule
+resolves to the first Sunday monthly (next elapse 2026-12-06 05:30), which is
+the only part of a timer that can be tested without installing it.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

@@ -5932,8 +5932,14 @@ checkup_disk_health() {
 # `healthy`: unavailable wear information is not evidence of health, and saying
 # so is the whole point. Advice is printed and escalates nothing.
 checkup_disk_wear() {  # $1 = device name
-  local dev="$1" wear
-  if ! mreport_smart_interpretable "$dev"; then
+  local dev="$1" wear interp
+  mreport_smart_interpretable "$dev"; interp=$?
+  if (( interp == 2 )); then
+    # Not the same finding as placeholders, and it must not borrow its words.
+    checkup_add advice "wear for /dev/$dev could not be READ -- smartctl returned no attribute table (it needs root; \`checkup\` under sudo does have it). Unknown, which is not evidence of health either."
+    return 0
+  fi
+  if (( interp != 0 )); then
     checkup_add advice "wear for /dev/$dev is NOT INTERPRETABLE -- every attribute reads alike, so the table holds vendor placeholders. That is not evidence of health, and no remaining-life figure can be derived from it."
     return 0
   fi
@@ -6367,12 +6373,25 @@ mreport_disk_temp_c() {
 # whose every attribute reads identically after 3054 hours is reporting
 # placeholders, and deriving a wear figure from that would manufacture a
 # confident "0% used" from nothing. Returns 0 when interpretable.
+# 0 = interpretable, 1 = the table is PLACEHOLDERS, 2 = the table could not be READ.
+#
+# The third status exists because the first version collapsed it into the
+# second, and the caller then asserted a cause it had not established: run
+# unprivileged, `smartctl` returns `Permission denied` with no attribute table
+# at all, and /dev/sda -- whose attributes ARE interpretable as root, 0.52% of
+# its 600 TBW used -- was reported as holding "vendor placeholders". "I could
+# not read it" is not "it reads alike", and a check that names the wrong cause
+# is the defect this project keeps correcting.
+#
+# Both non-zero statuses stay falsy, so every existing `if ! f` caller is
+# unaffected.
 mreport_smart_interpretable() {  # $1 = device name
   local n
-  cmd_exists jq || return 1
+  cmd_exists jq || return 2
   n="$(smartctl -j -A "/dev/$1" 2>/dev/null \
        | jq -r '[.ata_smart_attributes.table[]?.value] | unique | length' 2>/dev/null || echo 0)"
-  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] || return 2
+  (( n == 0 )) && return 2
   (( n > 1 ))
 }
 

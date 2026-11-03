@@ -5,9 +5,24 @@ Description=domum-media: schedule monthly btrfs scrub
 # First Sunday of the month, after the Sun 04:30 snapshot prune has finished.
 OnCalendar=Sun *-*-01..07 05:30:00
 RandomizedDelaySec=20m
-# A missed run fires at the next boot. Harmless here: unlike `snapshot prune`
-# this job deletes nothing, and the randomized delay keeps it off the boot
-# critical path. No OnBootSec=/OnStartupSec=.
+# A missed run fires at the next boot.
+#
+# That is acceptable, but NOT because the job is harmless: a default scrub is
+# READ-WRITE -- it repairs a corrupt metadata block from its DUP copy, and
+# Metadata and System on this filesystem are DUP. "It deletes nothing" was the
+# reason given here before, which is true of `snapshot prune` by contrast and
+# is not the same claim as "it is safe to fire unattended at boot".
+#
+# The actual mitigations, in order:
+#   * RandomizedDelaySec=20m keeps it off the boot critical path, which is the
+#     one that matters when 11 containers and any missed backup start too;
+#   * ExecStart passes --limit 150M, so it is ~25 min of throttled I/O rather
+#     than the 7m14s a full-rate scrub took when measured on 2026-10-21;
+#   * a metadata repair is an internal consistency operation, not an
+#     application-visible mutation, and btrfs serialises scrubs per filesystem.
+#
+# No OnBootSec=/OnStartupSec=: those would make a REBOOT a scrub trigger in its
+# own right, which is a different thing from catching up a missed monthly run.
 Persistent=true
 Unit=domum-media-btrfs-scrub.service
 
