@@ -4032,6 +4032,41 @@ finish. The real run causes downtime and `QUIESCED_CAPTURE_ENABLED` stays 0.
 
 ---
 
+**JELLYFIN ALSO CHECKPOINTS ITS WAL ON A CLEAN STOP** -- measured 2026-11-03
+with the production image pinned by ID: a 3,188,912-byte `jellyfin.db-wal`
+before the stop, nothing after it. Both services with no sqlite3 anywhere
+behave the same way, which is the result the quiesced path needed. Its six
+declared items appear in STAGES during startup (`encoding.xml` is absent until
+initialisation finishes), so a capture taken mid-startup correctly reports
+INCOMPLETE.
+
+**AND THE REAL IMAGE EXPOSED A DEFECT NO FIXTURE COULD.** The capture failed
+closed on `config/.aspnet/DataProtection-Keys` -- present, but the key inside is
+**`-rw------- root root`** and the rehearsal ran unprivileged, so `cp -a` could
+not read it. The one declared item that is mode-restricted is exactly the one
+that decrypts Jellyfin's stored secrets, so refusing was right. A fixture could
+never have shown this, because a fixture's 0600 key is owned by the user running
+the test.
+
+**But the capture had already STOPPED THE SERVICE.** `capture-state` did not
+call `need_root` while every other `storage` subcommand does, so an
+unprivileged operator would take real downtime for a capture that could never
+succeed. "A closed gate that still causes downtime is not a closed gate"
+applies to a missing privilege exactly as it does to a feature flag.
+`need_root` is now the FIRST thing the quiesced path does -- before the gate,
+before the lock, before the stop -- and the ordering is asserted behaviourally
+(nothing locked, nothing stopped, no destination created) and positionally.
+
+**`FAILED` now names its cause.** An item that exists and cannot be read is
+`FAILED:UNREADABLE`; a bare `FAILED` sent nobody anywhere, and an unactionable
+failure trains the operator to ignore it. **Three** readers examine an item
+mode -- the capture's tally, `verify-state` and `restore-state` -- and matching
+only the bare form would have made a `FAILED:UNREADABLE` item look like
+something to restore. The second site was caught by checking every match
+instead of the first.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

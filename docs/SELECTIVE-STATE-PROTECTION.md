@@ -525,3 +525,55 @@ been rehearsed this way. And this remains a disposable Kavita with an empty
 library — a production instance has 8 days of uptime, a populated library and
 active scan tasks, so its shutdown has more to finish. The real run still
 causes downtime and `QUIESCED_CAPTURE_ENABLED` stays 0.
+
+## Phase F (continued) — Jellyfin, and the defect the real image exposed
+
+**Jellyfin also checkpoints its WAL on a clean stop.** Measured 2026-11-03 with
+the production image pinned by ID (`sha256:438e44330078…`): a
+3,188,912-byte `jellyfin.db-wal` before the stop, and
+`quiesced: no open handles, no non-empty WAL, no hot journal` after it. Both
+services with no sqlite3 anywhere behave the same way, which is the result the
+quiesced path needed.
+
+Its six declared items appear in **stages** during startup —
+`config/encoding.xml` is absent until Jellyfin finishes initialising — so a
+capture taken mid-startup correctly reports `INCOMPLETE`. That is fail-closed
+working, not a defect, and it is worth knowing before anyone schedules one.
+
+### The capture failed, and it was right to — but it had already taken downtime
+
+```
+ITEM=dir|config/.aspnet/DataProtection-Keys|FAILED||
+RESULT=INCOMPLETE          1 of 6 declared item(s) could not be captured
+rc=1                       service restarted, same container id
+```
+
+The directory was present. The key inside is **`-rw------- root root`**, and the
+rehearsal ran unprivileged, so `cp -a` could not read it. The one declared item
+that is mode-restricted is exactly the one that decrypts Jellyfin's stored
+secrets, so failing closed on it is the correct outcome — and no fixture could
+have produced this, because a fixture's 0600 key is owned by the user running
+the test.
+
+**But the capture had already stopped the service.** `capture-state` did not
+require root, while every other `storage` subcommand does. So an unprivileged
+operator would take real downtime for a capture that could never succeed. "A
+closed gate that still causes downtime is not a closed gate" applies to a
+missing privilege exactly as it does to a feature flag.
+
+Fixed: `need_root` is the **first** thing the quiesced path does — before the
+gate, before the lock, and above all before the stop — and the ordering is
+asserted both behaviourally (nothing locked, nothing stopped, no destination
+created) and positionally in the source.
+
+### `FAILED` now names its cause
+
+`FAILED` alone sent nobody anywhere, and an unactionable failure trains the
+operator to ignore it. An item that exists but cannot be read is recorded
+`FAILED:UNREADABLE`, which is overwhelmingly a privilege problem.
+
+Three readers examine an item mode — the capture's own tally, `verify-state`
+and `restore-state` — and all three had to learn the labelled form. Matching
+only the bare `FAILED` would have made a `FAILED:UNREADABLE` item look like
+something to restore; that second site was caught by checking every match
+rather than the first one.

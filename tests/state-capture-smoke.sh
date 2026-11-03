@@ -515,6 +515,7 @@ echo "  killed: the refusal-before-writing is gone; the per-item digest still ca
 # writing. A quiesce is the only way to make them consistent.
 # ---------------------------------------------------------------------------
 QSTUB='
+need_root() { :; }
 compose_cmd() { printf "compose %s\n" "$*" >> "$CALLS"; }
 service_compose_services() { printf "jellyfin"; }
 service_runtime_state() { printf "%s" "${FAKE_RUNTIME:-running}"; }
@@ -522,6 +523,59 @@ migrate_assert_quiesced() { [[ -z "${FAKE_NOT_QUIESCED:-}" ]]; }
 domum_acquire_lock() { printf "lock %s\n" "$*" >> "$CALLS"; return 0; }
 domum_lock_holder() { printf "nobody"; }
 '
+
+sect "ROOT is required BEFORE the stop, not discovered after it"
+# Measured 2026-11-03 against the real Jellyfin image: its DataProtection key is
+# `-rw------- root root`, so an unprivileged run stopped the service, could not
+# read the one item that decrypts its stored secrets, and reported INCOMPLETE.
+# Failing closed was right; spending downtime on a capture that could never
+# succeed was not. "A closed gate that still causes downtime is not a closed
+# gate" applies to a missing privilege exactly as to a feature flag.
+#
+# need_root is deliberately NOT stubbed here, and the real one dies.
+build_jellyfin
+rm -rf "$TMP/out/r0"; : > "$TMP/calls"
+out="$(CALLS="$TMP/calls" QUIESCED_CAPTURE_ENABLED=1 \
+       probe 'compose_cmd() { printf "compose %s\n" "$*" >> "$CALLS"; }
+domum_acquire_lock() { printf "lock\n" >> "$CALLS"; return 0; }' \
+       "service_state_capture_quiesced jellyfin '$TMP/out/r0'; echo RC=\$?")"
+grep -qi 'run as root' <<< "$out" \
+  || fail "an unprivileged quiesced capture did not demand root: $out"
+[[ ! -s "$TMP/calls" ]] \
+  || fail "it took the lock or stopped something before finding out it needed
+root -- downtime spent on a capture that cannot succeed: $(cat "$TMP/calls")"
+[[ ! -d "$TMP/out/r0" ]] || fail "it created a destination it could not fill"
+# And the root check must come before the GATE too, so the ordering is pinned
+# in the source: a reader must not have to guess which refusal happens first.
+fn="$(awk '/^service_state_capture_quiesced\(\) \{/,/^\}/' "$CLI")"
+r_line="$(grep -n '^  need_root$' <<< "$fn" | head -1 | cut -d: -f1)"
+g_line="$(grep -n 'QUIESCED_CAPTURE_ENABLED' <<< "$fn" | head -1 | cut -d: -f1)"
+s_line="$(grep -n 'compose_cmd stop' <<< "$fn" | head -1 | cut -d: -f1)"
+[[ -n "$r_line" && -n "$g_line" && -n "$s_line" ]] || fail "could not locate root, gate and stop"
+(( r_line < g_line )) || fail "need_root at $r_line is after the gate at $g_line"
+(( g_line < s_line )) || fail "the gate at $g_line is after the stop at $s_line"
+echo "  root($r_line) < gate($g_line) < stop($s_line); nothing locked or stopped"
+
+sect "an UNREADABLE item is recorded as FAILED:UNREADABLE, not a bare FAILED"
+# An unactionable FAIL trains the operator to ignore it. The overwhelming cause
+# is a privilege problem, so the record says so.
+build_jellyfin
+chmod 0000 "$TMP/data/jellyfin/config/system.xml"
+rm -rf "$TMP/out/unread"
+out="$(probe "$QSTUB" "service_state_capture jellyfin '$TMP/out/unread'; echo RC=\$?")"
+chmod 0644 "$TMP/data/jellyfin/config/system.xml"
+grep -q 'RC=1' <<< "$out" || fail "an unreadable declared item did not fail the capture: $out"
+grep -q 'FAILED:UNREADABLE' "$TMP/out/unread/MANIFEST" \
+  || fail "the manifest does not say WHY the item could not be captured: $(cat "$TMP/out/unread/MANIFEST")"
+# verify and restore must treat the labelled form exactly like the bare one --
+# matching only bare FAILED would make it look like something to restore.
+out="$(probe "$QSTUB" "service_state_verify '$TMP/out/unread'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "verification accepted a capture with an unreadable item: $out"
+grep -q 'FAILED:\*' "$CLI" || fail "nothing matches the labelled form"
+[[ "$(grep -c 'FAILED:\*' "$CLI")" -ge 3 ]] \
+  || fail "the labelled form is matched in fewer than the three places that
+examine an item mode (capture's verify, verify-state, restore-state)"
+echo "  cause recorded, and every reader treats FAILED:REASON as never-captured"
 
 sect "the gate REFUSES before the lock and before any stop"
 # A closed gate that still causes downtime is not a closed gate.

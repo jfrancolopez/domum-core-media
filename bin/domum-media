@@ -8814,6 +8814,16 @@ service_state_capture_quiesced() {  # $1 = service, $2 = destination directory
   [[ -n "$service" && -n "$dest" ]] \
     || { warn "service_state_capture_quiesced needs a service and a destination"; return 1; }
 
+  # Root, checked FIRST -- before the gate, the lock and above all before the
+  # stop. Measured 2026-11-03 against the real Jellyfin image: its
+  # DataProtection key is `-rw------- root root`, so an unprivileged run stops
+  # the service, fails to read the one item that decrypts its stored secrets,
+  # and reports INCOMPLETE. The fail-closed behaviour is correct -- but the
+  # downtime was spent on a capture that could never have succeeded, and "a
+  # closed gate that still causes downtime is not a closed gate" applies to a
+  # missing privilege exactly as it does to a feature flag.
+  need_root
+
   # The gate refuses BEFORE the lock and BEFORE any stop. A closed gate that
   # still causes downtime is not a closed gate -- the same reasoning as
   # VOLUME_UPGRADE_ENABLED.
@@ -8938,7 +8948,11 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   while IFS= read -r line; do
     [[ "$line" == ITEM=* ]] || continue
     IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
-    case "$itemmode" in MISSING|FAILED|COLLISION) continue ;; esac
+    # FAILED:* as well as bare FAILED: the record now carries a reason, and an
+    # item that was never captured must be skipped however it is labelled.
+    # Matching only the bare form would have made a FAILED:UNREADABLE item look
+    # like something to restore.
+    case "$itemmode" in MISSING|FAILED|FAILED:*|COLLISION) continue ;; esac
     out="$dir/files/$(state_item_stored_name "$rel")"
     dst="$rtarget/$rel"
     install -d -m 0700 -- "$(dirname -- "$dst")" || { bad=$(( bad + 1 )); continue; }
@@ -9049,6 +9063,11 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
     items=$(( items + 1 ))
     src="$root/$rel"
     out="$dest/files/$(state_item_stored_name "$rel")"
+    # Why a copy failed is what the operator acts on. An unreadable item is
+    # overwhelmingly a privilege problem -- jellyfin's DataProtection key is
+    # mode 0600 -- and "FAILED" alone sent nobody anywhere.
+    local why=""
+    [[ -e "$src" && ! -r "$src" ]] && why="UNREADABLE"
     if [[ -e "$out" ]]; then
       printf 'ITEM=%s|%s|COLLISION|||\n' "$kind" "$rel" >> "$manifest"
       warn "two declared items map to the same stored name ($out); refusing to overwrite"
@@ -9071,7 +9090,7 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
           # it is: this is the only option when no sqlite3 exists anywhere.
           itemmode="file-copy-unproven"
         else
-          printf 'ITEM=%s|%s|FAILED||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
+          printf 'ITEM=%s|%s|FAILED%s||\n' "$kind" "$rel" "${why:+:$why}" >> "$manifest"; bad=$(( bad + 1 )); continue
         fi
         ;;
       file)
@@ -9079,7 +9098,7 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
           printf 'ITEM=%s|%s|MISSING||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
         fi
         cp -p -- "$src" "$out" 2>/dev/null || {
-          printf 'ITEM=%s|%s|FAILED||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue; }
+          printf 'ITEM=%s|%s|FAILED%s||\n' "$kind" "$rel" "${why:+:$why}" >> "$manifest"; bad=$(( bad + 1 )); continue; }
         itemmode="file-copy"
         ;;
       dir)
@@ -9090,7 +9109,7 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
         # secret must not come back world-readable. A restore that widens a
         # permission turns a recovery into a disclosure.
         cp -a -- "$src" "$out" 2>/dev/null || {
-          printf 'ITEM=%s|%s|FAILED||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue; }
+          printf 'ITEM=%s|%s|FAILED%s||\n' "$kind" "$rel" "${why:+:$why}" >> "$manifest"; bad=$(( bad + 1 )); continue; }
         itemmode="dir-copy"
         ;;
       *) continue ;;
@@ -9128,7 +9147,7 @@ service_state_verify() {  # $1 = capture directory
     [[ "$line" == ITEM=* ]] || continue
     IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
     case "$itemmode" in
-      MISSING|FAILED|COLLISION)
+      MISSING|FAILED|FAILED:*|COLLISION)
         warn "$rel was never captured ($itemmode)"; bad=$(( bad + 1 )); continue ;;
     esac
     out="$dir/files/$(state_item_stored_name "$rel")"
