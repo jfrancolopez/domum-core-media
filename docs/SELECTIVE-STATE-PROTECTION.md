@@ -457,3 +457,71 @@ was a `busybox` container holding a bind mount, not Kavita — so nothing here
 shows how Kavita itself shuts down, or whether it checkpoints its WAL on stop.
 That is the question the real run would answer, and it causes downtime.
 `QUIESCED_CAPTURE_ENABLED` stays 0.
+
+## Phase F — rehearsed against the REAL Kavita image
+
+**Measured 2026-11-03.** Phase E used a `busybox` stand-in, so it proved the
+mechanism and left one question open in its own words: *"nothing here shows how
+Kavita itself shuts down or whether it checkpoints its WAL on stop."* That is
+the question this answers, with the production image.
+
+The image was pinned **by ID** — `sha256:454f2a77ac74…`, read from the running
+container — not by `jvmilazz0/kavita:latest`, so a tag that moves cannot change
+what was rehearsed. A disposable project, its own bind mount under a temp
+directory, no external networks, no Traefik labels, production verified
+untouched.
+
+### Kavita checkpoints its WAL on a clean stop
+
+```
+running      kavita.db    430,080    kavita.db-wal  4,132,392
+clean stop   kavita.db  1,114,112    kavita.db-wal  ABSENT
+```
+
+The main database **grew by almost exactly the WAL's content** and the `-wal`
+file was removed outright. Verified a second time with the container stopped, to
+isolate the claim from anything the restart does. So `migrate_assert_quiesced`
+passed on its own terms rather than by luck:
+
+```
+ quiesced        : no open handles, no non-empty WAL, no hot journal
+ runtime         : running (unchanged)
+[domum-media] quiesced capture complete
+rc=0   same container id: YES
+```
+
+### The capture is real Kavita state
+
+```
+CAPTURE_MODE=quiesced
+IMAGE_ID=sha256:454f2a77ac740b70c58cc7300a11122fc9ce7b7e2161ef5b0d1df8f81067cc85
+ITEM=sqlite|config/kavita.db|file-copy-quiesced|1114112|644|0f94e7429c25…
+ITEM=dir|config/templates|dir-copy|68438|755|6bbb0ceaa900…
+RESULT=COMPLETE
+```
+
+The captured database opens read-only with **84 tables** and
+`integrity_check: ok`, and the table names are Kavita's own
+(`AppUserAnnotation`, `AppUserBookmark`, `AppUserCollection`, …) — so this is
+the application's real schema, not a fixture's.
+
+### A measurement that is easy to misread
+
+After the capture the service is restarted, and Kavita immediately creates a
+**new** 41,232-byte `-wal`. Looking at the directory *after* a capture therefore
+shows a non-empty WAL, which says nothing about the state the check saw. The
+decisive evidence is the main database's growth and the WAL's absence **while
+stopped**; the post-restart size is a different file in a different epoch. Both
+were recorded here because reading the later one as the earlier one would have
+inverted the conclusion.
+
+### What is now settled, and what is not
+
+Settled: Kavita's clean shutdown leaves no WAL, so the quiesced capture path
+succeeds for it on its merits, and the captured database is sound and complete.
+
+Not settled: **jellyfin**, the other service with no sqlite3 anywhere, has not
+been rehearsed this way. And this remains a disposable Kavita with an empty
+library — a production instance has 8 days of uptime, a populated library and
+active scan tasks, so its shutdown has more to finish. The real run still
+causes downtime and `QUIESCED_CAPTURE_ENABLED` stays 0.

@@ -3990,6 +3990,48 @@ instead of reasoning about it.
 
 ---
 
+**KAVITA CHECKPOINTS ITS WAL ON A CLEAN STOP -- measured 2026-11-03 against
+the REAL image, which settles the question Phase E left open.** The earlier
+rehearsal used a `busybox` stand-in and said so: *"nothing here shows how
+Kavita itself shuts down or whether it checkpoints its WAL on stop."*
+
+```
+running      kavita.db    430,080    kavita.db-wal  4,132,392
+clean stop   kavita.db  1,114,112    kavita.db-wal  ABSENT
+```
+
+The main database grew by almost exactly the WAL's content and the `-wal` was
+removed outright, verified a second time with the container stopped to isolate
+the claim from the restart. So `migrate_assert_quiesced` passed on its own
+terms, the capture completed (`rc=0`, same container id), and the captured
+database opens with **84 tables**, `integrity_check: ok`, and Kavita's own table
+names -- the application's real schema rather than a fixture's.
+
+The image was pinned **by ID** read from the running container, never by
+`jvmilazz0/kavita:latest`, so a tag that moves cannot change what was
+rehearsed.
+
+**A measurement that is easy to misread, and nearly was.** After the capture the
+service restarts and Kavita immediately creates a NEW 41,232-byte `-wal`. The
+directory inspected *after* a capture therefore shows a non-empty WAL, which
+says nothing about what the check saw. The decisive evidence is the main
+database's growth plus the WAL's absence WHILE STOPPED; the post-restart size
+is a different file in a different epoch, and reading the later one as the
+earlier one would have inverted the conclusion.
+
+**Teardown of a rehearsal whose container runs as ROOT.** Kavita writes
+root-owned files into the bind mount, so the fixture cannot be removed by the
+development account. A disposable `busybox` container with the temp directory
+mounted does it -- the same tool that created the problem removes it, and no
+privilege is needed on the host.
+
+**Still not rehearsed: jellyfin**, the other service with no sqlite3 anywhere.
+And this was a disposable Kavita with an EMPTY library; production has days of
+uptime, a populated library and active scan tasks, so its shutdown has more to
+finish. The real run causes downtime and `QUIESCED_CAPTURE_ENABLED` stays 0.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
