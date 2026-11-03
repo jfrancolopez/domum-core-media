@@ -3964,6 +3964,32 @@ of thing a test should pin, so it is pinned.
 
 ---
 
+**MY OWN FULL-SUITE RUN SILENTLY OMITTED A CI SUITE, and the inverse of that
+is already recorded here.** This file records that seven suites existed which
+CI never ran, and `tests/ci-coverage-audit.sh` was written to stop that. The
+mirror image went unnoticed: a local run that globs `tests/*.sh` and
+`tests/*.py` does **not** match
+`tests/integration/btrfs-migration-integration.sh`, which IS in the workflow
+and DOES run unprivileged. So "the full suite passes locally" was a claim about
+80 of the 81 runnable files, every time it was made.
+
+Run separately, it passes -- it exercises the real primitives (subvolume
+create/snapshot, `cp --reflink=always`, `rename(2)`, `flock`, `/proc`), which is
+exactly the coverage a stubbed suite cannot give, so omitting it was omitting
+the strongest one.
+
+**The two counts are different numbers and must not be quoted
+interchangeably.** `ci-coverage-audit` uses `find -maxdepth 2` and reports
+**82 test files**: 70 `tests/*.sh` + 10 `tests/*.py` + the integration suite +
+`tests/fixtures/email-client-simulation.py`, which is invoked BY a suite rather
+than run standalone. **81** are runnable standalone. Quoting 82 as "suites that
+pass" is a count of one thing wearing another's label -- and a first attempt at
+explaining the gap blamed `tests/fixtures/` alone, which does not add up
+(82 - 80 = 2, and that directory holds one file). Measure the difference
+instead of reasoning about it.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
