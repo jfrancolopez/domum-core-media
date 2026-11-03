@@ -4400,6 +4400,26 @@ copy inside the repository plus an independent route is redundancy, and the
 pack or anywhere this host can write would leave it reachable only through the
 thing it unlocks.
 
+**THE NEW SUBPROCESS DOES NOT ADD A SECRET READ, and "harden" it and you would
+ship theatre.** `checkup_recovery_pack_offhost` spawns `domum-media-backup
+pack-offhost`, and the backup CLI's `main` runs `export_compose_env`
+unconditionally, which ends in `load_runtime_secrets` -- so the child exports
+`CF_DNS_API_TOKEN`, `IMMICH_DB_PASSWORD` and `IMMICH_JWT_SECRET` for a question
+that is purely about include paths. The obvious fix is to skip
+`export_compose_env` for pure-configuration subcommands.
+
+**It would change nothing.** `checkup_cmd` itself calls
+`export_env_for_compose`, which ends in the SAME `load_runtime_secrets`, so the
+three values are already in the PARENT's environment and the child inherits
+them whatever it does. Skipping the export in the child would remove an
+assignment and not a value, while reading like a security fix -- which is worse
+than leaving it alone, because the next reader would believe the path no longer
+carries secrets.
+
+What WOULD change it is not exporting them in the parent, and that is load-
+bearing: `compose_cmd` needs them. So: measured, no change, recorded so it is
+not re-derived or "fixed".
+
 **THE SQUASH MERGE TOOK THE FIRST COMMIT'S SUBJECT, so `main`'s history leads
 with the premise this very PR corrected.** `581d94a` is titled *"dr-status:
 check the recovery pack's own coverage, which nothing verified"* and its first
