@@ -2909,7 +2909,7 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
 # pack needs to be in SOME set rather than in every one -- reporting per target
 # would alarm about `nas` for a pack sitting safely in `cloud`.
 do_pack_offhost() {
-  local json=0 target="" a
+  local json=0 target="" a t
   for a in "$@"; do
     case "$a" in
       --json) json=1 ;;
@@ -2923,7 +2923,7 @@ do_pack_offhost() {
   if [[ -n "$target" ]]; then
     # A typo must never widen the question to the fleet, and must never answer
     # about a target this host does not declare.
-    local known=0 t
+    local known=0
     while IFS= read -r t; do
       [[ "$t" == "$target" ]] && known=1
     done < <(backup_target_names)
@@ -2933,9 +2933,8 @@ do_pack_offhost() {
     targets="$(enabled_backup_targets 2>/dev/null || true)"
   fi
 
-  local pack rc=0 checked=0 n_in=0 n_out=0 n_unk=0 detail=""
+  local pack rc=0 checked=0 n_in=0 n_out=0 n_unk=0 detail="" state
   pack="$(recovery_pack_dest)"
-  local state
   for t in $targets; do
     checked=$((checked+1))
     rc=0
