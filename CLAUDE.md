@@ -3890,6 +3890,46 @@ audit that cries wolf is one somebody switches off.
 
 ---
 
+**THE QUIESCED CAPTURE IS NOW REHEARSED AGAINST A REAL CONTAINER, and the
+reason it was not is a mistake worth recording: I conflated two different
+blockers.** `docs/VOLUME-UPGRADE-REHEARSAL.md` correctly establishes that a
+rehearsal of `dump_volume_to_file` needs root, because it tars
+`/var/lib/docker/volumes/...` and that tree is `drwx--x--- root root`. I then
+treated "real-container rehearsal" as blocked in general. The quiesced capture
+reads `/srv/data/<service>`, a **bind mount**, so it needs no root at all.
+Measure the blocker for the path in front of you, not for a neighbouring one.
+
+Rehearsed 2026-11-02, unprivileged, against a disposable compose project, with
+production verified untouched afterwards:
+
+- **isolation asserted through the real CLI before anything mutated** --
+  `service_data_path kavita` resolved into the temp directory and not
+  `/srv/data/kavita`, only the fixture's compose file was layered, the
+  project's container list was empty, and production `kavita`
+  (`fae6d10aa732`) was checked absent from that list before the first stop;
+- **a non-empty WAL refuses and restarts.** The fixture left `kavita.db-wal`
+  at 4,152 bytes by skipping the clean close. The real function stopped the
+  real container, refused, and brought it back **with the same container id** --
+  which is what proves `compose start` rather than a recreate -- and left no
+  capture directory;
+- **the whole chain then worked**: `CAPTURE_MODE=quiesced`, `IMAGE_ID` read
+  from `docker inspect` rather than invented, `RESULT=COMPLETE`, verify and
+  restore both matching, and the restored database opened with
+  `integrity_check: ok` and **both** rows -- including the one that existed
+  only in the WAL before the checkpoint, so the capture carried the
+  checkpointed state rather than a stale main file;
+- **teardown asserted**: no `domum-caprehearsal` container, volume or network
+  remained, and production still had its 11 containers with `kavita`
+  `Up 7 days (healthy)`.
+
+**The limit stays explicit.** `kavita` in the rehearsal was a `busybox`
+container holding a bind mount, not Kavita. Nothing here shows how Kavita
+itself shuts down or whether it checkpoints its WAL on stop -- which is the
+question the real run answers, and it causes downtime.
+`QUIESCED_CAPTURE_ENABLED` stays 0.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
