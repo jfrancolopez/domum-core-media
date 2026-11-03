@@ -6075,7 +6075,14 @@ checkup_recovery_pack_offhost() {
     return 0
   fi
   out="$("$cli" pack-offhost --json 2>/dev/null)" || rc=$?
-  verdict="$(jq -r '.verdict // empty' <<< "$out" 2>/dev/null || true)"
+  # Take the FIRST line beginning with `{`, from the captured variable, with no
+  # pipe. `cleanup images --json` prints the machine-readable line and THEN the
+  # human report, and a `| tail -n 1` against that returned a line of prose --
+  # so extract positively rather than assuming the reply is JSON and nothing
+  # else. `sed -n` on a here-string cannot short-circuit, unlike a pipeline.
+  local json_line
+  json_line="$(sed -n '/^{/{p;q;}' <<< "$out" || true)"
+  verdict="$(jq -r '.verdict // empty' <<< "$json_line" 2>/dev/null || true)"
   case "$verdict" in
     offhost)
       checkup_add healthy "A recovery pack is delivered off-host, so the credentials that open the backup survive losing this machine (configured is not proven delivered, and the age private key is held only by the operator)."

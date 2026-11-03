@@ -291,8 +291,8 @@ cat > "$TMP_DIR/mut.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '''  verdict="$(jq -r '.verdict // empty' <<< "$out" 2>/dev/null || true)"'''
-new = '''  verdict="$(jq -r '.verdict // empty' <<< "$out" 2>/dev/null || true)"
+old = '''  verdict="$(jq -r '.verdict // empty' <<< "$json_line" 2>/dev/null || true)"'''
+new = '''  verdict="$(jq -r '.verdict // empty' <<< "$json_line" 2>/dev/null || true)"
   case "$rc" in 0) verdict=offhost ;; 1) verdict=none ;; *) verdict=unknown ;; esac'''
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
