@@ -4384,6 +4384,22 @@ never consulted**, and production sets it explicitly with the pack path as a
 literal. The values agree today, and they agree by having been written
 together, which is the accident the derived default was introduced to remove.
 
+**THE FALSE CLAIM WAS IN FIVE DOCUMENTS, and fixing one was the trap.** After
+correcting `docs/RECOVERY-KEY-CUSTODY.md` I grepped for the sentence and found
+it in four more -- `disaster-recovery.md` (the runbook read while the host is
+gone), `HIDDEN-RECOVERY-DEPENDENCIES.md`, `OFFSITE-COVERAGE-CLASSIFICATION.md`,
+and a *second* place in the custody document itself, where it was cited as the
+PRECEDENT for a rule about the age key. This file already records that changing
+one of two copies is worse than changing neither; here it was one of five, and
+the surviving copies would each have had a neighbour vouching for them. **After
+correcting a claim, grep for it.**
+
+The rule it was cited for is still right and is now stated where it binds: a
+copy inside the repository plus an independent route is redundancy, and the
+**age private key** has no independent route, so storing it in Hetzner, in the
+pack or anywhere this host can write would leave it reachable only through the
+thing it unlocks.
+
 **A test that required the over-alarming behaviour had to be corrected, not
 adapted around.** `offhost-recovery-audit-smoke` asserted `CIRCULAR` with
 delivery **enabled** -- i.e. it required the designed configuration to be

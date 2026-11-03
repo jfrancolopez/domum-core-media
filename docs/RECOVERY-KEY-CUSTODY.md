@@ -97,10 +97,14 @@ something an agent should do, and none of it is done here.
    same laptop is not a second copy. Paper in a different building, or a
    hardware token, or a sealed envelope with someone trusted — the requirement
    is that one event cannot destroy both.
-3. **Never put it where it would be needed to open itself.** The pack is
-   deliberately not inside the backup it unlocks; the same reasoning forbids
-   storing the key in Hetzner, in the pack, in `/srv/data`, or anywhere this
-   host can write.
+3. **Never put it where it would be needed to open itself.** This rule binds
+   for the **key**, and the pack is not the precedent it was once cited as: the
+   pack *is* inside the cloud backup set, deliberately, and that is harmless
+   only because it is **also** emailed off-host — one copy inside the
+   repository plus an independent route is redundancy, not circularity. The age
+   private key has no independent route, so storing it in Hetzner, in the pack,
+   in `/srv/data`, or anywhere this host can write would leave it reachable
+   only through the thing it unlocks.
 4. **Record the recipient's public key separately and durably.** It is not
    secret, and having it lets a future operator verify that a recovered private
    key is the right one before trusting a recovery.

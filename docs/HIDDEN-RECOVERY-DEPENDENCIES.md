@@ -17,10 +17,15 @@ reports success, and the application still does not come up.**
 
 ## 1. The age private key — the whole chain rests on it
 
-`37 encrypted recovery packs` existed on 2026-10-12, the newest 0 days old,
-off-host delivery by email ENABLED, and the pack correctly **not** inside the
-backup it would be needed to open. All of that is worth nothing without the age
+`37 encrypted recovery packs` existed on 2026-10-12, the newest 0 days old, and
+off-host delivery by email ENABLED. All of that is worth nothing without the age
 private key, which is held by the operator and deliberately not on this host.
+
+The audit also said the pack was "correctly **not** inside the backup it would
+be needed to open", and that was **false** — see §12 and
+`docs/RECOVERY-KEY-CUSTODY.md`. It is inside the cloud set, deliberately, which
+is redundancy because the email route is independent. Nothing about this entry
+changes: the key is still the whole chain.
 
 - **Why hidden**: it is the one input whose absence cannot be detected from the
   machine whose loss is being planned for. The audit's verdict is `UNPROVEN`
