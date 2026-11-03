@@ -835,6 +835,40 @@ grep -q 'OK|WEAR-CHECK-REACHED sda' <<< "$out" \
   || fail "checkup_disk_health never calls the wear check, so it is dead code: $out"
 echo "  reached for each disk"
 
+sect "UNREADABLE attributes must not be reported as PLACEHOLDERS"
+# Found by running the real checks unprivileged against this host: smartctl
+# returns `Permission denied` with no attribute table at all, and the first
+# version collapsed that into the placeholder case -- so /dev/sda, whose
+# attributes ARE interpretable as root (0.52% of its 600 TBW used), was
+# reported as holding "vendor placeholders". A check that names the wrong cause
+# is the defect this project keeps correcting, and "I could not read it" is not
+# "it reads alike".
+#
+# Three states, driven through the REAL mreport_smart_interpretable.
+EMPTY_TBL="smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[]}}'; }"
+PLACEHOLDERS="smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[{\"value\":100},{\"value\":100}]}}'; }"
+INTERP="smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[{\"value\":99},{\"value\":50}]}}'; }"
+
+out="$(probe "$EMPTY_TBL
+  w() { mreport_smart_interpretable sda; echo \"RC=\$?\"; }" w)"
+grep -q 'RC=2' <<< "$out" || fail "an empty attribute table is not status 2 (unreadable): $out"
+out="$(probe "$PLACEHOLDERS
+  w() { mreport_smart_interpretable sdb; echo \"RC=\$?\"; }" w)"
+grep -q 'RC=1' <<< "$out" || fail "a placeholder table is not status 1: $out"
+out="$(probe "$INTERP
+  w() { mreport_smart_interpretable sdc; echo \"RC=\$?\"; }" w)"
+grep -q 'RC=0' <<< "$out" || fail "an interpretable table is not status 0: $out"
+
+# And the ADVICE must not borrow the other case's words.
+out="$(probe "$EMPTY_TBL
+  w() { checkup_disk_wear sda; }" w)"
+grep -q 'could not be READ' <<< "$out" \
+  || fail "an unreadable table was not reported as unreadable: $out"
+grep -q 'placeholder' <<< "$out" \
+  && fail "it claimed vendor placeholders for a table it could not read: $out"
+grep -q 'CRITICAL' <<< "$out" && fail "an unreadable table reported CRITICAL: $out"
+echo "  2 unreadable / 1 placeholders / 0 interpretable, and the advice matches"
+
 sect "MUTATION: treating uninterpretable attributes as a wear figure"
 # The dangerous direction and the reason this file records NOT thresholding raw
 # attributes: a drive reporting placeholders would read as a confident healthy.
@@ -843,8 +877,11 @@ cat > "$TMP/mutate-wear.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '  if ! mreport_smart_interpretable "$dev"; then'
-new = '  if false; then'
+# The guard is now two branches on a THREE-state status (0 interpretable,
+# 1 placeholders, 2 unreadable), so neutralising it means forcing the status to
+# 0 rather than deleting one `if`.
+old = '  mreport_smart_interpretable "$dev"; interp=$?'
+new = '  mreport_smart_interpretable "$dev"; interp=0'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT

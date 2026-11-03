@@ -108,10 +108,10 @@ dispatch, the closed gate, and phase 4's model-awareness.
 
 | # | item | status |
 |---|---|---|
-| P4.1 | scrub unit + timer written, not installed | **done** — unit exists in `systemd/`, absent from the host |
+| P4.1 | scrub unit + timer written, not installed | **done; schedule now TESTED too** — `systemd-analyze calendar` resolves `Sun *-*-01..07 05:30:00` to the first Sunday monthly (next elapse 2026-12-06), which is the only part of a timer testable without installing it. Both units verify clean and neither is installed. The timer's comment justified `Persistent=true` with "this job deletes nothing" — true but the wrong reason for a READ-WRITE job; corrected to the real mitigations (`RandomizedDelaySec=20m`, and `--limit 150M` making it ~25 min rather than the measured 7m14s) |
 | P4.2 | per-filesystem dedup so one filesystem is scrubbed once | **done** — `btrfs_unique_roots`, both directions tested |
 | P4.3 | exit status contract (`0`/`1`/`3`) and a failed scrub failing the unit | **done** |
-| P4.4 | SMART wear reaching the notifier | **done** (`b8a36e6`) |
+| P4.4 | SMART wear reaching the notifier | **done, and re-verified against the real host 2026-11-03** — driving the checks unprivileged confirmed a permission failure reports `UNKNOWN` as a WARNING with **zero CRITICAL** (the recorded defect, fixed), and exposed a new one: `mreport_smart_interpretable` collapsed "no table at all" into "placeholders", so /dev/sda — interpretable as root — was reported as holding vendor placeholders. Three states now (0/1/2), advice worded per cause, pinned by a section no fixture could have reached |
 | P4.5 | duplicate-run protection *while a scrub is already running* | **done** — measured: `btrfs scrub start` on a busy filesystem returns non-zero and landed in the generic branch, so it reported `scrub FAILED`, failed the unit, and would have mailed a CRITICAL for an entirely normal condition. `btrfs_scrub_running` reads the `Status:` field and btrfs's own `already running` error closes the race; a skip does not fail the unit; the summary narrows its claim instead of saying `clean`; an unreadable status is `unknown`, never `not running`; an unrecognised error stays a failure. 1 mutant, killed |
 | P4.6 | install/enable the timer, run a scrub | **BLOCKED** — operator decision |
 
