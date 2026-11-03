@@ -86,7 +86,7 @@ grep -q -- '-m 0644' <<< "$logrotate_install" \
 # Measured: usage text containing a backticked `apply --service <s>` printed as
 # "  upgrades ONE ... Bare  is the" -- the backticked words were EXECUTED and
 # vanished, and `<s>` inside the substitution parsed as an input redirection.
-# shellcheck reported it as a parse error; `--help` would have shown it to anyone
+# A parse error was reported for it; `--help` would have shown it to anyone
 # who looked.
 #
 # Scoped deliberately. A first version flagged every heredoc and tripped on

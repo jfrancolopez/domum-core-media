@@ -3732,6 +3732,75 @@ to enforce it, which is now its fifth recorded occurrence.
 
 ---
 
+**`tests/find-abort-audit.py` -- `find` inside a command substitution must not
+be able to abort the shell.** This was queued as "deliberately not shipped yet"
+on the grounds that it would cry wolf. Measured instead of assumed: across the
+three CLIs there are **18** command substitutions containing a `find`, and only
+**three** lacked a guard. All three were real, and one of them mattered:
+
+```
+checkup:  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" … | wc -l | tr -d ' ')"
+```
+
+`image-updates` does not exist until `ensure_dirs` has run, `find` then exits
+1, and `2>/dev/null` hides the message and not the status -- so under pipefail
+the assignment fails and `set -e` kills `checkup`. The report prints only after
+every check has completed, so that produces a **BLANK report**, which is
+indistinguishable from a healthy one. **That is the exact shape that blanked
+the report in production once already**, with a `grep` instead of a `find`, and
+it was still live in a second place. Reproduced standalone: exit 1, and the
+line after it never runs.
+
+**`| wc -l` does not save it.** pipefail takes the rightmost non-zero status,
+so `find /absent | wc -l` is a failed pipeline even though `wc` succeeded and
+printed `0`. The fix is `|| true`, which leaves the `0` and fixes only the
+status.
+
+Scope, stated in the audit rather than left implicit: `bin/*` only, because the
+operator wrappers verify their paths far earlier than any window this could
+inspect; continuations are joined, because two of the pipefail audit's findings
+were invisible to a line-at-a-time search; a QUOTED heredoc body is data; and
+an explicit `# find-audit: <reason>` marker exempts **its own line only** and
+is PRINTED. A marker on the preceding line deliberately does NOT exempt -- it
+would drift away from the line it vouches for, the same problem as a comment
+between a warning and its remedy, and the smoke test asserts that direction.
+
+**It is deliberately NOT a guard-detection audit.** Recognising `[[ -d "$x" ]]`
+before a `find "$x/y"` is fragile and the guard is often many lines away;
+requiring `|| true` unconditionally is simpler and strictly safer, because it
+costs nothing where the path is guaranteed.
+
+`tests/find-abort-audit-smoke.sh` drives the audit against fixtures in both
+directions, including that it **accepts the fix it prescribes** -- an audit
+that rejected its own remedy would be switched off -- and that it cannot pass
+vacuously. Reporting the problems BEFORE the vacuity guard was a correction: a
+stale target list produces zero matches AND a problem, and the first version
+printed "matched no find" while hiding "the target list is stale", which is the
+actionable half.
+
+---
+
+**`tests/` IS NOW SHELLCHECKED, at `--severity=error` only.** A backtick in a
+double-quoted message is command substitution: it executes when the string is
+built and silently deletes the words it wraps. That happened **twice in one
+session** -- once in a heredoc comment and once in a `fail` message -- and
+nothing in CI could see either, because `log-hygiene-smoke` covers backticks in
+unquoted HEREDOCS and the shellcheck step covered only `bin/`, `install.sh` and
+`operator/`.
+
+Error level and not warning level, deliberately: `SC1090` (cannot follow a
+non-constant source) is legitimate and unavoidable in a test harness, so
+`--severity=warning` would flood and the step would get switched off. What
+error level catches is PARSE failures, which is exactly the gap. All suites
+pass it today.
+
+**A prose comment must not BEGIN with the word `shellcheck`**, or it is parsed
+as a directive -- `SC1072`/`SC1073`. One such comment existed, in the suite
+that exists to police exactly this family of quoting mistakes. Reworded rather
+than exempted.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

@@ -4254,7 +4254,7 @@ status_counts() {
   if [[ -d "$media_root" ]]; then
     for subdir in movies tv music books photos; do
       [[ -d "$media_root/$subdir" ]] || continue
-      printf '%s files: %s\n' "$subdir" "$(find "$media_root/$subdir" -type f 2>/dev/null | wc -l)"
+      printf '%s files: %s\n' "$subdir" "$(find "$media_root/$subdir" -type f 2>/dev/null | wc -l || true)"
     done
   fi
 }
@@ -7308,7 +7308,14 @@ checkup_collect_all() {
     checkup_add advice "docker ps -a --filter status=exited   # read-only; an enabled service that is DOWN is reported separately as an action"
   fi
 
-  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
+  # `|| true` is load-bearing: image-updates does not exist until ensure_dirs
+  # has run, `find` then exits 1, and `2>/dev/null` hides the message and not
+  # the status -- so under pipefail this assignment would fail and `set -e`
+  # would kill checkup. The report prints only after every check completes, so
+  # that produces a BLANK report, which is indistinguishable from a healthy
+  # one. `wc` still prints 0, so the count is right; only the status needed
+  # fixing. Same shape as the grep that blanked the report in production.
+  waiting_count="$(find "$DOMUM_STATE_ROOT/image-updates" -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ' || true)"
   if (( waiting_count > 0 )); then
     checkup_add warning "${waiting_count} service update candidates are waiting."
     # A STAGED image is not a pending task: discovery never implies deployment,
@@ -8341,7 +8348,7 @@ The application did not shut down cleanly. Investigate before migrating."
 migrate_measure() {
   local path="$1"
   printf '%s %s' \
-    "$(find "$path" -type f 2>/dev/null | wc -l)" \
+    "$(find "$path" -type f 2>/dev/null | wc -l || true)" \
     "$(du -sb --apparent-size "$path" 2>/dev/null | awk '{print $1}')"
 }
 
