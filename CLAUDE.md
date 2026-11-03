@@ -4400,6 +4400,45 @@ copy inside the repository plus an independent route is redundancy, and the
 pack or anywhere this host can write would leave it reachable only through the
 thing it unlocks.
 
+**THE NEW SUBPROCESS DOES NOT ADD A SECRET READ, and "harden" it and you would
+ship theatre.** `checkup_recovery_pack_offhost` spawns `domum-media-backup
+pack-offhost`, and the backup CLI's `main` runs `export_compose_env`
+unconditionally, which ends in `load_runtime_secrets` -- so the child exports
+`CF_DNS_API_TOKEN`, `IMMICH_DB_PASSWORD` and `IMMICH_JWT_SECRET` for a question
+that is purely about include paths. The obvious fix is to skip
+`export_compose_env` for pure-configuration subcommands.
+
+**It would change nothing.** `checkup_cmd` itself calls
+`export_env_for_compose`, which ends in the SAME `load_runtime_secrets`, so the
+three values are already in the PARENT's environment and the child inherits
+them whatever it does. Skipping the export in the child would remove an
+assignment and not a value, while reading like a security fix -- which is worse
+than leaving it alone, because the next reader would believe the path no longer
+carries secrets.
+
+What WOULD change it is not exporting them in the parent, and that is load-
+bearing: `compose_cmd` needs them. So: measured, no change, recorded so it is
+not re-derived or "fixed".
+
+**THE SQUASH MERGE TOOK THE FIRST COMMIT'S SUBJECT, so `main`'s history leads
+with the premise this very PR corrected.** `581d94a` is titled *"dr-status:
+check the recovery pack's own coverage, which nothing verified"* and its first
+two paragraphs argue for the question that was then replaced -- the correction
+is several screens further down, in the second commit's body. `gh pr merge
+--squash` ignored the PR title and concatenated all six commit bodies in order.
+
+**`git log --oneline` is a thing future sessions read**, and a subject that
+describes a superseded premise is a stale claim in the most-read place in the
+repository. It cannot be fixed after the fact: amending it means force-pushing
+`main`, which §8 forbids. **So pass `--subject` (and `--body`) explicitly when
+squash-merging a branch whose first commit was later corrected on the same
+branch** -- or rewrite that first commit's subject before pushing. The correct
+subject here was the PR's: *"Recovery pack: ask the question that decides it;
+enforce remedy pairing for criticals"*.
+
+This entry is the record. The authority on what that PR concluded is this file,
+not `581d94a`'s subject line.
+
 **A test that required the over-alarming behaviour had to be corrected, not
 adapted around.** `offhost-recovery-audit-smoke` asserted `CIRCULAR` with
 delivery **enabled** -- i.e. it required the designed configuration to be
