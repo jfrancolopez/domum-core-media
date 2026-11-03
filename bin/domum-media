@@ -300,6 +300,24 @@ human_age_from_epoch() {
   fi
 }
 
+# Which domum-media-backup does this CLI ask?
+#
+# The checkout's copy FIRST, matching `status`, because the two CLIs must be at
+# the SAME revision: a new checkup asking an older installed binary a question
+# it has never heard of produces "could not ask" for a reason that is about the
+# deployment rather than about the thing being checked. The installed path is
+# the fallback for a checkout that is absent. DOMUM_BACKUP_CLI exists so a
+# fixture can redirect it -- every root a test uses must be redirected into it.
+backup_cli_path() {
+  if [[ -n "${DOMUM_BACKUP_CLI:-}" ]]; then
+    printf '%s' "$DOMUM_BACKUP_CLI"
+  elif [[ -x "$DOMUM_DIR/bin/domum-media-backup" ]]; then
+    printf '%s' "$DOMUM_DIR/bin/domum-media-backup"
+  else
+    printf '%s' /usr/local/bin/domum-media-backup
+  fi
+}
+
 json_escape() {
   jq -Rsa .
 }
@@ -6019,6 +6037,75 @@ checkup_immich_offsite() {
   done
 }
 
+# Can the ENCRYPTED RECOVERY PACK leave this host?
+#
+# This is the artefact that makes every other off-site copy openable -- the
+# configuration, the secrets, Traefik's ACME account private key and the
+# validated Uptime Kuma dump. It was checked in `dr-status` and in
+# `dr-offhost-audit`, and NEITHER is a notification path, so a pack that never
+# left this machine would have been visible only to an operator who ran a
+# command by hand. That is the babysitting this phase exists to end.
+#
+# It is asked of the OTHER CLI, because the helpers that resolve the pack
+# destination and a target's include scope live in bin/domum-media-backup.
+# Writing those three calls here produced three undefined functions, which
+# tests/function-definition-audit.py caught at once -- the undefined-helper
+# family. A wrapper asserts on BEHAVIOUR, never on prose, so the contract is
+# the subcommand's EXIT STATUS.
+#
+# The JSON is required as well, and that is the load-bearing part: an exit
+# status ALONE cannot tell a verdict from a non-answer. An installed binary
+# that predates `pack-offhost` dies with status 1, which is the ALARMING
+# answer -- a critical about the family photographs, manufactured from a binary
+# that never looked. So a reply that does not parse, or carries a verdict this
+# reader does not know, is reported as "could not ask" and never as a finding
+# about the pack. The `capabilities --has` rule in both directions: an unknown
+# token must not read as a yes, and must not read as a no either.
+checkup_recovery_pack_offhost() {
+  local cli out rc=0 verdict
+  cli="$(backup_cli_path)"
+  if [[ ! -x "$cli" ]]; then
+    checkup_add warning "Whether the encrypted recovery pack can leave this host could not be checked: $cli is not executable."
+    checkup_add advice "ls -l $cli   # read-only: the pack check asks the backup CLI, which is installed by 'domum-media install'"
+    return 0
+  fi
+  if ! cmd_exists jq; then
+    checkup_add warning "Whether the encrypted recovery pack can leave this host is UNKNOWN: jq is not installed."
+    checkup_add advice "apt-get install -y jq"
+    return 0
+  fi
+  out="$("$cli" pack-offhost --json 2>/dev/null)" || rc=$?
+  verdict="$(jq -r '.verdict // empty' <<< "$out" 2>/dev/null || true)"
+  case "$verdict" in
+    offhost)
+      checkup_add healthy "A recovery pack is delivered off-host, so the credentials that open the backup survive losing this machine (configured is not proven delivered, and the age private key is held only by the operator)."
+      ;;
+    circular)
+      checkup_add critical "The encrypted RECOVERY PACK is not delivered off-host, and its only copy off this machine is INSIDE the repository it would be needed to open. You would need the credentials in order to fetch the credentials."
+      # Worded identically to checkup_notification_path's remedy so
+      # checkup_add's exact-duplicate suppression collapses them when both
+      # fire. They are different findings -- one is "nothing can tell you",
+      # this one is "nothing could open the backup" -- with one fix.
+      checkup_add action "set RECOVERY_PACK_EMAIL_ENABLED=1 in $CFG_FILE, then prove it ONCE with 'domum-media health-notify --force' -- that command SENDS and needs operator approval"
+      ;;
+    none)
+      checkup_add critical "The encrypted RECOVERY PACK never leaves this host, so losing both disks loses the ability to open the off-site backup at all. It holds the configuration, the secrets, Traefik's ACME account private key and the validated Uptime Kuma dump."
+      checkup_add action "set RECOVERY_PACK_EMAIL_ENABLED=1 in $CFG_FILE, then prove it ONCE with 'domum-media health-notify --force' -- that command SENDS and needs operator approval"
+      ;;
+    unknown)
+      checkup_add warning "Whether the encrypted recovery pack can leave this host is UNKNOWN: its configuration could not be read, and an unread setting is not a setting of 0."
+      checkup_add advice "sudo domum-media-backup pack-offhost   # read-only: reads configuration only, no restic and no network"
+      ;;
+    *)
+      # Includes: the subcommand does not exist in the installed binary, a
+      # usage error, and any verdict word added later that this reader has not
+      # been taught. None of them is evidence about the pack.
+      checkup_add warning "Whether the encrypted recovery pack can leave this host could not be checked: $(basename "$cli") pack-offhost did not answer (exit $rc)."
+      checkup_add advice "$cli pack-offhost   # read-only. A usage error here means the installed backup CLI predates this check"
+      ;;
+  esac
+}
+
 # Can this host actually TELL anyone?
 #
 # The whole notification contract is that silence means nothing needed
@@ -7422,6 +7509,9 @@ checkup_collect_all() {
   checkup_btrfs_health
   checkup_disk_health
   checkup_immich_offsite
+  # Whether the credentials that open the off-site backup exist anywhere but
+  # here. Reported by dr-status and dr-offhost-audit, neither of which notifies.
+  checkup_recovery_pack_offhost
   # Whether a warranted alert can leave the host at all. Last, because it is
   # the check that decides whether any of the above would ever be seen.
   checkup_notification_path

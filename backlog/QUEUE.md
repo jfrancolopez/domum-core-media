@@ -172,7 +172,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 
 ---
 
-| P6.6 | let `checkup` ask whether the recovery pack is in the backup scope | open — the check exists in `dr-status` but the helpers live in `bin/domum-media-backup` while `checkup_add` lives in `bin/domum-media`, so writing it in `checkup` produced three undefined calls (caught by the function-definition audit). The bridge is a purpose-built subcommand whose EXIT STATUS states the fact — this project's own rule — rather than parsing prose. Until then the finding is **not mailed** |
+| P6.6 | let `checkup` ask whether the recovery pack can leave this host | **done** — `domum-media-backup pack-offhost [target] [--json]`, exit 0 delivered off-host / 1 none or CIRCULAR / 2 not answerable, consumed by `checkup_recovery_pack_offhost`. The question was CORRECTED on the way: "is the pack in the backup set" was the wrong one (the cloud scope includes it deliberately) and it contradicted `dr-offhost-audit`, whose circularity row read the GLOBAL include paths and so reassured about production. `recovery_pack_coverage` is now the one implementation for all three readers. `circular`/`none` are critical with an action, so they mail; a non-answer is a warning, which is why the caller requires the JSON and not just the status. 2 mutants, killed |
 
 ## P5 — Disaster recovery
 

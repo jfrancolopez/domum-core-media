@@ -4287,49 +4287,120 @@ the second is this one, in the opposite direction.
 
 ---
 
-**THE ENCRYPTED RECOVERY PACK'S OWN COVERAGE WAS NEVER CHECKED, and the
-configuration bypasses the fix that was supposed to protect it.** Found
-2026-11-03 from the production config, which the operator pasted while
-installing the scrub timer.
+**NOTHING CHECKED THE ENCRYPTED RECOVERY PACK, AND MY FIRST CHECK ASKED THE
+WRONG QUESTION -- the opposite of what `dr-offhost-audit` asks about the same
+configuration.** Found 2026-11-03 from the production config the operator
+pasted while installing the scrub timer.
 
 `dr_path_configured` verifies the Immich library, the five service paths and the
 image-archive directory. It was never asked about the **pack** -- the artefact
 that makes every other off-site copy openable, holding the configuration, the
 secrets, Traefik's ACME account private key and the validated Uptime Kuma dump.
 
-And the gap is reachable rather than theoretical. This file records that
-`immich_only_include_paths` was changed to DERIVE the pack path from
-`RECOVERY_PACK_DEST`, because a hardcoded literal goes stale if the pack moves.
-But `backup_target_include_paths` resolves `"${paths:-$target_default}"`, so an
+**The first version asked "is the pack in the backup set" and reported its
+absence as a risk. That is a finding about the DESIGNED configuration**:
+`immich_only_include_paths` -- the cloud target's own scope -- puts the pack
+there deliberately. Worse, it contradicted `dr_offhost_audit`, which reports the
+pack being **inside** the backup as `CIRCULAR` and counts it a problem. Two
+commands, opposite verdicts, one configuration, and
+`docs/RECOVERY-KEY-CUSTODY.md` carried **both claims three lines apart** -- a
+table row saying the pack lives "inside the cloud backup set" above a paragraph
+saying it was "correctly **not** inside the backup it would be needed to open".
+
+**The audit's row was reassuring because it read the WRONG SCOPE.** It looped
+over the global `BACKUP_INCLUDE_PATHS` (default `/srv/data`), under which
+`/var/lib/domum-media/recovery-pack` does not sit -- so on production it printed
+`pack inside the backup  no  correct -- that would be circular` about the one
+configuration it exists to warn about. That is the wrong-scope defect
+`dr_path_configured` already had, in the command that is supposed to be the
+authority, and it is why `recovery_pack_coverage` is now the ONE implementation
+consumed by all three readers.
+
+**And its POLARITY was wrong.** A copy inside the repository is circular only
+when it is the pack's **only** copy off this host -- you would need the
+credentials in order to fetch the credentials. While email delivery is enabled
+it is redundancy. So:
+
+| in a target's scope | off-host delivery | verdict |
+|---|---|---|
+| yes | enabled | `offhost` -- redundant, not a problem |
+| yes | **disabled** | **`circular`** -- its only copy off the host is inside the repository it opens |
+| no | enabled | `offhost` -- the email route is the designed one |
+| no | **disabled** | **`none`** -- the pack never leaves |
+| either | **unreadable config** | `unknown` -- an unread setting is not a setting of 0 |
+
+**The decisive question is whether a pack reaches anywhere this host is not, and
+"is it in the backup set" is a COMPONENT of the answer rather than the answer.**
+A check that fires on the designed configuration is how a real finding gets
+ignored.
+
+**`domum-media-backup pack-offhost [target] [--json]`** is the bridge, because
+the two commands that reported on the pack -- `dr-status` and
+`dr-offhost-audit` -- are not notification paths, so a pack that never left this
+machine was visible only to an operator running a command by hand. Its contract
+is the EXIT STATUS, matching `exclusion-audit` and `verify-snapshot-coverage`:
+**0** a pack is delivered off-host, **1** none or CIRCULAR, **2** not
+answerable. It reads configuration only -- a test asserts the function body
+contains no `restic`, `docker`, `curl`, `ssh` or `sftp`, because a report must
+do no recovery work.
+
+**The JSON is REQUIRED by the caller, and that is the load-bearing part.** An
+exit status alone cannot tell a verdict from a NON-ANSWER: an installed binary
+that predates this subcommand dies with status **1**, which is the alarming
+answer -- a CRITICAL about the family photographs manufactured from a binary
+that never looked. So `checkup` requires the reply to parse and to carry a
+verdict it has been taught, and anything else is reported as "could not ask".
+That is the `capabilities --has` rule in both directions: a token this binary
+never heard of must not read as a yes, **and must not read as a no either**.
+The mutation that classifies on the exit status alone must make an older
+binary's usage error become `never leaves this host`.
+
+**`checkup` asks it, so the finding is now mailed**, which was the whole point:
+`circular` and `none` are **critical with an action** (the only two classes that
+pass the notifier's silence gate), `unknown` and "could not ask" are **warnings
+with advice** and deliberately do not mail -- "I could not check it" is not "it
+is broken", and it is not healthy either. The remedy is worded IDENTICALLY to
+`checkup_notification_path`'s, so `checkup_add`'s exact-duplicate suppression
+collapses them when both fire: two different findings ("nothing can tell you"
+and "nothing could open the backup") with one fix.
+
+**`backup_cli_path` resolves the CHECKOUT's copy first**, matching `status`,
+because the two CLIs must be at the same revision -- a new `checkup` asking an
+older installed binary produces "could not ask" for a reason that is about the
+deployment rather than about the pack. `DOMUM_BACKUP_CLI` redirects it for a
+fixture.
+
+**`recovery_pack_dest` is the ONE implementation of the destination**, and the
+two it replaced were NOT equivalent: one defaulted `DOMUM_STATE_ROOT` and the
+other did not, so a caller that had not run `load_cfg` would die under `set -u`
+rather than fall back.
+
+**A fix in a default is not in force wherever the configuration overrides that
+default.** `immich_only_include_paths` was changed to DERIVE the pack path from
+`RECOVERY_PACK_DEST` because a literal goes stale if the pack moves -- but
+`backup_target_include_paths` resolves `"${paths:-$target_default}"`, so an
 explicit `BACKUP_TARGET_<T>_INCLUDE_PATHS` **wins and the derived default is
-never consulted** -- and production sets it explicitly, with the pack path
-written as a literal. The three values agree today, and they agree by having
-been written together, which is precisely the accident the derived default was
-introduced to remove. **A fix in a default is not in force wherever the
-configuration overrides that default.**
+never consulted**, and production sets it explicitly with the pack path as a
+literal. The values agree today, and they agree by having been written
+together, which is the accident the derived default was introduced to remove.
 
-So the check compares the RESOLVED destination against the scope the target
-will actually use, in `dr_remaining_risks`, where configuration cannot bypass
-it. Three states, as `dr_path_configured` already distinguishes: covered,
-NOT covered (named, with the consequence -- every other off-site copy becomes
-unopenable), and UNKNOWN when the target's roots cannot be read. It reports
-healthy on this host, so it is a regression guard rather than a live finding.
+**A test that required the over-alarming behaviour had to be corrected, not
+adapted around.** `offhost-recovery-audit-smoke` asserted `CIRCULAR` with
+delivery **enabled** -- i.e. it required the designed configuration to be
+reported as a defect. Before adapting a test to a change, ask which of the two
+is wrong; here the test was. Both directions are asserted now, because a
+single-verdict assertion cannot tell a check from one that always fires.
 
-**`recovery_pack_dest` is now the ONE implementation**, and the two it replaced
-were NOT equivalent: one defaulted `DOMUM_STATE_ROOT` and the other did not, so
-a caller that had not run `load_cfg` would die under `set -u` rather than fall
-back. A test asserts the expression appears once in code and that it survives
-an unset state root.
+**ONE ROOT CAUSE IS ONE GAP.** With delivery off, the audit's delivery row and
+its circularity row would each have incremented `problems`, so a single fixable
+cause read as two blocking gaps -- fixing delivery clears both. The circular row
+is reported and deliberately NOT counted again, and the test asserts
+`problems == 1`. Same defect as printing identical text twice making the host
+look twice as bad as it is, one level up.
 
-**The check is in `dr-status`, NOT in `checkup`, and that limit is deliberate
-rather than an oversight.** `dr_path_configured`, `dr_target_roots` and
-`recovery_pack_dest` live in `bin/domum-media-backup`; `checkup_add` lives in
-`bin/domum-media`. Writing the check in `checkup` first produced three
-undefined calls, which `tests/function-definition-audit.py` caught immediately
--- the undefined-helper family, in the same session that records it. Bridging
-the two CLIs properly means a purpose-built subcommand whose EXIT STATUS states
-the fact, which is this file's own rule, and that is queued rather than
-half-built. **So this finding is not yet mailed by `health-notify`.**
+`tests/pack-offhost-bridge-smoke.sh`; 2 mutants, both killed. Everything above
+reports healthy on this host, so it is a regression guard rather than a live
+finding.
 
 ---
 

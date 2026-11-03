@@ -18,8 +18,34 @@ things are needed in sequence:
 
 Step 3 is well covered. The off-host audit, run as root on 2026-10-12, found all
 four repository credentials present, 37 encrypted packs with the newest 0 days
-old, off-host delivery enabled by email, and the pack correctly **not** inside
-the backup it would be needed to open.
+old, and off-host delivery enabled by email.
+
+**It also reported that the pack was "correctly **not** inside the backup it
+would be needed to open", and that was false** — three lines below a table row
+saying the pack lives "inside the cloud backup set". Both statements were in
+this document at once. Corrected 2026-11-03:
+
+- the pack **is** inside the cloud backup set, deliberately:
+  `immich_only_include_paths` — the cloud target's own scope — lists the
+  resolved `RECOVERY_PACK_DEST`, and production repeats it as a literal in
+  `BACKUP_TARGET_CLOUD_INCLUDE_PATHS`;
+- the audit's circularity row read the **global** `BACKUP_INCLUDE_PATHS`
+  (default `/srv/data`), under which `/var/lib/domum-media/recovery-pack` does
+  not sit, so it answered "no" about a configuration that does the thing it
+  warns against. That is the wrong-scope defect `dr_path_configured` already
+  had, in the command that is supposed to be the authority;
+- and the row's **polarity** was wrong too. A copy inside the repository is
+  circular only when it is the pack's **only** copy off this host — you would
+  need the credentials in order to fetch the credentials. While email delivery
+  is enabled, that copy is redundancy. The audit now says
+  `pack inside the backup  yes  redundant — the email route is what makes it
+  non-circular`, and counts it as a problem only when delivery is off.
+
+So the decisive question is not whether the pack is in the backup set but
+whether a pack reaches anywhere this host is not. `domum-media-backup
+pack-offhost` answers exactly that, read-only and by exit status — 0 a pack is
+delivered off-host, 1 none or CIRCULAR, 2 not answerable — and `checkup` asks
+it, so the finding can now be mailed. It reports healthy on this host.
 
 ## The single point of failure
 

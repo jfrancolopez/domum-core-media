@@ -166,13 +166,46 @@ grep -qE 'off-host delivery +DISABLED' <<< "$o" && fail "unread config was repor
 echo "  a value that was never read is UNKNOWN, not 0"
 
 # ---------------------------------------------------------------------------
-sect "a pack stored INSIDE the backup set is flagged as circular"
-o="$(run_audit 'RECOVERY_PACK_EMAIL_ENABLED=1
-BACKUP_INCLUDE_PATHS="$DOMUM_STATE_ROOT"')"
-grep -q 'CIRCULAR' <<< "$o" || fail "a pack inside the backup was not flagged: $o"
-grep -q 'inside the repository they open' <<< "$o" || fail "the circularity is not explained: $o"
+sect "a pack inside the backup set is CIRCULAR only when nothing delivers it"
+# This section used to require CIRCULAR with delivery ENABLED, i.e. it asserted
+# the defect: a pack that is emailed off-host AND copied into the repository has
+# an independent route, so the copy inside is redundancy rather than a trap. The
+# trap is being inside the repository you would need the credentials to open
+# while having no other copy off the host.
+#
+# The row also read the GLOBAL BACKUP_INCLUDE_PATHS while the cloud target's
+# scope is three narrow roots, and `immich_only_include_paths` puts the pack in
+# that scope DELIBERATELY -- so on production it answered "no, correct, that
+# would be circular" about the one configuration it exists to warn about. It
+# asks recovery_pack_coverage per ENABLED target now, which is the same
+# implementation dr-status uses.
+o="$(run_audit 'RECOVERY_PACK_EMAIL_ENABLED=0')"
+grep -q 'CIRCULAR' <<< "$o" \
+  || fail "a pack inside the target's scope with no off-host route was not flagged: $o"
+grep -q 'inside the repository it opens' <<< "$o" || fail "the circularity is not explained: $o"
 grep -q 'EXITCODE=1' <<< "$o" || fail "circularity did not block: $o"
-echo "  you would need the credentials to fetch the credentials"
+# ONE gap, not two. The delivery row already counted "nothing delivers the
+# pack"; the circular row is an aggravating detail of it, and fixing delivery
+# clears both. Counting both makes the host look twice as bad as it is.
+j="$(run_audit 'RECOVERY_PACK_EMAIL_ENABLED=0' --json)"
+pj="$(sed -n '/^{/{p;q;}' <<< "$j")"
+[[ "$(jq -r '.problems' <<< "$pj")" == "1" ]] \
+  || fail "the one gap -- nothing delivers the pack -- was counted twice: $pj"
+echo "  no delivery + inside the repository: you would need the credentials to fetch them"
+echo "  and it is ONE blocking gap, not two"
+
+# The other direction, which is what makes the first assertion mean anything: a
+# delivered pack must not be called circular for also being in the repository.
+o="$(run_audit 'RECOVERY_PACK_EMAIL_ENABLED=1')"
+grep -q 'CIRCULAR' <<< "$o" \
+  && fail "a pack with a working off-host route was called circular merely for
+also being in the backup set, which reports the designed configuration as a
+defect: $o"
+grep -qE 'pack inside the backup +yes' <<< "$o" \
+  || fail "the audit no longer states that the pack IS in the backup set -- it
+read the global include paths and answered 'no' about production: $o"
+grep -q 'redundant' <<< "$o" || fail "it does not say why that is not a problem: $o"
+echo "  delivered + inside the repository: reported as redundant, not a problem"
 
 sect "no pack at all is a blocking gap"
 o="$(run_audit 'RECOVERY_PACK_EMAIL_ENABLED=1

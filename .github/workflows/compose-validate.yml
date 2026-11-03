@@ -106,6 +106,9 @@ jobs:
       - name: Off-host recovery audit smoke test
         run: tests/offhost-recovery-audit-smoke.sh
 
+      - name: Recovery-pack off-host bridge smoke test
+        run: tests/pack-offhost-bridge-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 

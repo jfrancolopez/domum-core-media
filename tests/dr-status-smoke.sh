@@ -1011,49 +1011,87 @@ grep -q '0 of 0 original' <<< "$mout" \
   || fail "the mutant did not show the undenominated claim: $mout"
 echo "  without the coverage requirement it reports 'RESTORE TESTED, 0 of 0'"
 
-sect "the ENCRYPTED RECOVERY PACK's coverage is checked, in all three states"
+sect "the ENCRYPTED RECOVERY PACK is checked on the question that decides it"
 # Nothing checked this before. dr_path_configured verified the Immich library,
 # the five service paths and the image-archive directory -- never the pack,
 # which is what makes every other off-site copy openable.
 #
-# The gap is reachable: immich_only_include_paths DERIVES the pack path from
-# RECOVERY_PACK_DEST, but backup_target_include_paths resolves
-# "${paths:-$target_default}" -- so an explicit config value WINS and the
-# derived default is never consulted. Production sets it explicitly, with the
-# pack path as a literal.
+# The question is NOT "is the pack in the backup set", and getting that wrong
+# is why these sections exist. `immich_only_include_paths` puts the pack in the
+# cloud scope DELIBERATELY, so treating its absence as a risk reports the
+# designed configuration as a defect -- and it contradicts dr-offhost-audit,
+# which calls the pack being INSIDE the backup circular. Two commands, opposite
+# verdicts, one configuration.
+#
+# The decisive question is whether a pack reaches anywhere this host is not.
+# A copy inside the repository is redundancy while that route exists, and the
+# circularity trap only when it is the only copy off the host.
+: > "$TMP_DIR/fixture.conf"
+PACKCFG="CFG_FILE='$TMP_DIR/fixture.conf'"
 
-# 1. COVERED -- the pack sits under one of the target's roots.
-out="$(run_dr "BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library $STATE/recovery-pack'
+# 1. The production shape: delivered off-host AND inside the cloud scope.
+out="$(run_dr "$PACKCFG
+  RECOVERY_PACK_EMAIL_ENABLED=1
+  BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library $STATE/recovery-pack'
   RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
-grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$out" \
-  && fail "a pack inside the target's scope was reported as not covered: $out"
-echo "  covered: no risk raised"
+grep -qiE 'RECOVERY PACK (has no off-host|never leaves)' <<< "$out" \
+  && fail "the production shape was reported as a pack risk: $out"
+echo "  delivered + in the scope: no risk raised"
 
-# 2. NOT COVERED -- the config names a literal that is no longer where the pack
-#    is written. This is exactly what moving RECOVERY_PACK_DEST would do, and
-#    the derived default cannot save it because the config overrides it.
-out="$(run_dr "BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library $STATE/recovery-pack'
-  RECOVERY_PACK_DEST='$STATE/somewhere-else/recovery-pack'")"
-grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$out" \
-  || fail "the pack being outside every backup root was not reported: $out"
+# 2. Delivered off-host and NOT in any backup root. This is the polarity
+#    correction: the first version of this check called it a risk, which is a
+#    finding about the designed route rather than about the pack.
+out="$(run_dr "$PACKCFG
+  RECOVERY_PACK_EMAIL_ENABLED=1
+  BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library'
+  RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
+grep -qiE 'RECOVERY PACK (has no off-host|never leaves)' <<< "$out" \
+  && fail "a pack with a working off-host route was reported as a risk merely
+for being outside the backup scope: $out"
+grep -q 'ENCRYPTED RECOVERY PACK is NOT in the' <<< "$out" \
+  && fail "the superseded 'not in the backup set' risk is still emitted: $out"
+echo "  delivered + outside the scope: still no risk -- that is the designed route"
+
+# 3. NOT delivered, and inside the repository it would be needed to open. The
+#    circularity trap: you would need the credentials to fetch the credentials.
+out="$(run_dr "$PACKCFG
+  RECOVERY_PACK_EMAIL_ENABLED=0
+  BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library $STATE/recovery-pack'
+  RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
+grep -q 'has no off-host route' <<< "$out" \
+  || fail "a pack with no off-host route was not reported: $out"
+grep -q 'credentials in order to' <<< "$out" \
+  || fail "the circularity is not named: $out"
+grep -q "$STATE/recovery-pack" <<< "$out" \
+  || fail "the risk does not name the path it checked: $out"
+echo "  not delivered + in the scope: reported as circular, path named"
+
+# 4. NOT delivered and nowhere else either -- the pack simply never leaves.
+out="$(run_dr "$PACKCFG
+  RECOVERY_PACK_EMAIL_ENABLED=0
+  BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library'
+  RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
+grep -q 'never leaves this host' <<< "$out" \
+  || fail "a pack that never leaves the host was not reported: $out"
 grep -q 'unopenable' <<< "$out" \
   || fail "the risk does not say what losing the pack costs: $out"
-grep -q 'somewhere-else/recovery-pack' <<< "$out" \
-  || fail "the risk does not name the path it checked: $out"
-echo "  not covered: reported, named, and the consequence stated"
+grep -q 'credentials in order to' <<< "$out" \
+  && fail "the circularity wording was used for a pack that is not in any
+repository, which describes a case that did not occur: $out"
+echo "  not delivered + outside the scope: reported as never leaving"
 
-# 3. UNKNOWN -- the target's roots cannot be resolved. Never a pass and never a
-#    failure; this is the third state dr_path_configured exists to keep.
-out="$(run_dr "BACKUP_TARGET_CLOUD_INCLUDE_PATHS=''
-  BACKUP_INCLUDE_PATHS=''
-  immich_only_include_paths() { printf ''; }
+# 5. UNKNOWN -- the configuration could not be read. An unread setting is not a
+#    setting of 0, and this is the state that keeps an unprivileged run honest:
+#    the production config is 0600 root.
+out="$(run_dr "CFG_FILE='$TMP_DIR/absent.conf'
+  RECOVERY_PACK_EMAIL_ENABLED=1
   RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
-grep -qE 'recovery pack is off-site is UNKNOWN' <<< "$out" \
-  || fail "unresolvable roots did not produce the UNKNOWN state: $out"
-grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$out" \
-  && fail "unresolvable roots were reported as NOT covered, which asserts more
-than was observed: $out"
-echo "  unknown: neither excused nor blamed"
+grep -q 'ever leaves this host is' <<< "$out" \
+  || fail "an unreadable config did not produce the UNKNOWN state: $out"
+grep -qiE 'RECOVERY PACK (has no off-host|never leaves)' <<< "$out" \
+  && fail "an unreadable config was reported as a definite failure, which
+asserts more than was observed: $out"
+echo "  unreadable config: neither excused nor blamed"
 
 sect "recovery_pack_dest is the ONE implementation, and it defaults safely"
 # Two copies of the expression existed and they were NOT equivalent: one
@@ -1072,18 +1110,19 @@ grep -q 'PACK=/var/lib/domum-media/recovery-pack' <<< "$out" \
   || fail "with neither variable set it must fall back, not die: $out"
 echo "  one implementation, and it survives an unset state root"
 
-sect "MUTATION: without the comparison, a pack outside every root reads as safe"
-# The whole value of this check is that configuration cannot bypass it, so the
-# mutation neutralises the COMPARISON itself -- never `&& false` inside `[[ ]]`,
-# where the bare word is a non-empty string.
+sect "MUTATION: with delivery forced open, a pack that never leaves reads as safe"
+# The whole value of this check is that it reports a pack with no off-host
+# route. The mutation neutralises the COMPARISON itself -- never `&& false`
+# inside `[[ ]]`, where the bare word is a non-empty string rather than the
+# command -- and the observable is that the finding DISAPPEARS.
 MUTP="$TMP_DIR/mut-pack"
 cp "$REPO_ROOT/bin/domum-media-backup" "$MUTP"
 cat > "$TMP_DIR/mutpack.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '  dr_path_configured "$pack_dest" "$target" || pcfg=$?'
-new = '  dr_path_configured "$pack_dest" "$pack_dest" >/dev/null 2>&1; pcfg=0'
+old = '  [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]]\n}'
+new = '  [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" != "${RECOVERY_PACK_EMAIL_ENABLED:-0}x" ]]\n}'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
@@ -1095,13 +1134,15 @@ mout="$(
   source "$TMP_DIR/dbstub.sh"
   set +e
   die() { echo "DIE: $*"; exit 9; }
-  BACKUP_TARGET_CLOUD_INCLUDE_PATHS="$DATA/immich/library $STATE/recovery-pack"
-  RECOVERY_PACK_DEST="$STATE/somewhere-else/recovery-pack"
+  CFG_FILE="$TMP_DIR/fixture.conf"
+  RECOVERY_PACK_EMAIL_ENABLED=0
+  BACKUP_TARGET_CLOUD_INCLUDE_PATHS="$DATA/immich/library"
+  RECOVERY_PACK_DEST="$STATE/recovery-pack"
   do_dr_status 2>&1
 )"
-grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$mout" \
-  && fail "the mutation changed no ANSWER -- forcing the comparison to 'covered'
-must make a pack outside every backup root read as safe"
-echo "  killed: without the comparison a pack nowhere in the scope reads as covered"
+grep -qiE 'RECOVERY PACK (has no off-host|never leaves)' <<< "$mout" \
+  && fail "the mutation changed no ANSWER -- forcing delivery to read as enabled
+must make a pack that never leaves this host read as safe"
+echo "  killed: with delivery forced open, a pack that never leaves is not reported"
 
 echo "PASS: dr-status-smoke"
