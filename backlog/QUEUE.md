@@ -86,7 +86,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 |---|---|---|
 | P3.1 | phase-4 model awareness (a volume upgrade could not succeed) | **done** (`b67eee1`) |
 | P3.2 | readiness reported as UNPROVEN where it cannot be evidenced | **done** (`b67eee1`) |
-| P3.3 | readiness log pattern consulted by the upgrade, with a bounded wait | open — reverted once for escalating without a wait; needs its own tests |
+| P3.3 | readiness log pattern consulted by the upgrade, with a bounded wait | **done** — `UPGRADE_READY_LOG_WAIT` (default 60 s, 5 s steps) with ONE attempt before any sleep, so a wait of 0 means look-once. Deliberately asymmetric: found strengthens the claim, absent is reported and never sets `rc`, because escalating on absence is what got the first attempt reverted. The boundary is captured before the deploy and the ORDER is asserted. The UNPROVEN sentence is now built from what is actually absent, so it cannot claim a service has no declared pattern when it has one |
 | P3.4 | end-to-end rehearsal against **real disposable containers** (not fixtures) | open |
 | P3.5 | production upgrade | **BLOCKED** — `VOLUME_UPGRADE_ENABLED=0`, operator decision |
 

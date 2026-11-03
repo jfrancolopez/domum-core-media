@@ -3643,6 +3643,49 @@ re-applying the working-tree edits deterministic.
 
 ---
 
+**THE DECLARED READINESS LINE IS NOW CONSULTED BY THE UPGRADE, BOUNDED AND
+DELIBERATELY ASYMMETRIC.** `service_logged_ready_since` existed and only the
+MIGRATION path used it, so an upgrade had **weaker** readiness evidence than a
+migration of the same service. The first attempt at closing that gap was
+reverted, and the reason governs the design: phase 4 runs immediately after
+`up -d`, so a line that lags by seconds read as a FAILURE, and escalating on
+absence changes the success criteria for the four services that declare a
+pattern.
+
+So finding the line STRENGTHENS the claim and not finding it is REPORTED and
+never sets `rc`. The wait is `UPGRADE_READY_LOG_WAIT`, default 60 s in 5 s
+steps, and it makes **one attempt before any sleep** -- so a wait of 0 means
+"look once, do not sleep", which is what lets a test drive both outcomes
+without a minute of real time per run. The fixture sets it to 0.
+
+**The boundary is captured BEFORE the deploy**, so a readiness line from the
+previous start can never be accepted as evidence of this one. It is defined at
+the top of phase 3 rather than inside phase 4 because referencing
+`$restart_boundary` before defining it once killed this function under
+`set -u` -- and the test asserts the ORDER (boundary < deploy < readiness read)
+rather than trusting it.
+
+**The UNPROVEN sentence is BUILT from what is actually absent.** The fixed
+wording said "no container healthcheck, no readiness probe and no declared log
+pattern", which would be **false** for a service that declares a pattern and
+stayed silent -- a report describing something it is not, in the one place an
+upgrade is being declared successful. It now distinguishes "no readiness probe"
+from "a readiness probe that did not answer", and "no declared log pattern"
+from "a declared log pattern that did not appear". A test asserts the false
+form does not appear.
+
+**`missing` is an ARRAY name elsewhere in this file**, and my first version
+used it as a string local -- SC2178/SC2128, the pair this project has already
+paid two CI failures for. shellcheck reported it in seconds, exactly as §9
+promises. Renamed `ready_missing`.
+
+**`EXTRA_STUB` is a per-section stub hook in the integration fixture**,
+appended LAST so a section can override any stub above it. Without it a section
+cannot change one behaviour without duplicating the whole fixture, which is how
+a suite ends up with two fixtures that drift apart.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

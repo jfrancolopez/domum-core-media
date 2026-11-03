@@ -11314,6 +11314,12 @@ The staged image was NOT deployed."
     || die "The pre-upgrade recovery point did not verify. The staged image was NOT deployed."
 
   # ---- phase 3: deploy ONLY this service -------------------------------------
+  # The readiness-log boundary is taken BEFORE the restart, so a line from the
+  # PREVIOUS start can never be accepted as evidence of this one. Defined here
+  # rather than inside phase 4 on purpose: referencing this variable before
+  # defining it once killed the function under `set -u`.
+  local restart_boundary
+  restart_boundary="$(date -u +%Y-%m-%dT%H:%M:%S)"
   echo "[domum-media] phase 3/4: deploying $target_image to $compose_svcs only"
   # shellcheck disable=SC2086
   compose_cmd up -d $compose_svcs \
@@ -11372,12 +11378,63 @@ rollback instructions in $meta."
       rc=1
     fi
   fi
+  # A DECLARED readiness line, with a BOUNDED WAIT.
+  #
+  # service_logged_ready_since already existed and only the MIGRATION path used
+  # it, so an upgrade had weaker readiness evidence than a migration of the same
+  # service. The first attempt at closing that gap was reverted, for a reason
+  # that governs the design here: phase 4 runs immediately after `up -d`, so a
+  # service whose readiness line lags by seconds was reported as having FAILED.
+  #
+  # So this is deliberately asymmetric. Finding the line STRENGTHENS the claim;
+  # not finding it is REPORTED and never sets rc. Escalating on absence would
+  # change the success criteria for the four services that declare a pattern,
+  # and half of that change is worse than none.
+  local ready_log_state="none"
+  if service_ready_log_pattern "$service" >/dev/null 2>&1; then
+    # Always ONE attempt, then wait only if it is still absent -- so a wait of 0
+    # means "look once and do not sleep", which is what lets a test drive both
+    # outcomes without a minute of real time per run.
+    local lwaited=0 lwait="${UPGRADE_READY_LOG_WAIT:-60}"
+    while :; do
+      if service_logged_ready_since "$service" "$restart_boundary"; then
+        ready_log_state="logged"; break
+      fi
+      (( lwaited >= lwait )) && break
+      sleep 5; lwaited=$(( lwaited + 5 ))
+    done
+    if [[ "$ready_log_state" == "logged" ]]; then
+      ready_evidence="${ready_evidence:+$ready_evidence; }logged its declared readiness line"
+      echo "  readiness (log) : LOGGED since the restart: \"$(service_ready_log_pattern "$service")\""
+    else
+      ready_log_state="silent"
+      echo "  readiness (log) : NOT logged within ${lwait}s of the restart."
+      echo "                    Reported, NOT a failure: the line may simply lag, and"
+      echo "                    escalating on absence would change the success criteria."
+    fi
+  fi
+
   # Nothing asked the application anything. Say so rather than letting a
   # started container read as a working one -- that substitution is the defect
   # this project refuses to make elsewhere, and it must not appear in the one
   # place an upgrade is being declared successful.
+  #
+  # The message is BUILT from what is actually absent. A fixed sentence saying
+  # "no declared log pattern" would be false for a service that declares one and
+  # stayed silent -- a report describing something it is not, which is the
+  # defect this whole file exists to correct.
   if [[ -z "$ready_evidence" && "$(service_health_state "$service")" == "none" ]]; then
-    echo "  readiness       : UNPROVEN -- no container healthcheck, no readiness probe and no declared log pattern. RUNNING is the whole claim."
+    local ready_missing="no container healthcheck"
+    if service_ready_probe "$service" >/dev/null 2>&1; then
+      ready_missing="$ready_missing, a readiness probe that did not answer"
+    else
+      ready_missing="$ready_missing, no readiness probe"
+    fi
+    case "$ready_log_state" in
+      silent) ready_missing="$ready_missing, and a declared log pattern that did not appear" ;;
+      *)      ready_missing="$ready_missing and no declared log pattern" ;;
+    esac
+    echo "  readiness       : UNPROVEN -- $ready_missing. RUNNING is the whole claim."
   fi
 
   # The pre-upgrade artefacts must still be exactly as created -- and WHICH
