@@ -3825,6 +3825,42 @@ for those specific files.
 
 ---
 
+**P3.4 -- a rehearsal against REAL disposable volumes -- REQUIRES ROOT, and
+that was measured rather than assumed.** The half fixtures cannot establish is
+`dump_volume_to_file` / `restore_volume_from_file`, and both `tar -C` the
+volume's host mountpoint from
+`docker volume inspect --format '{{.Mountpoint}}'`. Measured 2026-11-02:
+`/var/lib/docker` is `drwx--x--- root root`, so **no** volume mountpoint is
+readable unprivileged -- verified against a volume created for the probe and
+removed afterwards, so it is not an artefact of production ownership.
+
+**The isolation itself is sound and was checked BEFORE anything else.**
+`storage_volume_pre_upgrade_point` resolves volumes from `docker inspect` of
+the running container, so the compose PROJECT is the boundary: production is
+`domum-media_*` and a `domum-rehearsal` project yields `domum-rehearsal_*`,
+both of which were verified free. A rehearsal must assert, before anything
+mutating, that every resolved volume name carries the disposable prefix and
+that none exists yet -- the "every root a fixture uses must be redirected into
+it, and asserted to be" rule applied to Docker objects instead of filesystem
+paths.
+
+**A rootless variant was considered and REJECTED, twice over.** A volume can be
+read without host root by mounting it into a helper container; that would let
+the rehearsal run unprivileged and would not be driving the production
+primitives, so it would prove something adjacent -- a fixture-backed probe is
+not production evidence, and a helper container reading the volume is a
+fixture. Changing the production code to use a helper container was rejected
+too: the CLI already runs as root in production so it buys nothing there, and
+it would change the semantics of a RESTORE path -- `--numeric-owner`, xattrs
+and ACLs behave differently inside a container's user namespace, and
+`acme.json`'s mode 0600 is exactly what must not change. A restore path is the
+worst place to trade correctness for testability.
+
+See `docs/VOLUME-UPGRADE-REHEARSAL.md` for the six things the rehearsal would
+prove and the shape it should take.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

@@ -87,7 +87,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 | P3.1 | phase-4 model awareness (a volume upgrade could not succeed) | **done** (`b67eee1`) |
 | P3.2 | readiness reported as UNPROVEN where it cannot be evidenced | **done** (`b67eee1`) |
 | P3.3 | readiness log pattern consulted by the upgrade, with a bounded wait | **done** — `UPGRADE_READY_LOG_WAIT` (default 60 s, 5 s steps) with ONE attempt before any sleep, so a wait of 0 means look-once. Deliberately asymmetric: found strengthens the claim, absent is reported and never sets `rc`, because escalating on absence is what got the first attempt reverted. The boundary is captured before the deploy and the ORDER is asserted. The UNPROVEN sentence is now built from what is actually absent, so it cannot claim a service has no declared pattern when it has one |
-| P3.4 | end-to-end rehearsal against **real disposable containers** (not fixtures) | open |
+| P3.4 | end-to-end rehearsal against **real disposable containers** (not fixtures) | **BLOCKED — requires root, measured 2026-11-02.** The half fixtures cannot prove is `dump_volume_to_file` / `restore_volume_from_file`, and both `tar -C` the volume's host mountpoint. `/var/lib/docker` is `drwx--x--- root root`, so NO volume mountpoint is readable unprivileged — verified against a volume created for the probe and then removed. Isolation itself is sound and was checked: a `domum-rehearsal` compose project yields `domum-rehearsal_*` volumes, and production is `domum-media_*`. Unblock: run the rehearsal as root once written. See `docs/VOLUME-UPGRADE-REHEARSAL.md` for what it would prove and why a rootless variant was rejected |
 | P3.5 | production upgrade | **BLOCKED** — `VOLUME_UPGRADE_ENABLED=0`, operator decision |
 
 ---
