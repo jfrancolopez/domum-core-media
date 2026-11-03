@@ -3930,6 +3930,40 @@ question the real run answers, and it causes downtime.
 
 ---
 
+**A STALE PROTECTION CLAIM WAS STILL IN A CODE COMMENT.**
+`image_archive_dir`'s comment justified the location partly by asserting that
+an archive there is in the off-host backup set, because restic is given
+`"$DOMUM_DATA_ROOT"`. That is true of the GLOBAL include set and false of the
+target that actually runs -- the cloud target is immich-only and
+`/srv/data/backups/images` is NOT COVERED. The operator found exactly this
+error in `dr-status` by listing the Hetzner snapshot from another machine; the
+code comment carried it for longer, because nothing reads a comment. Corrected,
+and the test asserts the claim is gone AND that the replacement says what is
+actually true -- not just that a string disappeared.
+
+**My correction first QUOTED the old claim verbatim, and the assertion fired on
+the documentation of the fix.** A comment quoting the broken form is normally
+how a fix documents itself, and it is the right instinct -- but not when the
+subject under assertion IS a comment. Paraphrase there instead, and the
+assertion keeps its full strictness rather than learning to skip the fix.
+
+**`storage capture-state` now has a DEFAULT destination.**
+`state_capture_dir()` -> `<data>/backups/state/<service>/<stamp>`. Without one,
+every invocation needed an operator-invented path, which means nothing could be
+scheduled and a backup scope had nothing stable to name -- the missing link
+between "the capture works" and "the capture can be protected". It is a sibling
+of the service directory and never inside it: a capture written under
+`/srv/data/<service>` would duplicate into every per-service snapshot of that
+service, and a capture of a service is not part of that service's state.
+
+It puts nothing off-site, and the comment says so: the cloud target is
+immich-only, so the default is on the protected local tier and nowhere else.
+`--quiesce` is accepted in the destination slot and must never be taken AS the
+destination -- a capture written to a directory called `--quiesce` is the kind
+of thing a test should pin, so it is pinned.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
