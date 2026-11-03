@@ -4260,6 +4260,33 @@ filesystem uuid `211e06b3`, which is the recorded dedup.
 
 ---
 
+**`sudo` IS UNOBTAINABLE HERE, AND THAT IS NOW MEASURED RATHER THAN ASSERTED.**
+This file has always said sudo "requires interactive authentication that the
+agent cannot supply". Measured 2026-11-03:
+
+```
+$ sudo -n true          -> sudo: a password is required
+$ sudo -n -l            -> sudo: a password is required
+   NOPASSWD entries visible: 0
+```
+
+It is worth having as a measurement because it settles every root-gated
+question at once -- `du` on the image archives, installing a unit, traversing
+`/var/lib/docker`, running the deployment, running `install.sh` -- without
+each one having to be argued separately. A future session should check this
+once and then stop re-deriving it per item.
+
+**"The command exists in the installed binary" is not "the agent can run it",
+and I conflated them.** An operator block described `du -sb
+/srv/data/backups/images` and the scrub-timer install as working "against the
+installed binary today", meaning only that they would not give a usage error.
+Both halves have to hold before anything is runnable: the subcommand must be
+DEPLOYED *and* the privilege must be obtainable. The first was the defect
+recorded when `storage verify-recovery` was recommended off an unmerged branch;
+the second is this one, in the opposite direction.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

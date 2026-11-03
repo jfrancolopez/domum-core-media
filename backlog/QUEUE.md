@@ -18,6 +18,43 @@ rather than being deleted.
 
 ---
 
+## Why the remaining items are unavailable to an agent — MEASURED
+
+**`sudo` requires interactive authentication that this account cannot supply.**
+Measured 2026-11-03:
+
+```
+$ sudo -n true
+sudo: a password is required
+$ sudo -n -l | grep -c NOPASSWD
+0
+```
+
+That is not a judgement call, and it settles every remaining row at once.
+`/srv/data/backups/images` (P2.1), installing a unit (P4.6), traversing
+`/var/lib/docker` (P3.4), the deployment that P1.7 and P1.8 depend on, and
+`install.sh` for P5.3 all need root, and root is unobtainable here. CLAUDE.md
+§10 says so and now the queue has the measurement.
+
+**A command existing in the installed binary is not the same as being runnable
+by this account**, and an earlier note conflated them: "works against the
+installed binary today" meant the command would not give a usage error, not
+that the agent could execute it. Both halves have to hold.
+
+So each remaining item is blocked by at least one of:
+
+| | measured-unavailable | explicitly prohibited |
+|---|---|---|
+| P1.7 activate a target | needs the deployment (root) | "activate production backups" |
+| P1.8 real quiesced run | needs root; `need_root` is now first in that path | "restart services"; downtime |
+| P2.1 `du` the archives | root | — |
+| P3.4 volume rehearsal | root; `/var/lib/docker` denies traversal | — |
+| P3.5 production upgrade | — | "upgrade production applications" |
+| P4.6 enable the scrub timer | root | "enable timers" |
+| P5.2 off-host key copy | — | "do not make credential copies" |
+| P5.3 fresh-host restore | root + a second machine | — |
+| P5.5 full Immich restore | ~130 GiB + the UGREEN hardware | — |
+
 ## Deployment — and what depends on it
 
 **`capture-state`, `verify-state` and `restore-state` are NOT in the installed
