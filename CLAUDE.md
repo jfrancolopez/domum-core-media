@@ -4112,6 +4112,48 @@ assertion belongs in the rehearsal, not in a later review.
 
 ---
 
+**THE ARCHIVE COST DID NOT NEED ROOT, and calling it blocked cost several
+sessions of a withheld recommendation.** `/srv/data/backups/images` is
+`drwxr-x--- root root`, so it cannot be LISTED unprivileged -- and I let that
+stand for the whole question. But what gated the recommendation was never the
+directory listing: it was the size of **one archive per service**, and
+`docker save <id> | wc -c` measures that exactly, without touching
+`/srv/data` and without writing anything.
+
+Measured 2026-11-03:
+
+```
+traefik        55,649,280   53 MiB      kavita        253,559,808  242 MiB
+navidrome      89,996,288   86 MiB      calibre-web   270,126,080  258 MiB
+plex          187,711,488  179 MiB      jellyfin      348,975,616  333 MiB
+                                        uptime-kuma   600,544,256  573 MiB
+all seven  1,806,562,816  1.68 GiB      mean 246 MiB
+```
+
+An archive is **26-30% of the image size** -- `docker save` stores the layer
+blobs already compressed, which is also why restic will dedupe and compress
+almost nothing of them. Budget the full 1.68 GiB.
+
+The earlier guess that the archives could be "two orders of magnitude larger
+than everything else combined" was right: **190x** the 8.90 MiB of service
+state. And against the 207.5 GiB already in the cloud repository, 1.68 GiB is
+**+0.8%**, so the §4b retention policy (newest valid point per service) is
+affordable and the recommendation is no longer withheld.
+
+What genuinely still needs root is **how many archives exist on disk now** --
+which is a retention question, not a cost question: it decides how much of the
+current directory the policy would EXCLUDE, not what the policy costs going
+forward.
+
+**The lesson is the same one the quiesced capture taught, in a second place:
+measure the blocker for the question you are actually asking.** "The directory
+needs root" is true and was not an answer to "what would this cost". This is
+the third time in two sessions that a blocker turned out to belong to a
+neighbouring question -- the volume mountpoint versus the bind mount, and now
+the directory listing versus the archive size.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
