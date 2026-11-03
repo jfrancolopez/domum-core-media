@@ -61,8 +61,18 @@ load_cfg() {
 # that does not exist while the pack -- which holds the config, the secrets,
 # Traefik's ACME private key and Uptime Kuma's database -- silently stopped
 # being backed up, with the run still reporting success.
+# ONE implementation of the pack destination. Two copies of this expression
+# existed and they were NOT equivalent -- the other omitted the
+# DOMUM_STATE_ROOT default, so a caller that had not run load_cfg would die
+# under `set -u` rather than fall back. Same shape as every other "one
+# implementation of a check" rule in CLAUDE.md.
+recovery_pack_dest() {
+  printf '%s' "${RECOVERY_PACK_DEST:-${DOMUM_STATE_ROOT:-/var/lib/domum-media}/recovery-pack}"
+}
+
 immich_only_include_paths() {
-  local pack="${RECOVERY_PACK_DEST:-${DOMUM_STATE_ROOT:-/var/lib/domum-media}/recovery-pack}"
+  local pack
+  pack="$(recovery_pack_dest)"
   printf '%s/immich/library %s/immich/backup-staging %s' \
     "$DOMUM_DATA_ROOT" "$DOMUM_DATA_ROOT" "$pack"
 }
@@ -2749,6 +2759,44 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
     fi
   fi
 
+  # Is the ENCRYPTED RECOVERY PACK itself in the backup set?
+  #
+  # Nothing checked this. dr_path_configured verifies the Immich library, the
+  # five service paths and the image-archive directory -- never the pack, which
+  # is the artefact that makes every other off-site copy openable: it holds the
+  # configuration, the secrets, Traefik's ACME account private key and the
+  # validated Uptime Kuma dump.
+  #
+  # The gap is reachable rather than theoretical. `immich_only_include_paths`
+  # DERIVES the pack path from RECOVERY_PACK_DEST -- a fix made precisely
+  # because a hardcoded literal goes stale if the pack moves -- but
+  # `backup_target_include_paths` resolves "${paths:-$target_default}", so an
+  # explicit BACKUP_TARGET_<T>_INCLUDE_PATHS in the configuration WINS and the
+  # derived default is never consulted. Production sets it explicitly with the
+  # pack path written as a literal; the values agree today, and they agree by
+  # having been written together, which is the accident the derived default was
+  # introduced to remove.
+  #
+  # So the check compares the RESOLVED destination against the scope the target
+  # will actually use, which configuration cannot bypass. It reports healthy on
+  # this host, so it is a regression guard rather than a live finding.
+  local pack_dest pcfg=0
+  pack_dest="$(recovery_pack_dest)"
+  dr_path_configured "$pack_dest" "$target" || pcfg=$?
+  if (( pcfg == 1 )); then
+    n=$((n+1))
+    echo "    $n. The ENCRYPTED RECOVERY PACK is NOT in the $target backup set."
+    echo "       $pack_dest"
+    echo "       It holds the configuration, the secrets, Traefik's ACME account"
+    echo "       private key and the validated Uptime Kuma dump -- so without it"
+    echo "       every other off-site copy is unopenable. This is the first thing"
+    echo "       to fix, ahead of any coverage question below."
+  elif (( pcfg == 2 )); then
+    n=$((n+1))
+    echo "    $n. Whether the encrypted recovery pack is off-site is UNKNOWN: no"
+    echo "       include paths could be read for $target."
+  fi
+
   # The exact-image archives are the APPLICATION half of a recovery point, and
   # they are not off-site.
   #
@@ -4697,7 +4745,7 @@ do_dr_offhost_audit() {
   # file yet". Measuring the files removes the cross-script dependency and
   # reports what EXISTS rather than what was once recorded.
   local pack_dir pack_age="" pack_ts="" newest=""
-  pack_dir="${RECOVERY_PACK_DEST:-$DOMUM_STATE_ROOT/recovery-pack}"
+  pack_dir="$(recovery_pack_dest)"
   if [[ -d "$pack_dir" ]]; then
     newest="$(find "$pack_dir" -maxdepth 1 -type f -name '*.age' -printf '%T@ %p\n' 2>/dev/null \
       | sort -rn | head -1 | cut -d' ' -f2- || true)"

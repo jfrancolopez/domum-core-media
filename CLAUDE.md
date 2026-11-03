@@ -4287,6 +4287,52 @@ the second is this one, in the opposite direction.
 
 ---
 
+**THE ENCRYPTED RECOVERY PACK'S OWN COVERAGE WAS NEVER CHECKED, and the
+configuration bypasses the fix that was supposed to protect it.** Found
+2026-11-03 from the production config, which the operator pasted while
+installing the scrub timer.
+
+`dr_path_configured` verifies the Immich library, the five service paths and the
+image-archive directory. It was never asked about the **pack** -- the artefact
+that makes every other off-site copy openable, holding the configuration, the
+secrets, Traefik's ACME account private key and the validated Uptime Kuma dump.
+
+And the gap is reachable rather than theoretical. This file records that
+`immich_only_include_paths` was changed to DERIVE the pack path from
+`RECOVERY_PACK_DEST`, because a hardcoded literal goes stale if the pack moves.
+But `backup_target_include_paths` resolves `"${paths:-$target_default}"`, so an
+explicit `BACKUP_TARGET_<T>_INCLUDE_PATHS` **wins and the derived default is
+never consulted** -- and production sets it explicitly, with the pack path
+written as a literal. The three values agree today, and they agree by having
+been written together, which is precisely the accident the derived default was
+introduced to remove. **A fix in a default is not in force wherever the
+configuration overrides that default.**
+
+So the check compares the RESOLVED destination against the scope the target
+will actually use, in `dr_remaining_risks`, where configuration cannot bypass
+it. Three states, as `dr_path_configured` already distinguishes: covered,
+NOT covered (named, with the consequence -- every other off-site copy becomes
+unopenable), and UNKNOWN when the target's roots cannot be read. It reports
+healthy on this host, so it is a regression guard rather than a live finding.
+
+**`recovery_pack_dest` is now the ONE implementation**, and the two it replaced
+were NOT equivalent: one defaulted `DOMUM_STATE_ROOT` and the other did not, so
+a caller that had not run `load_cfg` would die under `set -u` rather than fall
+back. A test asserts the expression appears once in code and that it survives
+an unset state root.
+
+**The check is in `dr-status`, NOT in `checkup`, and that limit is deliberate
+rather than an oversight.** `dr_path_configured`, `dr_target_roots` and
+`recovery_pack_dest` live in `bin/domum-media-backup`; `checkup_add` lives in
+`bin/domum-media`. Writing the check in `checkup` first produced three
+undefined calls, which `tests/function-definition-audit.py` caught immediately
+-- the undefined-helper family, in the same session that records it. Bridging
+the two CLIs properly means a purpose-built subcommand whose EXIT STATUS states
+the fact, which is this file's own rule, and that is queued rather than
+half-built. **So this finding is not yet mailed by `health-notify`.**
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

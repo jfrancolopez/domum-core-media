@@ -1011,4 +1011,97 @@ grep -q '0 of 0 original' <<< "$mout" \
   || fail "the mutant did not show the undenominated claim: $mout"
 echo "  without the coverage requirement it reports 'RESTORE TESTED, 0 of 0'"
 
+sect "the ENCRYPTED RECOVERY PACK's coverage is checked, in all three states"
+# Nothing checked this before. dr_path_configured verified the Immich library,
+# the five service paths and the image-archive directory -- never the pack,
+# which is what makes every other off-site copy openable.
+#
+# The gap is reachable: immich_only_include_paths DERIVES the pack path from
+# RECOVERY_PACK_DEST, but backup_target_include_paths resolves
+# "${paths:-$target_default}" -- so an explicit config value WINS and the
+# derived default is never consulted. Production sets it explicitly, with the
+# pack path as a literal.
+
+# 1. COVERED -- the pack sits under one of the target's roots.
+out="$(run_dr "BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library $STATE/recovery-pack'
+  RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
+grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$out" \
+  && fail "a pack inside the target's scope was reported as not covered: $out"
+echo "  covered: no risk raised"
+
+# 2. NOT COVERED -- the config names a literal that is no longer where the pack
+#    is written. This is exactly what moving RECOVERY_PACK_DEST would do, and
+#    the derived default cannot save it because the config overrides it.
+out="$(run_dr "BACKUP_TARGET_CLOUD_INCLUDE_PATHS='$DATA/immich/library $STATE/recovery-pack'
+  RECOVERY_PACK_DEST='$STATE/somewhere-else/recovery-pack'")"
+grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$out" \
+  || fail "the pack being outside every backup root was not reported: $out"
+grep -q 'unopenable' <<< "$out" \
+  || fail "the risk does not say what losing the pack costs: $out"
+grep -q 'somewhere-else/recovery-pack' <<< "$out" \
+  || fail "the risk does not name the path it checked: $out"
+echo "  not covered: reported, named, and the consequence stated"
+
+# 3. UNKNOWN -- the target's roots cannot be resolved. Never a pass and never a
+#    failure; this is the third state dr_path_configured exists to keep.
+out="$(run_dr "BACKUP_TARGET_CLOUD_INCLUDE_PATHS=''
+  BACKUP_INCLUDE_PATHS=''
+  immich_only_include_paths() { printf ''; }
+  RECOVERY_PACK_DEST='$STATE/recovery-pack'")"
+grep -qE 'recovery pack is off-site is UNKNOWN' <<< "$out" \
+  || fail "unresolvable roots did not produce the UNKNOWN state: $out"
+grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$out" \
+  && fail "unresolvable roots were reported as NOT covered, which asserts more
+than was observed: $out"
+echo "  unknown: neither excused nor blamed"
+
+sect "recovery_pack_dest is the ONE implementation, and it defaults safely"
+# Two copies of the expression existed and they were NOT equivalent: one
+# defaulted DOMUM_STATE_ROOT and the other did not, so a caller that had not
+# run load_cfg would die under `set -u` rather than fall back.
+code="$(sed 's/#.*//' "$REPO_ROOT/bin/domum-media-backup")"
+n="$(grep -c 'RECOVERY_PACK_DEST:-' <<< "$code" || true)"
+[[ "$n" == "1" ]] \
+  || fail "the pack-destination expression appears $n times in code; it must be
+one implementation: $(grep -n 'RECOVERY_PACK_DEST:-' <<< "$code")"
+# run_dr evaluates the setup BEFORE do_dr_status, so the probe's output lands
+# in the captured text; it takes no second argument.
+out="$(run_dr "unset DOMUM_STATE_ROOT RECOVERY_PACK_DEST
+  echo \"PACK=\$(recovery_pack_dest)\"" 2>&1)"
+grep -q 'PACK=/var/lib/domum-media/recovery-pack' <<< "$out" \
+  || fail "with neither variable set it must fall back, not die: $out"
+echo "  one implementation, and it survives an unset state root"
+
+sect "MUTATION: without the comparison, a pack outside every root reads as safe"
+# The whole value of this check is that configuration cannot bypass it, so the
+# mutation neutralises the COMPARISON itself -- never `&& false` inside `[[ ]]`,
+# where the bare word is a non-empty string.
+MUTP="$TMP_DIR/mut-pack"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTP"
+cat > "$TMP_DIR/mutpack.py" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  dr_path_configured "$pack_dest" "$target" || pcfg=$?'
+new = '  dr_path_configured "$pack_dest" "$pack_dest" >/dev/null 2>&1; pcfg=0'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+( python3 -I "$TMP_DIR/mutpack.py" "$MUTP" ) || fail "the pack mutation did not apply"
+mout="$(
+  # shellcheck disable=SC1090
+  source "$MUTP" >/dev/null 2>&1
+  # shellcheck disable=SC1090
+  source "$TMP_DIR/dbstub.sh"
+  set +e
+  die() { echo "DIE: $*"; exit 9; }
+  BACKUP_TARGET_CLOUD_INCLUDE_PATHS="$DATA/immich/library $STATE/recovery-pack"
+  RECOVERY_PACK_DEST="$STATE/somewhere-else/recovery-pack"
+  do_dr_status 2>&1
+)"
+grep -q 'ENCRYPTED RECOVERY PACK is NOT' <<< "$mout" \
+  && fail "the mutation changed no ANSWER -- forcing the comparison to 'covered'
+must make a pack outside every backup root read as safe"
+echo "  killed: without the comparison a pack nowhere in the scope reads as covered"
+
 echo "PASS: dr-status-smoke"
