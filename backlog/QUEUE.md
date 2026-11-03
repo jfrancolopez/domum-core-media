@@ -63,9 +63,9 @@ they do not have would turn "not checked" into a check that always fails.
 
 | # | item | status |
 |---|---|---|
-| P2.1 | measure `/srv/data/backups/images` | **BLOCKED** — `root 0750`. Unblock: `sudo du -sb /srv/data/backups/images && sudo ls -l /srv/data/backups/images` |
+| P2.1 | measure `/srv/data/backups/images` | **BLOCKED — the ONLY remaining gate on P2** (`root 0750`). Unblock, read-only: `sudo du -sb /srv/data/backups/images && sudo ls -l /srv/data/backups/images`. Everything else in P2 is designed and implemented; this is the one number that decides whether off-site archive coverage is affordable |
 | P2.2 | identify which archives a *still-valid* recovery point names | **done in code** — `storage archives` names the point per archive and now also says whether the archive actually holds that image. Still needs root to run against production |
-| P2.3 | off-site preservation + retention procedure for archives | open — designable now, depends on P2.1 only for the cost figure |
+| P2.3 | off-site preservation + retention procedure for archives | **designed** — `docs/OFFSITE-COVERAGE-CLASSIFICATION.md` §4b: retain off-site only an archive a *still-valid* recovery point names, verify it holds that image (`domum_archive_identity`, read-only) before counting it as coverage, never select by filename or mtime, keep the newest valid point per service, and treat off-site retention and on-disk retention as separate decisions. Every rule is answerable by the CLI today. §4a is now the selective capture (8.90 MiB) rather than whole directories. Activation still gated on P2.1 |
 | P2.4 | restore-from-archive procedure, proven on a disposable image | **partly done** — `domum_archive_identity` proves, read-only, that an archive contains the image its recovery point names (content-addressing; measured against a real `docker save` archive). Reported by `verify-archive` and by the `archives` inventory. What remains is proving a loaded image RUNS, which needs a disposable container |
 
 Measured 2026-10-28 and still true: **traefik and uptime-kuma run images with
