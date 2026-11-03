@@ -4195,6 +4195,44 @@ the only part of a timer that can be tested without installing it.
 
 ---
 
+**SPLICING A LINE BY REBUILDING IT FROM THE PREFIX YOU MATCHED SILENTLY
+DELETES THE REST OF IT.** Found 2026-11-03 during a final backlog review:
+`backlog/QUEUE.md`'s **P1.7** row -- the one item gating the whole
+selective-backup priority -- had read
+
+```
+| P1.7 | activate a production backup target for it |
+```
+
+with **no status column at all** since `731a907`. The cause was my own edit:
+
+```python
+old = "| P1.7 | activate a production backup target for it |"   # a PREFIX
+i = s.index(old); j = s.index("\n", i)
+s = s[:i] + new_rows + old + s[j:]        # rebuilds the line from the prefix
+```
+
+`s.index` found the prefix, `j` was the end of the whole line, and the line was
+reassembled from the prefix alone -- so `**BLOCKED** - operator decision; needs
+the archive size (P2.1)` was dropped. The edit APPLIED, the assertion passed,
+and nothing was malformed enough to notice: four commits carried a
+two-column row in a three-column table.
+
+To insert before a line, match the WHOLE line (ending in `\n`) and write
+`new_rows + whole_line`, or insert at `i` without consuming anything. Never
+rebuild a line from a fragment you searched with. "Assert that the anchor
+matched" does not cover this: the anchor matched exactly once and the edit
+still destroyed data.
+
+**And a status column that is empty reads as "no status", not as "blocked".**
+The row that mattered most for P1 looked unexamined for four commits, in the
+file whose entire purpose is to survive context compaction. Every remaining
+blocked row now names the specific prohibition or resource and, where one
+exists, the exact command that unblocks it -- so the terminal state is
+self-documenting rather than something a later session has to re-derive.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
