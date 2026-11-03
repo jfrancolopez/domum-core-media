@@ -3566,6 +3566,83 @@ result.
 
 ---
 
+**THREE MORE `set -euo pipefail` ABORTS, where the PRODUCER may legitimately
+find nothing.** The recorded family is "when a function's failure is EXPECTED
+and handled, capture it with `|| true`"; these are three sites where it was
+not, found by sweeping both CLIs with comments stripped and then **reproducing
+each one standalone** before changing anything:
+
+- **the nightly dump.** `pg_cid="$(docker ps --filter … -q 2>/dev/null | head -1)"`
+  in `quiesce_immich_postgres`. An unreachable daemon makes `docker ps` exit
+  non-zero, so the assignment failed and `set -e` killed the function **before**
+  the `if [[ -n "$pg_cid" ]]` branch written to report the database as absent.
+  The backup's highest-value stage, aborting instead of degrading.
+- **`dr_immich_summary`.** Three `find "$lib/<subtree>" … 2>/dev/null | awk …`
+  byte sums. `find` on a missing directory exits 1 and `2>/dev/null` hides the
+  message, not the status -- so the report died part-way. The `${th_b:-0}`
+  defaults a few lines below were already written on the assumption that an
+  empty value is survivable, which is the tell. It aborts exactly where it is
+  needed most: a freshly restored host, where the derivative subtrees have not
+  been rebuilt.
+- **phase B's live-photo selection.**
+  `lp_img="$(grep '^livephoto image|' <<< "$sel_lines" | cut -d'|' -f2 | head -1)"`.
+  A user with no live photo is the normal case, and grep finding nothing killed
+  the function before its own `if [[ -n "$lp_img" ]]`. Measured: exit 1, and the
+  `if` is never reached. It also carried the stop-early shape, so it is sliced
+  with `sed -n '1p'` now and nothing can take SIGPIPE.
+
+**An audit for this family is NOT shipped, deliberately.** `find` and `grep`
+inside `$( )` are everywhere and most instances are genuinely guaranteed to
+match, so a naive rule would cry wolf -- which this file already says is how an
+audit gets switched off. A narrow form (a `find` over a PATH with no `|| true`
+and no `[[ -d ]]` guard) looks tractable and needs its own mutation testing
+before it can be trusted; it is queued rather than rushed.
+
+**My own sweep read comments as code, for the fourth recorded time.** Grepping
+for a boolean read through `jq`'s `//` flagged `.smart_status.passed // empty`
+three times -- all three being the COMMENT that documents that exact defect and
+its measured outputs. The shipped code uses `| tostring`. Strip comments first,
+including when the thing being audited is this file's own history.
+
+---
+
+**I put a backtick in a comment INSIDE AN UNQUOTED HEREDOC, and two
+independent controls caught it.** The comment explaining why the call must not
+be short-circuited was written inside `<<STRICT`, so the backticked words were
+command substitution: bash tried to run them when the heredoc was WRITTEN, the
+words vanished from the generated script, and shellcheck reported `SC1070
+Parsing stopped here`. `tests/log-hygiene-smoke.sh`'s repository-wide scan also
+catches it -- verified by reintroducing one backtick and watching the suite go
+from 0 to 1 -- so it was not a blind spot; I had simply run shellcheck first.
+This is the second recorded instance of this family in a test rather than in
+help text. No backticks in a heredoc comment.
+
+**My own strict-mode harness defeated itself with `|| true`.** The test for
+"does this function abort under production's shell options" called it as
+`do_dr_status 2>&1 || true`, and bash suppresses errexit for a function invoked
+as part of an `&&`/`||` list -- the trap this file already records. The mutant
+therefore ran to completion and the test "failed" against code that was right.
+The call is bare now, and the OUTER `bash … || true` is what keeps the suite
+alive.
+
+**And the observable was wrong in a second way: `do_dr_status` legitimately
+returns non-zero.** It exits non-zero when the weakest tier is UNKNOWN, which
+is the normal state of this host, so a marker echoed after the call could never
+run even on a healthy report. The observable is the OUTPUT -- an abort inside
+TRUNCATES the report, so the assertions read for the regenerable-data block and
+the final `WEAKEST TIER` line. Name the observable the mutation actually
+changes, and check it is reachable at all on a passing run.
+
+**`git rebase --onto origin/main <tip>~1` drops the commit before the tip.**
+`--onto X Y` replays `Y..HEAD`, so passing the second-newest commit as the
+upstream silently excluded the newer of my two commits -- and the conflict it
+then raised showed the OLD rows, which is what gave it away. The upstream is
+the last commit that LANDED upstream, not an offset from the local tip. Nothing
+was lost: `git rebase --abort` restored the branch, and the patch scripts made
+re-applying the working-tree edits deterministic.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

@@ -29,6 +29,11 @@ set -euo pipefail
 
 case "${1:-}" in
   ps)
+    # An unreachable daemon: `docker ps` exits non-zero and prints nothing.
+    if [ -n "${FAKE_DOCKER_PS_FAILS:-}" ]; then
+      echo "Cannot connect to the Docker daemon" >&2
+      exit 1
+    fi
     echo immich-postgres-container
     ;;
   exec)
@@ -72,6 +77,37 @@ write_sql_body() {
       "$i" "$i" "$((i * 7919))"
   done
 }
+
+# An UNREACHABLE docker daemon must not abort the backup.
+#
+# `pg_cid="$(docker ps … | head -1)"` was unguarded, so a daemon that cannot be
+# reached made the assignment fail and `set -e` killed the function BEFORE the
+# branch written to report the database as absent -- the family where a
+# graceful path is unreachable because its own precondition aborts first.
+#
+# This has to run in its OWN bash process: inside `if f; then` bash suppresses
+# errexit for the function, so the abort could not show here.
+cat > "$TMP_DIR/strict-nodaemon.sh" <<STRICT
+set -euo pipefail
+export PATH="$FAKE_BIN:\$PATH"
+export FAKE_DOCKER_PS_FAILS=1
+export FAKE_PG_DUMP_PAYLOAD="$FAKE_PAYLOAD"
+source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+DOMUM_DATA_ROOT="$DATA_DIR"
+DOMUM_SNAPSHOT_ROOT="$SNAPSHOT_DIR"
+DOMUM_LOG_DIR="$LOG_DIR"
+LOG_FILE="$LOG_DIR/backup.log"
+quiesce_immich_postgres >/dev/null 2>&1 || true
+echo REACHED-END
+STRICT
+printf '%s\n' 'known-good-dump' | gzip -9 > "$dump_file"
+nod_out="$(bash "$TMP_DIR/strict-nodaemon.sh" 2>&1 || true)"
+grep -q 'REACHED-END' <<< "$nod_out" \
+  || fail "an unreachable docker daemon aborted the function under 'set -euo
+pipefail' instead of taking the no-container branch: $nod_out"
+cmp -s "$known_good" "$dump_file" \
+  || fail "with no daemon reachable the prior dump was modified"
+assert_no_temp_dump
 
 # A failed pg_dump must not replace the previous known-good artifact.
 printf '%s\n' 'partial dump' > "$FAKE_PAYLOAD"

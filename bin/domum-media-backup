@@ -339,7 +339,10 @@ quiesce_immich_postgres() {
   local pg_user="${IMMICH_DB_USERNAME:-postgres}"
   local pg_db="${IMMICH_DB_DATABASE_NAME:-immich}"
   local pg_cid
-  pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null | head -1)"
+  # An unreachable docker daemon makes `docker ps` exit non-zero, which under
+  # pipefail aborted the backup here rather than letting the `else` below report
+  # the database as not running. Finding no container is also a normal answer.
+  pg_cid="$(docker ps --filter "name=immich_postgres" --filter "status=running" -q 2>/dev/null | sed -n '1p' || true)"
   if [[ -n "$pg_cid" ]]; then
     log "pg_dump immich -> $dump_file"
     dump_tmp="$(mktemp "$stage_dir/.immich-postgres.dump.sql.gz.XXXXXX.tmp")"
@@ -2551,10 +2554,14 @@ dr_immich_summary() {  # $1 = target, $2 = library root, $3 = counts, $4 = inven
 
   # What an exclusion would save, measured now rather than quoted from a doc.
   local th_b ev_all_b ev_d_b
-  th_b="$(find "$lib/thumbs" -type f -printf '%s\n' 2>/dev/null | awk '{b+=$1} END{print b+0}')"
-  ev_all_b="$(find "$lib/encoded-video" -type f -printf '%s\n' 2>/dev/null | awk '{b+=$1} END{print b+0}')"
+  # `find` on a subtree that does not exist exits 1, and `2>/dev/null` hides the
+  # message but not the status -- so under pipefail these assignments aborted the
+  # whole report. The `${th_b:-0}` defaults below were already written on the
+  # assumption that an empty value is survivable; `|| true` is what makes it so.
+  th_b="$(find "$lib/thumbs" -type f -printf '%s\n' 2>/dev/null | awk '{b+=$1} END{print b+0}' || true)"
+  ev_all_b="$(find "$lib/encoded-video" -type f -printf '%s\n' 2>/dev/null | awk '{b+=$1} END{print b+0}' || true)"
   ev_d_b="$(find "$lib/encoded-video" -type f -name '*[0-9a-f].mp4' -printf '%s\n' 2>/dev/null \
-    | awk '{b+=$1} END{print b+0}')"
+    | awk '{b+=$1} END{print b+0}' || true)"
   echo "  REGENERABLE DATA (currently backed up)"
   printf '    %-34s %s\n' "thumbs/" "$(sample_human_bytes "${th_b:-0}")"
   printf '    %-34s %s\n' "encoded-video/ (whole subtree)" "$(sample_human_bytes "${ev_all_b:-0}")"
@@ -4365,7 +4372,11 @@ production actually runs, so it will not substitute a tag."
     # The live-photo VIDEO is selected from the chosen image, because the
     # relationship is not 1:1 and must be followed rather than guessed.
     local lp_img
-    lp_img="$(grep '^livephoto image|' <<< "$sel_lines" | cut -d'|' -f2 | head -1)"
+    # grep finding NOTHING is the expected case -- a user with no live photo --
+    # and under `set -euo pipefail` an unguarded pipeline made the assignment
+    # fail and killed the function before the `if` below could run. Sliced with
+    # sed rather than `| head -1` so nothing can take SIGPIPE either.
+    lp_img="$(sed -nE 's/^livephoto image\|([^|]*).*/\1/p' <<< "$sel_lines" | sed -n '1p' || true)"
     if [[ -n "$lp_img" ]]; then
       sel_lines="$sel_lines
 $(phaseb_livephoto_video_sql "$lp_img" | docker exec -i "$c_pg" psql -U postgres -d immich -At 2>/dev/null || true)"

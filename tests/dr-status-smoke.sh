@@ -85,6 +85,98 @@ run_dr() {  # $1 = optional shell evaluated after sourcing, to stub a function
   )
 }
 
+# A library whose derivative subtrees do NOT exist must not abort the report.
+#
+# `find "$lib/thumbs" … 2>/dev/null | awk …` was unguarded: `find` on a missing
+# directory exits 1, `2>/dev/null` hides the message and not the status, and
+# under pipefail the assignment failed and `set -e` killed `dr_immich_summary`
+# part-way through the report. The `${th_b:-0}` defaults a few lines below were
+# already written on the assumption that an empty value is survivable.
+#
+# `run_dr` sets `set +e`, so the abort cannot show there -- a test that relaxes
+# production's shell options is not a test of production. This drives the real
+# `do_dr_status` in its own strict bash process.
+strict_dr() {  # $1 = library root to use
+  cat > "$TMP_DIR/strict-dr.sh" <<STRICT
+set -euo pipefail
+source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+source "$TMP_DIR/dbstub.sh"
+die() { echo "DIE: \$*"; exit 9; }
+IMMICH_LIBRARY_DIR="$1"
+# Deliberately NOT guarded with a short-circuit here: bash suppresses errexit
+# for a function invoked as part of an && / || list, so guarding the call would
+# defeat the whole point. The OUTER bash invocation is what keeps the suite
+# alive.
+#
+# And the observable is the OUTPUT, not a marker after the call: do_dr_status
+# legitimately returns non-zero when the weakest tier is UNKNOWN, so a trailing
+# echo would never run even on a healthy report. An abort inside TRUNCATES the
+# report, which is what the assertions below read.
+#
+# No backticks in this comment: it lives inside an UNQUOTED heredoc, where a
+# backtick is command substitution and silently deletes the words it wraps.
+do_dr_status 2>&1
+STRICT
+  bash "$TMP_DIR/strict-dr.sh" 2>&1 || true
+}
+
+mkdir -p "$TMP_DIR/emptylib"
+out="$(strict_dr "$TMP_DIR/emptylib")"
+grep -q 'REGENERABLE DATA' <<< "$out" \
+  || fail "a library with no thumbs/ or encoded-video/ aborted dr-status under
+'set -euo pipefail' before the regenerable-data block. The report dies exactly
+where it would be needed most -- on a freshly restored host: $out"
+grep -q 'WEAKEST TIER' <<< "$out" \
+  || fail "the report did not reach its final line, so it aborted part-way: $out"
+echo "  a library with absent derivative subtrees does not abort the report"
+
+# MUTATION: restore the unguarded form and require the abort to come back.
+MUTDR="$TMP_DIR/mut-dr-backup"
+cp "$REPO_ROOT/bin/domum-media-backup" "$MUTDR"
+cat > "$TMP_DIR/mutdr.py" <<'PYMUT'
+import io, sys
+# Strip the guard from th_b's line WITHOUT quoting the whole line: it contains
+# both quote characters and a trailing )" , which is how two earlier attempts
+# at this produced a Python SyntaxError and a mutation that silently did
+# nothing. Locate the line, then remove the guard from it.
+p = sys.argv[1]
+lines = io.open(p, encoding="utf-8").read().splitlines(True)
+hits = [i for i, l in enumerate(lines) if l.lstrip().startswith('th_b="$(find')]
+assert len(hits) == 1, "expected one th_b find line, got %d" % len(hits)
+i = hits[0]
+assert " || true" in lines[i], "the guard is not on that line: %s" % lines[i]
+lines[i] = lines[i].replace(" || true", "", 1)
+io.open(p, "w", encoding="utf-8").writelines(lines)
+PYMUT
+( python3 -I "$TMP_DIR/mutdr.py" "$MUTDR" ) || fail "the dr-status find mutation did not apply"
+cat > "$TMP_DIR/strict-dr-mut.sh" <<STRICT
+set -euo pipefail
+source "$MUTDR" >/dev/null 2>&1
+source "$TMP_DIR/dbstub.sh"
+die() { echo "DIE: \$*"; exit 9; }
+IMMICH_LIBRARY_DIR="$TMP_DIR/emptylib"
+# Deliberately NOT guarded with a short-circuit here: bash suppresses errexit
+# for a function invoked as part of an && / || list, so guarding the call would
+# defeat the whole point. The OUTER bash invocation is what keeps the suite
+# alive.
+#
+# And the observable is the OUTPUT, not a marker after the call: do_dr_status
+# legitimately returns non-zero when the weakest tier is UNKNOWN, so a trailing
+# echo would never run even on a healthy report. An abort inside TRUNCATES the
+# report, which is what the assertions below read.
+#
+# No backticks in this comment: it lives inside an UNQUOTED heredoc, where a
+# backtick is command substitution and silently deletes the words it wraps.
+do_dr_status 2>&1
+STRICT
+mout="$(bash "$TMP_DIR/strict-dr-mut.sh" 2>&1 || true)"
+grep -q 'REGENERABLE DATA' <<< "$mout" \
+  && fail "the mutation changed no ANSWER -- without '|| true' a missing
+thumbs/ must abort the report BEFORE the regenerable-data block: $mout"
+grep -q 'WEAKEST TIER' <<< "$mout" \
+  && fail "the mutant reached the report's final line, so it did not abort: $mout"
+echo "  killed: unguarded, the missing subtree aborts dr-status"
+
 # The legend line names all five levels, so a negative assertion must be
 # scoped to a RESULT ROW or it matches the legend and passes vacuously.
 row_level() {  # $1 = output, $2 = tier -> the level in that row
