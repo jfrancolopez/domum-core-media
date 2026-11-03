@@ -4652,19 +4652,40 @@ service_named_volumes() {  # $1 = service
 # --numeric-owner --xattrs --acls because this is a restore source, not a backup
 # for reading: traefik's acme.json is mode 0600 owned by root and must come back
 # that way. Restoring it world-readable would turn a recovery into a disclosure.
+# The first line of a captured stderr, for a warning that must name its cause.
+#
+# The volume dump and restore discarded stderr with `2>/dev/null` and then
+# warned without a reason, so a failure for permission, for space, or for an
+# xattr the destination cannot take produced one identical sentence. The STATUS
+# was always checked correctly -- only the cause was thrown away, and those
+# three have sharply different remedies. An unactionable failure trains the
+# operator to ignore it.
+#
+# Returns a value on stdout, so it logs nothing: `tests/captured-stdout-purity-smoke.sh`
+# exists because a progress line once became part of a caller's captured value.
+first_error_line() {  # $1 = a file holding captured stderr
+  local line=""
+  [[ -r "${1:-}" ]] \
+    && line="$(sed -n '/[^[:space:]]/{p;q;}' "$1" 2>/dev/null || true)"
+  printf '%s' "${line:-no diagnostic was produced}"
+}
+
 dump_volume_to_file() {  # $1 = volume name, $2 = destination .tar
-  local vol="$1" dest="$2" dir mp
+  local vol="$1" dest="$2" dir mp terr
   dir="$(dirname "$dest")"
   install -d -m 0750 "$dir" || { warn "cannot create $dir"; return 1; }
   [[ -e "$dest" ]] && { warn "refusing to overwrite an existing dump: $dest"; return 1; }
   mp="$(docker_volume_mountpoint "$vol")"
   [[ -n "$mp" && -d "$mp" ]] \
     || { warn "volume $vol has no readable mountpoint"; return 1; }
-  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$dest.partial" . 2>/dev/null; then
+  terr="$(mktemp)" || { warn "cannot create a temporary file for tar's output"; return 1; }
+  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$dest.partial" . 2>"$terr"; then
     rm -f -- "$dest.partial"
-    warn "could not archive volume $vol from $mp"
+    warn "could not archive volume $vol from $mp: $(first_error_line "$terr")"
+    rm -f -- "$terr"
     return 1
   fi
+  rm -f -- "$terr"
   sha256sum "$dest.partial" | awk '{print $1}' > "$dest.sha256.partial" \
     || { rm -f -- "$dest.partial" "$dest.sha256.partial"; warn "could not checksum the dump"; return 1; }
   sync -f "$dest.partial" 2>/dev/null || sync 2>/dev/null || true
@@ -10561,7 +10582,7 @@ storage_verify_volume_dumps() {  # $1 = recovery point
 #
 # Refuses before touching anything if the dump does not match its checksum.
 restore_volume_from_file() {  # $1 = volume, $2 = dump .tar, $3 = stamp
-  local vol="$1" dump="$2" stamp="$3" mp aside
+  local vol="$1" dump="$2" stamp="$3" mp aside terr
   verify_volume_dump_file "$dump" || return 1
   mp="$(docker_volume_mountpoint "$vol")"
   [[ -n "$mp" && -d "$mp" ]] || { warn "volume $vol has no readable mountpoint"; return 1; }
@@ -10571,11 +10592,14 @@ restore_volume_from_file() {  # $1 = volume, $2 = dump .tar, $3 = stamp
     warn "refusing to overwrite an existing preserved dump: $aside"
     return 1
   fi
-  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$aside.partial" . 2>/dev/null; then
+  terr="$(mktemp)" || { warn "cannot create a temporary file for tar's output"; return 1; }
+  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$aside.partial" . 2>"$terr"; then
     rm -f -- "$aside.partial"
-    warn "could not preserve the current contents of $vol; nothing was restored"
+    warn "could not preserve the current contents of $vol; nothing was restored: $(first_error_line "$terr")"
+    rm -f -- "$terr"
     return 1
   fi
+  rm -f -- "$terr"
   sync -f "$aside.partial" 2>/dev/null || sync 2>/dev/null || true
   mv -- "$aside.partial" "$aside" || { warn "could not publish $aside"; return 1; }
   chmod 0640 "$aside" 2>/dev/null || true
@@ -10583,12 +10607,18 @@ restore_volume_from_file() {  # $1 = volume, $2 = dump .tar, $3 = stamp
 
   # Clear, then unpack. `find -delete` rather than `rm -rf "$mp"`: the volume
   # mountpoint itself must survive, because docker owns it.
-  find "$mp" -mindepth 1 -delete 2>/dev/null \
-    || { warn "could not clear $mp; the preserved copy is at $aside"; return 1; }
-  if ! tar -C "$mp" --numeric-owner --xattrs --acls -xf "$dump" 2>/dev/null; then
-    warn "could not unpack $dump into $mp. The previous contents are at $aside."
+  terr="$(mktemp)" || { warn "cannot create a temporary file; the preserved copy is at $aside"; return 1; }
+  if ! find "$mp" -mindepth 1 -delete 2>"$terr"; then
+    warn "could not clear $mp: $(first_error_line "$terr"). The preserved copy is at $aside."
+    rm -f -- "$terr"
     return 1
   fi
+  if ! tar -C "$mp" --numeric-owner --xattrs --acls -xf "$dump" 2>"$terr"; then
+    warn "could not unpack $dump into $mp: $(first_error_line "$terr"). The previous contents are at $aside."
+    rm -f -- "$terr"
+    return 1
+  fi
+  rm -f -- "$terr"
   return 0
 }
 

@@ -426,5 +426,120 @@ grep -q 'compose stop' <<< "$(calls)" \
 section 15 is not proving the ordering"
 echo "  without it the service IS stopped before the corruption is found"
 
+# ===========================================================================
+# A FAILURE MUST NAME ITS CAUSE. These paths discarded tar's stderr with
+# `2>/dev/null` and then warned without a reason, so permission, no space, and
+# an xattr the destination cannot take all produced one identical sentence --
+# three failures with sharply different remedies. An unactionable failure
+# trains the operator to ignore it, and this is a RESTORE path.
+# ===========================================================================
+
+echo "== 20. a dump that cannot read the volume says WHY =="
+setup
+mkdir -p "$ENV_DIR/vol/unreadable"
+printf 'x\n' > "$ENV_DIR/vol/unreadable/f"
+chmod 000 "$ENV_DIR/vol/unreadable"
+# An explicit fresh destination: dump_file() finds an EXISTING dump, and there
+# is none here on purpose -- a pre-existing one would hit the overwrite refusal
+# instead of the tar failure this section is about.
+d="$ENV_DIR/data/backups/volumes/20261103-200000-fixture-vol.tar"
+rc="$(probe "dump_volume_to_file fixture-vol $d")"
+chmod 755 "$ENV_DIR/vol/unreadable"
+[ "$rc" != "0" ] || { out; fail "20: an unreadable subdirectory did not fail the dump"; }
+grep -q 'could not archive volume' "$ENV_DIR/err" \
+  || { out; fail "20: the failure is not reported"; }
+grep -qi 'permission denied' "$ENV_DIR/err" \
+  || { out; fail "20: the warning does not NAME the cause. Without it, permission,
+no space and an unsupported xattr are one sentence with three remedies"; }
+grep -q 'no diagnostic was produced' "$ENV_DIR/err" \
+  && { out; fail "20: the stand-in was used although tar did produce a diagnostic"; }
+[ ! -e "$d.partial" ] || { out; fail "20: the partial dump was left behind"; }
+echo "  fails, names the cause, and leaves no partial"
+
+echo "== 21. an unpack that fails says WHY, and still names the preserved copy =="
+# The restore's most dangerous moment: the volume has already been cleared, so
+# the warning is the only thing standing between the operator and a lost
+# volume. It must say what went wrong AND where the previous contents are.
+setup
+probe 'storage_volume_pre_upgrade_point traefik --archive-image' >/dev/null
+d="$(dump_file)"
+# A dump that is not a tar at all: tar fails on unpack, after the clear.
+cp "$d" "$ENV_DIR/good.tar"
+printf 'this is not a tar archive\n' > "$d"
+sha256sum "$d" | awk '{print $1}' > "$d.sha256"
+rc="$(probe "restore_volume_from_file fixture-vol $d 20261103-200000")"
+[ "$rc" != "0" ] || { out; fail "21: a corrupt archive unpacked successfully?"; }
+grep -q 'could not unpack' "$ENV_DIR/err" || { out; fail "21: the failure is not reported"; }
+grep -q 'previous contents are at' "$ENV_DIR/err" \
+  || { out; fail "21: it does not say where the previous contents are, which is the
+one thing the operator needs once the volume has been cleared"; }
+grep -q 'no diagnostic was produced' "$ENV_DIR/err" \
+  && { out; fail "21: tar's own diagnostic was discarded"; }
+echo "  fails, names tar's own reason, and points at the preserved copy"
+
+echo "== 22. first_error_line returns a value and never logs =="
+# It is used inside a `warn` string, so anything it writes to stdout becomes
+# part of that message -- and `tests/captured-stdout-purity-smoke.sh` exists
+# because a progress line once became part of a caller's captured value.
+f="$ENV_DIR/err-sample"
+printf '\n\n  tar: /x: Cannot open: Permission denied\nsecond line\n' > "$f"
+probe "first_error_line $f" >/dev/null
+got="$(cat "$ENV_DIR/out")"
+grep -q 'Cannot open: Permission denied' <<< "$got" \
+  || { echo "got: [$got]"; fail "22: it did not return the first non-empty line"; }
+grep -q 'second line' <<< "$got" \
+  && { echo "got: [$got]"; fail "22: it returned more than the first line"; }
+grep -q 'Cannot open' <<< "$(cat "$ENV_DIR/err")" \
+  && { out; fail "22: it wrote the reason to stderr as well, so a caller that
+captures it gets the value twice"; }
+# An absent file is a stand-in, never an empty message: a warning ending in
+# ": " reads as a truncated sentence and tells the operator nothing.
+probe "first_error_line $ENV_DIR/definitely-absent" >/dev/null
+got2="$(cat "$ENV_DIR/out")"
+grep -q 'no diagnostic was produced' <<< "$got2" \
+  || { echo "got: [$got2]"; fail "22: an absent capture produced an empty reason"; }
+echo "  the first non-empty line, and a stand-in when there is none"
+
+echo "== 23. MUTATION: discarding tar's stderr must make the cause disappear =="
+# Restores the shape these three sections exist to retire: `2>/dev/null` plus a
+# warning with no reason. Without this, the new assertions could rot into
+# always-passing and nothing would notice, because a passing assertion looks
+# the same either way.
+mut2="$TMP_DIR/mut-stderr"
+mkdir -p "$mut2"
+cp "$CLI" "$mut2/domum-media"
+python3 -I - "$mut2/domum-media" <<'PYMUT' || fail "23: the mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '''  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$dest.partial" . 2>"$terr"; then
+    rm -f -- "$dest.partial"
+    warn "could not archive volume $vol from $mp: $(first_error_line "$terr")"'''
+new = '''  if ! tar -C "$mp" --numeric-owner --xattrs --acls -cf "$dest.partial" . 2>/dev/null; then
+    rm -f -- "$dest.partial"
+    warn "could not archive volume $vol from $mp"'''
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUT
+grep -q 'warn "could not archive volume \$vol from \$mp"$' "$mut2/domum-media" \
+  || fail "23: the mutation is not in the file"
+setup
+mkdir -p "$ENV_DIR/vol/unreadable"
+printf 'x\n' > "$ENV_DIR/vol/unreadable/f"
+chmod 000 "$ENV_DIR/vol/unreadable"
+d="$ENV_DIR/data/backups/volumes/20261103-210000-fixture-vol.tar"
+saved="$CLI"; CLI="$mut2/domum-media"
+rc="$(probe "dump_volume_to_file fixture-vol $d")"
+CLI="$saved"
+chmod 755 "$ENV_DIR/vol/unreadable"
+[ "$rc" != "0" ] || fail "23: the mutant did not fail at all, so it is not the
+same failure path section 20 drives"
+grep -q 'could not archive volume' "$ENV_DIR/err" \
+  || { out; fail "23: the mutant did not reach the warning"; }
+grep -qi 'permission denied' "$ENV_DIR/err" \
+  && { out; fail "23: the mutation changed no ANSWER -- discarding tar's stderr
+must make the cause disappear from the warning"; }
+echo "  killed: without the capture the operator is told only that it failed"
+
 echo
 echo "PASS: volume recovery point smoke"
