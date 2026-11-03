@@ -8,8 +8,8 @@ Reconciled against the repository and the live host on **2026-11-03**.
 
 | | |
 |---|---|
-| production | `a63ad19` |
-| development / `main` | `f7e6d5d` |
+| production | `a63ad19` — **verified by hash, not repeated**: the installed `/usr/local/bin/domum-media` is `5e65f06c…`, which is `bin/domum-media` at exactly that commit, and the installed and checkout copies of both CLIs are byte-identical (the deployment's own invariant) |
+| development / `main` | `accc366` — this line said `f7e6d5d`, thirteen commits stale. A revision constant inside the repository it pins goes stale by construction, which is why the deployment script refuses to carry one; here it is a header a new session reads first, so check it against `git rev-parse origin/main` rather than trusting it |
 | rule | an item is only `done` with evidence named here |
 
 Statuses: `open` · `in progress` · `done (sha)` · `BLOCKED (reason)`.
