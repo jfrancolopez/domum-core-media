@@ -4233,6 +4233,33 @@ self-documenting rather than something a later session has to re-derive.
 
 ---
 
+**FOUR OF THE APPROVAL-GATED ITEMS NEED THE DEPLOYMENT FIRST, which no row
+said.** `capture-state`, `verify-state` and `restore-state` are **not in the
+installed binary** -- production is `a63ad19` and predates all of them. So
+**P1.7** (activate a target for the captures) and **P1.8**'s real run are
+gated on the deployment and only then on approval, while **P4.6**, **P3.5** and
+**P5.2** act on what is installed today.
+
+Recommending a capture command now would hand the operator a usage error --
+precisely the recorded defect from when `storage verify-recovery` was suggested
+while it sat on an unmerged branch. The rule is "never tell the operator to run
+a command that is not DEPLOYED", and it applies to an OPERATOR ACTION REQUIRED
+block more than anywhere else, because that block is written to be pasted.
+
+Checked while assembling it: `QUIESCED_CAPTURE_ENABLED` is read from the
+environment and is **not** set by `load_cfg`, so `sudo env
+QUIESCED_CAPTURE_ENABLED=1 …` is the correct form -- `domum-media` is a script
+file, not a shell function, so `env` can exec it.
+
+**Btrfs error escalation, re-verified against the real host 2026-11-03:**
+unreadable counters give `0 CRITICAL` and a warning paired with the
+`btrfs device stats` remedy, so the finding reaches the notifier without
+claiming damage; a simulated `corruption_errs = 7` escalates to **CRITICAL**;
+and `btrfs_unique_roots` collapses `/srv/data` and `/srv/snapshots` to the one
+filesystem uuid `211e06b3`, which is the recorded dedup.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

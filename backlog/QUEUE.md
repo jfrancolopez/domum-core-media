@@ -18,6 +18,24 @@ rather than being deleted.
 
 ---
 
+## Deployment — and what depends on it
+
+**`capture-state`, `verify-state` and `restore-state` are NOT in the installed
+binary.** Production is `a63ad19`, which predates every one of them. So the
+operator-approval items split into two groups, and the order matters:
+
+| needs the deployment FIRST | works against the installed binary today |
+|---|---|
+| **P1.7** (activate a target for the captures) | **P4.6** (install + enable the scrub timer) |
+| **P1.8** real run (`capture-state --quiesce`) | **P5.2** (off-host key copy — no command on this host at all) |
+| | **P3.5** (`updates apply --service …`; `volume-pre-upgrade-point` is installed) |
+
+Recommending a capture command today would give the operator a usage error —
+the recorded defect from when `storage verify-recovery` was suggested off an
+unmerged branch. `QUIESCED_CAPTURE_ENABLED` is read from the environment and is
+**not** set by `load_cfg` (checked), so `sudo env QUIESCED_CAPTURE_ENABLED=1 …`
+is the right form once it is deployed.
+
 ## Deployment
 
 Production is at `a63ad19` with **no drift** — every installed file's sha256
