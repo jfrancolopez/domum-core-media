@@ -4067,6 +4067,51 @@ instead of the first.
 
 ---
 
+**A REHEARSAL WHOSE CONTAINER RUNS AS ROOT LEAVES LITTER THE DEVELOPMENT
+ACCOUNT CANNOT REMOVE, and I made that avoidable mistake.** The Jellyfin
+rehearsal set `PUID: "0"` / `PGID: "0"` in its disposable compose file, so the
+container wrote 39 root-owned entries into the fixture. Tearing the container
+down worked; `rm -rf` on the fixture then failed with `Permission denied` and
+left 1.2 MB behind in the scratch directory.
+
+**linuxserver.io images honour `PUID`/`PGID`** -- Jellyfin is one -- so a
+rehearsal should pass the invoking account's own ids:
+
+```
+    environment:
+      PUID: "<id -u>"
+      PGID: "<id -g>"
+```
+
+Then every file the rehearsal creates belongs to the account that has to delete
+it. That is the fix, and it costs nothing: the rehearsal is about shutdown
+behaviour and capture correctness, neither of which depends on the container
+running as root.
+
+The Kavita rehearsal met the same problem and solved it differently -- a
+disposable `busybox` container with the fixture mounted did the removal, the
+same tool that created the problem removing it. That works, but it is the
+second-best answer: it needs a privileged container to clean up after an
+unprivileged test, and a removal run inside a container is exactly the shape a
+safety check should and does question. Prefer `PUID`/`PGID`.
+
+**What the two rehearsals DID get right**, and what any future one must: a
+disposable compose project whose name is checked free first, images pinned by
+ID read from the running container rather than by a mutable tag, bind mounts
+under a temp directory, no external network, no production path or volume, the
+production container id asserted absent from the project's scope BEFORE the
+first stop, and teardown asserted rather than assumed. The one thing not
+asserted was the FIXTURE's removal -- only the container's -- which is how the
+litter went unnoticed until the final state check counted 12 containers instead
+of 11.
+
+**Count the containers at the end.** That is what caught it: the final
+verification printed `containers 12 running` and one `rehears` match, and the
+Jellyfin project had never been torn down at all. A rehearsal's teardown
+assertion belongs in the rehearsal, not in a later review.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
