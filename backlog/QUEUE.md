@@ -97,7 +97,7 @@ designed. **No implementation exists** — verified 2026-11-03, there is no
 | P1.4 | capture manifest: sha256, sizes, image identity, capture mode | **done** — `MANIFEST` carries `CAPTURE_MODE`, `IMAGE_ID` and a digest per item; `service_state_verify` re-reads them, and a missing declared item is `RESULT=INCOMPLETE` with exit 1 |
 | P1.5 | restore into a scratch target, never over live state | **done** — `service_state_restore` + `storage restore-state`. Refuses a target that overlaps the live state root (resolved paths, so a symlink or `..` cannot walk in), refuses a non-empty target, refuses a capture that does not verify, re-proves every restored item's digest and mode, and integrity-checks restored databases. 4 mutants, all killed |
 | P1.6 | disposable-fixture tests + mutations | **done** — `tests/state-capture-smoke.sh`, wired into CI; 2 mutants, both killed. A `docker` stub that exits non-zero is on PATH, so reaching the real daemon fails rather than quietly succeeding |
-| P1.8 | jellyfin/kavita are WAL-mode with no sqlite3 anywhere — a quiesced capture is the only way to make their mode consistent | **rehearsed against the REAL Kavita image; gated off** — measured 2026-11-03: Kavita's clean stop folds its 4,132,392-byte WAL into the main database and removes the `-wal` outright, so quiescence passes on its merits and the captured database opens with 84 tables and `integrity_check: ok`. Image pinned by ID, production untouched, teardown asserted. `docs/SELECTIVE-STATE-PROTECTION.md` Phase E (mechanism, busybox) and Phase F (real image). **jellyfin not yet rehearsed**, and production Kavita has a populated library and days of uptime, so the real run — which causes downtime — stays an operator decision |
+| P1.8 | jellyfin/kavita are WAL-mode with no sqlite3 anywhere — a quiesced capture is the only way to make their mode consistent | **rehearsed against the REAL Kavita image; gated off** — measured 2026-11-03: Kavita's clean stop folds its 4,132,392-byte WAL into the main database and removes the `-wal` outright, so quiescence passes on its merits and the captured database opens with 84 tables and `integrity_check: ok`. Image pinned by ID, production untouched, teardown asserted. `docs/SELECTIVE-STATE-PROTECTION.md` Phase E (mechanism, busybox) and Phase F (real image). **Jellyfin rehearsed too, same day and same result** — a 3,188,912-byte `jellyfin.db-wal` before the clean stop and nothing after it, so both services with no sqlite3 behave alike; that rehearsal is also what exposed `capture-state` missing `need_root` (it stopped the service for a capture that could never succeed, because the `0600 root` DataProtection key is unreadable unprivileged) and what showed the six declared items appearing in STAGES during startup. **Still gated:** production Kavita and Jellyfin have populated libraries and days of uptime, so their shutdown has more to finish, and the real run causes downtime — an operator decision |
 | P1.9 | surface `CAPTURE_MODE` in the restore report | **done** — printed with its reason; a consistent capture reports distinctly so the unproven wording cannot be boilerplate, and an absent key reads `unknown`, never the reassuring value |
 | P1.6b | a DEFAULT capture destination, so captures are schedulable | **done** — `state_capture_dir()` -> `<data>/backups/state/<service>/<stamp>`, a sibling of the service directory and never inside it (a capture written under `/srv/data/<service>` would duplicate into every per-service snapshot of that service). Proven end to end, not just in the dispatcher. It puts nothing off-site: the cloud target is immich-only, so the default is on the protected local tier and nowhere else |
 | P1.6c | a stale protection claim in `image_archive_dir`'s comment | **fixed** — it asserted an archive there was covered off-site because restic is given `$DOMUM_DATA_ROOT`. True of the GLOBAL include set, false of the target that runs. The operator found the same error in `dr-status` by listing the Hetzner snapshot; the code comment still carried it |
@@ -113,16 +113,29 @@ so every consistent capture depends on the service's own binary.
 | plex | `/usr/lib/plexmediaserver/Plex SQLite` 3.39.4 | **911,792 B** + `-shm` | `.backup` — and only this binary can read its `collating` FTS tokenizer |
 | navidrome | `/usr/bin/sqlite3` 3.45.3 | **20,632 B** + `-shm` | `.backup` |
 | calibre-web | `/usr/bin/sqlite3` 3.45.1 | none (`journal_mode delete`) | `.backup`, and a copy is already sound |
-| jellyfin | **none** | **no `-wal`, no `-shm`** | **unprovable** — see below |
-| kavita | **none** | **no `-wal`/`-shm`** on `kavita.db` | **unprovable** |
+| jellyfin | **none** | WAL-mode, sidecars removed at close | **not in place** — quiesce; proven to checkpoint on a clean stop |
+| kavita | **none** | WAL-mode, sidecars removed at close | **not in place** — quiesce; proven to checkpoint on a clean stop |
 
-The two services with no sqlite3 are exactly the two showing no WAL sidecars,
-which is fortunate but **is not proof of non-WAL mode**: SQLite removes the
-`-wal` when the last connection closes, and the absent `-shm` only says there
-is no open WAL connection *right now*. Without a binary that can run
-`PRAGMA journal_mode` there is no way to establish it, so their capture mode
-must be reported as unproven rather than assumed safe. Declaring a sqlite path
-they do not have would turn "not checked" into a check that always fails.
+The two services with no sqlite3 are exactly the two that showed no WAL
+sidecars, and **that absence is not proof of non-WAL mode** — SQLite removes
+the `-wal` when the last connection closes. An earlier version of this table
+read it the other way and called their mode *unprovable without a
+`PRAGMA journal_mode`*. Both halves of that were wrong, and `CLAUDE.md` records
+the measurements:
+
+- **the mode is readable without any binary.** Bytes 18/19 of the SQLite file
+  header are `write_version`/`read_version`; measured 2026-11-02 as a pure read
+  — no open, no lock, no privilege — both are `2`, i.e. **WAL**. navidrome is
+  WAL too; calibre-web is `1`/`1`, a rollback journal;
+- **a clean stop checkpoints.** Measured 2026-11-03 against both production
+  images pinned by ID: kavita folded a 4,132,392-byte WAL into its main
+  database and jellyfin a 3,188,912-byte one, each removing the `-wal` outright.
+
+So an *in-place* capture of either is torn rather than merely crash-consistent,
+which is why `CAPTURE_MODE=unproven` is the honest word for it, and
+`--quiesce` is the path that earns `file-copy-quiesced`. Declaring a sqlite
+path they do not have would still turn "not checked" into a check that always
+fails.
 
 ---
 
@@ -172,8 +185,6 @@ dispatch, the closed gate, and phase 4's model-awareness.
 
 ---
 
-| P6.6 | let `checkup` ask whether the recovery pack can leave this host | **done** — `domum-media-backup pack-offhost [target] [--json]`, exit 0 delivered off-host / 1 none or CIRCULAR / 2 not answerable, consumed by `checkup_recovery_pack_offhost`. The question was CORRECTED on the way: "is the pack in the backup set" was the wrong one (the cloud scope includes it deliberately) and it contradicted `dr-offhost-audit`, whose circularity row read the GLOBAL include paths and so reassured about production. `recovery_pack_coverage` is now the one implementation for all three readers. `circular`/`none` are critical with an action, so they mail; a non-answer is a warning, which is why the caller requires the JSON and not just the status. 2 mutants, killed |
-
 ## P5 — Disaster recovery
 
 | # | item | status |
@@ -197,3 +208,4 @@ Found and fixed this session: see `CLAUDE.md`. Ongoing hunt, no fixed list.
 | P6.3 | audit remaining CLI paths for the defect families CLAUDE.md records | **pass 1 and pass 2 done; continuous** — pass 1: boolean `//` reads and trailing-field arity reads clean, three real aborts found and fixed (P6.4), audit shipped (P6.5). pass 2: the unbound-config-variable family **does not warrant an audit** — 14 of `load_cfg`'s 26 variables are read without a default across 160+ sites, all 24 dispatch arms reach a handler that calls `load_cfg`, and 20 suites stub it deliberately, so a rule would reject twenty suites and almost every CLI path. Recorded so it is not re-derived |
 | P6.4 | three `set -euo pipefail` aborts where the producer may legitimately find nothing | **done** — the nightly dump's `docker ps` (an unreachable daemon aborted the backup instead of reporting the database absent), `dr-status`'s three `find`s on derivative subtrees that need not exist (the report died on a freshly restored host), and phase-b's live-photo selection (a user with no live photo aborted before the branch written for it). All three reproduced standalone before fixing; 1 mutant, killed |
 | P6.5 | an AUDIT for that family, not just the three fixes | **done** — `tests/find-abort-audit.py` + smoke test, in CI. The cry-wolf worry was measured rather than assumed: 18 command substitutions contain a `find` and only **three** lacked a guard, all three real. One was `checkup`'s `waiting_count` over `image-updates`, which does not exist until `ensure_dirs` has run — the shape that blanked the report in production once already, still live in a second place. `bin/*` only, continuations joined, quoted heredocs skipped, and a `# find-audit:` marker exempts its own line and is printed |
+| P6.6 | let `checkup` ask whether the recovery pack can leave this host | **done** — `domum-media-backup pack-offhost [target] [--json]`, exit 0 delivered off-host / 1 none or CIRCULAR / 2 not answerable, consumed by `checkup_recovery_pack_offhost`. The question was CORRECTED on the way: "is the pack in the backup set" was the wrong one (the cloud scope includes it deliberately) and it contradicted `dr-offhost-audit`, whose circularity row read the GLOBAL include paths and so reassured about production. `recovery_pack_coverage` is now the one implementation for all three readers. `circular`/`none` are critical with an action, so they mail; a non-answer is a warning, which is why the caller requires the JSON and not just the status. 2 mutants, killed |

@@ -4404,6 +4404,30 @@ finding.
 
 ---
 
+**THE QUEUE CONTRADICTED THIS FILE ON TWO MEASURED FACTS, and both stale
+copies pointed at "we cannot know".** Found 2026-11-03 while reviewing
+`backlog/QUEUE.md` -- the file whose entire purpose is to survive context
+compaction, and therefore the one a new session trusts first:
+
+- P1.8 said **"jellyfin not yet rehearsed"**. It was rehearsed the same day,
+  against the production image pinned by ID, and that rehearsal is what found
+  `capture-state` missing `need_root`;
+- the capability table called jellyfin's and kavita's capture mode
+  **"unprovable"**, adding that *"without a binary that can run
+  `PRAGMA journal_mode` there is no way to establish it"*. Both halves are
+  false: bytes 18/19 of the SQLite file header give the mode as a pure read
+  with no binary at all, and a clean stop was measured to checkpoint.
+
+A stale row that **understates** capability is worse than one that overstates
+it, because nothing ever contradicts it: the next session reads "unprovable",
+does not re-measure, and reports the limitation to the operator as current.
+That is the third recorded instance of "a fact appears twice and I changed one
+copy", and the first where the surviving copy denied a measurement that had
+already been taken. **When a measurement lands in `CLAUDE.md`, update every row
+that asserted it could not be made.**
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
