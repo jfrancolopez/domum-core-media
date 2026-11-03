@@ -4400,6 +4400,25 @@ copy inside the repository plus an independent route is redundancy, and the
 pack or anywhere this host can write would leave it reachable only through the
 thing it unlocks.
 
+**THE SQUASH MERGE TOOK THE FIRST COMMIT'S SUBJECT, so `main`'s history leads
+with the premise this very PR corrected.** `581d94a` is titled *"dr-status:
+check the recovery pack's own coverage, which nothing verified"* and its first
+two paragraphs argue for the question that was then replaced -- the correction
+is several screens further down, in the second commit's body. `gh pr merge
+--squash` ignored the PR title and concatenated all six commit bodies in order.
+
+**`git log --oneline` is a thing future sessions read**, and a subject that
+describes a superseded premise is a stale claim in the most-read place in the
+repository. It cannot be fixed after the fact: amending it means force-pushing
+`main`, which §8 forbids. **So pass `--subject` (and `--body`) explicitly when
+squash-merging a branch whose first commit was later corrected on the same
+branch** -- or rewrite that first commit's subject before pushing. The correct
+subject here was the PR's: *"Recovery pack: ask the question that decides it;
+enforce remedy pairing for criticals"*.
+
+This entry is the record. The authority on what that PR concluded is this file,
+not `581d94a`'s subject line.
+
 **A test that required the over-alarming behaviour had to be corrected, not
 adapted around.** `offhost-recovery-audit-smoke` asserted `CIRCULAR` with
 delivery **enabled** -- i.e. it required the designed configuration to be

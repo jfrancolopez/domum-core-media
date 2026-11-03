@@ -11,6 +11,7 @@ Reconciled against the repository and the live host on **2026-11-03**.
 | production | `a63ad19` — **verified by hash, not repeated**: the installed `/usr/local/bin/domum-media` is `5e65f06c…`, which is `bin/domum-media` at exactly that commit, and the installed and checkout copies of both CLIs are byte-identical (the deployment's own invariant) |
 | development / `main` | `accc366` — this line said `f7e6d5d`, thirteen commits stale. A revision constant inside the repository it pins goes stale by construction, which is why the deployment script refuses to carry one; here it is a header a new session reads first, so check it against `git rev-parse origin/main` rather than trusting it |
 | rule | an item is only `done` with evidence named here |
+| caution | **`581d94a`'s subject describes a premise that same PR corrected** — `gh pr merge --squash` took the FIRST commit's subject, not the PR title. `git log --oneline` therefore reads as though the pack check asks "is it in the backup set"; it does not. See `CLAUDE.md`, which is the authority, and pass `--subject` explicitly when squashing a branch whose first commit was later corrected |
 
 Statuses: `open` · `in progress` · `done (sha)` · `BLOCKED (reason)`.
 A blocker must name what would unblock it, and blocked items stay in the queue
