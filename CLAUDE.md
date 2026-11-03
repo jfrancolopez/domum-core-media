@@ -3861,6 +3861,35 @@ prove and the shape it should take.
 
 ---
 
+**THE UNBOUND-CONFIG-VARIABLE FAMILY DOES NOT WARRANT AN AUDIT, and that was
+measured rather than assumed.** `DISK_WEAR_WARN_PERCENT` had to be defaulted at
+its use site because a variable set only by `load_cfg` is unbound for a caller
+that has not run it, and under `set -u` that kills the shell -- the defect that
+once made `checkup` print nothing at all. The obvious next step is an audit for
+the whole family. Measured 2026-11-02, it would be noise:
+
+- `load_cfg` assigns **26** config variables, and **14** of them are read
+  somewhere outside it with no `${VAR:-}` default, across **160+ sites**.
+  `DOMUM_DATA_ROOT` alone has 54. A blanket rule would reject almost every
+  path in the CLI.
+- the production path is **structurally safe**: all **24** arms of `main`'s
+  dispatcher delegate to a handler, and the handlers call `load_cfg` before
+  reading anything. `load_cfg` is not called in the dispatcher, which is why a
+  check at that level reads as "none of them do" and proves nothing.
+- the one recorded failure was a **FIXTURE** stubbing `load_cfg`, and **20
+  suites stub it deliberately** -- they set the roots as environment variables
+  instead. Forbidding the stub would reject all twenty.
+
+So the correct scope is the fix already applied: a fixture that needs every
+default applied runs the REAL `load_cfg` against a real config, as
+`checkup-produces-output-smoke` now does, and a use site that a caller can
+reach without `load_cfg` carries its own default. Neither is a rule a scanner
+can usefully enforce. Recorded so the question is settled rather than
+re-derived: "we looked and decided no" is worth as much as an audit, and an
+audit that cries wolf is one somebody switches off.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
