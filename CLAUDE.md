@@ -4067,6 +4067,93 @@ instead of the first.
 
 ---
 
+**A REHEARSAL WHOSE CONTAINER RUNS AS ROOT LEAVES LITTER THE DEVELOPMENT
+ACCOUNT CANNOT REMOVE, and I made that avoidable mistake.** The Jellyfin
+rehearsal set `PUID: "0"` / `PGID: "0"` in its disposable compose file, so the
+container wrote 39 root-owned entries into the fixture. Tearing the container
+down worked; `rm -rf` on the fixture then failed with `Permission denied` and
+left 1.2 MB behind in the scratch directory.
+
+**linuxserver.io images honour `PUID`/`PGID`** -- Jellyfin is one -- so a
+rehearsal should pass the invoking account's own ids:
+
+```
+    environment:
+      PUID: "<id -u>"
+      PGID: "<id -g>"
+```
+
+Then every file the rehearsal creates belongs to the account that has to delete
+it. That is the fix, and it costs nothing: the rehearsal is about shutdown
+behaviour and capture correctness, neither of which depends on the container
+running as root.
+
+The Kavita rehearsal met the same problem and solved it differently -- a
+disposable `busybox` container with the fixture mounted did the removal, the
+same tool that created the problem removing it. That works, but it is the
+second-best answer: it needs a privileged container to clean up after an
+unprivileged test, and a removal run inside a container is exactly the shape a
+safety check should and does question. Prefer `PUID`/`PGID`.
+
+**What the two rehearsals DID get right**, and what any future one must: a
+disposable compose project whose name is checked free first, images pinned by
+ID read from the running container rather than by a mutable tag, bind mounts
+under a temp directory, no external network, no production path or volume, the
+production container id asserted absent from the project's scope BEFORE the
+first stop, and teardown asserted rather than assumed. The one thing not
+asserted was the FIXTURE's removal -- only the container's -- which is how the
+litter went unnoticed until the final state check counted 12 containers instead
+of 11.
+
+**Count the containers at the end.** That is what caught it: the final
+verification printed `containers 12 running` and one `rehears` match, and the
+Jellyfin project had never been torn down at all. A rehearsal's teardown
+assertion belongs in the rehearsal, not in a later review.
+
+---
+
+**THE ARCHIVE COST DID NOT NEED ROOT, and calling it blocked cost several
+sessions of a withheld recommendation.** `/srv/data/backups/images` is
+`drwxr-x--- root root`, so it cannot be LISTED unprivileged -- and I let that
+stand for the whole question. But what gated the recommendation was never the
+directory listing: it was the size of **one archive per service**, and
+`docker save <id> | wc -c` measures that exactly, without touching
+`/srv/data` and without writing anything.
+
+Measured 2026-11-03:
+
+```
+traefik        55,649,280   53 MiB      kavita        253,559,808  242 MiB
+navidrome      89,996,288   86 MiB      calibre-web   270,126,080  258 MiB
+plex          187,711,488  179 MiB      jellyfin      348,975,616  333 MiB
+                                        uptime-kuma   600,544,256  573 MiB
+all seven  1,806,562,816  1.68 GiB      mean 246 MiB
+```
+
+An archive is **26-30% of the image size** -- `docker save` stores the layer
+blobs already compressed, which is also why restic will dedupe and compress
+almost nothing of them. Budget the full 1.68 GiB.
+
+The earlier guess that the archives could be "two orders of magnitude larger
+than everything else combined" was right: **190x** the 8.90 MiB of service
+state. And against the 207.5 GiB already in the cloud repository, 1.68 GiB is
+**+0.8%**, so the §4b retention policy (newest valid point per service) is
+affordable and the recommendation is no longer withheld.
+
+What genuinely still needs root is **how many archives exist on disk now** --
+which is a retention question, not a cost question: it decides how much of the
+current directory the policy would EXCLUDE, not what the policy costs going
+forward.
+
+**The lesson is the same one the quiesced capture taught, in a second place:
+measure the blocker for the question you are actually asking.** "The directory
+needs root" is true and was not an answer to "what would this cost". This is
+the third time in two sessions that a blocker turned out to belong to a
+neighbouring question -- the volume mountpoint versus the bind mount, and now
+the directory listing versus the archive size.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

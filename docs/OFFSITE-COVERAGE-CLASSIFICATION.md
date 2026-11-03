@@ -213,3 +213,61 @@ Two risks to design around, both already recorded rules:
    `docs/SSD-HEALTH-STATUS.md`. `/dev/sda` has used 0.52% of its 600 TBW;
    `/dev/sdb` reports placeholders, which is why no attribute threshold was
    added.
+
+## 6. The archive cost, MEASURED — and the recommendation that follows
+
+**Measured 2026-11-03, unprivileged.** §4b and §5 said the archives' size was
+the one number still missing and the only gate on a recommendation. It did not
+need root after all: the directory needs root to *list*, but what decides
+affordability is the size of **one archive per service**, and `docker save`
+measures that exactly without touching `/srv/data` and without writing anything.
+
+| service | image bytes | **archive bytes** | archive |
+|---|---|---|---|
+| traefik | 250,640,183 | 55,649,280 | 53 MiB |
+| navidrome | 335,728,912 | 89,996,288 | 86 MiB |
+| plex | 629,243,297 | 187,711,488 | 179 MiB |
+| kavita | 898,895,693 | 253,559,808 | 242 MiB |
+| calibre-web | 1,141,866,088 | 270,126,080 | 258 MiB |
+| jellyfin | 1,262,147,567 | 348,975,616 | 333 MiB |
+| uptime-kuma | 2,475,280,445 | 600,544,256 | 573 MiB |
+| **all seven** | | **1,806,562,816** | **1.68 GiB** |
+
+An archive is **26–30% of the image size**, because `docker save` stores the
+layer blobs as they are — already compressed.
+
+### What this settles
+
+The earlier guess was that the archives could be "two orders of magnitude
+larger than everything else combined". Measured, that was right: 1.68 GiB
+against the **8.90 MiB** of service state is **190×**.
+
+And it settles the decision. The retention policy in §4b keeps the newest valid
+point per service, so the steady-state off-site cost is **~1.68 GiB** — against
+the **207.5 GiB** already in the cloud repository that is **+0.8%**. The
+nightly window is not at risk: current runs add 10–60 MiB, and an archive
+changes only when a service is upgraded.
+
+**So the recommendation, no longer withheld:** covering the image archives
+off-site is affordable, and it closes the sharpest gap in §3 — the archives are
+the only proven copy of the application half of every recovery point, and no
+tagged image on this host has an independent registry reference.
+
+Expect **little help from restic** on them: the blobs are already compressed,
+so deduplication and compression have almost nothing to find. Budget the full
+1.68 GiB, not a fraction of it.
+
+### What still needs root, and what it changes
+
+How many archives exist on disk **now**. That is a retention question, not a
+cost question: it decides how much of the current directory would be *excluded*
+by the policy, not what the policy costs going forward. `storage archives`
+answers it in one read-only command, and the §4b rules are all computable from
+the recovery metadata it reads.
+
+```
+sudo du -sb /srv/data/backups/images && sudo domum-media storage archives
+```
+
+Nothing above authorises a change: activating coverage is still an operator
+decision, and no backup target, include path or exclusion has been touched.

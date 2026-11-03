@@ -577,3 +577,32 @@ and `restore-state` — and all three had to learn the labelled form. Matching
 only the bare `FAILED` would have made a `FAILED:UNREADABLE` item look like
 something to restore; that second site was caught by checking every match
 rather than the first one.
+
+### Rehearsal hygiene — what the two runs taught
+
+Both rehearsals asserted the right things before mutating: a disposable project
+name checked free, images pinned **by ID** read from the running container, bind
+mounts under a temp directory, no external network, no production path or
+volume, and the production container id asserted **absent** from the project's
+scope before the first stop. Teardown of the container was asserted too.
+
+What neither asserted was removal of the **fixture**. The Jellyfin rehearsal set
+`PUID: "0"` / `PGID: "0"`, so its container wrote 39 root-owned entries that the
+development account cannot delete — and because only the container's teardown
+was checked, the project itself was left running until a final container count
+showed **12 instead of 11**.
+
+For any future rehearsal of a linuxserver.io image, pass the invoking account's
+own ids:
+
+```yaml
+    environment:
+      PUID: "<id -u>"
+      PGID: "<id -g>"
+```
+
+Then every file belongs to whoever has to delete it. The rehearsal is about
+shutdown behaviour and capture correctness, neither of which needs the container
+to run as root. Removing the litter with a privileged `busybox` container works —
+the Kavita rehearsal did that — but it is the second-best answer, and a removal
+run inside a container is exactly the shape a safety check should question.
