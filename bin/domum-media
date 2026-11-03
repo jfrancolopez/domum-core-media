@@ -300,6 +300,24 @@ human_age_from_epoch() {
   fi
 }
 
+# Which domum-media-backup does this CLI ask?
+#
+# The checkout's copy FIRST, matching `status`, because the two CLIs must be at
+# the SAME revision: a new checkup asking an older installed binary a question
+# it has never heard of produces "could not ask" for a reason that is about the
+# deployment rather than about the thing being checked. The installed path is
+# the fallback for a checkout that is absent. DOMUM_BACKUP_CLI exists so a
+# fixture can redirect it -- every root a test uses must be redirected into it.
+backup_cli_path() {
+  if [[ -n "${DOMUM_BACKUP_CLI:-}" ]]; then
+    printf '%s' "$DOMUM_BACKUP_CLI"
+  elif [[ -x "$DOMUM_DIR/bin/domum-media-backup" ]]; then
+    printf '%s' "$DOMUM_DIR/bin/domum-media-backup"
+  else
+    printf '%s' /usr/local/bin/domum-media-backup
+  fi
+}
+
 json_escape() {
   jq -Rsa .
 }
@@ -6019,6 +6037,82 @@ checkup_immich_offsite() {
   done
 }
 
+# Can the ENCRYPTED RECOVERY PACK leave this host?
+#
+# This is the artefact that makes every other off-site copy openable -- the
+# configuration, the secrets, Traefik's ACME account private key and the
+# validated Uptime Kuma dump. It was checked in `dr-status` and in
+# `dr-offhost-audit`, and NEITHER is a notification path, so a pack that never
+# left this machine would have been visible only to an operator who ran a
+# command by hand. That is the babysitting this phase exists to end.
+#
+# It is asked of the OTHER CLI, because the helpers that resolve the pack
+# destination and a target's include scope live in bin/domum-media-backup.
+# Writing those three calls here produced three undefined functions, which
+# tests/function-definition-audit.py caught at once -- the undefined-helper
+# family. A wrapper asserts on BEHAVIOUR, never on prose, so the contract is
+# the subcommand's EXIT STATUS.
+#
+# The JSON is required as well, and that is the load-bearing part: an exit
+# status ALONE cannot tell a verdict from a non-answer. An installed binary
+# that predates `pack-offhost` dies with status 1, which is the ALARMING
+# answer -- a critical about the family photographs, manufactured from a binary
+# that never looked. So a reply that does not parse, or carries a verdict this
+# reader does not know, is reported as "could not ask" and never as a finding
+# about the pack. The `capabilities --has` rule in both directions: an unknown
+# token must not read as a yes, and must not read as a no either.
+checkup_recovery_pack_offhost() {
+  local cli out rc=0 verdict
+  cli="$(backup_cli_path)"
+  if [[ ! -x "$cli" ]]; then
+    checkup_add warning "Whether the encrypted recovery pack can leave this host could not be checked: $cli is not executable."
+    checkup_add advice "ls -l $cli   # read-only: the pack check asks the backup CLI, which is installed by 'domum-media install'"
+    return 0
+  fi
+  if ! cmd_exists jq; then
+    checkup_add warning "Whether the encrypted recovery pack can leave this host is UNKNOWN: jq is not installed."
+    checkup_add advice "apt-get install -y jq"
+    return 0
+  fi
+  out="$("$cli" pack-offhost --json 2>/dev/null)" || rc=$?
+  # Take the FIRST line beginning with `{`, from the captured variable, with no
+  # pipe. `cleanup images --json` prints the machine-readable line and THEN the
+  # human report, and a `| tail -n 1` against that returned a line of prose --
+  # so extract positively rather than assuming the reply is JSON and nothing
+  # else. `sed -n` on a here-string cannot short-circuit, unlike a pipeline.
+  local json_line
+  json_line="$(sed -n '/^{/{p;q;}' <<< "$out" || true)"
+  verdict="$(jq -r '.verdict // empty' <<< "$json_line" 2>/dev/null || true)"
+  case "$verdict" in
+    offhost)
+      checkup_add healthy "A recovery pack is delivered off-host, so the credentials that open the backup survive losing this machine (configured is not proven delivered, and the age private key is held only by the operator)."
+      ;;
+    circular)
+      checkup_add critical "The encrypted RECOVERY PACK is not delivered off-host, and its only copy off this machine is INSIDE the repository it would be needed to open. You would need the credentials in order to fetch the credentials."
+      # Worded identically to checkup_notification_path's remedy so
+      # checkup_add's exact-duplicate suppression collapses them when both
+      # fire. They are different findings -- one is "nothing can tell you",
+      # this one is "nothing could open the backup" -- with one fix.
+      checkup_add action "set RECOVERY_PACK_EMAIL_ENABLED=1 in $CFG_FILE, then prove it ONCE with 'domum-media health-notify --force' -- that command SENDS and needs operator approval"
+      ;;
+    none)
+      checkup_add critical "The encrypted RECOVERY PACK never leaves this host, so losing both disks loses the ability to open the off-site backup at all. It holds the configuration, the secrets, Traefik's ACME account private key and the validated Uptime Kuma dump."
+      checkup_add action "set RECOVERY_PACK_EMAIL_ENABLED=1 in $CFG_FILE, then prove it ONCE with 'domum-media health-notify --force' -- that command SENDS and needs operator approval"
+      ;;
+    unknown)
+      checkup_add warning "Whether the encrypted recovery pack can leave this host is UNKNOWN: its configuration could not be read, and an unread setting is not a setting of 0."
+      checkup_add advice "sudo domum-media-backup pack-offhost   # read-only: reads configuration only, no restic and no network"
+      ;;
+    *)
+      # Includes: the subcommand does not exist in the installed binary, a
+      # usage error, and any verdict word added later that this reader has not
+      # been taught. None of them is evidence about the pack.
+      checkup_add warning "Whether the encrypted recovery pack can leave this host could not be checked: $(basename "$cli") pack-offhost did not answer (exit $rc)."
+      checkup_add advice "$cli pack-offhost   # read-only. A usage error here means the installed backup CLI predates this check"
+      ;;
+  esac
+}
+
 # Can this host actually TELL anyone?
 #
 # The whole notification contract is that silence means nothing needed
@@ -7110,19 +7204,31 @@ health_notify_cmd() {
 # checkup, health-notify and the weekly report all collect through here.
 # Callers reset the four arrays; this only appends.
 checkup_collect_all() {
-  [[ -n "${DOMUM_DOMAIN:-}" ]] || checkup_add critical "DOMUM_DOMAIN is empty."
-  [[ -n "${BACKUP_POLICY:-}" ]] || checkup_add critical "BACKUP_POLICY is unset."
+  [[ -n "${DOMUM_DOMAIN:-}" ]] || checkup_add critical "DOMUM_DOMAIN is empty." # critical-bare: names the exact variable, which is the remedy
+  [[ -n "${BACKUP_POLICY:-}" ]] || checkup_add critical "BACKUP_POLICY is unset." # critical-bare: names the exact variable, which is the remedy
   case "${BACKUP_POLICY^^}" in
     STRICT|BALANCED|LENIENT) ;;
-    *) checkup_add critical "BACKUP_POLICY must be STRICT, BALANCED, or LENIENT." ;;
+    *) checkup_add critical "BACKUP_POLICY must be STRICT, BALANCED, or LENIENT." ;; # critical-bare: names the variable and every legal value
   esac
-  if grep -qE '^(IMMICH_VERSION|JELLYFIN_VERSION|NAVIDROME_VERSION)=' "$CFG_FILE" 2>/dev/null; then
-    checkup_add critical "Legacy image pin variables are still present in the config."
+  # This said only "Legacy image pin variables are still present in the config"
+  # -- a critical that MAILS while naming neither the variables nor the file.
+  # A critical with no remedy is worse than a warning with none. Measured: no
+  # file in this repository reads any of the three, so a config that sets them
+  # pins nothing and reads as though it does.
+  local legacy_pins
+  legacy_pins="$(grep -oE '^(IMMICH_VERSION|JELLYFIN_VERSION|NAVIDROME_VERSION)' "$CFG_FILE" 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+  if [[ -n "${legacy_pins// /}" ]]; then
+    checkup_add critical "Legacy image pin variables are still in $CFG_FILE: ${legacy_pins% }. Nothing reads them, so they pin no version while reading as though they do."
+    checkup_add action "grep -nE '^(IMMICH|JELLYFIN|NAVIDROME)_VERSION=' $CFG_FILE   # read-only: the exact lines to remove"
   fi
   local enabled_targets
   enabled_targets="$(enabled_backup_targets || true)"
   if [[ -z "${enabled_targets//[[:space:]]/}" ]]; then
-    checkup_add critical "No backup targets are enabled."
+    checkup_add critical "No backup targets are enabled, so NOTHING is backed up. Declared targets come from BACKUP_TARGETS in $CFG_FILE and each is switched on by BACKUP_TARGET_<NAME>_ENABLED."
+    # Deliberately scoped to the declaration and the ENABLED flags. A
+    # repository URL and a credential path are not needed to answer "which
+    # targets are switched on", and a remedy must not widen what it prints.
+    checkup_add action "grep -nE '^BACKUP_TARGET(S|_[A-Z]+_ENABLED)=' $CFG_FILE   # read-only: what is declared, and which are off"
   else
     checkup_add healthy "At least one backup target is enabled."
   fi
@@ -7132,7 +7238,10 @@ checkup_collect_all() {
     $([[ "${ENABLE_TRAEFIK:-0}" == "1" ]] && printf '%s ' "$SECRETS_DIR/cloudflare_api_token" "${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}") \
     $([[ "${ENABLE_IMMICH:-0}" == "1" ]] && printf '%s ' "$SECRETS_DIR/immich_db_password" "$SECRETS_DIR/immich_jwt_secret"); do
     if [[ ! -s "$required_secret" ]]; then
+      # Symmetric with the backup password file below: name the path, and give
+      # a read-only way to look at it that cannot print what is in it.
       checkup_add critical "Missing or empty secret: $required_secret"
+      checkup_add action "ls -l $required_secret   # read-only: the path this service is given. Never print its contents"
     fi
   done
   while IFS= read -r target; do
@@ -7140,7 +7249,11 @@ checkup_collect_all() {
     local pw_file pw_size
     pw_file="$(backup_target_password_file "$target")"
     if [[ ! -s "$pw_file" ]]; then
-      checkup_add critical "Missing backup password file for $target."
+      # $pw_file was already resolved on the line above and the message did not
+      # use it, while the sibling secret check names its exact path. Without it
+      # the operator is told a credential is missing and not where it belongs.
+      checkup_add critical "Missing or empty backup password file for $target: $pw_file. Without it that repository cannot be read or written."
+      checkup_add action "ls -l $pw_file   # read-only: the path restic is given for $target. Never print its contents"
     else
       pw_size="$(wc -c < "$pw_file" | tr -d ' ')"
       if [[ "${pw_size:-0}" -lt 12 ]]; then
@@ -7422,6 +7535,9 @@ checkup_collect_all() {
   checkup_btrfs_health
   checkup_disk_health
   checkup_immich_offsite
+  # Whether the credentials that open the off-site backup exist anywhere but
+  # here. Reported by dr-status and dr-offhost-audit, neither of which notifies.
+  checkup_recovery_pack_offhost
   # Whether a warranted alert can leave the host at all. Last, because it is
   # the check that decides whether any of the above would ever be seen.
   checkup_notification_path

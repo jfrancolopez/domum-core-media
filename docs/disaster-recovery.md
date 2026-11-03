@@ -17,7 +17,7 @@ project exists to correct.
 | step | status | evidence |
 |---|---|---|
 | 1 bootstrap | **never executed** | `install.sh` is in CI (`bash -n`, shellcheck) but has never run on a bare machine |
-| 2 decrypt the pack | **partly proven** | 37 packs existed 2026-10-12, newest 0 days old, off-host delivery enabled, pack correctly **not** inside the backup needed to open it. The age private key is held by the operator and is **not** on this host, so the decrypt itself is unproven — and 37 copies are 37 unopenable files without it |
+| 2 decrypt the pack | **partly proven** | 37 packs existed 2026-10-12, newest 0 days old, off-host delivery by email enabled. The pack is also inside the cloud backup set, deliberately — redundancy, because the email route is independent of the repository it would open; `domum-media-backup pack-offhost` states which routes exist, by exit status. The age private key is held by the operator and is **not** on this host, so the decrypt itself is unproven — and 37 copies are 37 unopenable files without it |
 | 3 scratch restore | **proven** | the Immich dump restores from the repository and revalidates (`verify-restore`); a 12-file sample of originals restores and compares byte-for-byte, accumulating across runs |
 | 4 restore to `/` | **never executed** | nothing has written a snapshot back to production paths |
 | database import | **proven, disposable only** | `verify-db-restore`, 2026-10-11: 23,033 assets into 61 tables under `ON_ERROR_STOP=1`, in a `--network none` tmpfs instance |

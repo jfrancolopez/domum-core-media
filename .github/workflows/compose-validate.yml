@@ -106,6 +106,9 @@ jobs:
       - name: Off-host recovery audit smoke test
         run: tests/offhost-recovery-audit-smoke.sh
 
+      - name: Recovery-pack off-host bridge smoke test
+        run: tests/pack-offhost-bridge-smoke.sh
+
       - name: Operation lock smoke test
         run: tests/operation-lock-smoke.sh
 
@@ -257,6 +260,9 @@ jobs:
       # tests/ci-coverage-audit.sh now fails when a test file is not listed here.
       - name: Library stdout purity audit
         run: python3 tests/lib-stdout-purity-audit.py
+
+      - name: Critical-finding pairing audit
+        run: python3 tests/lib-critical-pairing-audit.py
 
       - name: Reconcile boundary audit
         run: python3 tests/reconcile-boundary-audit.py

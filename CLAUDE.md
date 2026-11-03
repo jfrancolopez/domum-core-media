@@ -4287,6 +4287,203 @@ the second is this one, in the opposite direction.
 
 ---
 
+**NOTHING CHECKED THE ENCRYPTED RECOVERY PACK, AND MY FIRST CHECK ASKED THE
+WRONG QUESTION -- the opposite of what `dr-offhost-audit` asks about the same
+configuration.** Found 2026-11-03 from the production config the operator
+pasted while installing the scrub timer.
+
+`dr_path_configured` verifies the Immich library, the five service paths and the
+image-archive directory. It was never asked about the **pack** -- the artefact
+that makes every other off-site copy openable, holding the configuration, the
+secrets, Traefik's ACME account private key and the validated Uptime Kuma dump.
+
+**The first version asked "is the pack in the backup set" and reported its
+absence as a risk. That is a finding about the DESIGNED configuration**:
+`immich_only_include_paths` -- the cloud target's own scope -- puts the pack
+there deliberately. Worse, it contradicted `dr_offhost_audit`, which reports the
+pack being **inside** the backup as `CIRCULAR` and counts it a problem. Two
+commands, opposite verdicts, one configuration, and
+`docs/RECOVERY-KEY-CUSTODY.md` carried **both claims three lines apart** -- a
+table row saying the pack lives "inside the cloud backup set" above a paragraph
+saying it was "correctly **not** inside the backup it would be needed to open".
+
+**The audit's row was reassuring because it read the WRONG SCOPE.** It looped
+over the global `BACKUP_INCLUDE_PATHS` (default `/srv/data`), under which
+`/var/lib/domum-media/recovery-pack` does not sit -- so on production it printed
+`pack inside the backup  no  correct -- that would be circular` about the one
+configuration it exists to warn about. That is the wrong-scope defect
+`dr_path_configured` already had, in the command that is supposed to be the
+authority, and it is why `recovery_pack_coverage` is now the ONE implementation
+consumed by all three readers.
+
+**And its POLARITY was wrong.** A copy inside the repository is circular only
+when it is the pack's **only** copy off this host -- you would need the
+credentials in order to fetch the credentials. While email delivery is enabled
+it is redundancy. So:
+
+| in a target's scope | off-host delivery | verdict |
+|---|---|---|
+| yes | enabled | `offhost` -- redundant, not a problem |
+| yes | **disabled** | **`circular`** -- its only copy off the host is inside the repository it opens |
+| no | enabled | `offhost` -- the email route is the designed one |
+| no | **disabled** | **`none`** -- the pack never leaves |
+| either | **unreadable config** | `unknown` -- an unread setting is not a setting of 0 |
+
+**The decisive question is whether a pack reaches anywhere this host is not, and
+"is it in the backup set" is a COMPONENT of the answer rather than the answer.**
+A check that fires on the designed configuration is how a real finding gets
+ignored.
+
+**`domum-media-backup pack-offhost [target] [--json]`** is the bridge, because
+the two commands that reported on the pack -- `dr-status` and
+`dr-offhost-audit` -- are not notification paths, so a pack that never left this
+machine was visible only to an operator running a command by hand. Its contract
+is the EXIT STATUS, matching `exclusion-audit` and `verify-snapshot-coverage`:
+**0** a pack is delivered off-host, **1** none or CIRCULAR, **2** not
+answerable. It reads configuration only -- a test asserts the function body
+contains no `restic`, `docker`, `curl`, `ssh` or `sftp`, because a report must
+do no recovery work.
+
+**The JSON is REQUIRED by the caller, and that is the load-bearing part.** An
+exit status alone cannot tell a verdict from a NON-ANSWER: an installed binary
+that predates this subcommand dies with status **1**, which is the alarming
+answer -- a CRITICAL about the family photographs manufactured from a binary
+that never looked. So `checkup` requires the reply to parse and to carry a
+verdict it has been taught, and anything else is reported as "could not ask".
+That is the `capabilities --has` rule in both directions: a token this binary
+never heard of must not read as a yes, **and must not read as a no either**.
+The mutation that classifies on the exit status alone must make an older
+binary's usage error become `never leaves this host`.
+
+**`checkup` asks it, so the finding is now mailed**, which was the whole point:
+`circular` and `none` are **critical with an action** (the only two classes that
+pass the notifier's silence gate), `unknown` and "could not ask" are **warnings
+with advice** and deliberately do not mail -- "I could not check it" is not "it
+is broken", and it is not healthy either. The remedy is worded IDENTICALLY to
+`checkup_notification_path`'s, so `checkup_add`'s exact-duplicate suppression
+collapses them when both fire: two different findings ("nothing can tell you"
+and "nothing could open the backup") with one fix.
+
+**`backup_cli_path` resolves the CHECKOUT's copy first**, matching `status`,
+because the two CLIs must be at the same revision -- a new `checkup` asking an
+older installed binary produces "could not ask" for a reason that is about the
+deployment rather than about the pack. `DOMUM_BACKUP_CLI` redirects it for a
+fixture.
+
+**`recovery_pack_dest` is the ONE implementation of the destination**, and the
+two it replaced were NOT equivalent: one defaulted `DOMUM_STATE_ROOT` and the
+other did not, so a caller that had not run `load_cfg` would die under `set -u`
+rather than fall back.
+
+**A fix in a default is not in force wherever the configuration overrides that
+default.** `immich_only_include_paths` was changed to DERIVE the pack path from
+`RECOVERY_PACK_DEST` because a literal goes stale if the pack moves -- but
+`backup_target_include_paths` resolves `"${paths:-$target_default}"`, so an
+explicit `BACKUP_TARGET_<T>_INCLUDE_PATHS` **wins and the derived default is
+never consulted**, and production sets it explicitly with the pack path as a
+literal. The values agree today, and they agree by having been written
+together, which is the accident the derived default was introduced to remove.
+
+**THE FALSE CLAIM WAS IN FIVE DOCUMENTS, and fixing one was the trap.** After
+correcting `docs/RECOVERY-KEY-CUSTODY.md` I grepped for the sentence and found
+it in four more -- `disaster-recovery.md` (the runbook read while the host is
+gone), `HIDDEN-RECOVERY-DEPENDENCIES.md`, `OFFSITE-COVERAGE-CLASSIFICATION.md`,
+and a *second* place in the custody document itself, where it was cited as the
+PRECEDENT for a rule about the age key. This file already records that changing
+one of two copies is worse than changing neither; here it was one of five, and
+the surviving copies would each have had a neighbour vouching for them. **After
+correcting a claim, grep for it.**
+
+The rule it was cited for is still right and is now stated where it binds: a
+copy inside the repository plus an independent route is redundancy, and the
+**age private key** has no independent route, so storing it in Hetzner, in the
+pack or anywhere this host can write would leave it reachable only through the
+thing it unlocks.
+
+**A test that required the over-alarming behaviour had to be corrected, not
+adapted around.** `offhost-recovery-audit-smoke` asserted `CIRCULAR` with
+delivery **enabled** -- i.e. it required the designed configuration to be
+reported as a defect. Before adapting a test to a change, ask which of the two
+is wrong; here the test was. Both directions are asserted now, because a
+single-verdict assertion cannot tell a check from one that always fires.
+
+**ONE ROOT CAUSE IS ONE GAP.** With delivery off, the audit's delivery row and
+its circularity row would each have incremented `problems`, so a single fixable
+cause read as two blocking gaps -- fixing delivery clears both. The circular row
+is reported and deliberately NOT counted again, and the test asserts
+`problems == 1`. Same defect as printing identical text twice making the host
+look twice as bad as it is, one level up.
+
+`tests/pack-offhost-bridge-smoke.sh`; 2 mutants, both killed. Everything above
+reports healthy on this host, so it is a regression guard rather than a live
+finding.
+
+---
+
+**THE QUEUE CONTRADICTED THIS FILE ON TWO MEASURED FACTS, and both stale
+copies pointed at "we cannot know".** Found 2026-11-03 while reviewing
+`backlog/QUEUE.md` -- the file whose entire purpose is to survive context
+compaction, and therefore the one a new session trusts first:
+
+- P1.8 said **"jellyfin not yet rehearsed"**. It was rehearsed the same day,
+  against the production image pinned by ID, and that rehearsal is what found
+  `capture-state` missing `need_root`;
+- the capability table called jellyfin's and kavita's capture mode
+  **"unprovable"**, adding that *"without a binary that can run
+  `PRAGMA journal_mode` there is no way to establish it"*. Both halves are
+  false: bytes 18/19 of the SQLite file header give the mode as a pure read
+  with no binary at all, and a clean stop was measured to checkpoint.
+
+A stale row that **understates** capability is worse than one that overstates
+it, because nothing ever contradicts it: the next session reads "unprovable",
+does not re-measure, and reports the limitation to the operator as current.
+That is the third recorded instance of "a fact appears twice and I changed one
+copy", and the first where the surviving copy denied a measurement that had
+already been taken. **When a measurement lands in `CLAUDE.md`, update every row
+that asserted it could not be made.**
+
+---
+
+**NOTHING ENFORCED THE PAIRING FOR *CRITICALS*, and a critical is the one that
+MAILS.** `tests/warning-remedy-smoke.sh` has a universal scan requiring every
+`checkup_add warning` to carry an action or an advice. The critical side was
+only ever fixed case by case -- this file records the backup criticals being
+given remedies -- and with nothing enforcing it, **three more were sitting
+there**. Measured 2026-11-03: 25 critical sites, 7 bare, of which three were
+real:
+
+- `Legacy image pin variables are still present in the config.` -- named
+  neither the variables nor the file. And **measured: no file in this
+  repository reads `IMMICH_VERSION`, `JELLYFIN_VERSION` or
+  `NAVIDROME_VERSION`**, so a config that sets them pins nothing while reading
+  as though it does. The message now names which were found and the remedy is
+  the read-only `grep -n` that prints the exact lines;
+- `No backup targets are enabled.` -- a critical saying the photographs may be
+  unbacked-up, with no way to see why. Its remedy is deliberately scoped to
+  `BACKUP_TARGETS` and the `*_ENABLED` keys: a repository URL and a credential
+  path are not needed to answer "which targets are switched on", and **a remedy
+  must not widen what it prints**;
+- `Missing backup password file for $target.` -- did not name the path,
+  **although `$pw_file` was resolved on the line above** and the sibling secret
+  check names its own. The two are symmetric now, and both remedies are an
+  `ls -l` that says explicitly never to print the contents.
+
+**A CRITICAL WITH NO REMEDY IS WORSE THAN A WARNING WITH NONE**, because a
+warning stays quiet while a critical opens the silence gate: the operator gets
+an alarm and no command.
+
+`tests/lib-critical-pairing-audit.py` enforces it, standalone in CI like
+`lib-stdout-purity-audit.py` and also driven by the smoke test against a
+mutant. Three criticals stay deliberately bare because they name the exact
+variable and every legal value, which IS the remedy; they carry an explicit
+`# critical-bare: <reason>` marker, read BEFORE comments are stripped,
+exempting only its own line, and **every exemption is printed** -- an allowance
+nobody can see is how a real defect gets a marker stuck on it. The audit also
+fails when it finds fewer than ten sites, so it cannot pass by scanning
+nothing. 1 mutant, killed: removing a critical's only remedy must fail CI.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

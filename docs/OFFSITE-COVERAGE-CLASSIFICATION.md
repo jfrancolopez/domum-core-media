@@ -46,9 +46,17 @@ here.
 | `meta/rendered-compose.yml` | the resolved compose configuration |
 | restore instructions + manifest | generated |
 
-The pack is correctly **not** inside the backup it would be needed to open, and
-delivery off-host is by email. The whole chain rests on the age private key:
-37 copies of the pack are equally useless without it.
+The pack **is** inside the cloud backup set — `immich_only_include_paths` puts
+the resolved `RECOVERY_PACK_DEST` there deliberately — **and** it is delivered
+off-host by email. One copy inside the repository plus an independent route is
+redundancy; it would be the circularity trap only if the email route did not
+exist, because you would then need the credentials in order to fetch the
+credentials. `domum-media-backup pack-offhost` answers exactly that, by exit
+status. (This paragraph previously claimed the pack was "correctly not inside
+the backup", which was the global-scope read and the opposite of the truth.)
+
+The whole chain still rests on the age private key: 37 copies of the pack are
+equally useless without it.
 
 ## 3. Classification
 

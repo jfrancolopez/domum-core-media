@@ -248,6 +248,59 @@ they may. Neither leaves a finding nobody can do anything with."
 }
 echo "  every warning is paired"
 
+sect "EVERY critical carries a remedy too, and every exemption is PRINTED"
+# A CRITICAL with no remedy is worse than a warning with none: a critical opens
+# the notifier's silence gate, so it MAILS -- the operator gets an alarm and no
+# command. CLAUDE.md already records that defect being fixed for the backup
+# criticals, and nothing enforced it, so three more were sitting here:
+#
+#   "Legacy image pin variables are still present in the config."
+#       -- named neither the variables nor the file. Measured: nothing in this
+#          repository reads any of the three, so they pin nothing.
+#   "No backup targets are enabled."
+#       -- the photographs may be unbacked-up, with no way to see why.
+#   "Missing backup password file for $target."
+#       -- did not name the path, although $pw_file was resolved one line
+#          above and the sibling secret check names its own.
+#
+# Three are deliberately bare because they name the exact variable and its
+# legal values, which IS the remedy. Those carry an explicit
+# `# critical-bare: <reason>` marker, read BEFORE comments are stripped and
+# exempting only their own line -- and every exemption is printed, because an
+# allowance nobody can see is how a real defect gets a marker stuck on it.
+crit_rc=0
+crit_out="$(python3 -I "$REPO_ROOT/tests/lib-critical-pairing-audit.py" "$CLI" 2>&1)" || crit_rc=$?
+printf '%s\n' "$crit_out"
+(( crit_rc == 0 )) || fail "a critical carries neither an action nor an advice, or
+the scan found too few to be scanning at all. A critical MAILS, so one with no
+remedy sends the operator an alarm and no command."
+grep -q 'exempt' <<< "$crit_out" \
+  || fail "no exemption was printed; an allowance nobody can see is how a real
+defect gets a marker stuck on it"
+echo "  every critical is paired, and the bare ones say why on their own line"
+
+sect "mutation: a critical left bare must fail that audit"
+# Without this the audit could rot into always-passing, and nobody would
+# notice: a passing audit looks the same either way.
+MUTC="$TMP/mut-crit"
+cp "$CLI" "$MUTC"
+python3 -I - "$MUTC" <<'PYMC' || fail "the critical-pairing mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '      checkup_add action "ls -l $pw_file   # read-only: the path restic is given for $target. Never print its contents"\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYMC
+grep -q 'ls -l \$pw_file' "$MUTC" \
+  && fail "the mutation did not actually remove the remedy"
+mrc=0
+python3 -I "$REPO_ROOT/tests/lib-critical-pairing-audit.py" "$MUTC" >/dev/null 2>&1 || mrc=$?
+(( mrc != 0 )) \
+  || fail "the mutation changed no ANSWER -- removing a critical's only remedy
+must make the pairing audit fail"
+echo "  killed: a mailing critical with no command fails CI"
+
 sect "the ROUTINE warnings carry ADVICE, never ACTION -- that is what keeps them quiet"
 # The anti-flood contract, now expressed where it actually lives. An ACTION
 # escalates the verdict to ACTION REQUIRED and opens the silence gate; an
