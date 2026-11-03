@@ -4523,6 +4523,48 @@ nothing. 1 mutant, killed: removing a critical's only remedy must fail CI.
 
 ---
 
+**A VOLUME DUMP OR RESTORE THAT FAILED COULD NOT SAY WHY, and that is a RESTORE
+path.** Four sites in `dump_volume_to_file` and `restore_volume_from_file` ran
+`tar` and `find -delete` with `2>/dev/null` and then warned without a reason, so
+permission denied, no space, and an xattr the destination cannot take produced
+**one identical sentence** -- three failures whose remedies have nothing in
+common. The exit STATUS was always checked correctly; only the cause was thrown
+away. This file already records that an unactionable `FAIL` trains the operator
+to ignore it, and the worst instance is the unpack: by then the volume has been
+CLEARED, so that warning is the only thing between the operator and a lost
+volume.
+
+`first_error_line` is the one implementation -- the first non-empty line of a
+captured stderr, with `no diagnostic was produced` as a stand-in, because a
+warning ending in `": "` reads as a truncated sentence. It returns a value on
+stdout and logs nothing, which the stdout-purity audit requires and a test
+asserts in both directions.
+
+`tests/volume-recovery-point-smoke.sh` sections 20-23; the mutation restores
+`2>/dev/null` and the reasonless warning, and the cause must disappear.
+
+**P3.4's BLOCKER WAS ONE LINE NARROWER THAN THE QUEUE CLAIMED -- the fourth
+instance this session of measuring the wrong question's blocker.** The row said
+fixtures cannot establish `dump_volume_to_file` / `restore_volume_from_file`.
+They do: `volume-recovery-point-smoke` drives both with real tar, real
+checksums, real xattrs and ACLs, real file modes, real quiescence and a real
+restore, and its own comment says `docker_volume_mountpoint` is *"the ONE
+stubbed seam"*. Measured 2026-11-03, **half of that seam needs no privilege**:
+`docker volume inspect --format '{{.Mountpoint}}'` resolves correctly here for
+both production volumes. What is genuinely root-only is whether
+`tar -C <mountpoint>` can read it, because `/var/lib/docker` is
+`drwx--x--- root root`. So the unblock is ONE privileged command, not a whole
+rehearsal -- and a row that overstates its blocker is the understating-stale-row
+failure in its own right: nobody re-measures a blocker.
+
+**A pessimistic blocker is also how I nearly mis-measured it.** `tar -cf
+/dev/null -C "$mp" . 2>&1 | head -1` reported `rc=0` while printing
+`Permission denied`, because `$?` was `head`'s. The claim "tar succeeded" would
+have been a pipeline artefact -- the same shape as every `cmd | grep -q` defect
+in this file. Check the status of the command you mean, not of the pipeline.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
