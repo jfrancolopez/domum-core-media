@@ -10175,14 +10175,40 @@ storage_protection() {  # $1 = service (optional: all services when omitted)
 # Where a durable image archive lives.
 #
 # /srv/data/backups is the right tier, and the alternatives are wrong:
-#   * it is on the protected Btrfs tier and `restic backup` is given
-#     "$DOMUM_DATA_ROOT" with only immich-tmp and media-cache excluded, so an
-#     archive here IS in the off-host backup set (measured);
+#   * it is on the protected Btrfs tier, which is where irreplaceable local
+#     state belongs.
+#
+#     This comment used to assert that an archive here was covered off-site,
+#     on the grounds that restic is given "$DOMUM_DATA_ROOT". That was true of
+#     the GLOBAL include set and false of the target that actually runs: the
+#     cloud target is immich-only by design --
+#     `immich/library`, `immich/backup-staging` and the recovery pack -- and
+#     `/srv/data/backups/images` is NOT COVERED. The operator found that from
+#     another machine by listing the Hetzner snapshot. Corrected here because a
+#     stale claim about protection is the defect this project exists to
+#     prevent, and a code comment is where it hides longest;
 #   * it is a top-level ordinary directory, NOT inside any service subvolume, so
 #     it does not duplicate into per-service snapshots;
 #   * /srv/media is the deliberately replaceable tier, and / is not backed up.
 image_archive_dir() {
   printf '%s/backups/images' "${DOMUM_DATA_ROOT%/}"
+}
+
+# Where `storage capture-state` writes when the caller names no destination.
+#
+# The same tier and the same reasoning as image_archive_dir, and for the same
+# reason it is a sibling rather than a child of a service directory: a capture
+# written inside /srv/data/<service> would duplicate into every per-service
+# snapshot of that service, and a capture of a service is not part of that
+# service's state.
+#
+# A DEFAULT is what makes the captures schedulable and what gives a backup
+# scope something stable to name. It does not put them off-site: the cloud
+# target is immich-only, so a capture here is on the protected local tier and
+# nowhere else. Covering it is an operator decision -- see
+# docs/OFFSITE-COVERAGE-CLASSIFICATION.md section 4a.
+state_capture_dir() {
+  printf '%s/backups/state' "${DOMUM_DATA_ROOT%/}"
 }
 
 # Archive an image by ID, with a checksum beside it.
@@ -12068,10 +12094,18 @@ storage_cmd() {
       # that causes downtime, so it is gated on QUIESCED_CAPTURE_ENABLED and
       # refuses before the lock and before any stop.
       load_cfg
-      if [[ "${3:-}" == "--quiesce" ]]; then
-        service_state_capture_quiesced "${1:-}" "${2:-}"
+      # The destination defaults to state_capture_dir()/<service>/<timestamp>,
+      # so a capture can be taken without the operator inventing a path and so
+      # a schedule or a backup scope has something stable to name. An explicit
+      # path still wins.
+      local cap_svc="${1:-}" cap_dest="${2:-}" cap_flag="${3:-}"
+      if [[ "$cap_dest" == "--quiesce" ]]; then cap_flag="--quiesce"; cap_dest=""; fi
+      [[ -n "$cap_dest" ]] \
+        || cap_dest="$(state_capture_dir)/${cap_svc}/$(date -u +%Y%m%d-%H%M%S)"
+      if [[ "$cap_flag" == "--quiesce" ]]; then
+        service_state_capture_quiesced "$cap_svc" "$cap_dest"
       else
-        service_state_capture "${1:-}" "${2:-}"
+        service_state_capture "$cap_svc" "$cap_dest"
       fi ;;
     verify-state)
       shift
@@ -12116,7 +12150,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir> [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
   esac
 }
 

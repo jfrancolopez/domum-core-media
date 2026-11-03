@@ -359,3 +359,101 @@ everything else in this proposal combined — and `cleanup images` already keeps
 more than one. That is why the retention policy for archives (only images a
 *still-valid* recovery point names) matters far more than any decision about
 the databases.
+
+## Phase E — the quiesced capture, REHEARSED against a real container
+
+**Measured 2026-11-02.** Unprivileged, on this host, against a disposable
+compose project. Production was untouched throughout and verified so afterwards.
+
+This closes the gap Phase D left open: every earlier test of the quiesced path
+stubbed `compose_cmd` and `migrate_assert_quiesced`, so nothing had shown the
+real container lifecycle. It needed no root — the quiesced capture reads
+`/srv/data/<service>`, a **bind mount**, not a Docker volume mountpoint. (The
+root blocker measured for `docs/VOLUME-UPGRADE-REHEARSAL.md` is a different
+code path: `dump_volume_to_file` tars `/var/lib/docker/volumes/...`, which is
+`drwx--x--- root root`.) Conflating the two is what deferred this.
+
+### Isolation, asserted through the real CLI before anything mutated
+
+```
+COMPOSE_PROJECT_NAME     domum-caprehearsal      (no such container/volume existed)
+service_data_path kavita <tmp>/data/kavita       NOT /srv/data/kavita
+compose files            <tmp>/repo/compose/base.yml  only
+compose ps -qa           []                      my project held nothing
+production kavita        fae6d10aa732            must never appear in my scope
+```
+
+The container that came up was `2c2a2e412d74`
+(`domum-caprehearsal-kavita`), and the production id was checked absent from
+the project's container list before the first stop.
+
+### Case 1 — a non-empty WAL must REFUSE, and must restart the service
+
+The fixture left `kavita.db-wal` at 4,152 bytes by skipping the clean close,
+which is what an unclean shutdown looks like. Driving the real function:
+
+```
+[domum-media] quiesced capture of kavita (runtime before: running)
+ Container domum-caprehearsal-kavita Stopping / Stopped
+[domum-media] WARN: Non-empty SQLite write-ahead logs remain after stopping …
+[domum-media] WARN: REFUSING: … is not quiesced after the stop. Nothing was captured.
+rc=1
+runtime after refusal : running
+same container id     : YES
+capture dir created   : no
+```
+
+So the refusal path works against a real stop: the service came back, **the
+container id was unchanged** — proving `compose start` rather than a recreate —
+and no capture directory was left behind.
+
+### Case 2 — checkpointed WAL, the whole chain
+
+After `pragma wal_checkpoint(TRUNCATE)`:
+
+```
+ quiesced        : no open handles, no non-empty WAL, no hot journal
+ runtime         : running (unchanged)
+[domum-media] quiesced capture complete
+
+CAPTURE_MODE=quiesced
+IMAGE_ID=sha256:fd7dc98638c8…            <- read from docker inspect, not invented
+ITEM=sqlite|config/kavita.db|file-copy-quiesced|8192|644|4a09165d98…
+ITEM=dir|config/templates|dir-copy|4|775|983409dc41…
+RESULT=COMPLETE
+
+capture verified: 2 item(s) match their recorded digests
+restored 2 item(s) …, all matching their recorded digests
+restored databases: 1 checked sound, 0 not checked
+capture mode: quiesced -- … This is the strongest capture mode.
+this proves the CAPTURE restores. It is not a proof that kavita runs against it.
+```
+
+And the restored file is a working database, not just matching bytes:
+
+```
+rows:      [(1, 'kavita-rehearsal'), (2, 'uncheckpointed')]
+integrity: ok
+```
+
+Row 2 is the one that existed only in the WAL before the checkpoint, so the
+capture carried the checkpointed state rather than a stale main file.
+
+### Teardown, asserted
+
+`compose down -v` removed the container and the project network; no
+`domum-caprehearsal` container, volume or network remains. Production: 11
+containers, `kavita` `Up 7 days (healthy)` — the same container, never stopped.
+
+### What this does and does not prove
+
+It proves the quiesced path's **real** behaviour: the stop happens, quiescence
+is genuinely evaluated against files on disk, a refusal restarts the service
+without recreating it, the capture records the running image's real id, and the
+captured database restores and opens.
+
+It does **not** prove the path against the production services. `kavita` here
+was a `busybox` container holding a bind mount, not Kavita — so nothing here
+shows how Kavita itself shuts down, or whether it checkpoints its WAL on stop.
+That is the question the real run would answer, and it causes downtime.
+`QUIESCED_CAPTURE_ENABLED` stays 0.

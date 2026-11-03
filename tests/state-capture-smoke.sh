@@ -638,8 +638,56 @@ grep -q '^PLAIN ' <<< "$out" \
   || fail "a misspelled flag selected something other than the ordinary path: $out"
 echo "  --quiesce routes to the quiesced path; absent or misspelled routes to the plain one"
 
+sect "the destination DEFAULTS, so a capture is schedulable"
+# Without a default every invocation needs an operator-invented path, which
+# means nothing can be scheduled and a backup scope has nothing stable to name.
+# It deliberately does NOT put the capture off-site: the cloud target is
+# immich-only, so the default is on the protected local tier and nowhere else.
+DEFSTUB='
+load_cfg() { :; }
+service_state_capture() { printf "PLAIN %s|%s\n" "$1" "$2"; }
+service_state_capture_quiesced() { printf "QUIESCED %s|%s\n" "$1" "$2"; }
+'
+out="$(probe "$DEFSTUB" "DOMUM_DATA_ROOT=/d storage_cmd capture-state kavita")"
+grep -qE '^PLAIN kavita\|/d/backups/state/kavita/[0-9]{8}-[0-9]{6}$' <<< "$out" \
+  || fail "no default destination, so a capture cannot be scheduled: $out"
+# A sibling of the service directory, never inside it: a capture written under
+# /srv/data/<service> would duplicate into every per-service snapshot.
+grep -q '|/d/kavita' <<< "$out" \
+  && fail "the default is INSIDE the service directory, so it would duplicate
+into every per-service snapshot of that service: $out"
+echo "  defaults to <data>/backups/state/<service>/<stamp>, beside the service"
+
+sect "an explicit destination still wins, and --quiesce works in either position"
+out="$(probe "$DEFSTUB" "DOMUM_DATA_ROOT=/d storage_cmd capture-state kavita /tmp/mine")"
+grep -q '^PLAIN kavita|/tmp/mine$' <<< "$out" || fail "an explicit path was ignored: $out"
+out="$(probe "$DEFSTUB" "DOMUM_DATA_ROOT=/d storage_cmd capture-state kavita /tmp/mine --quiesce")"
+grep -q '^QUIESCED kavita|/tmp/mine$' <<< "$out" || fail "--quiesce after a path did not route: $out"
+# --quiesce in the destination slot must not be taken AS the destination, or the
+# capture would be written to a directory called "--quiesce".
+out="$(probe "$DEFSTUB" "DOMUM_DATA_ROOT=/d storage_cmd capture-state kavita --quiesce")"
+grep -qE '^QUIESCED kavita\|/d/backups/state/kavita/[0-9]{8}-[0-9]{6}$' <<< "$out" \
+  || fail "--quiesce in the destination slot was mishandled: $out"
+grep -q 'quiesce' <<< "${out#*|}" \
+  && fail "it used the flag as the destination path: $out"
+echo "  explicit path wins; --quiesce in either slot never becomes the path"
+
+sect "the stale 'in the backup set' claim is gone from the archive comment"
+# It read "an archive here IS in the off-host backup set (measured)", which was
+# true of the GLOBAL include set and false of the target that runs: the cloud
+# target is immich-only and /srv/data/backups/images is NOT COVERED. The
+# operator found that by listing the Hetzner snapshot from another machine.
+arch="$(sed -n '/^# \/srv\/data\/backups is the right tier/,/^image_archive_dir() {/p' "$CLI")"
+[[ -n "$arch" ]] || fail "could not locate the archive-dir comment block"
+grep -q 'IS in the off-host backup set' <<< "$arch" \
+  && fail "the archive comment still claims an archive there is in the off-host
+backup set. The cloud target is immich-only: $arch"
+grep -q 'NOT COVERED' <<< "$arch" \
+  || fail "the corrected comment does not say the archives are not covered: $arch"
+echo "  corrected, and it says what is actually true"
+
 sect "--quiesce is in the usage text, so the operator can find it"
-grep -q 'capture-state <service> <dir> \[--quiesce\]' "$CLI" \
+grep -q "capture-state <service> \[dir\] \[--quiesce\]" "$CLI" \
   || fail "--quiesce is not documented in the storage usage string"
 echo "  documented"
 

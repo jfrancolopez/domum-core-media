@@ -3890,6 +3890,80 @@ audit that cries wolf is one somebody switches off.
 
 ---
 
+**THE QUIESCED CAPTURE IS NOW REHEARSED AGAINST A REAL CONTAINER, and the
+reason it was not is a mistake worth recording: I conflated two different
+blockers.** `docs/VOLUME-UPGRADE-REHEARSAL.md` correctly establishes that a
+rehearsal of `dump_volume_to_file` needs root, because it tars
+`/var/lib/docker/volumes/...` and that tree is `drwx--x--- root root`. I then
+treated "real-container rehearsal" as blocked in general. The quiesced capture
+reads `/srv/data/<service>`, a **bind mount**, so it needs no root at all.
+Measure the blocker for the path in front of you, not for a neighbouring one.
+
+Rehearsed 2026-11-02, unprivileged, against a disposable compose project, with
+production verified untouched afterwards:
+
+- **isolation asserted through the real CLI before anything mutated** --
+  `service_data_path kavita` resolved into the temp directory and not
+  `/srv/data/kavita`, only the fixture's compose file was layered, the
+  project's container list was empty, and production `kavita`
+  (`fae6d10aa732`) was checked absent from that list before the first stop;
+- **a non-empty WAL refuses and restarts.** The fixture left `kavita.db-wal`
+  at 4,152 bytes by skipping the clean close. The real function stopped the
+  real container, refused, and brought it back **with the same container id** --
+  which is what proves `compose start` rather than a recreate -- and left no
+  capture directory;
+- **the whole chain then worked**: `CAPTURE_MODE=quiesced`, `IMAGE_ID` read
+  from `docker inspect` rather than invented, `RESULT=COMPLETE`, verify and
+  restore both matching, and the restored database opened with
+  `integrity_check: ok` and **both** rows -- including the one that existed
+  only in the WAL before the checkpoint, so the capture carried the
+  checkpointed state rather than a stale main file;
+- **teardown asserted**: no `domum-caprehearsal` container, volume or network
+  remained, and production still had its 11 containers with `kavita`
+  `Up 7 days (healthy)`.
+
+**The limit stays explicit.** `kavita` in the rehearsal was a `busybox`
+container holding a bind mount, not Kavita. Nothing here shows how Kavita
+itself shuts down or whether it checkpoints its WAL on stop -- which is the
+question the real run answers, and it causes downtime.
+`QUIESCED_CAPTURE_ENABLED` stays 0.
+
+---
+
+**A STALE PROTECTION CLAIM WAS STILL IN A CODE COMMENT.**
+`image_archive_dir`'s comment justified the location partly by asserting that
+an archive there is in the off-host backup set, because restic is given
+`"$DOMUM_DATA_ROOT"`. That is true of the GLOBAL include set and false of the
+target that actually runs -- the cloud target is immich-only and
+`/srv/data/backups/images` is NOT COVERED. The operator found exactly this
+error in `dr-status` by listing the Hetzner snapshot from another machine; the
+code comment carried it for longer, because nothing reads a comment. Corrected,
+and the test asserts the claim is gone AND that the replacement says what is
+actually true -- not just that a string disappeared.
+
+**My correction first QUOTED the old claim verbatim, and the assertion fired on
+the documentation of the fix.** A comment quoting the broken form is normally
+how a fix documents itself, and it is the right instinct -- but not when the
+subject under assertion IS a comment. Paraphrase there instead, and the
+assertion keeps its full strictness rather than learning to skip the fix.
+
+**`storage capture-state` now has a DEFAULT destination.**
+`state_capture_dir()` -> `<data>/backups/state/<service>/<stamp>`. Without one,
+every invocation needed an operator-invented path, which means nothing could be
+scheduled and a backup scope had nothing stable to name -- the missing link
+between "the capture works" and "the capture can be protected". It is a sibling
+of the service directory and never inside it: a capture written under
+`/srv/data/<service>` would duplicate into every per-service snapshot of that
+service, and a capture of a service is not part of that service's state.
+
+It puts nothing off-site, and the comment says so: the cloud target is
+immich-only, so the default is on the protected local tier and nowhere else.
+`--quiesce` is accepted in the destination slot and must never be taken AS the
+destination -- a capture written to a directory called `--quiesce` is the kind
+of thing a test should pin, so it is pinned.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
