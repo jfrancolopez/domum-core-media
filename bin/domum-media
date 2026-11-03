@@ -8794,6 +8794,96 @@ state_item_mode() {  # $1 = path -> octal mode, or empty
   stat -c '%a' "$1" 2>/dev/null || true
 }
 
+service_state_capture_quiesced() {  # $1 = service, $2 = destination directory
+  # The strongest capture available for a service whose image ships no sqlite3:
+  # stop it, PROVE it is quiescent, copy, start the same container again.
+  #
+  # Measured 2026-11-02 from the SQLite file header: jellyfin.db and kavita.db
+  # are BOTH WAL-mode, and neither their images nor this host has an sqlite3 --
+  # so their ordinary captures are `unproven`, i.e. copies of a WAL database
+  # taken while the service may be writing. A quiesce is the only way to make
+  # them consistent, and it is the only capture path that causes DOWNTIME.
+  local service="$1" dest="$2"
+  [[ -n "$service" && -n "$dest" ]] \
+    || { warn "service_state_capture_quiesced needs a service and a destination"; return 1; }
+
+  # The gate refuses BEFORE the lock and BEFORE any stop. A closed gate that
+  # still causes downtime is not a closed gate -- the same reasoning as
+  # VOLUME_UPGRADE_ENABLED.
+  if (( ${QUIESCED_CAPTURE_ENABLED:-0} != 1 )); then
+    warn "REFUSING: a quiesced capture STOPS $service, and QUIESCED_CAPTURE_ENABLED is not 1."
+    warn "Nothing was locked and nothing was stopped. This path has only ever run against"
+    warn "fixtures; set QUIESCED_CAPTURE_ENABLED=1 deliberately to use it in production."
+    return 1
+  fi
+
+  local path compose_svcs runtime_before started=0 rc=0
+  path="$(service_data_path "$service")"
+  [[ -d "$path" ]] || { warn "$service has no state directory at $path"; return 1; }
+  service_essential_state "$service" >/dev/null 2>&1 \
+    || { warn "$service declares no essential state"; return 1; }
+
+  domum_acquire_lock "capture-state $service" 0 \
+    || { warn "Another domum-media operation holds the lock: $(domum_lock_holder)"; return 1; }
+
+  compose_svcs="$(service_compose_services "$service" 2>/dev/null || true)"
+  runtime_before="$(service_runtime_state "$service" 2>/dev/null || printf 'unknown')"
+  echo "[domum-media] quiesced capture of $service (runtime before: $runtime_before)"
+
+  # Restart with `compose start`, which starts the container that was stopped and
+  # therefore resolves NO image reference. NOT recreating: `up -d` reconciles and
+  # would deploy whatever the tag now points at, turning a capture into an
+  # unreviewed deployment.
+  capture_restart() {
+    (( started == 1 )) || return 0
+    [[ -n "$compose_svcs" ]] || return 0
+    # shellcheck disable=SC2086
+    compose_cmd start $compose_svcs >/dev/null 2>&1 && return 0
+    warn "Could not restart $compose_svcs with \`compose start\`."
+    warn "NOT recreating: that resolves the image tag and could deploy a staged image."
+    warn "$service is DOWN. The capture, if any, is in $dest."
+    return 1
+  }
+
+  if [[ "$runtime_before" == "running" && -n "$compose_svcs" ]]; then
+    # shellcheck disable=SC2086
+    compose_cmd stop $compose_svcs \
+      || { warn "Could not stop $compose_svcs; nothing was captured"; return 1; }
+    started=1
+  fi
+
+  # Consistent, or refuse. Without this the quiesced mode would be a claim about
+  # the stop rather than about the bytes.
+  if ! migrate_assert_quiesced "$path"; then
+    capture_restart
+    warn "REFUSING: $path is not quiesced after the stop. Nothing was captured."
+    return 1
+  fi
+  echo "  quiesced        : no open handles, no non-empty WAL, no hot journal"
+
+  service_state_capture "$service" "$dest" quiesced || rc=1
+
+  capture_restart || rc=1
+
+  # A capture must preserve runtime state: running before -> running after.
+  local runtime_after
+  runtime_after="$(service_runtime_state "$service" 2>/dev/null || printf 'unknown')"
+  if [[ "$runtime_after" != "$runtime_before" ]]; then
+    warn "Runtime state CHANGED across the capture: $runtime_before -> $runtime_after."
+    rc=1
+  else
+    echo "  runtime         : $runtime_after (unchanged)"
+  fi
+  # There is deliberately NO release call: `domum_acquire_lock` holds the lock
+  # through a file descriptor for the life of the process and nothing in this
+  # CLI releases it early -- `storage_pre_upgrade_point` does not either. It is
+  # also re-entrant, so a caller that already holds it is unaffected. Inventing
+  # a `domum_release_lock` is exactly what the function-definition audit caught
+  # here: it does not exist.
+  (( rc == 0 )) && echo "[domum-media] quiesced capture complete: $dest"
+  return "$rc"
+}
+
 service_state_restore() {  # $1 = capture directory, $2 = scratch target
   # Restores a capture into a target the operator names. It NEVER writes into
   # the live state tree: restoring over a running service's state would be a
@@ -8900,6 +8990,11 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
         echo "              none, so its database was COPIED while the service could be writing."
         echo "              The bytes restored are the bytes captured; whether they were a"
         echo "              consistent point in time is not established." ;;
+      quiesced)
+        echo "[domum-media] capture mode: quiesced -- the service was STOPPED and proved"
+        echo "              quiescent (no open handles, no non-empty WAL, no hot journal)"
+        echo "              before a byte was read, so the copy is a consistent point in"
+        echo "              time. This is the strongest capture mode." ;;
       *)
         echo "[domum-media] capture mode: $cap_mode -- not recorded, so consistency is unknown." ;;
     esac
@@ -8908,8 +9003,8 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   return "$rc"
 }
 
-service_state_capture() {  # $1 = service, $2 = destination directory
-  local service="$1" dest="$2"
+service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode override
+  local service="$1" dest="$2" mode_override="${3:-}"
   [[ -n "$service" && -n "$dest" ]] || { warn "service_state_capture needs a service and a destination"; return 1; }
   service_essential_state "$service" >/dev/null 2>&1 \
     || { warn "$service declares no essential state"; return 1; }
@@ -8917,7 +9012,13 @@ service_state_capture() {  # $1 = service, $2 = destination directory
   local root mode img cid manifest rc=0 items=0 bad=0
   root="$(service_data_path "$service")"
   [[ -d "$root" ]] || { warn "$service has no state directory at $root"; return 1; }
-  mode="$(service_state_capture_mode "$service")"
+  # The override exists for the QUIESCED path, where the service is stopped: a
+  # plain copy is then consistent BY CONSTRUCTION, and `.backup` through the
+  # container is impossible because the container is not running. It is a
+  # parameter rather than an environment variable so it cannot be set by
+  # accident, and the caller that passes it is the one that took the lock and
+  # proved quiescence.
+  mode="${mode_override:-$(service_state_capture_mode "$service")}"
   cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
   img="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
 
@@ -8952,7 +9053,11 @@ service_state_capture() {  # $1 = service, $2 = destination directory
         if [[ ! -f "$src" ]]; then
           printf 'ITEM=%s|%s|MISSING||\n' "$kind" "$rel" >> "$manifest"; bad=$(( bad + 1 )); continue
         fi
-        if [[ "$mode" == "consistent" ]] && service_sqlite_backup "$service" "$src" "$out"; then
+        if [[ "$mode" == "quiesced" ]] && cp -p -- "$src" "$out" 2>/dev/null; then
+          # Nothing is writing: the service is stopped and quiescence was proved
+          # before this ran, so the bytes are a consistent point in time.
+          itemmode="file-copy-quiesced"
+        elif [[ "$mode" == "consistent" ]] && service_sqlite_backup "$service" "$src" "$out"; then
           itemmode="sqlite-backup"
         elif cp -p -- "$src" "$out" 2>/dev/null; then
           # A copy of a database the service may be writing. Recorded as what
@@ -11951,8 +12056,16 @@ storage_cmd() {
       # This ACTIVATES NOTHING. It writes to the given directory and stops;
       # whether that directory is ever sent off-site is an operator decision,
       # and no backup target, include path or exclusion is touched.
+      # --quiesce STOPS the service, proves it quiescent, copies, and starts the
+      # same container again with `compose start`. It is the only capture path
+      # that causes downtime, so it is gated on QUIESCED_CAPTURE_ENABLED and
+      # refuses before the lock and before any stop.
       load_cfg
-      service_state_capture "${1:-}" "${2:-}" ;;
+      if [[ "${3:-}" == "--quiesce" ]]; then
+        service_state_capture_quiesced "${1:-}" "${2:-}"
+      else
+        service_state_capture "${1:-}" "${2:-}"
+      fi ;;
     verify-state)
       shift
       # Re-verify a capture against its own manifest. Read-only. A checksum
@@ -11996,7 +12109,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir>|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> <dir> [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
   esac
 }
 

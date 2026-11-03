@@ -3686,6 +3686,52 @@ a suite ends up with two fixtures that drift apart.
 
 ---
 
+**A QUIESCED CAPTURE EXISTS FOR THE TWO SERVICES THAT CANNOT HAVE A CONSISTENT
+ONE ANY OTHER WAY, and it is the only capture path that causes downtime.**
+jellyfin.db and kavita.db are both WAL-mode and neither their images nor this
+host has an sqlite3, so their ordinary captures are copies of a WAL database
+taken while the service may be writing.
+`storage capture-state <service> <dir> --quiesce` stops the service, PROVES it
+quiescent with `migrate_assert_quiesced`, copies, and starts the same container
+again with **`compose start`** -- never `up -d`, which reconciles and would turn
+a capture into an unreviewed deployment of whatever the tag now resolves to.
+`service_state_capture_quiesced` is in `PRESERVING` in
+`tests/reconcile-boundary-audit.py`, so that is enforced rather than intended.
+
+`QUIESCED_CAPTURE_ENABLED` defaults to 0 and **the refusal happens before the
+lock and before any stop** -- a closed gate that still causes downtime is not a
+closed gate, the same reasoning as `VOLUME_UPGRADE_ENABLED`. The mutation
+neutralises the comparison and must make an unset flag actually stop the
+service.
+
+Rules it follows, each already recorded: quiescence is PROVED rather than
+assumed (a refusal restarts the service and captures nothing); runtime state is
+preserved, so a service that was stopped is captured without being started;
+and the mode is a PARAMETER of `service_state_capture`, not an environment
+variable, so it cannot be set by accident -- the caller that passes `quiesced`
+is the one that took the lock and proved quiescence. A quiesced copy is
+recorded `file-copy-quiesced` and the restore reports it as the strongest mode.
+
+**I invented `domum_release_lock`, and the function-definition audit caught
+it.** There is no release function: `domum_acquire_lock` holds the lock through
+a file descriptor for the life of the process, it is re-entrant, and
+`storage_pre_upgrade_point` does not release it either. Three calls to a
+function that does not exist -- the `service_upgrade` undefined-helper family,
+and `bash -n` cannot see it.
+
+**My test STUBBED that invented function**, which is why the calls looked fine
+while the suite passed: a stub of a function the CLI does not have makes the
+fixture agree with the mistake. The ordering assertion now covers lock < stop <
+start only, and additionally asserts that nothing in the CLI calls a release at
+all.
+
+**And that new assertion flagged its own explanatory comment** -- the comment
+naming `domum_release_lock` to document the mistake. Comments are stripped
+first. That is the rule this project records, broken in the assertion written
+to enforce it, which is now its fifth recorded occurrence.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

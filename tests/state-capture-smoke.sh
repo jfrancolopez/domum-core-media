@@ -506,4 +506,164 @@ grep -q 'RC=1' <<< "$mout" \
 per-item digest comparison in place: $mout"
 echo "  killed: the refusal-before-writing is gone; the per-item digest still catches it"
 
+# ---------------------------------------------------------------------------
+# The QUIESCED capture -- the only capture path that causes downtime.
+#
+# Measured 2026-11-02 from the SQLite file header: jellyfin.db and kavita.db are
+# BOTH WAL-mode, and neither their images nor this host has an sqlite3, so their
+# ordinary captures are copies of a WAL database taken while the service may be
+# writing. A quiesce is the only way to make them consistent.
+# ---------------------------------------------------------------------------
+QSTUB='
+compose_cmd() { printf "compose %s\n" "$*" >> "$CALLS"; }
+service_compose_services() { printf "jellyfin"; }
+service_runtime_state() { printf "%s" "${FAKE_RUNTIME:-running}"; }
+migrate_assert_quiesced() { [[ -z "${FAKE_NOT_QUIESCED:-}" ]]; }
+domum_acquire_lock() { printf "lock %s\n" "$*" >> "$CALLS"; return 0; }
+domum_lock_holder() { printf "nobody"; }
+'
+
+sect "the gate REFUSES before the lock and before any stop"
+# A closed gate that still causes downtime is not a closed gate.
+build_jellyfin
+rm -rf "$TMP/out/q1"; : > "$TMP/calls"
+out="$(CALLS="$TMP/calls" probe "$QSTUB" "service_state_capture_quiesced jellyfin '$TMP/out/q1'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "the gate did not refuse: $out"
+grep -q 'REFUSING' <<< "$out" || fail "it does not say it is refusing: $out"
+[[ ! -s "$TMP/calls" ]] \
+  || fail "the refusal took the lock or stopped something: $(cat "$TMP/calls")"
+[[ ! -d "$TMP/out/q1" ]] || fail "it created a destination for a capture it refused"
+echo "  refused, no lock, no stop, no destination"
+
+sect "with the gate OPEN it stops, proves quiescence, captures and uses compose START"
+build_jellyfin
+rm -rf "$TMP/out/q2"; : > "$TMP/calls"
+out="$(CALLS="$TMP/calls" QUIESCED_CAPTURE_ENABLED=1 \
+       probe "$QSTUB" "service_state_capture_quiesced jellyfin '$TMP/out/q2'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "a clean quiesced capture failed: $out
+calls: $(cat "$TMP/calls")"
+grep -q '^compose stop jellyfin$' "$TMP/calls" || fail "it never stopped the service: $(cat "$TMP/calls")"
+grep -q '^compose start jellyfin$' "$TMP/calls" || fail "it never restarted the service: $(cat "$TMP/calls")"
+grep -qE '^compose up' "$TMP/calls" \
+  && fail "it used 'up -d', which RECONCILES -- that turns a capture into an
+unreviewed deployment of whatever the tag now resolves to: $(cat "$TMP/calls")"
+grep -q '^RESULT=COMPLETE$' "$TMP/out/q2/MANIFEST" || fail "the capture is not complete"
+grep -q '^CAPTURE_MODE=quiesced$' "$TMP/out/q2/MANIFEST" \
+  || fail "the mode is not recorded as quiesced: $(cat "$TMP/out/q2/MANIFEST")"
+grep -q 'file-copy-quiesced' "$TMP/out/q2/MANIFEST" \
+  || fail "the database item is not recorded as a quiesced copy: $(cat "$TMP/out/q2/MANIFEST")"
+grep -q 'file-copy-unproven' "$TMP/out/q2/MANIFEST" \
+  && fail "a stopped service's copy is still called unproven: $(cat "$TMP/out/q2/MANIFEST")"
+echo "  stop -> quiesce proof -> capture -> compose start; mode quiesced"
+
+sect "the LOCK is taken before the stop, and nothing invents a release"
+# The lock must be taken before the stop, or a concurrent operation could run
+# against a service this one has stopped.
+#
+# There is no release assertion, because there is no release FUNCTION:
+# domum_acquire_lock holds the lock through a file descriptor for the life of
+# the process, it is re-entrant, and storage_pre_upgrade_point does not release
+# it either. The first version of this test stubbed a `domum_release_lock` --
+# a stub of a function the CLI does not have, which is precisely how the
+# invented call survived until tests/function-definition-audit.py found it.
+l="$(grep -n '^lock' "$TMP/calls" | head -1 | cut -d: -f1)"
+st="$(grep -n '^compose stop' "$TMP/calls" | head -1 | cut -d: -f1)"
+sr="$(grep -n '^compose start' "$TMP/calls" | head -1 | cut -d: -f1)"
+[[ -n "$l" && -n "$st" && -n "$sr" ]] || fail "missing a call: $(cat "$TMP/calls")"
+(( l < st )) || fail "the lock was taken at $l, AFTER the stop at $st"
+(( st < sr )) || fail "the restart at $sr precedes the stop at $st"
+# Comments stripped: the comment explaining this very mistake names the
+# function, and the first version of this assertion flagged it. That is the
+# rule this project records -- strip comments before asserting code does NOT
+# contain something -- broken in the assertion written to enforce it.
+code="$(sed 's/#.*//' "$REPO_ROOT/bin/domum-media")"
+grep -q 'domum_release_lock' <<< "$code" \
+  && fail "something CALLS domum_release_lock, which does not exist"
+echo "  lock($l) < stop($st) < start($sr); no invented release"
+
+sect "a STOPPED service is captured without starting it"
+# A capture preserves runtime state: stopped before -> stopped after. Starting
+# it would be a side effect nobody asked for.
+build_jellyfin
+rm -rf "$TMP/out/q3"; : > "$TMP/calls"
+out="$(CALLS="$TMP/calls" QUIESCED_CAPTURE_ENABLED=1 FAKE_RUNTIME=stopped \
+       probe "$QSTUB" "service_state_capture_quiesced jellyfin '$TMP/out/q3'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "capturing an already-stopped service failed: $out"
+grep -qE '^compose (stop|start)' "$TMP/calls" \
+  && fail "it stopped or started a service that was already stopped: $(cat "$TMP/calls")"
+grep -q '^CAPTURE_MODE=quiesced$' "$TMP/out/q3/MANIFEST" || fail "mode not quiesced"
+echo "  no stop, no start, still a quiesced capture"
+
+sect "quiescence that cannot be PROVEN refuses, and restarts the service"
+build_jellyfin
+rm -rf "$TMP/out/q4"; : > "$TMP/calls"
+out="$(CALLS="$TMP/calls" QUIESCED_CAPTURE_ENABLED=1 FAKE_NOT_QUIESCED=1 \
+       probe "$QSTUB" "service_state_capture_quiesced jellyfin '$TMP/out/q4'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "an unquiesced state still produced a capture: $out"
+grep -q 'not quiesced' <<< "$out" || fail "it does not say why it refused: $out"
+grep -q '^compose start jellyfin$' "$TMP/calls" \
+  || fail "it refused and left the service DOWN: $(cat "$TMP/calls")"
+[[ ! -d "$TMP/out/q4" ]] || fail "it wrote a capture it had refused to make"
+echo "  refused, service restarted, nothing captured"
+
+sect "a RESTORE of a quiesced capture states the stronger claim"
+rm -rf "$TMP/out/q2restored"
+out="$(probe '' "service_state_restore '$TMP/out/q2' '$TMP/out/q2restored'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "a quiesced capture did not restore: $out"
+grep -q 'capture mode: quiesced' <<< "$out" || fail "the quiesced mode is not reported: $out"
+grep -q 'strongest capture mode' <<< "$out" \
+  || fail "it does not distinguish quiesced from the other two modes: $out"
+grep -q 'UNPROVEN' <<< "$out" && fail "a quiesced restore was called unproven: $out"
+echo "  reported as the strongest mode, and not as unproven"
+
+sect "the DISPATCH reaches the quiesced path only with --quiesce"
+# A function that works when called directly but is unreachable through the
+# dispatcher is the defect the capabilities audit exists for. `load_cfg` runs
+# before the dispatch and needs a real config, so it is stubbed here and the
+# real `storage_cmd` arm is what gets driven.
+DSTUB='
+load_cfg() { :; }
+service_state_capture() { printf "PLAIN %s %s\n" "$1" "$2"; }
+service_state_capture_quiesced() { printf "QUIESCED %s %s\n" "$1" "$2"; }
+'
+out="$(probe "$DSTUB" "storage_cmd capture-state jellyfin /tmp/x --quiesce")"
+grep -q '^QUIESCED jellyfin /tmp/x$' <<< "$out" \
+  || fail "--quiesce does not reach the quiesced path through storage_cmd: $out"
+out="$(probe "$DSTUB" "storage_cmd capture-state jellyfin /tmp/x")"
+grep -q '^PLAIN jellyfin /tmp/x$' <<< "$out" \
+  || fail "the ordinary capture is not reached without the flag: $out"
+# An unknown third argument must not silently select the downtime path.
+out="$(probe "$DSTUB" "storage_cmd capture-state jellyfin /tmp/x --quiesceee")"
+grep -q '^PLAIN ' <<< "$out" \
+  || fail "a misspelled flag selected something other than the ordinary path: $out"
+echo "  --quiesce routes to the quiesced path; absent or misspelled routes to the plain one"
+
+sect "--quiesce is in the usage text, so the operator can find it"
+grep -q 'capture-state <service> <dir> \[--quiesce\]' "$CLI" \
+  || fail "--quiesce is not documented in the storage usage string"
+echo "  documented"
+
+sect "MUTATION: without the gate it STOPS a production service"
+build_jellyfin
+rm -rf "$TMP/out/qm"; : > "$TMP/calls"
+cp "$CLI" "$TMP/cli.origq"
+cat > "$TMP/mutq.py" <<'PYMUTQ'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if (( ${QUIESCED_CAPTURE_ENABLED:-0} != 1 )); then'
+new = '  if (( 1 != 1 )); then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUTQ
+( python3 -I "$TMP/mutq.py" "$CLI" ) || { cp "$TMP/cli.origq" "$CLI"; fail "the gate mutation did not apply"; }
+mout="$(CALLS="$TMP/calls" probe "$QSTUB" "service_state_capture_quiesced jellyfin '$TMP/out/qm'" 2>&1)"
+stopped=0; grep -q '^compose stop' "$TMP/calls" && stopped=1
+cp "$TMP/cli.origq" "$CLI"
+[[ "$stopped" == "1" ]] \
+  || fail "the mutation changed no ANSWER -- with the gate neutralised and the
+flag unset, the service must actually be stopped: $mout
+calls: $(cat "$TMP/calls")"
+echo "  killed: without the gate, an unset flag still stops the service"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"
