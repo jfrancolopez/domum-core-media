@@ -20,20 +20,24 @@ mtime would have misled, as it has three times before in this project.)
 
 ## What would change
 
-Exactly **two files**. Verified by hashing each deployment target's blob at both
-revisions:
+Exactly **two files** — and the *shape* of that is what this plan rests on:
+**two binaries, no unit files, no handover.** Re-verified against `origin/main`
+after every merge since this was written.
 
-Measured **2026-11-02** against `origin/main` at `dcf943a`. The *shape* of the
-change — two binaries, no units, no handover — is what this plan rests on;
-re-read the dry run's own table before confirming, because these figures are a
-dated measurement and not a promise about a later revision.
+The table gives only the **installed** hashes. Those are a fact about
+production and cannot change until a deployment happens. The target hashes are
+deliberately left out: one goes stale the moment `main` moves, which is the same
+mistake as storing a revision constant — and the first draft of this plan
+quoted both a constant and a target hash, and the hash was wrong within an
+hour. Read the target side from the dry run, which computes it against the
+revision you are actually deploying.
 
-| file | |
-|---|---|
-| `/usr/local/bin/domum-media` | `5e65f06c8a7a` → `aea3fcd552f2` |
-| `/usr/local/bin/domum-media-backup` | `08a81ba20658` → `2c6aec3afd82` |
-| `/usr/local/lib/domum-media/domum-media-report` | **unchanged** |
-| `domum-media-weekly-report.service` / `.timer` | **unchanged** |
+| installed file | current sha256 (production, `a63ad19`) | changes? |
+|---|---|---|
+| `/usr/local/bin/domum-media` | `5e65f06c8a7a…` | **yes** |
+| `/usr/local/bin/domum-media-backup` | `08a81ba20658…` | **yes** |
+| `/usr/local/lib/domum-media/domum-media-report` | `d813ae0e4181…` | no |
+| `domum-media-weekly-report.service` / `.timer` | — | no |
 
 Consequences of that:
 
@@ -107,7 +111,24 @@ repository is touched by either direction.
 
 ## Evidence
 
-- 82 suites and audits pass locally; CI green on the branch.
+- **81 suites and audits pass, none failed.** The arithmetic, because two
+  different numbers get quoted for this and they are not the same number:
+
+  ```
+  82  test files        ci-coverage-audit, find -maxdepth 2
+   =  70  tests/*.sh
+   +  10  tests/*.py
+   +   1  tests/integration/btrfs-migration-integration.sh
+   +   1  tests/fixtures/email-client-simulation.py   <- invoked BY a suite
+  81  runnable standalone, and all 81 pass
+  ```
+
+  The integration suite is in CI and is **not** matched by a `tests/*.sh`
+  glob, so a local run that globs only the top level silently omits it. It was
+  run separately and passes, exercising the real btrfs primitives — subvolume
+  create/snapshot, `cp --reflink=always`, `rename(2)`, `flock`, `/proc`.
+- CI green on the exact tree now on `main`, verified by comparing the run's
+  head sha to the tree rather than trusting the badge.
 - shellcheck clean with CI's flags on `bin/*`, `install.sh`, `operator/*.sh`,
   and all suites now pass `--severity=error`.
 - `bash -n` on all three entrypoints.

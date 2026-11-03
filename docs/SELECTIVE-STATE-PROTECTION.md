@@ -457,3 +457,123 @@ was a `busybox` container holding a bind mount, not Kavita — so nothing here
 shows how Kavita itself shuts down, or whether it checkpoints its WAL on stop.
 That is the question the real run would answer, and it causes downtime.
 `QUIESCED_CAPTURE_ENABLED` stays 0.
+
+## Phase F — rehearsed against the REAL Kavita image
+
+**Measured 2026-11-03.** Phase E used a `busybox` stand-in, so it proved the
+mechanism and left one question open in its own words: *"nothing here shows how
+Kavita itself shuts down or whether it checkpoints its WAL on stop."* That is
+the question this answers, with the production image.
+
+The image was pinned **by ID** — `sha256:454f2a77ac74…`, read from the running
+container — not by `jvmilazz0/kavita:latest`, so a tag that moves cannot change
+what was rehearsed. A disposable project, its own bind mount under a temp
+directory, no external networks, no Traefik labels, production verified
+untouched.
+
+### Kavita checkpoints its WAL on a clean stop
+
+```
+running      kavita.db    430,080    kavita.db-wal  4,132,392
+clean stop   kavita.db  1,114,112    kavita.db-wal  ABSENT
+```
+
+The main database **grew by almost exactly the WAL's content** and the `-wal`
+file was removed outright. Verified a second time with the container stopped, to
+isolate the claim from anything the restart does. So `migrate_assert_quiesced`
+passed on its own terms rather than by luck:
+
+```
+ quiesced        : no open handles, no non-empty WAL, no hot journal
+ runtime         : running (unchanged)
+[domum-media] quiesced capture complete
+rc=0   same container id: YES
+```
+
+### The capture is real Kavita state
+
+```
+CAPTURE_MODE=quiesced
+IMAGE_ID=sha256:454f2a77ac740b70c58cc7300a11122fc9ce7b7e2161ef5b0d1df8f81067cc85
+ITEM=sqlite|config/kavita.db|file-copy-quiesced|1114112|644|0f94e7429c25…
+ITEM=dir|config/templates|dir-copy|68438|755|6bbb0ceaa900…
+RESULT=COMPLETE
+```
+
+The captured database opens read-only with **84 tables** and
+`integrity_check: ok`, and the table names are Kavita's own
+(`AppUserAnnotation`, `AppUserBookmark`, `AppUserCollection`, …) — so this is
+the application's real schema, not a fixture's.
+
+### A measurement that is easy to misread
+
+After the capture the service is restarted, and Kavita immediately creates a
+**new** 41,232-byte `-wal`. Looking at the directory *after* a capture therefore
+shows a non-empty WAL, which says nothing about the state the check saw. The
+decisive evidence is the main database's growth and the WAL's absence **while
+stopped**; the post-restart size is a different file in a different epoch. Both
+were recorded here because reading the later one as the earlier one would have
+inverted the conclusion.
+
+### What is now settled, and what is not
+
+Settled: Kavita's clean shutdown leaves no WAL, so the quiesced capture path
+succeeds for it on its merits, and the captured database is sound and complete.
+
+Not settled: **jellyfin**, the other service with no sqlite3 anywhere, has not
+been rehearsed this way. And this remains a disposable Kavita with an empty
+library — a production instance has 8 days of uptime, a populated library and
+active scan tasks, so its shutdown has more to finish. The real run still
+causes downtime and `QUIESCED_CAPTURE_ENABLED` stays 0.
+
+## Phase F (continued) — Jellyfin, and the defect the real image exposed
+
+**Jellyfin also checkpoints its WAL on a clean stop.** Measured 2026-11-03 with
+the production image pinned by ID (`sha256:438e44330078…`): a
+3,188,912-byte `jellyfin.db-wal` before the stop, and
+`quiesced: no open handles, no non-empty WAL, no hot journal` after it. Both
+services with no sqlite3 anywhere behave the same way, which is the result the
+quiesced path needed.
+
+Its six declared items appear in **stages** during startup —
+`config/encoding.xml` is absent until Jellyfin finishes initialising — so a
+capture taken mid-startup correctly reports `INCOMPLETE`. That is fail-closed
+working, not a defect, and it is worth knowing before anyone schedules one.
+
+### The capture failed, and it was right to — but it had already taken downtime
+
+```
+ITEM=dir|config/.aspnet/DataProtection-Keys|FAILED||
+RESULT=INCOMPLETE          1 of 6 declared item(s) could not be captured
+rc=1                       service restarted, same container id
+```
+
+The directory was present. The key inside is **`-rw------- root root`**, and the
+rehearsal ran unprivileged, so `cp -a` could not read it. The one declared item
+that is mode-restricted is exactly the one that decrypts Jellyfin's stored
+secrets, so failing closed on it is the correct outcome — and no fixture could
+have produced this, because a fixture's 0600 key is owned by the user running
+the test.
+
+**But the capture had already stopped the service.** `capture-state` did not
+require root, while every other `storage` subcommand does. So an unprivileged
+operator would take real downtime for a capture that could never succeed. "A
+closed gate that still causes downtime is not a closed gate" applies to a
+missing privilege exactly as it does to a feature flag.
+
+Fixed: `need_root` is the **first** thing the quiesced path does — before the
+gate, before the lock, and above all before the stop — and the ordering is
+asserted both behaviourally (nothing locked, nothing stopped, no destination
+created) and positionally in the source.
+
+### `FAILED` now names its cause
+
+`FAILED` alone sent nobody anywhere, and an unactionable failure trains the
+operator to ignore it. An item that exists but cannot be read is recorded
+`FAILED:UNREADABLE`, which is overwhelmingly a privilege problem.
+
+Three readers examine an item mode — the capture's own tally, `verify-state`
+and `restore-state` — and all three had to learn the labelled form. Matching
+only the bare `FAILED` would have made a `FAILED:UNREADABLE` item look like
+something to restore; that second site was caught by checking every match
+rather than the first one.

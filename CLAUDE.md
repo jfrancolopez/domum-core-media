@@ -3964,6 +3964,109 @@ of thing a test should pin, so it is pinned.
 
 ---
 
+**MY OWN FULL-SUITE RUN SILENTLY OMITTED A CI SUITE, and the inverse of that
+is already recorded here.** This file records that seven suites existed which
+CI never ran, and `tests/ci-coverage-audit.sh` was written to stop that. The
+mirror image went unnoticed: a local run that globs `tests/*.sh` and
+`tests/*.py` does **not** match
+`tests/integration/btrfs-migration-integration.sh`, which IS in the workflow
+and DOES run unprivileged. So "the full suite passes locally" was a claim about
+80 of the 81 runnable files, every time it was made.
+
+Run separately, it passes -- it exercises the real primitives (subvolume
+create/snapshot, `cp --reflink=always`, `rename(2)`, `flock`, `/proc`), which is
+exactly the coverage a stubbed suite cannot give, so omitting it was omitting
+the strongest one.
+
+**The two counts are different numbers and must not be quoted
+interchangeably.** `ci-coverage-audit` uses `find -maxdepth 2` and reports
+**82 test files**: 70 `tests/*.sh` + 10 `tests/*.py` + the integration suite +
+`tests/fixtures/email-client-simulation.py`, which is invoked BY a suite rather
+than run standalone. **81** are runnable standalone. Quoting 82 as "suites that
+pass" is a count of one thing wearing another's label -- and a first attempt at
+explaining the gap blamed `tests/fixtures/` alone, which does not add up
+(82 - 80 = 2, and that directory holds one file). Measure the difference
+instead of reasoning about it.
+
+---
+
+**KAVITA CHECKPOINTS ITS WAL ON A CLEAN STOP -- measured 2026-11-03 against
+the REAL image, which settles the question Phase E left open.** The earlier
+rehearsal used a `busybox` stand-in and said so: *"nothing here shows how
+Kavita itself shuts down or whether it checkpoints its WAL on stop."*
+
+```
+running      kavita.db    430,080    kavita.db-wal  4,132,392
+clean stop   kavita.db  1,114,112    kavita.db-wal  ABSENT
+```
+
+The main database grew by almost exactly the WAL's content and the `-wal` was
+removed outright, verified a second time with the container stopped to isolate
+the claim from the restart. So `migrate_assert_quiesced` passed on its own
+terms, the capture completed (`rc=0`, same container id), and the captured
+database opens with **84 tables**, `integrity_check: ok`, and Kavita's own table
+names -- the application's real schema rather than a fixture's.
+
+The image was pinned **by ID** read from the running container, never by
+`jvmilazz0/kavita:latest`, so a tag that moves cannot change what was
+rehearsed.
+
+**A measurement that is easy to misread, and nearly was.** After the capture the
+service restarts and Kavita immediately creates a NEW 41,232-byte `-wal`. The
+directory inspected *after* a capture therefore shows a non-empty WAL, which
+says nothing about what the check saw. The decisive evidence is the main
+database's growth plus the WAL's absence WHILE STOPPED; the post-restart size
+is a different file in a different epoch, and reading the later one as the
+earlier one would have inverted the conclusion.
+
+**Teardown of a rehearsal whose container runs as ROOT.** Kavita writes
+root-owned files into the bind mount, so the fixture cannot be removed by the
+development account. A disposable `busybox` container with the temp directory
+mounted does it -- the same tool that created the problem removes it, and no
+privilege is needed on the host.
+
+**Still not rehearsed: jellyfin**, the other service with no sqlite3 anywhere.
+And this was a disposable Kavita with an EMPTY library; production has days of
+uptime, a populated library and active scan tasks, so its shutdown has more to
+finish. The real run causes downtime and `QUIESCED_CAPTURE_ENABLED` stays 0.
+
+---
+
+**JELLYFIN ALSO CHECKPOINTS ITS WAL ON A CLEAN STOP** -- measured 2026-11-03
+with the production image pinned by ID: a 3,188,912-byte `jellyfin.db-wal`
+before the stop, nothing after it. Both services with no sqlite3 anywhere
+behave the same way, which is the result the quiesced path needed. Its six
+declared items appear in STAGES during startup (`encoding.xml` is absent until
+initialisation finishes), so a capture taken mid-startup correctly reports
+INCOMPLETE.
+
+**AND THE REAL IMAGE EXPOSED A DEFECT NO FIXTURE COULD.** The capture failed
+closed on `config/.aspnet/DataProtection-Keys` -- present, but the key inside is
+**`-rw------- root root`** and the rehearsal ran unprivileged, so `cp -a` could
+not read it. The one declared item that is mode-restricted is exactly the one
+that decrypts Jellyfin's stored secrets, so refusing was right. A fixture could
+never have shown this, because a fixture's 0600 key is owned by the user running
+the test.
+
+**But the capture had already STOPPED THE SERVICE.** `capture-state` did not
+call `need_root` while every other `storage` subcommand does, so an
+unprivileged operator would take real downtime for a capture that could never
+succeed. "A closed gate that still causes downtime is not a closed gate"
+applies to a missing privilege exactly as it does to a feature flag.
+`need_root` is now the FIRST thing the quiesced path does -- before the gate,
+before the lock, before the stop -- and the ordering is asserted behaviourally
+(nothing locked, nothing stopped, no destination created) and positionally.
+
+**`FAILED` now names its cause.** An item that exists and cannot be read is
+`FAILED:UNREADABLE`; a bare `FAILED` sent nobody anywhere, and an unactionable
+failure trains the operator to ignore it. **Three** readers examine an item
+mode -- the capture's tally, `verify-state` and `restore-state` -- and matching
+only the bare form would have made a `FAILED:UNREADABLE` item look like
+something to restore. The second site was caught by checking every match
+instead of the first.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
