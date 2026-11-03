@@ -18,6 +18,16 @@ rather than being deleted.
 
 ---
 
+## Deployment
+
+Production is at `a63ad19` with **no drift** — every installed file's sha256
+matches that revision's blob, verified 2026-11-02. A reviewed plan for
+`a63ad19` → current `origin/main` is in `docs/DEPLOYMENT-PLAN-2026-11-02.md`:
+two files change, no unit changes, no `daemon-reload`, no container touched, no
+timer enabled, and no handover. Not executed — that is an approval boundary.
+
+---
+
 ## P1 — Selective off-site protection for media-service state
 
 Design: `docs/SELECTIVE-STATE-PROTECTION.md`. Phase A measured, Phase B
