@@ -261,6 +261,9 @@ jobs:
       - name: Library stdout purity audit
         run: python3 tests/lib-stdout-purity-audit.py
 
+      - name: Critical-finding pairing audit
+        run: python3 tests/lib-critical-pairing-audit.py
+
       - name: Reconcile boundary audit
         run: python3 tests/reconcile-boundary-audit.py
 

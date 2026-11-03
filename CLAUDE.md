@@ -4428,6 +4428,46 @@ that asserted it could not be made.**
 
 ---
 
+**NOTHING ENFORCED THE PAIRING FOR *CRITICALS*, and a critical is the one that
+MAILS.** `tests/warning-remedy-smoke.sh` has a universal scan requiring every
+`checkup_add warning` to carry an action or an advice. The critical side was
+only ever fixed case by case -- this file records the backup criticals being
+given remedies -- and with nothing enforcing it, **three more were sitting
+there**. Measured 2026-11-03: 25 critical sites, 7 bare, of which three were
+real:
+
+- `Legacy image pin variables are still present in the config.` -- named
+  neither the variables nor the file. And **measured: no file in this
+  repository reads `IMMICH_VERSION`, `JELLYFIN_VERSION` or
+  `NAVIDROME_VERSION`**, so a config that sets them pins nothing while reading
+  as though it does. The message now names which were found and the remedy is
+  the read-only `grep -n` that prints the exact lines;
+- `No backup targets are enabled.` -- a critical saying the photographs may be
+  unbacked-up, with no way to see why. Its remedy is deliberately scoped to
+  `BACKUP_TARGETS` and the `*_ENABLED` keys: a repository URL and a credential
+  path are not needed to answer "which targets are switched on", and **a remedy
+  must not widen what it prints**;
+- `Missing backup password file for $target.` -- did not name the path,
+  **although `$pw_file` was resolved on the line above** and the sibling secret
+  check names its own. The two are symmetric now, and both remedies are an
+  `ls -l` that says explicitly never to print the contents.
+
+**A CRITICAL WITH NO REMEDY IS WORSE THAN A WARNING WITH NONE**, because a
+warning stays quiet while a critical opens the silence gate: the operator gets
+an alarm and no command.
+
+`tests/lib-critical-pairing-audit.py` enforces it, standalone in CI like
+`lib-stdout-purity-audit.py` and also driven by the smoke test against a
+mutant. Three criticals stay deliberately bare because they name the exact
+variable and every legal value, which IS the remedy; they carry an explicit
+`# critical-bare: <reason>` marker, read BEFORE comments are stripped,
+exempting only its own line, and **every exemption is printed** -- an allowance
+nobody can see is how a real defect gets a marker stuck on it. The audit also
+fails when it finds fewer than ten sites, so it cannot pass by scanning
+nothing. 1 mutant, killed: removing a critical's only remedy must fail CI.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

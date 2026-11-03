@@ -7197,19 +7197,31 @@ health_notify_cmd() {
 # checkup, health-notify and the weekly report all collect through here.
 # Callers reset the four arrays; this only appends.
 checkup_collect_all() {
-  [[ -n "${DOMUM_DOMAIN:-}" ]] || checkup_add critical "DOMUM_DOMAIN is empty."
-  [[ -n "${BACKUP_POLICY:-}" ]] || checkup_add critical "BACKUP_POLICY is unset."
+  [[ -n "${DOMUM_DOMAIN:-}" ]] || checkup_add critical "DOMUM_DOMAIN is empty." # critical-bare: names the exact variable, which is the remedy
+  [[ -n "${BACKUP_POLICY:-}" ]] || checkup_add critical "BACKUP_POLICY is unset." # critical-bare: names the exact variable, which is the remedy
   case "${BACKUP_POLICY^^}" in
     STRICT|BALANCED|LENIENT) ;;
-    *) checkup_add critical "BACKUP_POLICY must be STRICT, BALANCED, or LENIENT." ;;
+    *) checkup_add critical "BACKUP_POLICY must be STRICT, BALANCED, or LENIENT." ;; # critical-bare: names the variable and every legal value
   esac
-  if grep -qE '^(IMMICH_VERSION|JELLYFIN_VERSION|NAVIDROME_VERSION)=' "$CFG_FILE" 2>/dev/null; then
-    checkup_add critical "Legacy image pin variables are still present in the config."
+  # This said only "Legacy image pin variables are still present in the config"
+  # -- a critical that MAILS while naming neither the variables nor the file.
+  # A critical with no remedy is worse than a warning with none. Measured: no
+  # file in this repository reads any of the three, so a config that sets them
+  # pins nothing and reads as though it does.
+  local legacy_pins
+  legacy_pins="$(grep -oE '^(IMMICH_VERSION|JELLYFIN_VERSION|NAVIDROME_VERSION)' "$CFG_FILE" 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+  if [[ -n "${legacy_pins// /}" ]]; then
+    checkup_add critical "Legacy image pin variables are still in $CFG_FILE: ${legacy_pins% }. Nothing reads them, so they pin no version while reading as though they do."
+    checkup_add action "grep -nE '^(IMMICH|JELLYFIN|NAVIDROME)_VERSION=' $CFG_FILE   # read-only: the exact lines to remove"
   fi
   local enabled_targets
   enabled_targets="$(enabled_backup_targets || true)"
   if [[ -z "${enabled_targets//[[:space:]]/}" ]]; then
-    checkup_add critical "No backup targets are enabled."
+    checkup_add critical "No backup targets are enabled, so NOTHING is backed up. Declared targets come from BACKUP_TARGETS in $CFG_FILE and each is switched on by BACKUP_TARGET_<NAME>_ENABLED."
+    # Deliberately scoped to the declaration and the ENABLED flags. A
+    # repository URL and a credential path are not needed to answer "which
+    # targets are switched on", and a remedy must not widen what it prints.
+    checkup_add action "grep -nE '^BACKUP_TARGET(S|_[A-Z]+_ENABLED)=' $CFG_FILE   # read-only: what is declared, and which are off"
   else
     checkup_add healthy "At least one backup target is enabled."
   fi
@@ -7219,7 +7231,10 @@ checkup_collect_all() {
     $([[ "${ENABLE_TRAEFIK:-0}" == "1" ]] && printf '%s ' "$SECRETS_DIR/cloudflare_api_token" "${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}") \
     $([[ "${ENABLE_IMMICH:-0}" == "1" ]] && printf '%s ' "$SECRETS_DIR/immich_db_password" "$SECRETS_DIR/immich_jwt_secret"); do
     if [[ ! -s "$required_secret" ]]; then
+      # Symmetric with the backup password file below: name the path, and give
+      # a read-only way to look at it that cannot print what is in it.
       checkup_add critical "Missing or empty secret: $required_secret"
+      checkup_add action "ls -l $required_secret   # read-only: the path this service is given. Never print its contents"
     fi
   done
   while IFS= read -r target; do
@@ -7227,7 +7242,11 @@ checkup_collect_all() {
     local pw_file pw_size
     pw_file="$(backup_target_password_file "$target")"
     if [[ ! -s "$pw_file" ]]; then
-      checkup_add critical "Missing backup password file for $target."
+      # $pw_file was already resolved on the line above and the message did not
+      # use it, while the sibling secret check names its exact path. Without it
+      # the operator is told a credential is missing and not where it belongs.
+      checkup_add critical "Missing or empty backup password file for $target: $pw_file. Without it that repository cannot be read or written."
+      checkup_add action "ls -l $pw_file   # read-only: the path restic is given for $target. Never print its contents"
     else
       pw_size="$(wc -c < "$pw_file" | tr -d ' ')"
       if [[ "${pw_size:-0}" -lt 12 ]]; then
