@@ -25,9 +25,10 @@ LIST="$REPO_ROOT/systemd/auto-enable.timers"
 
 # Timers that must never be enabled by installation or convergence.
 DEPLOYMENT_TIMERS=(domum-media-image-refresh.timer)
-# Not a DEPLOYMENT timer -- read-only -- but still never auto-enabled, because
-# enabling it means a scrub WILL start unattended and starting one is an
-# operator decision. Listed separately so the reason stays attached to it.
+# Not a DEPLOYMENT timer, and not read-only either: no `-r` is passed, so a
+# scrub REPAIRS DUP metadata by writing. Never auto-enabled, because enabling
+# it means a scrub WILL start unattended and starting one is an operator
+# decision. Listed separately so the reason stays attached to it.
 OPERATOR_ONLY_TIMERS=(domum-media-btrfs-scrub.timer)
 
 # ---------------------------------------------------------------------------

@@ -366,4 +366,115 @@ grep -qi 'corrected_errors' <<< "$out" \
   || fail "it does not explain that a metadata error would have been corrected: $out"
 echo "  exit 3 attributed to data, with the reason"
 
+
+sect "NO TRACKED FILE describes the scrub as read-only -- repository-wide"
+# The section above drives the runtime OUTPUT. That is why three textual claims
+# survived the correction that fixed this in thirteen places:
+#
+#   systemd/auto-enable.timers          "Read-only, and protective"
+#   tests/timer-auto-enable-safety-smoke.sh  "Not a DEPLOYMENT timer -- read-only --"
+#   bin/domum-media  (storage_cmd)      "Read-only verification."
+#
+# The last one is in the INSTALLED binary too. And a line-at-a-time grep MISSED
+# the first, because the word "scrub" is on the preceding line -- the same
+# blind spot that hid two of the pipefail audit's ten findings. So this scans a
+# WINDOW, not a line.
+#
+# CLAUDE.md is exempt by name: it is the historical record and quotes the
+# broken form in order to document the fix. A window that also contains a
+# negation, or that is about `scrub status` (which genuinely is read-only), is
+# not a claim.
+scrub_claims="$(python3 - "$REPO_ROOT" <<'PY'
+import io, os, re, sys
+root = sys.argv[1]
+SCRUB = re.compile(r'scrub', re.I)
+CLAIM = re.compile(r'read[- ]only|never writes|deletes nothing|cannot be the cause', re.I)
+# A window that says the opposite, or is about `scrub status`, is not a claim.
+# A window that says the opposite, discusses the -r flag that WOULD make it
+# read-only, or is about a different read-only command, is not a claim. These
+# were measured against the real tree: without them the scan reports 9 windows
+# of which 5 are its own documentation and 2 are legitimate -- and an audit
+# that cries wolf is one somebody switches off.
+OK = re.compile(r'not read-only|NOT read-only|read-write|READ-WRITE|is not\b'
+                r'|scrub status|genuinely read-only|detection pass'
+                r'|(?<![A-Za-z])-r(?![A-Za-z])|findmnt|filesystem df'
+                r'|no root required', re.I)
+# CLAUDE.md is the historical record and QUEUE.md records the fix; both quote
+# the broken form deliberately. This suite is exempt for the same reason -- it
+# has to name the exact sentences it exists to catch, including in its own
+# negative control.
+EXEMPT = {"CLAUDE.md", os.path.join("tests", "btrfs-scrub-smoke.sh")}
+WINDOW = 3
+found = 0
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
+    for fn in filenames:
+        rel = os.path.relpath(os.path.join(dirpath, fn), root)
+        if rel in EXEMPT:
+            continue
+        if not re.search(r'\.(md|sh|py|timer|service|timers|yml|conf)$', fn) \
+           and fn not in ("domum-media", "domum-media-backup", "domum-media-report"):
+            continue
+        try:
+            lines = io.open(os.path.join(dirpath, fn), encoding="utf-8",
+                            errors="replace").read().split("\n")
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            if not CLAIM.search(line):
+                continue
+            lo, hi = max(0, i - WINDOW), min(len(lines), i + WINDOW + 1)
+            window = "\n".join(lines[lo:hi])
+            if not SCRUB.search(window):
+                continue
+            if OK.search(window):
+                continue
+            print("%s:%d  %s" % (rel, i + 1, line.strip()[:100]))
+            found += 1
+print("windows flagged: %d" % found)
+PY
+)"
+printf '%s\n' "$scrub_claims"
+flagged="$(sed -n 's/^windows flagged: //p' <<< "$scrub_claims")"
+[ "${flagged:-1}" = "0" ] \
+  || fail "a tracked file still describes the scrub as read-only. It passes no -r,
+so on a replicated profile it repairs by WRITING -- and Metadata and System on
+this host are DUP."
+# It must not be able to pass by scanning nothing: the scrub IS described in
+# several files, so a window count of zero with no file read is a broken scan.
+grep -q 'windows flagged' <<< "$scrub_claims" \
+  || fail "the scan produced no verdict at all"
+echo "  no tracked file outside CLAUDE.md makes the claim"
+
+sect "and the scan would CATCH the claim if it came back"
+# Proves the window logic rather than trusting it, including the cross-line
+# case a grep missed. Without this the section above could pass against a scan
+# that matches nothing.
+probe_dir="$TMP/scrubclaim"
+rm -rf "$probe_dir"; mkdir -p "$probe_dir"
+printf '#   domum-media-btrfs-scrub.timer\n#       Read-only, and protective.\n' \
+  > "$probe_dir/auto-enable.timers"
+caught="$(python3 - "$probe_dir" <<'PY'
+import io, os, re, sys
+root = sys.argv[1]
+SCRUB = re.compile(r'scrub', re.I)
+CLAIM = re.compile(r'read[- ]only|never writes|deletes nothing|cannot be the cause', re.I)
+OK = re.compile(r'not read-only|NOT read-only|read-write|READ-WRITE|is not\b|scrub status|genuinely read-only', re.I)
+n = 0
+for fn in os.listdir(root):
+    lines = io.open(os.path.join(root, fn), encoding="utf-8").read().split("\n")
+    for i, line in enumerate(lines):
+        if not CLAIM.search(line):
+            continue
+        w = "\n".join(lines[max(0, i - 3):i + 4])
+        if SCRUB.search(w) and not OK.search(w):
+            n += 1
+print(n)
+PY
+)"
+[ "$caught" = "1" ] \
+  || fail "the scan did not catch the exact historical claim, with 'scrub' on the
+PRECEDING line -- so the real scan above proves nothing (got: $caught)"
+echo "  catches it across lines, which is how the real one hid"
+
 echo "PASS: btrfs scrub smoke test"

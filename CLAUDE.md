@@ -4625,6 +4625,52 @@ the direction nothing ever contradicts.
 
 ---
 
+**"THIRTEEN PLACES" WAS FIVE SHORT, and one of the survivors was the
+OPERATOR-FACING `--help` TEXT.** This file records correcting the read-only
+scrub claim in thirteen places. Found 2026-11-04 by grepping for the sentence
+-- the rule this file adopted the same week after the pack claim turned up in
+five documents:
+
+| survivor | why it mattered |
+|---|---|
+| `systemd/auto-enable.timers` | *"Read-only, and protective"* -- the single source of truth for what installation may auto-enable |
+| `tests/timer-auto-enable-safety-smoke.sh` | *"Not a DEPLOYMENT timer -- read-only --"*, in the suite that pins that decision |
+| `bin/domum-media` `storage_cmd` | *"Read-only verification."* -- and this one is in the INSTALLED binary too |
+| `bin/domum-media` scrub-estimate comment | *"a 10-minute read-only verification"* |
+| **`bin/domum-media` `--help`** | *"Read-only: it DETECTS corruption and, with data \"single\", cannot repair it"* -- wrong twice: the word, and reasoning from the DATA half while Metadata and System are DUP and ARE repaired by writing |
+
+**A LINE-AT-A-TIME GREP MISSED THE FIRST ONE**, because the word `scrub` is on
+the preceding line and `read-only` on the next. That is the same blind spot
+that hid two of the pipefail audit's ten findings, so the assertion scans a
+WINDOW rather than a line.
+
+**The existing assertion could not have caught any of them: it drove the
+runtime OUTPUT.** `btrfs-scrub-smoke` asserted that `storage_scrub_start`'s
+printed message says READ-WRITE, which was true throughout. Five textual
+claims sat beside it. **Asserting on what a function prints is not asserting on
+what the repository says.**
+
+The repository-wide window scan is now in that suite, and **its exemptions were
+measured rather than guessed**: unfiltered it reports 9 windows, of which 5 are
+its own documentation and 2 are legitimate -- a window discussing the `-r` flag
+that WOULD make a scrub read-only, and one about `findmnt`. An audit that cries
+wolf is one somebody switches off, so `-r`, `detection pass`, `findmnt`,
+`filesystem df` and `scrub status` are recognised, and this suite plus
+`CLAUDE.md` are exempt by name because both must quote the broken form to
+describe it.
+
+**It has its own negative control**, which is what makes the clean verdict mean
+anything: a fixture reproducing the exact historical claim with `scrub` on the
+PRECEDING line must still be caught. Without that, a clean result is
+indistinguishable from a scan that matches nothing.
+
+**And my own replacement text tripped it once** -- *"Use status for the
+read-only question"*, whose negation sat six lines away, outside the window.
+Naming the subcommand (`scrub status`) fixed the scan and read better anyway.
+Sixth occurrence of an assertion flagging its author's own prose.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
