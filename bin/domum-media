@@ -8858,6 +8858,26 @@ service_essential_state() {  # $1 = service
     calibre-web)
       printf 'sqlite|config/app.db\n'
       printf 'file|config/gdrive.db\n'
+      # config/.key is 44 bytes -- a Fernet key -- and app.db stores credentials
+      # ENCRYPTED with it. Measured 2026-11-04 from the production schema (names
+      # only; no value was read): the `_e` suffix is calibre-web's convention
+      # for an encrypted column, and app.db has `settings.mail_password_e`,
+      # `settings.config_ldap_serv_password_e` and
+      # `settings.config_reverse_proxy_login_header_secret_e`.
+      #
+      # So a capture of "the database" alone restores those values as
+      # undecryptable bytes, and calibre-web would come up and silently fail to
+      # send mail or bind to LDAP. That is exactly the case jellyfin's
+      # `.aspnet/DataProtection-Keys` is declared for, and this declaration
+      # missed it.
+      printf 'file|config/.key\n'
+      # The companion to the gdrive.db already declared above: it carries the
+      # OAuth client secret when Google Drive is configured. 3 bytes here
+      # because it is not, so it costs nothing to carry and is the credential
+      # half when it is. Measured: a FRESH calibre-web creates all four of
+      # these, so declaring them cannot make a capture fail closed for being
+      # absent.
+      printf 'file|config/client_secrets.json\n'
       ;;
     *) return 1 ;;
   esac

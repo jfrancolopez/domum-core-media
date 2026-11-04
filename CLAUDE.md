@@ -4795,6 +4795,54 @@ That is the only honest guarantee that nothing left the host.
 
 ---
 
+**CALIBRE-WEB'S DECLARATION MISSED THE KEY THAT DECRYPTS ITS OWN DATABASE --
+the jellyfin DataProtection-Keys case, in the service whose declaration was
+written to avoid it.** It declared `config/app.db` and `config/gdrive.db` and
+nothing else. Measured 2026-11-04 from the PRODUCTION schema (column names
+only; no value was read, and the key's bytes were never printed):
+
+```
+config/.key                 44 bytes   <- a Fernet key
+settings.mail_password_e
+settings.config_ldap_serv_password_e
+settings.config_reverse_proxy_login_header_secret_e
+```
+
+The `_e` suffix is calibre-web's own convention for a Fernet-encrypted value.
+So a capture of "the database" restores those three as **undecryptable bytes**:
+calibre-web comes up, looks healthy, and silently cannot send mail or bind to
+LDAP. Exactly what jellyfin's `.aspnet/DataProtection-Keys` is declared for,
+and the comment there even says *"a capture built from 'the database' alone
+would miss them"*.
+
+**`config/.key` and `config/client_secrets.json` are now declared, and
+declaring them cannot make a capture fail closed** -- measured against a fresh
+disposable calibre-web, which creates all four. That mattered: a declared item
+that an install does not create would make every capture `INCOMPLETE` forever,
+which is how Plex's staged `blobs.db` reaches the fail-closed path.
+
+**The mode is the other half.** A Fernet key restored world-readable is a
+disclosure, and a digest covers CONTENTS, not modes. The manifest records
+`config/.key|file-copy|44|600` and the restore brings it back at 600, asserted
+in both the rehearsal and the fixture suite. **Production's `.key` is 644 while
+a fresh calibre-web creates it 600** -- read-only observation, reported and not
+changed; the capture preserves whatever is there rather than quietly
+normalising it.
+
+**calibre-web is also the only one of the five whose database is
+`journal_mode delete`** -- measured in the rehearsal -- so it is what proves
+the `.backup` path does not DEPEND on there being a WAL to walk. All five
+named services have now been rehearsed against their real images.
+
+**The mutation is on the ANSWER, not on source text.** A presence assertion
+over a declaration passes for any list; dropping `file|config/.key` must make
+the CAPTURE produce 3 items with no key. And my fixture's key was 43 bytes on
+the first attempt -- a Fernet key is 43 urlsafe-base64 characters plus the `=`
+pad -- so the assertion failed on the FIXTURE rather than on the code. Count
+the bytes a real artefact has before asserting on them.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
