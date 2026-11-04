@@ -56,6 +56,25 @@ MKCW
   printf 'log noise\n' > "$TMP/data/calibre-web/config/calibre-web.log"
 }
 
+build_kavita() {
+  rm -rf "$TMP/data/kavita"
+  mkdir -p "$TMP/data/kavita/config/templates" "$TMP/data/kavita/config/logs"
+  python3 - "$TMP/data/kavita/config/kavita.db" <<'MKKV'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table AppUser(Id integer primary key, UserName text)")
+con.execute("insert into AppUser values (1,'operator')")
+con.commit(); con.close()
+MKKV
+  printf '<t/>\n' > "$TMP/data/kavita/config/templates/EmailTemplate.html"
+  # The JWT TokenKey lives here. A restored kavita.db without it means Kavita
+  # mints a NEW key and every session and API key silently stops working.
+  printf '{"TokenKey":"%s","Port":5000}\n' "$(printf 'k%.0s' $(seq 1 338))" \
+    > "$TMP/data/kavita/config/appsettings.json"
+  # Regenerable, and deliberately NOT declared.
+  printf 'log noise\n' > "$TMP/data/kavita/config/logs/kavita.log"
+}
+
 build_jellyfin() {
   rm -rf "$TMP/data/jellyfin"
   mkdir -p "$TMP/data/jellyfin/config/data/data" \
@@ -75,6 +94,11 @@ MKDB
   done
   printf '<key id="a"/>\n' > "$TMP/data/jellyfin/config/.aspnet/DataProtection-Keys/key-a.xml"
   chmod 0600 "$TMP/data/jellyfin/config/.aspnet/DataProtection-Keys/key-a.xml"
+  # The server's IDENTITY, 35 bytes in production and on a fresh install. Same
+  # artefact class as plex's Preferences.xml, which is declared for exactly
+  # this reason.
+  printf '%s\n' '01234567890123456789012345678901234' \
+    > "$TMP/data/jellyfin/config/data/data/device.txt"
   # Regenerable, and deliberately NOT declared -- if it appears in a capture
   # the declaration has grown something it should not have.
   printf 'log noise\n' > "$TMP/data/jellyfin/config/log/jellyfin.log"
@@ -155,11 +179,15 @@ grep -q '^SERVICE=jellyfin$' "$TMP/out/jf/MANIFEST" || fail "the manifest does n
 grep -q '^CAPTURE_MODE=unproven$' "$TMP/out/jf/MANIFEST" \
   || fail "jellyfin's capture mode must be recorded as unproven: $(cat "$TMP/out/jf/MANIFEST")"
 n_items="$(grep -c '^ITEM=' "$TMP/out/jf/MANIFEST")"
-[[ "$n_items" == "6" ]] || fail "expected 6 captured items, manifest has $n_items"
+# 7 since device.txt was declared: the server's IDENTITY, the same artefact
+# class as plex's Preferences.xml. This count moved because the DECLARATION
+# was wrong, not because the test was -- a restored jellyfin without it is a
+# new server and every client must re-pair.
+[[ "$n_items" == "7" ]] || fail "expected 7 captured items, manifest has $n_items"
 # Nothing regenerable came along.
 stray="$(find "$TMP/out/jf/files" -name '*jellyfin.log*')"
 [[ -z "$stray" ]] || fail "the capture included the log directory, which is not declared: $stray"
-echo "  6 items, manifest COMPLETE, mode recorded, no undeclared files"
+echo "  7 items, manifest COMPLETE, mode recorded, no undeclared files"
 
 sect "the capture records a digest for every item, and verify re-reads them"
 items="$(grep -E '^ITEM=' "$TMP/out/jf/MANIFEST")"
@@ -960,5 +988,78 @@ must not be captured"
 grep -q '^ITEMS=3$' "$TMP/out/cap-cw-m/MANIFEST" \
   || fail "expected 3 items in the mutant capture: $(cat "$TMP/out/cap-cw-m/MANIFEST")"
 echo "  killed: without it the capture is 3 items and app.db's _e values are undecryptable"
+
+
+sect "kavita declares the TOKEN KEY that signs its sessions"
+# appsettings.json holds the JWT TokenKey -- measured 2026-11-04 from the
+# production file, key names and lengths only, no value read: TokenKey is 338
+# characters, with OpenIdConnectSettings beside it. Restore kavita.db without
+# it and Kavita mints a NEW key on startup: every existing session and API key
+# stops working, silently, against a database that restored perfectly. Same
+# class as calibre-web's Fernet key and jellyfin's DataProtection-Keys.
+out="$(probe '' 'service_essential_state kavita')"
+for want in 'config/kavita.db' 'config/templates' 'config/appsettings.json'; do
+  grepF_q "$want" "$out" || fail "kavita does not declare $want: $out"
+done
+grepF_q 'config/backups' "$out" \
+  && fail "kavita declares its own backups directory, which CLAUDE.md measured at
+3.1x the database it backs up: $out"
+grepF_q 'cache.db' "$out" && fail "kavita declares its CACHE database: $out"
+echo "  kavita.db, templates and the token key; not backups, not the cache"
+
+sect "jellyfin declares its server IDENTITY, as plex does"
+out="$(probe '' 'service_essential_state jellyfin')"
+grepF_q 'config/data/data/device.txt' "$out" \
+  || fail "jellyfin does not declare device.txt -- without it a restored server is
+a NEW identity and every client must re-pair, which is the stated reason plex's
+Preferences.xml is declared: $out"
+echo "  device.txt is declared"
+
+sect "and both arrive in the CAPTURE, not just in the declaration"
+build_kavita
+rm -rf "$TMP/out/cap-kv" "$TMP/out/scratch-kv"
+out="$(probe '' "service_state_capture kavita '$TMP/out/cap-kv'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the kavita capture failed: $out"
+grep -q '^ITEMS=3$' "$TMP/out/cap-kv/MANIFEST" \
+  || fail "expected 3 kavita items: $(cat "$TMP/out/cap-kv/MANIFEST")"
+grep -q 'config/appsettings.json|file-copy|' "$TMP/out/cap-kv/MANIFEST" \
+  || fail "the token key file was not captured: $(cat "$TMP/out/cap-kv/MANIFEST")"
+out="$(probe '' "service_state_restore '$TMP/out/cap-kv' '$TMP/out/scratch-kv'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the kavita restore failed: $out"
+[[ -s "$(find "$TMP/out/scratch-kv" -name appsettings.json | head -1)" ]] \
+  || fail "appsettings.json was not restored"
+build_jellyfin
+rm -rf "$TMP/out/cap-jf-id"
+out="$(probe '' "service_state_capture jellyfin '$TMP/out/cap-jf-id'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the jellyfin capture failed: $out"
+grep -q 'config/data/data/device.txt|file-copy|' "$TMP/out/cap-jf-id/MANIFEST" \
+  || fail "device.txt was not captured: $(cat "$TMP/out/cap-jf-id/MANIFEST")"
+echo "  both captured and restored"
+
+sect "MUTATION: dropping either must change the capture, not just the text"
+for target in "file|config/appsettings.json" "file|config/data/data/device.txt"; do
+  MUTD="$TMP/mut-decl"; rm -rf "$MUTD"; mkdir -p "$MUTD"; cp "$CLI" "$MUTD/domum-media"
+  TARGET="$target" python3 -I - "$MUTD/domum-media" <<'PYMD' || fail "the declaration mutation did not apply for $target"
+import io, os, sys
+p = sys.argv[1]
+t = os.environ["TARGET"]
+s = io.open(p, encoding="utf-8").read()
+old = "      printf '%s\\n'\n" % t
+assert s.count(old) == 1, "anchor %r matched %d times" % (old, s.count(old))
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYMD
+  svc=kavita; rel='config/appsettings.json'
+  case "$target" in *device.txt) svc=jellyfin; rel='config/data/data/device.txt' ;; esac
+  "build_$(tr - _ <<< "$svc")"
+  rm -rf "$TMP/out/cap-mutd"
+  saved_cli="$CLI"; CLI="$MUTD/domum-media"
+  out="$(probe '' "service_state_capture $svc '$TMP/out/cap-mutd'; echo RC=\$?")"
+  CLI="$saved_cli"
+  grep -q 'RC=0' <<< "$out" || fail "the mutant capture of $svc failed unexpectedly: $out"
+  grep -qF "$rel" "$TMP/out/cap-mutd/MANIFEST" \
+    && fail "the mutation changed no ANSWER -- without the declaration $rel must
+not be captured"
+done
+echo "  killed: each one disappears from the capture when undeclared"
 
 echo "ALL STATE-CAPTURE CHECKS PASSED"

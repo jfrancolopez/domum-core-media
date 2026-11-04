@@ -8850,10 +8850,29 @@ service_essential_state() {  # $1 = service
       # encrypted. 2 KB, trivially overlooked, and a capture built from "the
       # database" alone would miss them.
       printf 'dir|config/.aspnet/DataProtection-Keys\n'
+      # device.txt is 35 bytes and is the server's IDENTITY. This project
+      # already declares plex's Preferences.xml for exactly this reason --
+      # "without it a restored Plex is a new server identity and every client
+      # must re-pair" -- and jellyfin has the same artefact. Measured against a
+      # FRESH jellyfin, which creates it, so declaring it cannot make a capture
+      # fail closed.
+      printf 'file|config/data/data/device.txt\n'
       ;;
     kavita)
       printf 'sqlite|config/kavita.db\n'
       printf 'dir|config/templates\n'
+      # appsettings.json holds the JWT **TokenKey**. Measured 2026-11-04 from
+      # the production file (key names and lengths only; no value was read):
+      # TokenKey is 338 characters, and OpenIdConnectSettings/{Authority,
+      # ClientId,Secret} live beside it.
+      #
+      # Restore kavita.db without it and Kavita mints a NEW TokenKey on
+      # startup: every existing session and API key stops working, silently,
+      # against a database that restored perfectly. Same class as calibre-web's
+      # Fernet key and jellyfin's DataProtection-Keys. Measured against a FRESH
+      # kavita, which creates it (634 bytes), so declaring it cannot make a
+      # capture fail closed.
+      printf 'file|config/appsettings.json\n'
       ;;
     calibre-web)
       printf 'sqlite|config/app.db\n'

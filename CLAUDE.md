@@ -4843,6 +4843,48 @@ the bytes a real artefact has before asserting on them.
 
 ---
 
+**THE CALIBRE-WEB KEY WAS NOT AN ISOLATED MISS -- a sweep of all five
+declarations against the real production directories found two more.** The
+lesson generalised: for each service, list what is actually in its state
+directory and ask which undeclared file is a CREDENTIAL or an IDENTITY rather
+than something regenerable.
+
+| service | undeclared artefact | consequence of restoring without it |
+|---|---|---|
+| **kavita** | `config/appsettings.json` | holds the JWT **TokenKey**, measured at **338 characters** (key names and lengths only; no value read). Kavita mints a NEW key on startup, so every session and API key silently stops working against a database that restored perfectly. `OpenIdConnectSettings` lives beside it |
+| **jellyfin** | `config/data/data/device.txt` | 35 bytes, the server's **IDENTITY**. This project already declares plex's `Preferences.xml` because *"without it a restored Plex is a new server identity and every client must re-pair"* -- jellyfin has the same artefact and it was not declared |
+
+**navidrome is verified COMPLETE, not assumed.** Its declaration is one line
+(`navidrome.db`) and that is correct: production holds only the database plus
+`artwork/`, `cache/` and an empty `plugins/`. `ND_CONFIGFILE` points at
+`/data/navidrome.toml`, which **does not exist** -- configuration comes from
+the compose environment, which the recovery pack already carries.
+
+**Both additions were checked against a FRESH install before being declared**,
+because a declared item an install does not create makes every capture
+`INCOMPLETE` forever. Measured: a fresh kavita writes `appsettings.json` (634
+bytes) and a fresh jellyfin writes `device.txt` (35 bytes).
+
+**I NEARLY REPORTED A FALSE DEFECT, from `ls | head -20`.** kavita declares
+`dir|config/templates`, and the truncated listing I had looked at did not reach
+it -- so for a moment it looked as though every kavita capture must be failing
+closed on a declared directory that does not exist. It exists (and so does
+`themes/`); `head -20` cut the listing two entries short. That is the
+"a measurement pipeline that can silently drop a record is not a measurement"
+rule, and the only reason it did not become a false claim is that the
+declaration was re-driven against the real paths before anything was written
+down.
+
+**An existing assertion pinned jellyfin at 6 captured items and now reads 7.**
+Before adapting a test to a change, ask which of the two is wrong: here the
+DECLARATION was wrong, so the count moved and the comment says why.
+
+**The mutations are on the CAPTURE, not on the declaration text.** A presence
+assertion over a list passes for any list; dropping either `printf` line must
+make the item disappear from the manifest. Both killed.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
