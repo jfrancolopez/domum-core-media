@@ -768,4 +768,95 @@ flag unset, the service must actually be stopped: $mout
 calls: $(cat "$TMP/calls")"
 echo "  killed: without the gate, an unset flag still stops the service"
 
+
+sect "a database the HOST cannot read is checked by the APPLICATION's own sqlite"
+# This function's comment said restored databases are asked "by the
+# application's own SQLite where there is one". That was true of the comment
+# and false of the code: it called domum_sqlite_check, which tries the HOST's
+# sqlite3 and then the host's python3, and never
+# domum_sqlite_check_via_container -- the one that uses service_sqlite_binary.
+# The migration path has used the container since the `collating` defect; the
+# restore did not.
+#
+# Found by rehearsing against the REAL images, 2026-11-04. navidrome's restored
+# database reported `1 checked sound` because the host python3 can read it,
+# while PLEX's reported `0 checked sound, 2 not checked` -- its FTS tables use
+# Plex's own `collating` tokenizer, which only `Plex SQLite` registers.
+# Externally, those exact restored bytes answer `ok` with 82 tables under that
+# binary. So the one service whose image is the only PROVEN copy of its
+# application half was also the one whose restore could not tell a sound
+# database from a broken one.
+build_jellyfin
+rm -rf "$TMP/out/cap-via" "$TMP/out/scratch-via"
+probe '' "service_state_capture jellyfin '$TMP/out/cap-via'" >/dev/null
+# The host cannot read it (the `collating` shape), and the application can.
+VIA_STUBS='domum_sqlite_check() { printf "unsupported: unknown tokenizer: collating"; }
+domum_sqlite_check_via_container() { printf "ok"; return 0; }'
+out="$(probe "$VIA_STUBS" "service_state_restore '$TMP/out/cap-via' '$TMP/out/scratch-via'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the restore failed: $out"
+grep -q 'restored databases: 1 checked sound, 0 not checked' <<< "$out" \
+  || fail "a database the host cannot read but the application CAN was still
+reported as not checked: $out"
+grep -q "checked with jellyfin's own sqlite3" <<< "$out" \
+  || fail "it does not say WHICH sqlite answered, so 'checked sound' cannot be
+distinguished from a host check: $out"
+echo "  the application answered, and the report says so"
+
+sect "and the container is asked ONLY when the host could not answer"
+# A host check that says the database is BROKEN must not be retried against the
+# container: a second opinion overturning a real failure is the wrong direction
+# for a restore. The stub RECORDS whether it was called, because asserting that
+# the restore failed would pass even if the fallback had run and agreed.
+rm -rf "$TMP/out/scratch-via2"; : > "$TMP/via-called"
+BAD_STUBS='domum_sqlite_check() { printf "integrity_check: database disk image is malformed"; }
+domum_sqlite_check_via_container() { echo called >> "'"$TMP"'/via-called"; printf "ok"; return 0; }'
+out="$(probe "$BAD_STUBS" "service_state_restore '$TMP/out/cap-via' '$TMP/out/scratch-via2'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a broken database restored successfully: $out"
+grep -q 'not a sound database after restore' <<< "$out" || fail "it does not say what is wrong: $out"
+[[ ! -s "$TMP/via-called" ]] \
+  || fail "the container was asked about a database the host already called BROKEN --
+a second opinion must not be able to overturn a real failure"
+echo "  a broken verdict stands; the fallback is not consulted"
+
+sect "and a database NEITHER can read is still 'not checked', never a pass"
+rm -rf "$TMP/out/scratch-via3"
+NONE_STUBS='domum_sqlite_check() { printf "unsupported: unknown tokenizer: collating"; }
+domum_sqlite_check_via_container() { return 1; }'
+out="$(probe "$NONE_STUBS" "service_state_restore '$TMP/out/cap-via' '$TMP/out/scratch-via3'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "an unreadable-but-not-broken database failed the restore: $out"
+grep -q 'restored databases: 0 checked sound, 1 not checked' <<< "$out" \
+  || fail "'I could not check it' was not reported as exactly that: $out"
+grep -q "checked with jellyfin's own sqlite3" <<< "$out" \
+  && fail "it claimed the application answered when the fallback returned nothing: $out"
+echo "  not checked, and it does not claim otherwise"
+
+sect "MUTATION: without the fallback, the application's own sqlite is never asked"
+MUTV="$TMP/mut-via"; mkdir -p "$MUTV"; cp "$CLI" "$MUTV/domum-media"
+python3 -I - "$MUTV/domum-media" <<'PYMV' || fail "the fallback mutation did not apply"
+import io, sys
+# Anchored on a SINGLE-LINE unique substring with no backslash in it.
+# Expressing the real line's trailing continuation through two heredoc layers
+# needs enough escaping to silently not match -- and a mutation that does not
+# match is one that applies textually while changing nothing, which this
+# project has paid for before.
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+# Narrowed to the RESTORE's call: migrate_sqlite_integrity makes the same call
+# with different arguments, so the shorter prefix matched twice.
+old = 'if via="$(domum_sqlite_check_via_container "$service" "$dst"'
+new = 'if false && via="$(domum_sqlite_check_via_container "$service" "$dst"'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMV
+grep -q 'if false && via=' "$MUTV/domum-media" \
+  || fail "the mutation is not in the file"
+rm -rf "$TMP/out/scratch-via4"
+saved_cli="$CLI"; CLI="$MUTV/domum-media"
+out="$(probe "$VIA_STUBS" "service_state_restore '$TMP/out/cap-via' '$TMP/out/scratch-via4'; echo RC=\$?")"
+CLI="$saved_cli"
+grep -q 'restored databases: 0 checked sound, 1 not checked' <<< "$out" \
+  || fail "the mutation changed no ANSWER -- without the fallback a database the
+host cannot read must read as 'not checked': $out"
+echo "  killed: without it, plex's databases are unverifiable on restore"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"

@@ -9132,9 +9132,40 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
     # And a restored database is asked whether it is sound, by the application's
     # own SQLite where there is one. "I could not check it" is reported as
     # exactly that, never as a pass.
+    #
+    # The sentence above was true of the COMMENT and false of the code: it
+    # called `domum_sqlite_check`, which tries the HOST's sqlite3 and then the
+    # host's python3, and never `domum_sqlite_check_via_container`, which is
+    # the one that uses `service_sqlite_binary`. The migration path has used
+    # the container since the `collating` defect; the restore did not.
+    #
+    # Measured 2026-11-04 by rehearsing against the REAL images: navidrome's
+    # restored database reported `1 checked sound` (the host python3 can read
+    # it), while plex's reported `0 checked sound, 2 not checked` -- because
+    # Plex's databases carry FTS tables built with its own `collating`
+    # tokenizer, which only `Plex SQLite` registers. Externally, those exact
+    # restored bytes answer `ok` with 82 tables under that binary. So the one
+    # service whose image is the only PROVEN copy of its application half was
+    # also the one whose restore could not tell a sound database from a broken
+    # one.
     if [[ "$kind" == "sqlite" ]]; then
       local chk
       chk="$(domum_sqlite_check "$dst" 2>/dev/null || true)"
+      # Fall back to the application's own SQLite, exactly as
+      # migrate_sqlite_integrity does -- and ONLY when the host could not
+      # answer. A host check that says the database is BROKEN is not retried
+      # against the container: that would let a second opinion overturn a real
+      # failure, which is the wrong direction for a restore.
+      case "$chk" in
+        unsupported:*|unchecked|""|*"command not found"*|*"unable to open"*|*"cannot open"*)
+          local via
+          if via="$(domum_sqlite_check_via_container "$service" "$dst" 2>/dev/null)" \
+             && [[ -n "$via" ]]; then
+            chk="$via"
+            [[ "$via" == "ok" ]] \
+              && echo "[domum-media] $rel: checked with ${service}'s own sqlite3"
+          fi ;;
+      esac
       case "$chk" in
         ok) sqlite_ok=$(( sqlite_ok + 1 )) ;;
         # "I could not check it" is not "it is broken". An extension this
