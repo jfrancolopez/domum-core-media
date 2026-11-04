@@ -1142,4 +1142,40 @@ mroot="$(stat -c %a "$(probe '' 'state_capture_dir')" 2>/dev/null || echo MISSIN
 capture root must come back at install's default of 0755, not 0700 (got $mroot)"
 echo "  killed: without it the root is $mroot -- install's default, not 0700"
 
+
+sect "no SHARED production path is re-moded by a capture"
+# `install -d -m MODE` sets the mode on an EXISTING directory too, so hardening
+# the chain could silently re-mode <data>/backups -- which images/
+# (drwxr-x--- root in production) and volumes/ share. The capture creates that
+# directory if absent and never passes -m for it. Asserted here rather than
+# intended, because "it does not touch it" is exactly the kind of claim this
+# project requires evidence for.
+rm -rf "$TMP/data/backups"
+install -d -m 0755 "$TMP/data/backups"
+install -d -m 0750 "$TMP/data/backups/images"
+install -d -m 0751 "$TMP/data/backups/volumes"
+before_backups="$(stat -c %a "$TMP/data/backups")"
+before_images="$(stat -c %a "$TMP/data/backups/images")"
+before_volumes="$(stat -c %a "$TMP/data/backups/volumes")"
+build_calibre_web
+probe '' "service_state_capture calibre-web '$(probe '' 'state_capture_dir')/calibre-web/shared1'" >/dev/null
+after_backups="$(stat -c %a "$TMP/data/backups")"
+after_images="$(stat -c %a "$TMP/data/backups/images")"
+after_volumes="$(stat -c %a "$TMP/data/backups/volumes")"
+printf '  backups %s -> %s   images %s -> %s   volumes %s -> %s\n' \
+  "$before_backups" "$after_backups" "$before_images" "$after_images" \
+  "$before_volumes" "$after_volumes"
+[[ "$before_backups" == "$after_backups" ]] \
+  || fail "the capture re-moded the SHARED <data>/backups directory
+($before_backups -> $after_backups). images/ and volumes/ live there too, and
+silently changing a production directory's mode is not this function's business"
+[[ "$before_images" == "$after_images" ]] \
+  || fail "the capture re-moded <data>/backups/images ($before_images -> $after_images)"
+[[ "$before_volumes" == "$after_volumes" ]] \
+  || fail "the capture re-moded <data>/backups/volumes ($before_volumes -> $after_volumes)"
+# And its own subtree IS hardened, so this is not passing by doing nothing.
+[[ "$(stat -c %a "$TMP/data/backups/state")" == "700" ]] \
+  || fail "the capture's own root is not 0700, so this section proves nothing"
+echo "  shared paths untouched; the capture's own subtree still 0700"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"

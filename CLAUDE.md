@@ -4885,8 +4885,17 @@ make the item disappear from the manifest. Both killed.
 
 ---
 
-**THE CAPTURE NOW CONTAINS CREDENTIALS, AND ONLY ONE DIRECTORY WAS PROTECTING
-THEM.** Declaring calibre-web's Fernet key, kavita's JWT TokenKey and
+**THE CAPTURE NOW CONTAINS CREDENTIALS, SO ITS DIRECTORY CHAIN IS 0700 -- AS
+DEFENCE IN DEPTH, AND I FIRST DESCRIBED IT AS CLOSING AN EXPOSURE, WHICH IT IS
+NOT.** `0700` on `files/` already prevents any other account from READING what
+is inside it; a 0755 parent lets you traverse to a directory you still cannot
+list. So the honest statement is narrower than the one I wrote: what the open
+parents leaked was the EXISTENCE and TIMING of captures -- which service, how
+many, when -- and they left the confidentiality of a Fernet key resting on a
+single mode bit rather than on a chain. Both are worth fixing; neither was a
+readable key. The operator made this correction.
+
+Declaring calibre-web's Fernet key, kavita's JWT TokenKey and
 jellyfin's device identity made "are these captures protected at rest?" a real
 question rather than a hypothetical one. Measured 2026-11-04 by driving a
 capture and listing every path it created:
@@ -4903,6 +4912,14 @@ parents came out **0755 -- install's own default, not the umask**: the mutation
 that drops `-m` returns 0755 under a umask of 0002, where a umask-derived mode
 would be 0775. I first wrote "the invoking umask" and corrected it, because
 describing a mechanism wrongly is the defect this file exists to correct.
+
+**NO SHARED PRODUCTION PATH IS RE-MODED, and that is tested rather than
+intended.** `install -d -m MODE` sets the mode on an EXISTING directory too, so
+hardening the chain could have silently re-moded `<data>/backups`, which
+`images/` (`drwxr-x--- root`) and `volumes/` share. The capture creates that
+directory if absent and never passes `-m` for it. The test pre-creates
+`<data>/backups` at 0755 and `<data>/backups/images` at 0750, runs a capture,
+and requires both to be byte-for-byte the same mode afterwards.
 
 Every directory from `state/` down is 0700 now. **`<data>/backups` is created
 if absent and its mode is deliberately NOT changed**: it is shared with
@@ -4926,6 +4943,42 @@ file that starts holding it fails rather than passing unnoticed.
 
 **No workflow uploads artifacts**, checked rather than assumed, so CI is not a
 leak path for the fixtures' keys.
+
+---
+
+**CALIBRE-WEB'S PRODUCTION `.key` IS 0644 AND LOCALLY READABLE -- measured,
+with the exposure stated at its real size rather than inflated.** The whole
+chain, 2026-11-04:
+
+```
+-rw-r--r--  jfranco:jfranco  /srv/data/calibre-web/config/.key   (44 bytes)
+drwxr-xr-x  jfranco:jfranco  /srv/data/calibre-web/config
+drwxr-xr-x  root:root        /srv/data/calibre-web
+drwxr-xr-x  jfranco:jfranco  /srv/data
+drwxr-xr-x  root:root        /srv
+```
+
+Every parent is world-traversable, so the 0644 is genuinely effective: any
+local account can read that Fernet key. **And the only non-system account on
+this host is `jfranco` (uid 1000), which OWNS the file** -- so the actual set
+of readers is root and the owner, which is the set that could read it at 0600
+anyway. The practical exposure today is therefore nil; what is wrong is that
+the mode is looser than the application's own default, and a second account or
+a container given a wider bind mount would change that silently.
+
+A fresh calibre-web creates it **0600** (measured). So the remedy is to restore
+the application's own default, which costs nothing:
+
+```
+OPERATOR ACTION REQUIRED
+sudo chmod 600 /srv/data/calibre-web/config/.key
+```
+
+**Not done here.** Changing the mode of a production file is a production
+change, and this one is owned by the service's own uid, so it is the operator's
+call. The capture deliberately preserves whatever mode is there rather than
+normalising it -- a capture that quietly "fixes" permissions would make the
+restore disagree with the system it came from.
 
 ---
 
