@@ -31,6 +31,12 @@ ROOT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__
 TARGETS = (["bin/domum-media", "bin/domum-media-backup", "bin/domum-media-report",
             "install.sh"]
            + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "operator").glob("*.sh"))
+           # The rehearsals drive production code against real images, and the
+           # first versions of both contained `docker logs | grep -q <readiness
+           # line>` -- which under pipefail makes a line that IS present read
+           # as absent. They are in scope for exactly that reason.
+           + sorted(str(p.relative_to(ROOT))
+                    for p in (ROOT / "operator" / "rehearsals").glob("*.sh"))
            # The suites too. They were NOT scanned, and that was a blind spot in
            # exactly the place where the failure mode is worst: under pipefail a
            # MATCH makes the left side take SIGPIPE, the pipeline reports 141,

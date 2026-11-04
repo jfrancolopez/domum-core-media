@@ -15,12 +15,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Bash syntax check
-        run: bash -n bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh
+        run: bash -n bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh operator/rehearsals/*.sh
 
       - name: shellcheck
         # Fail on real warnings/errors; info-level notes (e.g. sourcing
         # /etc/os-release, intentional subshell-scoped exports) are advisory.
-        run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh
+        run: shellcheck --severity=warning bin/domum-media bin/domum-media-backup bin/domum-media-report install.sh operator/*.sh operator/rehearsals/*.sh
 
       # The suites are shellchecked at severity=error only: SC1090 (cannot
       # follow a non-constant source) is legitimate and unavoidable in a test

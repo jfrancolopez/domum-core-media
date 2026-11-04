@@ -4744,6 +4744,57 @@ proving the application starts against it are different claims.
 
 ---
 
+**NAVIDROME STARTS AGAINST A RESTORED CAPTURE -- proven 2026-11-04, and the
+claim is deliberately one tier narrower than it sounds.** The restore's own
+output has always said *"this proves the CAPTURE restores. It is not a proof
+that navidrome runs against it."* That tier is now earned: a capture was taken
+from one disposable navidrome, restored, and a SECOND disposable navidrome was
+started with `/data` holding only the restored database. It logged
+`----> Navidrome server is ready!` in **671 ms**, stayed running, logged no
+panic or fatal, and the database passed `integrity_check` afterwards.
+
+**A MARKER ROW is what makes "it started" mean "it opened THAT database".** A
+fresh navidrome also creates tables, so a table count cannot tell a REUSED
+database from a RECREATED one -- it went 24 before startup to 46 after, because
+navidrome adds its own runtime tables. A row only the restored copy carried,
+read back after startup, can. That is instrumentation to identify the file, not
+evidence about health: nothing was fabricated to make the application look
+healthier than it is.
+
+**The ceiling is stated: it does not serve a library.** No music, no users, no
+client fetched anything. The tiers stay apart exactly as they do for Immich:
+`capture restores` < `application starts against it` < `application serves it`.
+
+**REHEARSALS NOW LIVE IN THE REPOSITORY, because three of them were reviewed by
+nothing.** The Kavita, Jellyfin and first Plex rehearsals existed only as output
+pasted into `docs/` -- nobody could re-run them or review how they established
+what they claimed. That is the identical argument that moved the operator
+wrappers into `operator/`. They are in `operator/rehearsals/`, shellchecked and
+`bash -n`'d by CI and deliberately NOT run by it: they need the production
+images and a Docker daemon, and `tests/ci-coverage-audit.sh` governs `tests/`
+and does not apply to them. They must never be presented as hermetic suites.
+
+**And putting them in scope immediately found the banned pipeline in both.**
+Each contained `docker logs … | grep -q <readiness line>`: under `pipefail`
+grep exits at the first match, `docker logs` takes SIGPIPE, the PIPELINE
+reports 141 -- so a readiness line that IS PRESENT reads as absent.
+Intermittent, and the dangerous direction. Tenth instance.
+`tests/pipefail-grep-audit.py` now scans `operator/rehearsals/*.sh`, and it
+also caught a `| head -8` stop-early shape; shellcheck then caught dead code
+and two unguarded `cd`.
+
+**A readiness pattern must be MEASURED from the image's own output.** The first
+navidrome run looked for `accepting requests` and failed -- navidrome logs
+`----> Navidrome server is ready!`. A guessed pattern reports a correct start
+as a failure, which is the same defect as `service_ready_log_pattern` declaring
+a line a service does not emit.
+
+**`network_mode: none` is proven by the logs rather than asserted.** The run
+shows `network is unreachable` as navidrome reaches for its background images.
+That is the only honest guarantee that nothing left the host.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
