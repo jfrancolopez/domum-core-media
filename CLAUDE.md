@@ -4671,6 +4671,79 @@ Sixth occurrence of an assertion flagging its author's own prose.
 
 ---
 
+**THE RESTORE'S OWN COMMENT CLAIMED A BEHAVIOUR THE CODE DID NOT HAVE, and the
+one service it mattered for is Plex.** `service_state_restore` said a restored
+database is asked whether it is sound *"by the application's own SQLite where
+there is one"*. True of the comment; false of the code. It called
+`domum_sqlite_check`, which tries the HOST's `sqlite3` and then the host's
+`python3`, and never `domum_sqlite_check_via_container` -- the function that
+uses `service_sqlite_binary`. The MIGRATION path has used the container since
+the `collating` defect; the restore never did.
+
+**Found by rehearsing against the REAL images, 2026-11-04 -- no fixture could
+have shown it**, because the asymmetry only appears when two services differ in
+what their own binary can read:
+
+```
+navidrome restore -> restored databases: 1 checked sound, 0 not checked
+plex      restore -> restored databases: 0 checked sound, 2 not checked
+```
+
+navidrome's database is plain SQLite, so the host `python3` reads it. Plex's
+carry FTS tables built with its own `collating` tokenizer, which only
+`Plex SQLite` registers -- so the host could not answer and the restore
+reported "not checked". Independently, those exact restored bytes answer `ok`
+with **82 tables** under that binary. **So the one service whose image is the
+only PROVEN copy of its application half was also the one whose restore could
+not tell a sound database from a broken one.** After the fix:
+`2 checked sound, 0 not checked`, with a line naming which sqlite answered.
+
+**The fallback is consulted ONLY when the host could not answer.** A host
+verdict of BROKEN is never retried against the container: a second opinion
+overturning a real failure is the wrong direction for a restore, and the test
+asserts it with a stub that RECORDS whether it was called -- asserting only
+that the restore failed would pass even if the fallback had run and agreed.
+A database neither can read stays `not checked` and must not claim the
+application answered.
+
+**What the two real-image rehearsals established that fixtures had not:**
+
+| | navidrome | plex |
+|---|---|---|
+| main db / live `-wal` at capture | 4,096 B / **2,195,992 B** | 335,872 B / 1,279,640 B |
+| captured database | **450,560 B, 24 tables** | 373,760 B, 82 tables |
+| mode | `consistent` (`sqlite-backup`) | `consistent` (`sqlite-backup`) |
+
+navidrome's numbers are the decisive ones: a plain file copy would have yielded
+a 4 KB near-empty database, so `.backup` demonstrably walked the committed
+state INCLUDING the WAL. That is the claim `CAPTURE_MODE=consistent` makes, and
+until now it had only ever been made against fixtures.
+
+**Plex also proved the fail-closed path, which only a real image reaches.** It
+creates `library.db` and `Preferences.xml` BEFORE `blobs.db`, so a capture
+taken in that window is partial -- and it correctly reported `INCOMPLETE`,
+named `blobs.db`, said *"a partial capture is not a backup"*, and exited 1. The
+same staged-initialisation behaviour already recorded for Jellyfin. A fixture
+creates every declared file at once and can never reach it.
+
+And Plex's three declared items exercise what no other service does: paths
+containing SPACES folded to stored names with **no collision**, a sqlite binary
+whose own path contains a space, and `Preferences.xml` -- the SERVER TOKEN --
+captured and restored at **mode 600**. A widened mode there would turn a
+recovery into a disclosure.
+
+**Both rehearsals passed `PUID`/`PGID` as the invoking account**, so nothing
+root-owned was left behind (`fixture left behind: 0`), production container ids
+were unchanged, and the count was 11 before and after. That is the lesson from
+the Jellyfin rehearsal that left 39 root-owned entries, applied rather than
+re-learned.
+
+**Still not proven, and stated:** that plex or navidrome RUNS against a
+restored capture. The restore says so in its own words. Capturing state and
+proving the application starts against it are different claims.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
