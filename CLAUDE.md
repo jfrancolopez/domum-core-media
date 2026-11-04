@@ -4565,6 +4565,66 @@ in this file. Check the status of the command you mean, not of the pipeline.
 
 ---
 
+**ENABLING THE SCRUB TIMER PUT A DATE ON A DEPLOYMENT, and nothing in the code
+changed to do it.** Measured 2026-11-04:
+
+```
+domum-media-btrfs-scrub.timer   enabled, active   next: Sun 2026-12-06 05:34:39
+btrfs_scrub_running in /usr/local/bin/domum-media : 0
+btrfs_scrub_running in bin/domum-media at main    : 2
+```
+
+`btrfs scrub start` REFUSES when a scrub is already running on that filesystem
+and returns non-zero. The installed binary has no branch for it, so it lands in
+the generic arm (`scrub FAILED on $root`), sets `worst=1`, and because the
+oneshot `ExecStart` carries no `-` prefix the unit FAILS -- which
+`checkup_systemd_health` reports as CRITICAL and `health-notify` mails. Mail
+delivery is proven. So a scrub in progress at 05:34 on a first Sunday would
+send a CRITICAL for an entirely normal condition: the exact false alarm the
+duplicate-run fix exists to prevent, in the path whose whole value is that
+silence means something.
+
+**The deployment plan was correct when written and was falsified by an operator
+action, not by a commit.** Its latency table said that fix could not fire
+"because the scrub timer is not installed or enabled". Both became true the next
+day. **A latency claim is a claim about live state and goes stale like any
+other** -- re-measure the reasons, not just the fixes.
+
+**`docs/DEPLOYMENT-PLAN-2026-11-02.md` is now `docs/DEPLOYMENT-PLAN.md`,
+because the date in the filename was the defect.** A plan is a living document
+about two revisions; a dated name reads as a review of whatever `main` is now.
+Two of its claims had already gone stale: "two binaries, **no unit files**" (the
+delta grew `systemd/domum-media-btrfs-scrub.timer`) and the scrub latency row
+above.
+
+**That unit change is COMMENT-ONLY -- every directive byte-identical -- and the
+narrow deploy script does not carry it.** `UNIT_TARGETS` holds only the two
+weekly-report units, so `UNITS_CHANGED` stays 0, **no `daemon-reload` happens**,
+and the enabled timer's next elapse cannot be re-randomised. Two things follow
+that must be said rather than discovered:
+
+- **the script's `installed == checkout` invariant covers only the files it
+  lists.** Step 5 iterates `$TARGETS $UNIT_TARGETS`; it is silent about
+  everything else, so it reports success while the installed scrub timer keeps
+  the old comment. Acceptable only because the change is comment-only, and it
+  is the same shape as the 2026-10-20 incident where a deployment installed one
+  binary, skipped BOTH unit files, and printed `== deployed ==`. **A
+  substantive unit change must be added to `UNIT_TARGETS` first.**
+- `install.sh` and `converge_local_installation` install `systemd/*.service`
+  and `systemd/*.timer` wholesale, so they WOULD carry it -- which is exactly
+  why neither is the mechanism for a narrow deployment.
+
+**A QUEUE HEADER CONTRADICTED ITS OWN TABLE, in the pessimistic direction
+again.** The P1 section opened with *"**No implementation exists** -- verified
+2026-11-03, there is no `service_state_capture` or equivalent in either CLI"*
+while every row beneath it was marked done. Verified: all four functions are
+defined and all three dispatcher arms exist. The real caveat is different and
+narrower -- they are not in the INSTALLED binary. That is the third stale
+queue header found in two days, and all three understated what exists, which is
+the direction nothing ever contradicts.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
