@@ -77,18 +77,40 @@ is the right form once it is deployed.
 ## Deployment
 
 Production is at `a63ad19` with **no drift** — every installed file's sha256
-matches that revision's blob, verified 2026-11-02. A reviewed plan for
-`a63ad19` → current `origin/main` is in `docs/DEPLOYMENT-PLAN-2026-11-02.md`:
-two files change, no unit changes, no `daemon-reload`, no container touched, no
-timer enabled, and no handover. Not executed — that is an approval boundary.
+matches that revision's blob, and the revision itself was identified BY HASH
+rather than read from a file (re-verified 2026-11-04). The reviewed plan is
+`docs/DEPLOYMENT-PLAN.md` — renamed from `DEPLOYMENT-PLAN-2026-11-02.md`,
+because a date in the filename implies a review of whatever `main` is now.
+
+**It has ONE dated item, and it comes from the operator enabling the scrub
+timer rather than from the code.** The timer is `enabled, active`, first elapse
+**Sun 2026-12-06 05:34:39**, and the INSTALLED binary has **zero** occurrences
+of `btrfs_scrub_running` (main has 2). `btrfs scrub start` refuses when a scrub
+is already running, which lands in the generic arm, sets `worst=1`, fails the
+oneshot unit, and `health-notify` mails a CRITICAL for a normal condition — the
+false alarm the fix exists to prevent, and mail delivery is proven. Deploying
+before 2026-12-06 retires it; after that the window reopens monthly.
+
+The installable surface is **two binaries plus one COMMENT-ONLY unit file**
+(every directive in `domum-media-btrfs-scrub.timer` is byte-identical). The
+narrow deploy script does not carry that unit, so `UNITS_CHANGED` stays 0 and
+no `daemon-reload` happens — stated in the plan rather than left to be
+discovered, together with the fact that the script's `installed == checkout`
+invariant covers only the files it lists. No container is touched, no timer is
+enabled, no handover. Not executed — that is an approval boundary.
 
 ---
 
 ## P1 — Selective off-site protection for media-service state
 
-Design: `docs/SELECTIVE-STATE-PROTECTION.md`. Phase A measured, Phase B
-designed. **No implementation exists** — verified 2026-11-03, there is no
-`service_state_capture` or equivalent in either CLI.
+Design: `docs/SELECTIVE-STATE-PROTECTION.md`. **This header used to say "no
+implementation exists", contradicting its own table below.** Verified
+2026-11-04: `service_essential_state`, `service_state_capture`,
+`service_state_verify` and `service_state_restore` are all defined in
+`bin/domum-media`, with `storage capture-state` / `verify-state` /
+`restore-state` arms in the dispatcher. They are NOT in the installed binary
+(production predates them), which is the real caveat and a different one — see
+the deployment section.
 
 | # | item | status |
 |---|---|---|
