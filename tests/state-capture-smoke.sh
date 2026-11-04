@@ -24,6 +24,38 @@ printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/docker"; chmod +x "$TMP/bin/docker"
 
 # A jellyfin-shaped state tree: a database, four XML files, and the
 # DataProtection keys whose modes must survive.
+grepF_q() {  # $1 = fixed string, $2 = already-captured text
+  grep -qF -- "$1" <<< "$2"
+}
+
+build_calibre_web() {
+  rm -rf "$TMP/data/calibre-web"
+  mkdir -p "$TMP/data/calibre-web/config"
+  # A REAL database with calibre-web's encrypted-column convention, so the
+  # premise of declaring the key is visible in the fixture rather than only in
+  # a comment: the `_e` suffix is what calibre-web uses for a Fernet-encrypted
+  # value.
+  python3 - "$TMP/data/calibre-web/config/app.db" <<'MKCW'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table settings(id integer primary key, mail_password_e text,"
+            " config_ldap_serv_password_e text)")
+con.execute("insert into settings values (1,'gAAAAAB_ciphertext','gAAAAAB_more')")
+con.commit(); con.close()
+MKCW
+  printf 'gdrive-placeholder\n' > "$TMP/data/calibre-web/config/gdrive.db"
+  printf '{}\n' > "$TMP/data/calibre-web/config/client_secrets.json"
+  # 44 bytes, 0600: the real shape of a Fernet key as calibre-web creates it.
+  # Exactly 44 bytes: a Fernet key is 43 urlsafe-base64 characters plus the
+  # '=' pad. The first version of this fixture was 43 and the assertion below
+  # failed on the FIXTURE rather than on the code.
+  printf '%s' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+    > "$TMP/data/calibre-web/config/.key"
+  chmod 0600 "$TMP/data/calibre-web/config/.key"
+  # Regenerable, and deliberately NOT declared.
+  printf 'log noise\n' > "$TMP/data/calibre-web/config/calibre-web.log"
+}
+
 build_jellyfin() {
   rm -rf "$TMP/data/jellyfin"
   mkdir -p "$TMP/data/jellyfin/config/data/data" \
@@ -858,5 +890,75 @@ grep -q 'restored databases: 0 checked sound, 1 not checked' <<< "$out" \
   || fail "the mutation changed no ANSWER -- without the fallback a database the
 host cannot read must read as 'not checked': $out"
 echo "  killed: without it, plex's databases are unverifiable on restore"
+
+
+sect "calibre-web declares the KEY that decrypts what is in its database"
+# config/.key is 44 bytes -- a Fernet key -- and app.db stores credentials
+# encrypted with it. Measured 2026-11-04 from the PRODUCTION schema (names
+# only, no value read): the `_e` suffix is calibre-web's own convention, and
+# app.db carries settings.mail_password_e,
+# settings.config_ldap_serv_password_e and
+# settings.config_reverse_proxy_login_header_secret_e.
+#
+# The declaration used to be app.db + gdrive.db and MISS the key, so a restore
+# would have brought those values back as undecryptable bytes and calibre-web
+# would have come up and silently failed to send mail or bind to LDAP. That is
+# exactly the case jellyfin's .aspnet/DataProtection-Keys is declared for.
+out="$(probe '' 'service_essential_state calibre-web')"
+for want in 'config/app.db' 'config/gdrive.db' 'config/.key' 'config/client_secrets.json'; do
+  grepF_q "$want" "$out" \
+    || fail "calibre-web does not declare $want: $out"
+done
+grepF_q 'calibre-web.log' "$out" \
+  && fail "calibre-web declares its LOG, which is regenerable: $out"
+grepF_q 'backups' "$out" \
+  && fail "calibre-web declares a backups directory: $out"
+echo "  app.db, gdrive.db, the key and the gdrive client secret; not the log"
+
+sect "and the key is CAPTURED with its mode, not just declared"
+# A declaration is a list; this drives the capture and asserts the key arrives
+# as a 0600 item. A Fernet key restored world-readable would be a disclosure,
+# and the digest alone would not notice -- it covers contents, not modes.
+build_calibre_web
+rm -rf "$TMP/out/cap-cw" "$TMP/out/scratch-cw"
+out="$(probe '' "service_state_capture calibre-web '$TMP/out/cap-cw'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the calibre-web capture failed: $out"
+grep -q '^ITEMS=4$' "$TMP/out/cap-cw/MANIFEST" || fail "expected 4 items: $(cat "$TMP/out/cap-cw/MANIFEST")"
+grep -q 'config/\.key|file-copy|44|600|' "$TMP/out/cap-cw/MANIFEST" \
+  || fail "the key was not captured as a 44-byte mode-600 item:
+$(cat "$TMP/out/cap-cw/MANIFEST")"
+out="$(probe '' "service_state_restore '$TMP/out/cap-cw' '$TMP/out/scratch-cw'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the calibre-web restore failed: $out"
+rkey="$(find "$TMP/out/scratch-cw" -name '.key' | head -1)"
+[[ -n "$rkey" ]] || fail "the key was not restored"
+[[ "$(stat -c %a "$rkey")" == "600" ]] \
+  || fail "the key restored as mode $(stat -c %a "$rkey"), not 600"
+echo "  captured 44|600 and restored 600"
+
+sect "MUTATION: dropping the key from the declaration must change the ANSWER"
+# Not a presence assertion on source text -- that would pass for any list. The
+# observable is the CAPTURE: three items instead of four, and no key to
+# decrypt app.db's _e columns with.
+MUTK="$TMP/mut-key"; mkdir -p "$MUTK"; cp "$CLI" "$MUTK/domum-media"
+python3 -I - "$MUTK/domum-media" <<'PYMK' || fail "the key mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "      printf 'file|config/.key\\n'\n"
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYMK
+build_calibre_web
+rm -rf "$TMP/out/cap-cw-m"
+saved_cli="$CLI"; CLI="$MUTK/domum-media"
+out="$(probe '' "service_state_capture calibre-web '$TMP/out/cap-cw-m'; echo RC=\$?")"
+CLI="$saved_cli"
+grep -q 'RC=0' <<< "$out" || fail "the mutant capture failed for an unrelated reason: $out"
+grep -q 'config/\.key' "$TMP/out/cap-cw-m/MANIFEST" \
+  && fail "the mutation changed no ANSWER -- without the declaration the key
+must not be captured"
+grep -q '^ITEMS=3$' "$TMP/out/cap-cw-m/MANIFEST" \
+  || fail "expected 3 items in the mutant capture: $(cat "$TMP/out/cap-cw-m/MANIFEST")"
+echo "  killed: without it the capture is 3 items and app.db's _e values are undecryptable"
 
 echo "ALL STATE-CAPTURE CHECKS PASSED"
