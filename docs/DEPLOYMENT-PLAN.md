@@ -84,6 +84,21 @@ Two consequences, both stated rather than left to be discovered:
 `systemd/*.timer` wholesale, so they *would* carry it — which is exactly why
 neither is the mechanism for a narrow deployment.
 
+**And it is the ONLY unit that differs, measured rather than inferred.** Every
+installed `domum-media-*.service` and `domum-media-*.timer` was compared by
+sha256 against the repository copy, 2026-11-04:
+
+```
+16 units compared        15 same, 1 DIFFERS
+differing                domum-media-btrfs-scrub.timer   (comment-only, §3)
+```
+
+That matters because §2 derives the installable surface from
+`git diff a63ad19..main`, which is a claim about the *repository*. This is the
+same claim checked from the other end — against what is actually on the host —
+and the two agree. The other 15 include `domum-media-image-refresh.timer`,
+which is byte-identical and remains `disabled, inactive`.
+
 ## 4. THE ONE DATED ITEM: the scrub timer is now enabled, and production lacks
 the duplicate-run protection
 
