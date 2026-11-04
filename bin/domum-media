@@ -5684,9 +5684,10 @@ checkup_systemd_health() {
 # The remedy used to say "takes hours". Measured on this host that is wrong by
 # roughly an order of magnitude: `Total to scrub: 215.87GiB` on a SATA SSD is
 # about ten minutes. The rule this project already records is that a remedy
-# which reads as expensive does not get run, and a 10-minute read-only
-# verification of 23,155 irreplaceable originals is the cheapest safety work
-# available here. So the estimate is derived, and the operator is told the real
+# which reads as expensive does not get run, and a 10-minute verification of
+# 23,155 irreplaceable originals is the cheapest safety work available here.
+# (It said "read-only" and is not: no -r is passed, so DUP metadata is repaired
+# by writing. The cost argument is unaffected.) So the estimate is derived, and the operator is told the real
 # size.
 #
 # Dividing bytes by a rate is legitimate HERE, unlike the verify-large estimate
@@ -12243,8 +12244,10 @@ storage_cmd() {
       esac ;;
     scrub)
       shift
-      # Read-only verification. `start` blocks (-B) so its exit status means
-      # something: 0 clean, 1 could not scrub, 3 uncorrectable errors found.
+      # `start` blocks (-B) so its exit status means something: 0 clean, 1
+      # could not scrub, 3 uncorrectable errors found. It is NOT read-only --
+      # no `-r` is passed, so a replicated profile is repaired by writing, and
+      # Metadata and System here are DUP. `status` is the read-only one.
       case "${1:-status}" in
         start)  shift; storage_scrub_start "$@" ;;
         status) storage_scrub_status ;;
@@ -12433,11 +12436,15 @@ Usage:
   domum-media storage scrub {start [--limit SIZE]|status}
                                             Verify every allocated extent
                                             against its checksum, ONCE per
-                                            filesystem. Read-only: it DETECTS
-                                            corruption and, with data "single",
-                                            cannot repair it. start blocks and
-                                            exits 0 clean, 1 could not scrub,
-                                            3 uncorrectable errors found
+                                            filesystem. NOT read-only: no -r is
+                                            passed, so DUP metadata and System
+                                            are REPAIRED by writing, while data
+                                            "single" has no second copy and is
+                                            reported rather than repaired.
+                                            start blocks and exits 0 clean,
+                                            1 could not scrub, 3 uncorrectable
+                                            errors found. Use scrub status for
+                                            the read-only question
   domum-media storage verify-recovery <service> <point> [--deep]
   domum-media storage archives              Which recovery point needs each
                                             image archive, and which are
