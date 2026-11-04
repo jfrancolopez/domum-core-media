@@ -1062,4 +1062,84 @@ not be captured"
 done
 echo "  killed: each one disappears from the capture when undeclared"
 
+
+sect "a captured SECRET never reaches stdout, stderr or the manifest"
+# The capture now deliberately contains encryption keys (calibre-web's Fernet
+# key), a JWT signing key (kavita) and a server token (plex). So "does a secret
+# value leak" stops being hypothetical, and the honest way to ask it is with a
+# sentinel rather than by reading the code: put a unique string IN the key and
+# require it to appear nowhere but the stored copy.
+build_calibre_web
+SENTINEL='SeNtInEl-7Q4w9ZxK-do-not-leak'
+printf '%s' "$SENTINEL" > "$TMP/data/calibre-web/config/.key"
+chmod 0600 "$TMP/data/calibre-web/config/.key"
+rm -rf "$TMP/out/cap-leak" "$TMP/out/scratch-leak"
+leak_out="$(probe '' "service_state_capture calibre-web '$TMP/out/cap-leak'
+service_state_verify '$TMP/out/cap-leak'
+service_state_restore '$TMP/out/cap-leak' '$TMP/out/scratch-leak'
+echo RC=\$?")"
+grep -q 'RC=0' <<< "$leak_out" || fail "the capture/verify/restore chain failed: $leak_out"
+grepF_q "$SENTINEL" "$leak_out" \
+  && fail "the key's VALUE appeared on stdout/stderr. A capture that contains
+credentials must never print them -- the operator pastes this output into
+issues and transcripts"
+grep -qF "$SENTINEL" "$TMP/out/cap-leak/MANIFEST" \
+  && fail "the key's VALUE is in the MANIFEST, which records digests and modes.
+A digest identifies the bytes; it must not BE the bytes"
+# It MUST be in the stored copy -- that is the backup. Anywhere else is a leak.
+holders="$(grep -rlF "$SENTINEL" "$TMP/out/cap-leak" "$TMP/out/scratch-leak" 2>/dev/null | sort)"
+expected="$TMP/out/cap-leak/files/config_.key
+$TMP/out/scratch-leak/config/.key"
+[[ "$holders" == "$(sort <<< "$expected")" ]] \
+  || fail "the secret is in files it should not be in.
+expected only the stored copy and the restored copy:
+$(sort <<< "$expected")
+found:
+$holders"
+echo "  present in the stored and restored copies, and nowhere else"
+
+sect "EVERY directory down to the capture is 0700, not just files/"
+# Measured 2026-11-04: `install -d -m 0700 "$dest/files"` applies the mode to
+# the LEAF only, so backups/, backups/state/, <service>/ and <stamp>/ came out
+# 0755 -- install's own default, not the umask (the mutation below returns 0755
+# under a umask of 0002, where a umask-derived mode would be 0775). The
+# credential was shielded by ONE directory with four world-traversable parents,
+# and the stored key itself is 0644 whenever production's is.
+rm -rf "$TMP/data/backups" "$TMP/out/cap-modes"
+dest_default="$(probe '' 'state_capture_dir')/calibre-web/stamp1"
+build_calibre_web
+probe '' "service_state_capture calibre-web '$dest_default'" >/dev/null
+for d in "$(probe '' 'state_capture_dir')" \
+         "$(probe '' 'state_capture_dir')/calibre-web" \
+         "$dest_default" "$dest_default/files"; do
+  m="$(stat -c %a "$d" 2>/dev/null || echo MISSING)"
+  printf '  %-4s %s\n' "$m" "${d#"$TMP/"}"
+  [[ "$m" == "700" ]] \
+    || fail "$d is mode $m, not 700 -- a capture containing an encryption key
+must not depend on the invoking umask for its confidentiality"
+done
+echo "  the whole chain is 0700"
+
+sect "MUTATION: hardening only the leaf must leave a parent open"
+MUTP2="$TMP/mut-perm"; mkdir -p "$MUTP2"; cp "$CLI" "$MUTP2/domum-media"
+python3 -I - "$MUTP2/domum-media" <<'PYMP' || fail "the permission mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  install -d -m 0700 -- "$cap_root" || return 1'
+new = '  install -d -- "$cap_root" || return 1'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMP
+rm -rf "$TMP/data/backups"
+build_calibre_web
+saved_cli="$CLI"; CLI="$MUTP2/domum-media"
+probe '' "service_state_capture calibre-web '$dest_default'" >/dev/null
+CLI="$saved_cli"
+mroot="$(stat -c %a "$(probe '' 'state_capture_dir')" 2>/dev/null || echo MISSING)"
+[[ "$mroot" != "700" ]] \
+  || fail "the mutation changed no ANSWER -- without the explicit mode the
+capture root must come back at install's default of 0755, not 0700 (got $mroot)"
+echo "  killed: without it the root is $mroot -- install's default, not 0700"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"

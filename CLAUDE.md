@@ -4885,6 +4885,50 @@ make the item disappear from the manifest. Both killed.
 
 ---
 
+**THE CAPTURE NOW CONTAINS CREDENTIALS, AND ONLY ONE DIRECTORY WAS PROTECTING
+THEM.** Declaring calibre-web's Fernet key, kavita's JWT TokenKey and
+jellyfin's device identity made "are these captures protected at rest?" a real
+question rather than a hypothetical one. Measured 2026-11-04 by driving a
+capture and listing every path it created:
+
+```
+drwxr-xr-x  backups/  backups/state/  <service>/  <stamp>/
+drwx------  <stamp>/files/            <- the ONLY protection
+-rw-r--r--  files/config_.key         <- calibre-web's Fernet key
+-rw-------  <stamp>/MANIFEST
+```
+
+`install -d -m 0700 "$dest/files"` applies the mode to the **leaf only**. The
+parents came out **0755 -- install's own default, not the umask**: the mutation
+that drops `-m` returns 0755 under a umask of 0002, where a umask-derived mode
+would be 0775. I first wrote "the invoking umask" and corrected it, because
+describing a mechanism wrongly is the defect this file exists to correct.
+
+Every directory from `state/` down is 0700 now. **`<data>/backups` is created
+if absent and its mode is deliberately NOT changed**: it is shared with
+`images/` and `volumes/`, and silently re-moding an existing production
+directory is not that function's business.
+
+**The stored file keeps its SOURCE mode on purpose.** Normalising captured
+files to 0600 looks safer and is wrong twice over: the restore `cp -a`s the
+stored copy and then verifies the result against the mode recorded in the
+manifest, so it would (a) fail every item whose source mode is not 0600 and
+(b) turn that check circular -- asserting a mode the restore had just set.
+Confidentiality belongs to the directory chain, which is how
+`/srv/data/backups/images` already does it.
+
+**"Does a secret leak?" is asked with a SENTINEL, not by reading the code.** A
+fixture key holding a unique string must appear in exactly two files -- the
+stored copy and the restored copy -- and nowhere in stdout, stderr or the
+MANIFEST. A digest identifies the bytes; it must not BE the bytes. Asserted by
+`grep -rl` over both trees and compared against the expected set, so a new
+file that starts holding it fails rather than passing unnoticed.
+
+**No workflow uploads artifacts**, checked rather than assumed, so CI is not a
+leak path for the fixtures' keys.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
