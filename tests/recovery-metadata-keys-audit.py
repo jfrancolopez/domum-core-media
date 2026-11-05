@@ -11,6 +11,22 @@ well-formed.
 This compares the two sets directly. It is deliberately a whole-file audit
 rather than a per-function one: a key is a contract between two places that are
 nowhere near each other in the file.
+
+TWO conventions live in this file and both are checked, because the patterns for
+one do not match the other:
+
+  recovery metadata   printf "KEY='%s'"   read by  sed -nE "s/^KEY='(.*)'$/\\1/p"
+  capture manifest    printf 'KEY=%s\\n'   read by  sed -nE "s/^KEY=(.*)$/\\1/p"
+
+The manifest convention was unaudited in either direction, and its summary keys
+were read by nothing: `service_state_verify` ignored RESULT, ITEMS and
+SCHEMA_VERSION, so a truncated manifest verified clean. The sets are counted
+PER CONVENTION -- a merged non-empty total would let one convention's patterns
+rot while the other kept the guard satisfied.
+
+Scope is this one CLI deliberately. `bin/domum-media-backup` writes 24 keys in
+the unquoted convention and reads none of them with that idiom, so including it
+would report two dozen orphans that are not defects.
 """
 import re
 import sys
@@ -35,6 +51,8 @@ def main() -> int:
         normalise(m)
         for m in re.findall(r"printf \"((?:CONTAINER_%s_)?[A-Z][A-Z0-9_]*)=", code)
     }
+    # The capture manifest's unquoted convention.
+    written_plain = set(re.findall(r"printf '([A-Z][A-Z0-9_]*)=", code))
     # Readers use `sed -nE "s/^KEY='(.*)'$/\1/p"` or grep -F "KEY='...'".
     read = {
         normalise(m)
@@ -44,11 +62,22 @@ def main() -> int:
         normalise(m)
         for m in re.findall(r"grep -qF \"((?:CONTAINER_\d+_)?[A-Z][A-Z0-9_]*)='", code)
     }
+    read_plain = set(re.findall(r"s/\^([A-Z][A-Z0-9_]*)=\(\.\*\)\$/", code))
 
-    if not written or not read:
-        print(f"FAIL: audit found nothing to compare (written={len(written)} read={len(read)})")
-        print("      the extraction patterns no longer match the code; fix this audit")
-        return 1
+    # Per convention, so one set of patterns breaking cannot hide behind the
+    # other's matches.
+    for label, w, r in (
+        ("quoted", written, read),
+        ("unquoted", written_plain, read_plain),
+    ):
+        if not w or not r:
+            print(f"FAIL: the {label} convention found nothing to compare "
+                  f"(written={len(w)} read={len(r)})")
+            print("      the extraction patterns no longer match the code; fix this audit")
+            return 1
+
+    written |= written_plain
+    read |= read_plain
 
     orphans = sorted(read - written)
     print(f"== recovery metadata keys: {len(written)} written, {len(read)} read")
