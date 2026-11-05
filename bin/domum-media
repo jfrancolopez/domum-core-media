@@ -4279,8 +4279,13 @@ status_counts() {
 
 status_storage() {
   echo "=== storage ==="
-  echo "  $DOMUM_DATA_ROOT   = durable / protected disk (snapshotted + backed up)"
-  echo "  $DOMUM_MEDIA_ROOT  = disposable media on the OS disk (not backed up by default)"
+  echo "  $DOMUM_DATA_ROOT = protected tier: the irreplaceable data lives here"
+  echo "      What is actually snapshotted, and what is actually off-site, BOTH"
+  echo "      vary per service. Ask 'storage topology' and 'dr-status'; this"
+  echo "      line deliberately asserts neither."
+  echo "  $DOMUM_MEDIA_ROOT = replaceable/reacquirable media on the OS disk"
+  echo "      Cheap to re-obtain -- that is a statement about recovery cost."
+  echo "      It is NOT permission to delete or restructure it."
   printf '%-28s %-8s %-8s %-8s %-6s\n' "PATH" "SIZE" "USED" "AVAIL" "USE%"
   for path in "$DOMUM_DATA_ROOT" "$DOMUM_MEDIA_ROOT" "$DOMUM_SNAPSHOT_ROOT" /; do
     [[ -e "$path" ]] || continue
