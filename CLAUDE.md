@@ -5331,6 +5331,41 @@ argument.
 
 ---
 
+**P3.4's BLOCKER RE-MEASURED FOR THE VARIANT THAT LOOKED LIKE A WAY AROUND
+IT, and it is still root.** Today's helper-container result -- a disposable
+container reading a live database with the directory mounted READ-ONLY -- is a
+real counterexample to "this needs privilege", and it raised the obvious
+question for volumes. Measured 2026-11-05 with a bind-type volume, which is the
+variant the 2026-11-02 measurement did not cover:
+
+```
+docker volume create --opt type=none --opt o=bind --opt device=<my dir>
+  Mountpoint : /var/lib/docker/volumes/<name>/_data
+  Options    : map[device:/tmp/... o:bind type:none]
+tar -C <Mountpoint>     Permission denied, rc=2
+tar -C <device path>    rc=0
+```
+
+So even when the bytes live in a directory this account owns, docker reports
+the `/var/lib/docker` path and `tar -C` on it is denied. `Options` does carry
+the device, but `docker_volume_mountpoint` returns the Mountpoint, so the
+production primitive cannot be driven either way -- and preferring
+`Options.device` would help only bind-type volumes, which production's are not.
+
+**A helper container reading the volume was rejected before and stays
+rejected**, for a reason the sqlite helper does not share: that helper only
+READS, while the volume path also RESTORES, and `--numeric-owner`, xattrs and
+ACLs behave differently inside a user namespace. `acme.json`'s mode 0600 is
+exactly what must not change. A restore path is the worst place to trade
+correctness for testability.
+
+Recorded so the question is settled rather than re-derived a third time. The
+general lesson stands and was worth re-testing: **measure the blocker for the
+question in front of you** -- it was wrong twice today in the optimistic
+direction (the quiesced capture, the archive cost) and right here.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
