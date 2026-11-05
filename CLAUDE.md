@@ -5155,6 +5155,54 @@ no books, no users, nothing fetched.
 
 ---
 
+**A RESTORED PLEX REMAINS THE SAME SERVER -- measured, with the negative
+control that makes it mean something.** `Preferences.xml` is declared because
+*"without it a restored Plex is a new server identity and every client must
+re-pair."* Rehearsed 2026-11-05 against the real image:
+
+```
+before restore                 MachineIdentifier 37be53c1-6233-4500-8c23-0dd7eec684d5
+after restore                  MachineIdentifier 37be53c1-...   IDENTICAL
+restore WITHOUT Preferences.xml  MachineIdentifier 655118fa-c396-43e2-84e8-e6beb6c42fcb
+```
+
+Plex started **just as happily** in the third case and wrote itself a new
+identity. So a capture that took "the databases" and left the token behind
+would produce a restore that reports success and is a different server to every
+client that was paired with it -- and nothing in Plex's own behaviour reveals
+it. The restored `Preferences.xml` is asserted mode **600** before the service
+starts, because it holds the server token.
+
+The restored library database also opens in **Plex's own SQLite** --
+`integrity_check: ok`, 82 tables -- which the host's sqlite3 cannot do at all,
+because of the `collating` tokenizer.
+
+**Three of the five now have an application-start proof, each with a negative
+control**: navidrome (it opened THAT database, proved by a marker row),
+calibre-web (its encrypted credential is still usable, and without the key the
+service starts fine and cannot read it), plex (same server, and without the
+token it is a different one). None has `SERVES ITS LIBRARY`.
+
+**IMAGE DEPENDENCIES RE-MEASURED 2026-11-05, and the position is unchanged --
+which is the useful result.**
+
+```
+plex, jellyfin, kavita, navidrome, calibre-web   tagged, RepoDigest == image Id
+traefik  9c3b91d5fb77                            RepoTags [] RepoDigests []  DANGLING
+uptime-kuma  a8610b3b4c38                        RepoTags [] RepoDigests []  DANGLING
+```
+
+Still two dangling and prune-exposed, exactly as recorded on 2026-10-28, and
+still no service with an independent registry reference -- a `RepoDigest` equal
+to the image Id is not one. So the `docker save` archive remains the only
+PROVEN copy of the application half for all seven, and
+`/srv/data/backups/images` is still not in the cloud target. All five
+capture-relevant image ids resolve locally today, so a manifest's `IMAGE_ID`
+names an object that exists; whether it could be re-obtained is a different
+question and the answer is still no.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
