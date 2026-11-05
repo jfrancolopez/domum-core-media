@@ -185,18 +185,33 @@ for want in 'needed by' 'image id' 'checksum' 'local object' 'safe to delete' \
             'orphan' 'off-host copy'; do
   grep -qi -- "$want" <<< "$ar" || fail "the inventory does not report: $want"
 done
-# The off-host question is answered by TIMESTAMP, not by querying restic: a
-# read-only inventory must not need the repository password to answer a question
-# about scheduling. Sound because the archive lives under $DOMUM_DATA_ROOT, which
-# the backup includes and no exclude covers.
+# The off-host question is TWO questions, and this function used to answer only
+# the second while printing the first's conclusion. Its comment claimed the
+# timestamp inference was "sound because the archive lives under
+# $DOMUM_DATA_ROOT, which the backup includes and no exclude pattern covers" --
+# true of the GLOBAL include set, false of the target that runs. The cloud
+# target's scope is three immich/pack roots, so no scheduled run copies
+# /srv/data/backups/images off this host, and `off-host copy: yes` was printed
+# directly beneath "this archive is the only copy".
+#
+# What remains true, and is still asserted: a read-only inventory must not need
+# the repository password. Scope is CONFIGURATION and recency is recorded
+# evidence, so neither needs restic.
 ar_code="$(grep -vE '^\s*#' <<< "$ar" || true)"
 grep -qE '(^|[;&|[:space:]])restic' <<< "$ar_code" \
   && fail "the inventory invokes restic; that needs secrets and this is read-only"
-# It must use the ONE parser for the marker, which already existed. Rolling its
-# own was the bug: see section 13b.
-grep -q 'backup_last_success_epoch' <<< "$ar" \
-  || fail "the off-host answer does not use backup_last_success_epoch, the single
-parser for the successful-backup marker"
+# Scope must be ASKED, not inferred. The resolvers live only in the backup CLI.
+grep -q 'backup_scope_of_path' <<< "$ar_code" \
+  || fail "the off-host answer does not ask about backup SCOPE, so it is inferring
+coverage from a path again -- the defect that printed 'yes' for a directory no
+enabled target's scope includes"
+# Recency must be read PER TARGET. The aggregate heartbeat would let a success
+# of some other target vouch for this one.
+grep -q 'backup_run_last_success' <<< "$ar_code" \
+  || fail "the off-host answer does not read the per-target run evidence"
+grep -q 'backup_last_success_epoch' <<< "$ar_code" \
+  && fail "the off-host answer uses the AGGREGATE heartbeat. It is target-agnostic,
+so a successful run of a target that does not cover this path would vouch for it."
 # Comments stripped: the explanation in that function legitimately quotes the
 # broken form, and matching the text rather than the code flagged it -- twice in
 # this same section now, once for `restic` and once for this.
@@ -206,22 +221,24 @@ timestamp, not an epoch, and stripping it yields an 18-digit number larger than
 any mtime -- so the comparison is always true and the check can only say yes."
 echo "  reports need, id, checksum, local object, orphans, off-host; deletes nothing"
 
-echo "== 13b. the off-host answer is EXECUTED, in all three directions =="
+echo "== 13b. the off-host answer is EXECUTED, and SCOPE decides it =="
 #
-# WHY THIS IS NOT A GREP. The first version of this assertion checked that the
+# WHY THIS IS NOT A GREP. An earlier version of this assertion checked that the
 # strings 'yes', 'NOT YET' and 'UNKNOWN' appeared in the function's SOURCE. They
-# did, so it passed -- while the comparison itself could only ever reach 'yes',
-# because the marker was being digit-stripped into an 18-digit number. The check
-# shipped and reported "yes" in production for an archive the last backup
-# predated by six hours.
-#
+# did, so it passed -- while the comparison itself could only ever reach 'yes'.
 # That is the lesson already written down for service_upgrade: asserting on a
-# function's text does not prove the function runs. So this drives
-# storage_archives against real files with controlled timestamps.
-offhost_probe() {  # $1 = marker contents ("" = no file), $2 = archive mtime
+# function's text does not prove the function runs.
+#
+# It now also controls SCOPE, through a stub standing in for the backup CLI --
+# the same seam `pack-offhost`'s reader uses. A fixture cannot read the
+# production config, and the point is the verdict the inventory draws from the
+# reply, not the resolver (which has its own sections).
+offhost_probe() {  # $1 = scope verdict ("" = CLI absent), $2 = archive mtime,
+                   # $3 = run FINISHED_TS ("" = no run evidence)
   local root="$TMP_DIR/oh"
   rm -rf "$root"
-  mkdir -p "$root/data/backups/images" "$root/state/snapshots" "$root/log"
+  mkdir -p "$root/data/backups/images" "$root/state/snapshots" "$root/log" \
+           "$root/meta" "$root/bin"
   local arch="$root/data/backups/images/plex-abc.tar"
   printf 'ARCHIVE\n' > "$arch"
   sha256sum "$arch" | awk '{print $1}' > "$arch.sha256"
@@ -233,7 +250,26 @@ CONTAINER_1_IMAGE_ID='sha256:deadbeef'
 IMAGE_ARCHIVE='$arch'
 IMAGE_ARCHIVE_SHA256='$(cat "$arch.sha256")'
 EOF
-  [ -n "$1" ] && printf '%s\n' "$1" > "$root/log/last-success"
+  # Per-target run evidence, read by backup_run_last_success. RESULT=success is
+  # required by that reader, so a fixture cannot accidentally pass with a
+  # recorded failure.
+  if [ -n "$3" ]; then
+    cat > "$root/meta/cloud-run.env" <<EOF
+RESULT=success
+SNAPSHOT_ID=abc1234
+FINISHED_TS=$3
+EOF
+  fi
+  # The stub backup CLI. It emits the JSON line FIRST, as the real one does.
+  if [ -n "$1" ]; then
+    cat > "$root/bin/stub-backup" <<EOF
+#!/usr/bin/env bash
+printf '{"path":"x","verdict":"%s","in_scope":"%s","not_in_scope":"","unresolved":""}\n' \\
+  '$1' "\$( [ '$1' = in-scope ] && printf cloud )"
+echo "human readable report follows"
+EOF
+    chmod +x "$root/bin/stub-backup"
+  fi
   {
     printf 'set -uo pipefail\n'
     printf 'DOMUM_DIR=%q\n' "$REPO_ROOT"
@@ -244,69 +280,97 @@ EOF
     printf 'load_cfg() { :; }\n'
     printf 'DOMUM_DATA_ROOT=%q\n' "$root/data"
     printf 'DOMUM_LOG_DIR=%q\n' "$root/log"
+    printf 'REPO_META_DIR=%q\n' "$root/meta"
+    printf 'DOMUM_BACKUP_CLI=%q\n' "$root/bin/stub-backup"
     printf 'snapshot_metadata_dir() { printf %q; }\n' "$root/state/snapshots"
     printf 'image_archive_dir() { printf %q; }\n' "$root/data/backups/images"
     printf 'docker() { return 1; }\n'
     printf 'storage_archives\n'
   } > "$root/probe.sh"
-  bash "$root/probe.sh" 2>&1 | sed -n 's/.*off-host copy   : //p' | head -1
+  bash "$root/probe.sh" 2>&1 | sed -n 's/.*off-host copy   : //p' | sed -n '1p'
 }
 
-# (a) A backup that succeeded AFTER the archive appeared -> yes.
-got="$(offhost_probe '2026-10-08T12:00:00-04:00' '2026-10-08 06:00:00')"
+# (a) NOT IN SCOPE -> NO, whatever the timestamps say. This is production's
+#     exact shape: the archive directory is not in the immich-only cloud scope,
+#     and the old code printed 'yes' here because a nightly run had happened.
+got="$(offhost_probe 'not-in-scope' '2026-10-08 06:00:00' '2026-10-08T12:00:00-04:00')"
+case "$got" in
+  NO*) : ;;
+  *) fail "13b(a): a path NO enabled target covers gave '$got', expected NO.
+A backup newer than the file says nothing if that backup never looks at it." ;;
+esac
+
+# (b) IN SCOPE and a successful run of that target AFTER the file -> yes, and it
+#     must name WHEN. A blank timestamp there is what gave an earlier bug away.
+got="$(offhost_probe 'in-scope' '2026-10-08 06:00:00' '2026-10-08T12:00:00-04:00')"
 case "$got" in
   yes*) : ;;
-  *) fail "13b(a): a backup newer than the archive gave '$got', expected yes" ;;
+  *) fail "13b(b): in scope with a newer successful run gave '$got', expected yes" ;;
 esac
-# ...and it must name the timestamp. The broken version printed a blank there,
-# which is what gave the bug away in the deployment log.
 grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<< "$got" \
-  || fail "13b(a): the 'yes' answer does not state WHEN: '$got'"
+  || fail "13b(b): the 'yes' answer does not state WHEN: '$got'"
 
-# (b) A backup that predates the archive -> NOT YET. This is the case the
-#     broken version could never produce, and the one that matters.
-got="$(offhost_probe '2026-10-08T02:37:27-04:00' '2026-10-08 08:15:00')"
+# (c) IN SCOPE but the run PREDATES the file -> NOT YET.
+got="$(offhost_probe 'in-scope' '2026-10-08 08:15:00' '2026-10-08T02:37:27-04:00')"
 case "$got" in
   NOT\ YET*) : ;;
-  *) fail "13b(b): a backup OLDER than the archive gave '$got', expected NOT YET.
-This is production's exact shape -- marker 02:37, archive 08:15 -- and it was
-reported as 'yes'." ;;
+  *) fail "13b(c): in scope with an older run gave '$got', expected NOT YET" ;;
 esac
 
-# (c) No marker at all -> UNKNOWN, not either definite answer.
-got="$(offhost_probe '' '2026-10-08 08:15:00')"
+# (d) IN SCOPE with NO run evidence at all -> NOT YET, never yes.
+got="$(offhost_probe 'in-scope' '2026-10-08 08:15:00' '')"
+case "$got" in
+  NOT\ YET*) : ;;
+  *) fail "13b(d): in scope with no recorded run gave '$got', expected NOT YET" ;;
+esac
+
+# (e) Scope UNKNOWN -> UNKNOWN. An unread setting is not a setting of 'no', and
+#     it is certainly not a 'yes'.
+got="$(offhost_probe 'unknown' '2026-10-08 06:00:00' '2026-10-08T12:00:00-04:00')"
 case "$got" in
   UNKNOWN*) : ;;
-  *) fail "13b(c): a missing marker gave '$got', expected UNKNOWN" ;;
+  *) fail "13b(e): an unresolvable scope gave '$got', expected UNKNOWN" ;;
 esac
 
-# (d) An unparseable marker -> UNKNOWN. Fail closed: garbage must not read as yes.
-got="$(offhost_probe 'not-a-timestamp' '2026-10-08 08:15:00')"
+# (f) The backup CLI cannot be asked -- an installed binary predating
+#     `backup-scope` -- -> UNKNOWN. This is the non-answer, and reading it as
+#     either verdict would be worse than saying so.
+got="$(offhost_probe '' '2026-10-08 06:00:00' '2026-10-08T12:00:00-04:00')"
 case "$got" in
   UNKNOWN*) : ;;
-  *) fail "13b(d): an unparseable marker gave '$got', expected UNKNOWN" ;;
+  *) fail "13b(f): an unaskable backup CLI gave '$got', expected UNKNOWN.
+A binary that never heard of 'backup-scope' must not produce a coverage verdict." ;;
 esac
-echo "  yes / NOT YET / UNKNOWN(absent) / UNKNOWN(garbage) all reached"
+echo "  NO(not in scope) / yes / NOT YET(old run, no run) / UNKNOWN(unknown, unaskable)"
 
-echo "== 13c. mutation: the original defect is caught by 13b =="
-# Put the digit-stripping back and require case (b) to flip. If it does not, 13b
-# is not actually testing the comparison.
+echo "== 13c. mutation: ignoring SCOPE brings the false 'yes' back =="
+# The defect was answering from the timestamp alone. Put that back and require
+# case (a) -- a path no enabled target covers -- to report 'yes' again.
 mut="$TMP_DIR/mut-archives"; rm -rf "$mut"; mkdir -p "$mut"
 cp "$CLI" "$mut/domum-media"
-# sed, not a nested python heredoc: the replacement is full of quotes and the
-# nesting broke. The pattern deliberately avoids "$(" -- a BRE containing it is
-# the shape that silently matches nothing.
-sed -i 's@backup_last_success_epoch || true@tr -cd 0-9 < "$DOMUM_LOG_DIR/last-success" 2>/dev/null || true@' \
+# Ignore the reply and behave as the old code did: treat the path as covered
+# and answer from a run timestamp. Forcing the verdict alone is not enough --
+# the target list would be empty and it would fall through to NOT YET, which
+# would make the mutant look safe for the wrong reason.
+sed -i 's@      scope_verdict="${scope%% \*}"@      scope_verdict=in-scope@' \
   "$mut/domum-media"
+sed -i 's@      scope_targets="${scope#\* }"@      scope_targets=cloud@' \
+  "$mut/domum-media"
+grep -q 'scope_verdict=in-scope' "$mut/domum-media" \
+  || fail "13c: the scope-verdict mutation did not apply"
+grep -q 'scope_targets=cloud' "$mut/domum-media" \
+  || fail "13c: the scope-targets mutation did not apply"
 cmp -s "$CLI" "$mut/domum-media" && fail "13c: the mutation changed nothing"
 saved="$CLI"; CLI="$mut/domum-media"
-got="$(offhost_probe '2026-10-08T02:37:27-04:00' '2026-10-08 08:15:00')"
+got="$(offhost_probe 'not-in-scope' '2026-10-08 06:00:00' '2026-10-08T12:00:00-04:00')"
 CLI="$saved"
 case "$got" in
-  NOT\ YET*) fail "13c: restoring the digit-stripping still answered NOT YET, so
-13b(b) is not exercising the comparison" ;;
+  yes*) : ;;
+  *) fail "13c: with scope forced to 'in-scope', a path no target covers gave
+'$got'. The mutation must bring the false 'yes' back, or 13b(a) is not what
+prevents it." ;;
 esac
-echo "  digit-stripping flips (b) to '$(printf '%.20s' "$got")…' -- 13b holds it"
+echo "  forcing scope flips (a) to '$(printf '%.20s' "$got")…' -- 13b(a) holds it"
 # It must decide "needed" from the METADATA, not from the filename, which is
 # only a convenience.
 grep -q "IMAGE_ARCHIVE='" <<< "$ar" \

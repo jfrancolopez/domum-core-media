@@ -191,6 +191,120 @@ STUB
   chmod +x "$TMP_DIR/stub-cli"
 }
 
+# ---------------------------------------------------------------------------
+# `backup-scope`: the same bridge, for the question `storage archives` could not
+# ask and therefore inferred wrongly. Every scope resolver lives in THIS CLI,
+# so the other one cannot answer locally without a second copy of the resolver.
+# ---------------------------------------------------------------------------
+run_scope() {  # $1 = setup, rest = argv -> output then "exit=N"
+  local setup="$1"; shift
+  (
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+    set +e
+    die() { echo "DIE: $*"; exit 9; }
+    [[ -n "$setup" ]] && eval "$setup"
+    do_backup_scope "$@" 2>&1
+    echo "exit=$?"
+  )
+}
+
+# The PRODUCTION shape: cloud enabled, and its scope is immich-only by design.
+SCOPE_PROD='enabled_backup_targets() { echo cloud; }
+backup_target_include_paths() { immich_only_include_paths; }
+backup_exclude_patterns() { :; }'
+
+sect "the image-archive directory is NOT in the enabled target's scope"
+# This is the fact the inventory used to get wrong. Driven against the real
+# immich_only_include_paths, not a fixture scope of our own choosing.
+o="$(run_scope "$SCOPE_PROD" "$DOMUM_DATA_ROOT/backups/images/plex-abc.tar" --json)"
+grep -q 'exit=1' <<< "$o" || fail "an uncovered path did not exit 1: $o"
+[ "$(sed -n '/^{/{p;q;}' <<< "$o" | jq -r .verdict)" = "not-in-scope" ] \
+  || fail "verdict is not not-in-scope: $o"
+grep -q 'No scheduled run will ever copy this path' <<< "$o" \
+  || fail "it does not state the consequence: $o"
+echo "  not-in-scope, exit 1, consequence stated"
+
+sect "the immich library IS in scope, and that is not a claim it was collected"
+o="$(run_scope "$SCOPE_PROD" "$DOMUM_DATA_ROOT/immich/library/a.jpg" --json)"
+grep -q 'exit=0' <<< "$o" || fail "a covered path did not exit 0: $o"
+[ "$(sed -n '/^{/{p;q;}' <<< "$o" | jq -r .verdict)" = "in-scope" ] \
+  || fail "verdict is not in-scope: $o"
+[ "$(sed -n '/^{/{p;q;}' <<< "$o" | jq -r .in_scope)" = "cloud" ] \
+  || fail "the covering target is not named: $o"
+# Being in scope and having been collected are different claims, and this
+# command answers only the first.
+grep -q 'not the same as having been collected' <<< "$o" \
+  || fail "in-scope must not read as proof of collection: $o"
+echo "  in-scope cloud, exit 0, and it says what it does not prove"
+
+sect "an unresolvable scope is UNKNOWN, never 'not covered'"
+# `dr_path_configured` grew a third return code for exactly this: "not in the
+# backup set" and "the include set was never read" are different claims.
+o="$(run_scope 'enabled_backup_targets() { echo cloud; }
+backup_target_include_paths() { :; }
+backup_exclude_patterns() { :; }' "$DOMUM_DATA_ROOT/backups/images/x.tar" --json)"
+grep -q 'exit=2' <<< "$o" || fail "an unresolvable scope did not exit 2: $o"
+[ "$(sed -n '/^{/{p;q;}' <<< "$o" | jq -r .verdict)" = "unknown" ] \
+  || fail "verdict is not unknown: $o"
+grep -q 'not a setting of' <<< "$o" || fail "it does not say an unread setting is not a no: $o"
+echo "  unknown, exit 2"
+
+sect "no enabled target at all is UNKNOWN, not 'nothing covers it'"
+# With no target there is nothing to compare against, so the honest answer is
+# that the question was not answerable -- reporting not-in-scope would be a
+# finding manufactured from an empty list.
+o="$(run_scope 'enabled_backup_targets() { :; }
+backup_exclude_patterns() { :; }' "$DOMUM_DATA_ROOT/backups/images/x.tar" --json)"
+grep -q 'exit=2' <<< "$o" || fail "no enabled target did not exit 2: $o"
+grep -q 'no enabled backup target could be determined' <<< "$o" \
+  || fail "it does not name the reason: $o"
+echo "  unknown, exit 2, reason named"
+
+sect "the JSON is the FIRST line beginning with { , so no pipe is needed"
+o="$(run_scope "$SCOPE_PROD" "$DOMUM_DATA_ROOT/immich/library/a.jpg" --json)"
+first="$(sed -n '/^{/{p;q;}' <<< "$o")"
+jq -e . >/dev/null 2>&1 <<< "$first" || fail "the first { line is not valid JSON: $o"
+# And the human report follows it, so `tail -n 1` would return prose -- the
+# defect the deployment script hit.
+[ "$(printf '%s\n' "$o" | tail -n 2 | head -n 1)" = "$first" ] \
+  && fail "the JSON is the LAST line; the human report must follow it"
+echo "  JSON first, human report after"
+
+sect "without --json it prints no JSON at all"
+o="$(run_scope "$SCOPE_PROD" "$DOMUM_DATA_ROOT/immich/library/a.jpg")"
+j="$(sed -n '/^{/{p;q;}' <<< "$o" || true)"
+[ -z "$j" ] || fail "a non-json invocation emitted a JSON line: $o"
+grep -q 'IN SCOPE' <<< "$o" || fail "the human report is missing: $o"
+echo "  human report only"
+
+sect "backup-scope reads configuration only -- no restic, docker or network"
+# A report must do no recovery work, and an inventory must not need the
+# repository password to answer a question about scheduling.
+fn="$(awk '/^do_backup_scope\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup")"
+[ -n "$fn" ] || fail "do_backup_scope not found"
+fn_code="$(grep -vE '^\s*#' <<< "$fn" || true)"
+for bad in restic docker curl ssh sftp; do
+  grep -qE "(^|[;&|[:space:]])$bad([[:space:]]|$)" <<< "$fn_code" \
+    && fail "do_backup_scope invokes $bad; it must read configuration only"
+done
+echo "  no restic, docker, curl, ssh or sftp"
+
+sect "a typo must not widen the question or be silently answered"
+o="$(run_scope "$SCOPE_PROD" --nonsense)"
+grep -q 'DIE:' <<< "$o" || fail "an unknown option was accepted: $o"
+o="$(run_scope "$SCOPE_PROD" /a /b)"
+grep -q 'DIE:' <<< "$o" || fail "two paths were accepted: $o"
+o="$(run_scope "$SCOPE_PROD")"
+grep -q 'DIE:' <<< "$o" || fail "a missing path was accepted: $o"
+echo "  unknown option, two paths and no path all refused"
+
+sect "it is reachable through the real argv dispatcher"
+o="$(bash "$REPO_ROOT/bin/domum-media-backup" backup-scope 2>&1; echo "exit=$?")"
+grep -qE 'Run as root|Usage: domum-media-backup backup-scope' <<< "$o" \
+  || fail "backup-scope is not dispatched by the real argv path: $o"
+echo "  dispatched"
+
 run_checkup() {  # $1 = optional extra shell -> "LEVEL|text" lines
   local extra="${1:-}"
   (
