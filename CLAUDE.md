@@ -5560,6 +5560,67 @@ stop testing the step it is about.
 
 ---
 
+**THE WHOLE SELECTIVE-BACKUP SURFACE WAS UNADVERTISED -- 21 capability tokens
+and not one covered capture, verify, restore, pack or unpack.** Found
+2026-11-05 by asking what `capabilities` promises about the newest subsystem,
+having just built a bridge that had to work around its absence.
+
+This file already holds that `capabilities --has <token>` is **the** stable
+surface, that a wrapper may assert on it and may **not** grep the binary or
+assert on the CLI's prose, and that `--has` has three answers -- `0` supported,
+`1` implementation absent, **`2` token unknown**. With no token for these six
+subcommands, a wrapper asking "can the installed binary take an encrypted state
+pack?" had exactly two options, and the operator contract forbids both: grep
+`/usr/local/bin/domum-media`, or run the subcommand and read its usage error.
+
+**That absence is why `checkup_recovery_pack_offhost` needed a JSON contract.**
+Its own recorded reason -- *"an installed binary that predates this subcommand
+dies with status 1, which is the alarming answer"* -- is the shape of the gap
+rather than a fact about that one command: without a token there is nothing to
+ask, so the caller had to require a parseable reply **and** a verdict it had
+been taught in order to tell a non-answer from an answer. A token makes the same
+question one exit status.
+
+Eight tokens, and `tests/capabilities-contract-audit.py` proves each advertised
+argv path really reaches its implementation through the real dispatcher -- which
+matters most for the two that are not direct: `state-capture-quiesced` is
+reached only via the `--quiesce` branch, and
+`state-capture-consistent-via-helper` resolves transitively through
+`service_sqlite_backup` into `sqlite_backup_via_helper`. That last one is worth
+advertising in its own right: it is the difference between jellyfin and kavita
+capturing `consistent` and capturing `unproven`, i.e. whether a scheduler needs
+downtime at all.
+
+**Three answers, asserted as three.** A token whose implementation is renamed
+away must answer `1` and **not** `2` -- advertised-but-unperformable and
+never-heard-of are different facts to a script -- and a row deleted outright
+must answer `2`, which is the case an **older installed binary actually
+presents**. Production is `a63ad19` and has none of these functions, so a
+wrapper asking today gets `2`, correctly. The mutations drive both directions
+against the real `--has`.
+
+**Tokens are promises and are never renamed in place**, so these names are
+chosen once: `state-capture`, `state-capture-quiesced`,
+`state-capture-consistent-via-helper`, `state-verify`, `state-restore`,
+`state-pack`, `state-unpack`, `verify-state-pack`. The last follows the existing
+`verify-image-archive` rather than inventing a second shape for the same idea.
+
+**Nothing is enabled by this.** A capability says the binary *can* do a thing,
+never that it has been done or that it is switched on:
+`QUIESCED_CAPTURE_ENABLED` still defaults to 0 and still refuses before the lock
+and before any stop, and no backup target includes a pack. Advertising the
+surface is what lets the activation plan's preflight be written against a
+contract instead of against a grep.
+
+**And my new section called a `sect` helper this suite does not have.** It uses
+`echo "== N. … =="` directly; `sect` was not defined, the suite runs without
+errexit, so the header printed `sect: command not found` and the section ran
+anyway. It passed, which is the problem -- a section whose own header errors is
+one nobody reads the output of. Match the suite's idiom rather than the one in
+the suite next door.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

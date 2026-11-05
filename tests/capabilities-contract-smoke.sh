@@ -178,5 +178,49 @@ success having verified nothing"
 grep -q 'table is empty' "$TMP_DIR/mut.log" || fail "an empty table is not reported as such"
 echo "  an empty table fails instead of passing"
 
+# ---------------------------------------------------------------------------
+# The selective-backup surface was entirely UNADVERTISED: 21 tokens and not one
+# covered capture, verify, restore, pack or unpack. That is the gap that forced
+# `checkup_recovery_pack_offhost` to require parseable JSON and a known verdict
+# -- with no token to ask, an older binary's usage error was indistinguishable
+# from a real answer. A wrapper's only alternatives were grepping the binary,
+# which the operator contract forbids, or running the subcommand and reading its
+# prose, which the wrapper audit forbids.
+echo "== 9. the state-capture family is advertised, and each token is really gated =="
+for tok in state-capture state-capture-quiesced state-capture-consistent-via-helper \
+           state-verify state-restore state-pack state-unpack verify-state-pack; do
+  rc="$(probe '' "$tok")"
+  [ "$rc" = "0" ] || fail "capabilities --has $tok answered $rc, expected 0 (supported)"
+done
+echo "  all 8 tokens answer 0"
+
+# The rule is "never advertise a capability from an unchecked static list", so
+# the `declare -F` gate has to cover the NEW rows too and not just the old ones.
+# Renaming the implementation in the table must turn yes into "implementation
+# absent" -- rc 1 -- and must NOT turn it into 2, which would say the token is
+# unknown when it is advertised.
+gone='s@^state-pack|storage pack-state|service_state_pack@state-pack|storage pack-state|gone_pack_function@'
+rc="$(probe "$gone" state-pack)"
+[ "$rc" = "99" ] && fail "the state-pack row mutation could not be applied (sed error)"
+[ "$rc" = "98" ] && fail "the state-pack row is no longer present as written"
+[ "$rc" = "1" ] \
+  || fail "a state-pack token whose implementation is gone answered $rc, expected 1.
+An advertised token that cannot be performed must not read as supported, and
+must not read as unknown either -- those are different answers to a script"
+echo "  a missing implementation answers 1, not 0 and not 2"
+
+# And removing a row entirely must make it UNKNOWN (2), never supported: a
+# binary that predates these subcommands is the real case, and it has to be
+# distinguishable from one that has them.
+dropped='s@^state-pack|storage pack-state|service_state_pack$@@'
+rc="$(probe "$dropped" state-pack)"
+[ "$rc" = "99" ] && fail "the state-pack drop mutation could not be applied (sed error)"
+[ "$rc" = "98" ] && fail "dropping the state-pack row changed nothing"
+[ "$rc" = "2" ] \
+  || fail "a binary with no state-pack row answered $rc for it, expected 2 (unknown).
+This is the case an older installed binary presents, and reading it as anything
+but unknown is what made the pack-offhost bridge need a JSON contract"
+echo "  a dropped row answers 2 (unknown), which is the older-binary case"
+
 echo
 echo "PASS: capabilities contract smoke"

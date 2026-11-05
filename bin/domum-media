@@ -12575,6 +12575,14 @@ migration-integrity-proof|storage migrate-subvolume|migrate_verify_recovery_poin
 migration-live-tree-classification|storage migrate-subvolume|migrate_report_live_tree
 recovery-point-identity|storage migrate-subvolume|stage_recovery_point_metadata
 topology-verify|storage topology --verify|storage_topology_verify
+state-capture|storage capture-state|service_state_capture
+state-capture-quiesced|storage capture-state --quiesce|service_state_capture_quiesced
+state-capture-consistent-via-helper|storage capture-state|sqlite_backup_via_helper
+state-verify|storage verify-state|service_state_verify
+state-restore|storage restore-state|service_state_restore
+state-pack|storage pack-state|service_state_pack
+state-unpack|storage unpack-state|service_state_unpack
+verify-state-pack|storage verify-pack|service_state_pack_verify
 EOF
 }
 
