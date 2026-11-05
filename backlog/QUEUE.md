@@ -9,7 +9,7 @@ Reconciled against the repository and the live host on **2026-11-03**.
 | | |
 |---|---|
 | production | `a63ad19` — **verified by hash, not repeated**: the installed `/usr/local/bin/domum-media` is `5e65f06c…`, which is `bin/domum-media` at exactly that commit, and the installed and checkout copies of both CLIs are byte-identical (the deployment's own invariant) |
-| development / `main` | `accc366` — this line said `f7e6d5d`, thirteen commits stale. A revision constant inside the repository it pins goes stale by construction, which is why the deployment script refuses to carry one; here it is a header a new session reads first, so check it against `git rev-parse origin/main` rather than trusting it |
+| development / `main` | re-check with `git rev-parse origin/main` — it was `accc366` when this row was written and has moved many times since. A revision constant inside the repository it pins goes stale by construction, which is why the deployment script refuses to carry one; this row is a header a new session reads first, so it names the command rather than a value |
 | rule | an item is only `done` with evidence named here |
 | caution | **`581d94a`'s subject describes a premise that same PR corrected** — `gh pr merge --squash` took the FIRST commit's subject, not the PR title. `git log --oneline` therefore reads as though the pack check asks "is it in the backup set"; it does not. See `CLAUDE.md`, which is the authority, and pass `--subject` explicitly when squashing a branch whose first commit was later corrected |
 
@@ -81,6 +81,15 @@ matches that revision's blob, and the revision itself was identified BY HASH
 rather than read from a file (re-verified 2026-11-04). The reviewed plan is
 `docs/DEPLOYMENT-PLAN.md` — renamed from `DEPLOYMENT-PLAN-2026-11-02.md`,
 because a date in the filename implies a review of whatever `main` is now.
+
+**Re-measured 2026-11-05 against `origin/main` = `1bbab11`: 30 commits, and
+the installable surface is unchanged in shape** — two binaries, plus
+`domum-media-btrfs-scrub.timer` and `auto-enable.timers`, both verified
+**comment-only** by diffing with comments and blanks stripped (no directive
+changed in either). `bin/domum-media-report` is unchanged. The nine new
+`operator/rehearsals/*` files land in the checkout and nothing installs them.
+Production still has **no drift**: installed == checkout for both binaries, and
+the installed `domum-media` still hashes to `a63ad19`'s blob.
 
 **It has ONE dated item, and it comes from the operator enabling the scrub
 timer rather than from the code.** The timer is `enabled, active`, first elapse

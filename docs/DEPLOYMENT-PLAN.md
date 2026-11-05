@@ -13,7 +13,9 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-04** against `origin/main` = `ca9bcc9`.
+Reconciled **2026-11-05** against `origin/main` = `1bbab11`. The delta has
+grown from 16 commits to **30**, and the installable surface is unchanged in
+shape -- which is the point of re-measuring rather than assuming.
 
 ---
 
@@ -37,7 +39,9 @@ and it holds right now — so a run of it starts from a clean base.
 
 ## 2. What would change
 
-16 commits and 36 files, of which the **installable** surface is three:
+30 commits, of which the **installable** surface is still small. Re-measured
+2026-11-05 with `git diff --name-status a63ad19..main -- bin/ systemd/ operator/
+install.sh`:
 
 | repository path | installed as | changes? | note |
 |---|---|---|---|
@@ -45,7 +49,13 @@ and it holds right now — so a run of it starts from a clean base.
 | `bin/domum-media-backup` | `/usr/local/bin/domum-media-backup` | **yes** | |
 | `bin/domum-media-report` | `/usr/local/lib/domum-media/domum-media-report` | no | unchanged since 2026-10-11 |
 | `systemd/domum-media-btrfs-scrub.timer` | `/etc/systemd/system/…` | **yes, COMMENT-ONLY** | see §3 |
+| `systemd/auto-enable.timers` | read from the **checkout**, never installed | **yes, COMMENT-ONLY** | see §3a |
+| `operator/rehearsals/*` (9 new files) | **nothing** — checkout only | new | see §3a |
 | `domum-media-weekly-report.service` / `.timer` | `/etc/systemd/system/…` | no | |
+
+Both `systemd/` changes were verified comment-only by diffing with comments and
+blank lines stripped: **no directive changed in either**. `bin/domum-media-report`
+is unchanged, so the report library is not redeployed.
 
 Target hashes are deliberately **not** quoted here. One goes stale the moment
 `main` moves — the same mistake as storing a revision constant, and an earlier
@@ -83,6 +93,20 @@ Two consequences, both stated rather than left to be discovered:
 `install.sh` and `converge_local_installation` install `systemd/*.service` and
 `systemd/*.timer` wholesale, so they *would* carry it — which is exactly why
 neither is the mechanism for a narrow deployment.
+
+### 3a. Two things the fast-forward carries that are not "installed"
+
+`systemd/auto-enable.timers` is **read from the checkout** by `install.sh` and
+by `sync_timer_overrides`; it is never copied into `/etc`. So the fast-forward
+is the whole of its deployment, and its change here is comment-only — the
+correction of the "read-only scrub" claim that had survived in the one file
+that decides what installation may enable unattended. Nothing about which
+timers are listed changed.
+
+The nine new `operator/rehearsals/*` files are the same: they land in the
+checkout and nothing installs them. They are shellchecked by CI and
+deliberately **not run** by it, because they need the production images and a
+Docker daemon.
 
 **And it is the ONLY unit that differs, measured rather than inferred.** Every
 installed `domum-media-*.service` and `domum-media-*.timer` was compared by
@@ -173,7 +197,9 @@ non-latent item is §4.
 | readiness log in the upgrade | only runs during `updates apply --service <s>`, which no timer invokes |
 | recovery-pack off-host check | reports healthy on this host; a regression guard |
 | volume dump/restore naming its cause | `VOLUME_UPGRADE_ENABLED=0`; nothing reaches it |
-| capture / verify / restore / archive identity / `pack-offhost` | new subcommands; nothing invokes them |
+| capture / verify / restore / pack / unpack / verify-pack / archive identity / `pack-offhost` | new subcommands; nothing invokes them, and no timer references any |
+| helper-based consistent capture for jellyfin and kavita | only reachable through `storage capture-state`, which nothing schedules |
+| the visible `UNPROVEN` reason, and `SQLITE_HELPER` in the manifest | same: capture-only |
 
 **`health-notify`'s two reporting fixes are already deployed** — they landed in
 `a63ad19` itself (#145/#146 are in production). This plan is not carrying them,
@@ -219,6 +245,11 @@ sudo domum-media checkup                      # expect the pack line to answer, 
 sudo domum-media-backup pack-offhost          # expect: off-host mail enabled, verdict offhost, exit 0
 systemctl list-timers domum-media-btrfs-scrub.timer   # expect next elapse unchanged
 sha256sum /usr/local/bin/domum-media /opt/domum-core-media/bin/domum-media
+
+# And the new capability, read-only and writing only under /srv/data:
+sudo domum-media storage capture-state navidrome   # expect CAPTURE_MODE=consistent
+sudo domum-media storage capture-state jellyfin    # expect consistent too, via the helper
+#   -- if jellyfin says UNPROVEN it will now SAY why, which is the thing to read
 ```
 
 The first is the one that proves the deployment did something observable: on
