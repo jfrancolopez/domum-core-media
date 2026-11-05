@@ -98,10 +98,13 @@ neither is the mechanism for a narrow deployment.
 
 `systemd/auto-enable.timers` is **read from the checkout** by `install.sh` and
 by `sync_timer_overrides`; it is never copied into `/etc`. So the fast-forward
-is the whole of its deployment, and its change here is comment-only — the
-correction of the "read-only scrub" claim that had survived in the one file
-that decides what installation may enable unattended. Nothing about which
-timers are listed changed.
+is the whole of its deployment, and its change here is comment-only — it
+corrects a stale description of what a Btrfs scrub does, which had survived in
+the one file that decides what installation may enable unattended. (The
+accurate statement, and why the old one was wrong, is in `CLAUDE.md`. It is
+paraphrased here rather than quoted, so the repository-wide check that hunts
+that claim keeps its full strictness.) Nothing about which timers are listed
+changed.
 
 The nine new `operator/rehearsals/*` files are the same: they land in the
 checkout and nothing installs them. They are shellchecked by CI and
@@ -246,7 +249,8 @@ sudo domum-media-backup pack-offhost          # expect: off-host mail enabled, v
 systemctl list-timers domum-media-btrfs-scrub.timer   # expect next elapse unchanged
 sha256sum /usr/local/bin/domum-media /opt/domum-core-media/bin/domum-media
 
-# And the new capability, read-only and writing only under /srv/data:
+# And the new capability. It writes only under /srv/data, starts no
+# container, and resolves no service's image tag:
 sudo domum-media storage capture-state navidrome   # expect CAPTURE_MODE=consistent
 sudo domum-media storage capture-state jellyfin    # expect consistent too, via the helper
 #   -- if jellyfin says UNPROVEN it will now SAY why, which is the thing to read
