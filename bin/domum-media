@@ -10590,6 +10590,152 @@ image_archive_dir() {
 # target is immich-only, so a capture here is on the protected local tier and
 # nowhere else. Covering it is an operator decision -- see
 # docs/OFFSITE-COVERAGE-CLASSIFICATION.md section 4a.
+# Where an encrypted state pack is written. A sibling of the plaintext
+# captures, never inside one: a pack is a DIFFERENT artefact with a different
+# protection model, and nesting it would mean a later capture of the same
+# service swept it up.
+state_pack_dir() {
+  printf '%s/backups/state-packs' "${DOMUM_DATA_ROOT%/}"
+}
+
+# The age recipient a state pack is encrypted to.
+#
+# Deliberately the SAME key as the recovery pack: the operator already holds
+# exactly one private key off-host, and introducing a second would double the
+# custody problem that this project already calls its single point of failure.
+state_pack_recipient() {
+  local f="${STATE_PACK_AGE_PUBKEY_FILE:-${RECOVERY_PACK_AGE_PUBKEY_FILE:-$SECRETS_DIR/recovery_pack_pubkey}}"
+  [[ -s "$f" ]] || return 1
+  # The first non-comment, non-empty line. An age recipient is public material,
+  # so printing it is not a disclosure -- but it is read from a file rather
+  # than configured inline so it cannot end up in the config or in a report.
+  sed -nE '/^[[:space:]]*(#|$)/d; p' "$f" 2>/dev/null | sed -n '1p'
+}
+
+# Pack one verified capture into a single encrypted artefact.
+#
+# WHAT THIS IS FOR. The captures are 8.90 MiB across five services and they sit
+# on `/srv/data` -- the same SSD as every snapshot and every `.premigration`
+# copy. A local snapshot is not off-site protection, so a capture that never
+# leaves is lost with the disk it protects against.
+#
+# WHAT IT DOES NOT DO. It writes a file and stops. No backup target, include
+# path or exclusion is touched, and nothing is transmitted: putting the pack
+# somewhere is an operator decision, which is why `storage pack-state` exists
+# separately from any schedule.
+#
+# The capture is VERIFIED before it is packed. Encrypting a capture that does
+# not match its own manifest would produce an artefact whose integrity can be
+# proven and whose contents cannot -- the shape of every reporting defect this
+# project has corrected.
+service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
+  local cap="$1" dest="${2:-}" recipient plain tmp sha size
+  [[ -n "$cap" && -d "$cap" ]] || { warn "not a capture directory: $cap"; return 1; }
+  [[ -f "$cap/MANIFEST" ]] || { warn "no MANIFEST in $cap"; return 1; }
+  cmd_exists age || { warn "age is not installed; cannot encrypt a state pack"; return 1; }
+  cmd_exists tar || { warn "tar is not installed"; return 1; }
+
+  recipient="$(state_pack_recipient)" \
+    || { warn "no age recipient: ${STATE_PACK_AGE_PUBKEY_FILE:-${RECOVERY_PACK_AGE_PUBKEY_FILE:-$SECRETS_DIR/recovery_pack_pubkey}} is missing or empty"; return 1; }
+  [[ -n "$recipient" ]] || { warn "the age recipient file holds no key"; return 1; }
+
+  # Refuse a capture that does not verify. This is the gate, and it is first.
+  service_state_verify "$cap" >/dev/null 2>&1 \
+    || { warn "$cap does not match its own manifest; refusing to pack it"; return 1; }
+
+  local service
+  service="$(sed -nE "s/^SERVICE=(.*)$/\1/p" "$cap/MANIFEST" | sed -n '1p')"
+  [[ -n "$service" ]] || { warn "the manifest does not name a service"; return 1; }
+  [[ -n "$dest" ]] || dest="$(state_pack_dir)/${service}-$(date -u +%Y%m%d-%H%M%S).tar.age"
+
+  install -d -m 0700 -- "$(dirname -- "$dest")" || return 1
+  [[ -e "$dest" ]] && { warn "refusing to overwrite an existing pack: $dest"; return 1; }
+
+  # The PLAINTEXT tar is staged inside the destination directory, which is
+  # 0700, and removed on every path out. Staging it in /tmp would put a
+  # decrypted Fernet key, a JWT signing key and a server token somewhere with a
+  # different protection model for as long as the tar takes.
+  plain="$(mktemp "$(dirname -- "$dest")/.pack.XXXXXX")" || return 1
+  chmod 0600 "$plain" 2>/dev/null || true
+  tmp="$plain.age"
+  if ! tar -C "$cap" -cf "$plain" . 2>/dev/null; then
+    rm -f -- "$plain" "$tmp"; warn "could not archive $cap"; return 1
+  fi
+  if ! age -r "$recipient" -o "$tmp" "$plain" 2>/dev/null; then
+    rm -f -- "$plain" "$tmp"; warn "age could not encrypt the state pack"; return 1
+  fi
+  rm -f -- "$plain"
+  chmod 0600 "$tmp" 2>/dev/null || true
+  sync -f "$tmp" 2>/dev/null || sync 2>/dev/null || true
+  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; warn "could not publish $dest"; return 1; }
+  sha="$(sha256_of_file "$dest")"
+  size="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
+  printf '%s\n' "$sha" > "$dest.sha256"
+  chmod 0600 "$dest" "$dest.sha256" 2>/dev/null || true
+  echo "[domum-media] state pack: $dest"
+  echo "[domum-media] $size bytes, sha256 ${sha:0:16}..., encrypted to $(basename -- "${STATE_PACK_AGE_PUBKEY_FILE:-${RECOVERY_PACK_AGE_PUBKEY_FILE:-recovery_pack_pubkey}}")"
+  echo "[domum-media] This host holds only the PUBLIC key, so it cannot decrypt"
+  echo "              what it just wrote. That is the design, and it means the"
+  echo "              pack is only as recoverable as the operator's private key."
+  echo "[domum-media] Nothing was transmitted. No backup target was touched."
+  return 0
+}
+
+# Unpack an encrypted state pack, with an identity file, into a scratch dir.
+#
+# Separate from the restore on purpose: unpacking yields a CAPTURE, and
+# `service_state_restore` is what turns a capture into files plus the proof
+# that every digest and mode came back. Collapsing them would hide which half
+# failed.
+service_state_unpack() {  # $1 = pack .tar.age, $2 = identity file, $3 = target dir
+  local pack="$1" ident="$2" target="$3" want got
+  [[ -s "$pack" ]] || { warn "no such pack: $pack"; return 1; }
+  [[ -s "$ident" ]] || { warn "no such age identity file: $ident"; return 1; }
+  cmd_exists age || { warn "age is not installed"; return 1; }
+  [[ -n "$target" ]] || { warn "no target directory given"; return 1; }
+  # A non-empty target would make unpacked content indistinguishable from what
+  # was already there -- the same refusal service_state_restore makes.
+  if [[ -e "$target" ]] && [[ -n "$(find "$target" -mindepth 1 -maxdepth 1 2>/dev/null || true)" ]]; then
+    warn "$target is not empty; refusing to unpack into it"; return 1
+  fi
+  # The FILE's integrity first, where a checksum was recorded. It proves the
+  # bytes are the bytes; it says nothing about what they decrypt to, and the
+  # report keeps those apart.
+  if [[ -s "$pack.sha256" ]]; then
+    want="$(sed -n '1p' "$pack.sha256")"
+    got="$(sha256_of_file "$pack")"
+    if [[ "$want" != "$got" ]]; then
+      warn "pack checksum mismatch for $pack
+  recorded: $want
+  on disk : $got"
+      return 1
+    fi
+    echo "[domum-media] pack file matches its recorded sha256"
+  else
+    echo "[domum-media] no .sha256 beside the pack; file integrity NOT checked"
+  fi
+  install -d -m 0700 -- "$target" || return 1
+  local plain
+  plain="$(mktemp "$target/.unpack.XXXXXX")" || return 1
+  chmod 0600 "$plain" 2>/dev/null || true
+  if ! age -d -i "$ident" -o "$plain" "$pack" 2>/dev/null; then
+    rm -f -- "$plain"
+    warn "age could not decrypt $pack with $ident. A pack encrypted to the
+  operator's key cannot be opened by this host, which is the design."
+    return 1
+  fi
+  if ! tar -C "$target" -xf "$plain" 2>/dev/null; then
+    rm -f -- "$plain"; warn "could not unpack $pack"; return 1
+  fi
+  rm -f -- "$plain"
+  [[ -f "$target/MANIFEST" ]] \
+    || { warn "the pack decrypted but holds no MANIFEST, so it is not a capture"; return 1; }
+  echo "[domum-media] unpacked a capture of $(sed -nE "s/^SERVICE=(.*)$/\1/p" "$target/MANIFEST" | sed -n '1p') into $target"
+  echo "[domum-media] decrypting proves the pack opens. Use 'storage restore-state'"
+  echo "              to prove the capture RESTORES -- those are two claims."
+  return 0
+}
+
 state_capture_dir() {
   printf '%s/backups/state' "${DOMUM_DATA_ROOT%/}"
 }
@@ -12501,6 +12647,27 @@ storage_cmd() {
       else
         service_state_capture "$cap_svc" "$cap_dest"
       fi ;;
+    pack-state)
+      shift
+      # Encrypt a VERIFIED capture into one portable artefact, with age, to the
+      # same recipient the recovery pack uses -- the operator already holds
+      # exactly one private key off-host and a second would double the custody
+      # problem.
+      #
+      # It writes a file and stops. Nothing is transmitted, no backup target or
+      # include path is touched, and this host holds only the PUBLIC key, so it
+      # cannot decrypt what it just wrote. Putting the pack somewhere is an
+      # operator decision.
+      load_cfg
+      service_state_pack "${1:-}" "${2:-}" ;;
+    unpack-state)
+      shift
+      # Decrypt a pack into a scratch directory, with an identity file the
+      # OPERATOR supplies. Yields a capture; proving that capture restores is
+      # `restore-state`, deliberately a separate command because they are two
+      # different claims.
+      load_cfg
+      service_state_unpack "${1:-}" "${2:-}" "${3:-}" ;;
     verify-state)
       shift
       # Re-verify a capture against its own manifest. Read-only. A checksum
@@ -12544,7 +12711,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|unpack-state <pack> <identity> <dir>}" ;;
   esac
 }
 

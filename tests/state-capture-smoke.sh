@@ -1324,4 +1324,146 @@ grep -q -- '-v "\$dbdir:/dbsrc:ro"' <<< "$rwbody" \
 read-only assertion fail"
 echo "  killed: without :ro the helper could write to live application data"
 
+
+# ===========================================================================
+# ENCRYPTED OFF-SITE PACKS. The captures are 8.90 MiB across five services and
+# they sit on the same SSD as every snapshot and every .premigration copy, so a
+# capture that never leaves is lost with the disk it protects against.
+# ===========================================================================
+command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 || {
+  echo "SKIP: age is not installed; the pack sections cannot run"
+  echo "ALL STATE-CAPTURE CHECKS PASSED"; exit 0
+}
+mkdir -p "$TMP/keys"; chmod 0700 "$TMP/keys"
+age-keygen -o "$TMP/keys/ident" >/dev/null 2>&1 || fail "age-keygen failed"
+chmod 0600 "$TMP/keys/ident"
+age-keygen -y "$TMP/keys/ident" > "$TMP/keys/pub" 2>/dev/null || fail "no public key"
+PACKENV="STATE_PACK_AGE_PUBKEY_FILE='$TMP/keys/pub'"
+
+sect "a pack REFUSES a capture that does not match its own manifest"
+# The gate, and it is first. Encrypting an unverifiable capture produces an
+# artefact whose integrity can be proven and whose contents cannot -- the shape
+# of every reporting defect this project has corrected.
+build_calibre_web
+rm -rf "$TMP/out/cap-pk" "$TMP/out/packs"
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-pk'" >/dev/null
+printf 'tampered\n' >> "$TMP/out/cap-pk/files/config_gdrive.db"
+out="$(probe "$PACKENV" "service_state_pack '$TMP/out/cap-pk' '$TMP/out/packs/a.tar.age'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "a tampered capture was packed: $out"
+grep -q 'does not match its own manifest' <<< "$out" || fail "wrong refusal: $out"
+[[ ! -e "$TMP/out/packs/a.tar.age" ]] || fail "a pack was written for a tampered capture"
+echo "  refused, and no artefact was produced"
+
+sect "a good capture packs, 0600 inside a 0700 directory, and is really encrypted"
+build_calibre_web
+rm -rf "$TMP/out/cap-pk2" "$TMP/out/packs"
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-pk2'" >/dev/null
+out="$(probe "$PACKENV" "service_state_pack '$TMP/out/cap-pk2' '$TMP/out/packs/b.tar.age'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the pack failed: $out"
+[[ -s "$TMP/out/packs/b.tar.age" ]] || fail "no pack written"
+[[ "$(stat -c %a "$TMP/out/packs/b.tar.age")" == "600" ]] \
+  || fail "the pack is mode $(stat -c %a "$TMP/out/packs/b.tar.age"), not 600"
+[[ "$(stat -c %a "$TMP/out/packs")" == "700" ]] || fail "the pack directory is not 0700"
+[[ -s "$TMP/out/packs/b.tar.age.sha256" ]] || fail "no .sha256 beside the pack"
+hdr="$(head -c 64 "$TMP/out/packs/b.tar.age" || true)"
+grep -q 'age-encryption.org' <<< "$hdr" || fail "the pack has no age header"
+# The capture contains a Fernet key. It must not be readable in the artefact.
+# Searched in the FILE with `grep -qa`, not through a command substitution:
+# bash strips null bytes from $( ), so capturing a binary artefact first would
+# have made this assertion search something other than the artefact.
+grep -qaF 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' "$TMP/out/packs/b.tar.age" \
+  && fail "the fixture's key is readable in the ENCRYPTED pack"
+echo "  0600 in a 0700 dir, age header present, key not readable"
+
+sect "no PLAINTEXT staging file survives, on success or on failure"
+# The staging tar holds a decrypted Fernet key for as long as it exists, which
+# is why it is staged inside the 0700 destination rather than in /tmp.
+left="$(find "$TMP/out/packs" -name '.pack.*' || true)"
+[[ -z "$left" ]] || fail "a plaintext staging file survived a successful pack: $left"
+# Force age to fail by pointing at a recipient file that is not a key.
+build_calibre_web
+rm -rf "$TMP/out/cap-pk3" "$TMP/out/packs3"
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-pk3'" >/dev/null
+printf 'not-an-age-key\n' > "$TMP/keys/bogus"
+out="$(probe "STATE_PACK_AGE_PUBKEY_FILE='$TMP/keys/bogus'" \
+  "service_state_pack '$TMP/out/cap-pk3' '$TMP/out/packs3/c.tar.age'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "a bogus recipient still produced a pack: $out"
+left="$(find "$TMP/out/packs3" -name '.pack.*' -o -name '*.age' || true)"
+[[ -z "$left" ]] || fail "a failed pack left plaintext or a partial artefact: $left"
+echo "  nothing left behind either way"
+
+sect "unpack checks the pack's sha256, and a WRONG identity cannot open it"
+rm -rf "$TMP/out/unp"
+out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/ident' '$TMP/out/unp'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "unpack failed: $out"
+grep -q 'matches its recorded sha256' <<< "$out" || fail "the checksum was not checked: $out"
+[[ -f "$TMP/out/unp/MANIFEST" ]] || fail "no manifest after unpack"
+age-keygen -o "$TMP/keys/wrong" >/dev/null 2>&1 || fail "age-keygen failed"
+chmod 0600 "$TMP/keys/wrong"
+rm -rf "$TMP/out/unp-wrong"
+out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/wrong' '$TMP/out/unp-wrong'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "the WRONG identity opened the pack: $out"
+grep -q 'could not decrypt' <<< "$out" || fail "the refusal does not say what happened: $out"
+echo "  checksum verified; the wrong key is refused"
+
+sect "unpack refuses a NON-EMPTY target, so restored content is never ambiguous"
+mkdir -p "$TMP/out/unp-busy"; printf 'pre-existing\n' > "$TMP/out/unp-busy/other"
+out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/ident' '$TMP/out/unp-busy'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "it unpacked into a non-empty directory: $out"
+grep -q 'not empty' <<< "$out" || fail "wrong refusal: $out"
+echo "  refused"
+
+sect "MUTATION: without the verify gate, a tampered capture gets encrypted"
+MUTP3="$TMP/mut-pack"; mkdir -p "$MUTP3"; cp "$CLI" "$MUTP3/domum-media"
+python3 -I - "$MUTP3/domum-media" <<'PYMP3' || fail "the pack mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  service_state_verify "$cap" >/dev/null 2>&1 \\\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+new = '  true \\\n'
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMP3
+build_calibre_web
+rm -rf "$TMP/out/cap-m5" "$TMP/out/packs5"
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-m5'" >/dev/null
+printf 'tampered\n' >> "$TMP/out/cap-m5/files/config_gdrive.db"
+saved_cli="$CLI"; CLI="$MUTP3/domum-media"
+out="$(probe "$PACKENV" "service_state_pack '$TMP/out/cap-m5' '$TMP/out/packs5/d.tar.age'; echo RC=\$?")"
+CLI="$saved_cli"
+grep -q 'RC=0' <<< "$out" \
+  || fail "the mutation changed no ANSWER -- without the gate a tampered
+capture must be packed: $out"
+[[ -s "$TMP/out/packs5/d.tar.age" ]] \
+  || fail "the mutant produced no artefact, so the gate is not what stopped it"
+echo "  killed: without the gate the artefact has provable integrity and unprovable contents"
+
+sect "MUTATION: without the sha256 check, a tampered PACK unpacks silently"
+MUTP4="$TMP/mut-unpack"; mkdir -p "$MUTP4"; cp "$CLI" "$MUTP4/domum-media"
+python3 -I - "$MUTP4/domum-media" <<'PYMP4' || fail "the unpack mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if [[ -s "$pack.sha256" ]]; then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+new = '  if false; then'
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMP4
+# Corrupt the RECORDED checksum rather than the pack, so the real code must
+# refuse while the mutant proceeds -- the pack itself stays decryptable.
+printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" \
+  > "$TMP/out/packs/b.tar.age.sha256"
+rm -rf "$TMP/out/unp-m"
+out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/ident' '$TMP/out/unp-m'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "the real code unpacked a pack whose recorded checksum does not match: $out"
+grep -q 'checksum mismatch' <<< "$out" || fail "it does not say the checksum is wrong: $out"
+rm -rf "$TMP/out/unp-m2"
+saved_cli="$CLI"; CLI="$MUTP4/domum-media"
+out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/ident' '$TMP/out/unp-m2'; echo RC=\$?")"
+CLI="$saved_cli"
+grep -q 'RC=0' <<< "$out" \
+  || fail "the mutation changed no ANSWER -- without the check a mismatched
+checksum must be ignored: $out"
+echo "  killed: without it a pack whose checksum does not match unpacks anyway"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"
