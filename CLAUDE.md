@@ -5117,6 +5117,44 @@ is the vacuity hole in a new shape.
 
 ---
 
+**DECLARING CALIBRE-WEB'S `config/.key` IS NOW MEASURED RATHER THAN ARGUED, and
+the NEGATIVE CONTROL is the evidence.** When the key was added to the
+declaration the case for it was an argument: *"a capture of the database alone
+restores those values as undecryptable bytes."* Rehearsed 2026-11-05 against
+the real image, in both directions:
+
+```
+WITH the key      decrypted: domum-rehearsal-smtp-p... (34 chars)  -> matches
+WITHOUT the key   calibre-web regenerated a key, started fine
+                  decrypt attempt: cryptography.fernet.InvalidToken
+```
+
+A known plaintext was encrypted through **calibre-web's own Fernet** -- the
+`cryptography` 43.0.3 inside its image, so the test uses the same library the
+application does -- stored in `settings.mail_password_e`, and the stored value
+was asserted NOT to be the plaintext before anything else happened. The source
+was then destroyed, the capture restored, and a second disposable calibre-web
+started on it.
+
+**The control is what makes section 4 mean anything.** Without it, "the value
+decrypted" is equally consistent with calibre-web never having encrypted
+anything. And it demonstrates the exact failure this declaration exists to
+prevent: with the key missing **the service comes up looking perfectly
+healthy** and regenerates a new one, so a restore reports success while the
+stored SMTP credential is permanently unreadable. Nothing in the service's own
+behaviour would reveal it.
+
+**The restored key comes back at mode 600**, asserted before the service is
+started, because a Fernet key restored world-readable would turn a recovery
+into a disclosure.
+
+So calibre-web now has what navidrome has -- `APPLICATION STARTS AGAINST A
+RESTORED CAPTURE` -- plus one claim navidrome does not: a credential inside
+that capture is still **USABLE** afterwards. Neither has `SERVES ITS LIBRARY`:
+no books, no users, nothing fetched.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
