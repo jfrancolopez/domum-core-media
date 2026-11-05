@@ -1444,9 +1444,20 @@ python3 -I - "$MUTP4/domum-media" <<'PYMP4' || fail "the unpack mutation did not
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '  if [[ -s "$pack.sha256" ]]; then'
+# Anchored on text unique to service_state_unpack: the identical
+# `if [[ -s "$pack.sha256" ]]` line now also appears in
+# service_state_pack_verify, so the shorter anchor matched twice. The
+# "matched %d times" assertion is what caught that -- second time adding
+# similar code has made a mutation anchor ambiguous.
+old = '''  if [[ -s "$pack.sha256" ]]; then
+    want="$(sed -n '1p' "$pack.sha256")"
+    got="$(sha256_of_file "$pack")"
+    if [[ "$want" != "$got" ]]; then'''
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
-new = '  if false; then'
+new = '''  if false; then
+    want="$(sed -n '1p' "$pack.sha256")"
+    got="$(sha256_of_file "$pack")"
+    if [[ "$want" != "$got" ]]; then'''
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMP4
 # Corrupt the RECORDED checksum rather than the pack, so the real code must
@@ -1465,5 +1476,127 @@ grep -q 'RC=0' <<< "$out" \
   || fail "the mutation changed no ANSWER -- without the check a mismatched
 checksum must be ignored: $out"
 echo "  killed: without it a pack whose checksum does not match unpacks anyway"
+
+
+sect "verify-pack: four states, and UNKNOWN is not a pass"
+# The only claim this host can make about a production pack, because it holds
+# only the public key. Three claims stay apart on purpose: verify-pack says the
+# FILE is intact and carries age's header; unpack-state says it DECRYPTS;
+# restore-state says the capture RESTORES. Collapsing them is how "the backup
+# is verified" comes to mean "a file exists".
+printf 'plaintext\n' > "$TMP/vp-plain"
+age -r "$(cat "$TMP/keys/pub")" -o "$TMP/vp-good.age" "$TMP/vp-plain" 2>/dev/null \
+  || fail "could not build a pack fixture"
+sha256sum "$TMP/vp-good.age" | cut -d' ' -f1 > "$TMP/vp-good.age.sha256"
+cp "$TMP/vp-good.age" "$TMP/vp-nosum.age"
+cp "$TMP/vp-good.age" "$TMP/vp-bad.age"
+printf '%064d\n' 0 > "$TMP/vp-bad.age.sha256"
+printf 'not encrypted at all\n' > "$TMP/vp-notpack.age"
+sha256sum "$TMP/vp-notpack.age" | cut -d' ' -f1 > "$TMP/vp-notpack.age.sha256"
+
+out="$(probe '' "service_state_pack_verify '$TMP/vp-good.age'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "a good pack did not verify: $out"
+grep -q 'format        : age-encrypted' <<< "$out" || fail "the format line is wrong: $out"
+grep -q 'file integrity: VERIFIED' <<< "$out" || fail "it did not report VERIFIED: $out"
+grep -q 'does NOT prove' <<< "$out" \
+  || fail "it does not state what it fails to prove. A host that cannot decrypt
+must not let 'verified' read as 'recoverable': $out"
+
+out="$(probe '' "service_state_pack_verify '$TMP/vp-nosum.age'; echo RC=\$?")"
+grep -q 'RC=2' <<< "$out" || fail "a pack with no recorded checksum must exit 2, not pass or fail: $out"
+grep -q 'file integrity: UNKNOWN' <<< "$out" \
+  || fail "no checksum was reported as something other than UNKNOWN -- the
+weaker claim in the stronger claim's words: $out"
+grep -q 'file integrity: VERIFIED' <<< "$out" && fail "it claimed VERIFIED with no checksum: $out"
+
+out="$(probe '' "service_state_pack_verify '$TMP/vp-bad.age'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a checksum mismatch must exit 1: $out"
+grep -q 'file integrity: MISMATCH' <<< "$out" || fail "the mismatch is not named: $out"
+
+out="$(probe '' "service_state_pack_verify '$TMP/vp-notpack.age'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a file that is not a pack must exit 1: $out"
+grep -q 'format        : NOT RECOGNISED' <<< "$out" || fail "it did not say the format is wrong: $out"
+# An intact file that is NOT a pack: both facts are reported, and they are
+# different claims -- the checksum says nothing about the format.
+grep -q 'file integrity: VERIFIED' <<< "$out" \
+  || fail "it stopped reporting file integrity for a non-pack; those are two
+independent claims and both belong in the report: $out"
+
+out="$(probe '' "service_state_pack_verify '$TMP/does-not-exist.age'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "an absent pack verified: $out"
+echo "  verified / unknown / mismatch / not-a-pack, with distinct statuses"
+
+sect "MUTATION: treating a missing checksum as VERIFIED must break that"
+MUTV2="$TMP/mut-vp"; mkdir -p "$MUTV2"; cp "$CLI" "$MUTV2/domum-media"
+python3 -I - "$MUTV2/domum-media" <<'PYMV2' || fail "the verify-pack mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '''    echo "file integrity: UNKNOWN -- no .sha256 beside the pack"
+    rc=2'''
+new = '''    echo "file integrity: VERIFIED"
+    rc=0'''
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMV2
+saved_cli="$CLI"; CLI="$MUTV2/domum-media"
+out="$(probe '' "service_state_pack_verify '$TMP/vp-nosum.age'; echo RC=\$?")"
+CLI="$saved_cli"
+grep -q 'RC=0' <<< "$out" \
+  || fail "the mutation changed no ANSWER -- a pack with no recorded checksum
+must be able to read as VERIFIED once the UNKNOWN branch is removed: $out"
+echo "  killed: without the third state, an unverifiable pack reads as verified"
+
+
+sect "UNPROVEN now says WHICH kind, because it has two meanings"
+# Before the helper existed `unproven` meant exactly one thing: no sqlite3
+# anywhere. It now means two, and they call for different actions -- the
+# service genuinely has none and none is reachable, versus a helper exists on
+# this host and was not found. Auditing the jellyfin/kavita evidence is what
+# surfaced it: the mode degrades SILENTLY.
+build_jellyfin
+rm -rf "$TMP/out/cap-unp"
+out="$(probe 'sqlite_helper_image() { return 1; }' \
+  "service_state_capture jellyfin '$TMP/out/cap-unp'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the capture failed: $out"
+grep -q 'capture mode UNPROVEN' <<< "$out" \
+  || fail "an unproven capture said nothing about why: $out"
+# Matched on a phrase that does not straddle the wrap: "no other running
+# service" is split across two output lines, so the obvious pattern failed
+# against correct output. Same line-at-a-time trap as the scrub claim.
+grep -q "offers one either" <<< "$out" \
+  || fail "it does not distinguish 'no helper exists' from 'a helper was missed': $out"
+grep -q '^SQLITE_IN_IMAGE=no$' "$TMP/out/cap-unp/MANIFEST" \
+  || fail "the manifest does not record that the image ships no sqlite3"
+grep -q '^SQLITE_HELPER=none$' "$TMP/out/cap-unp/MANIFEST" \
+  || fail "the manifest does not record that no helper was available"
+echo "  says no helper exists, and records both facts in the manifest"
+
+sect "and an unproven capture WITH a helper available is a WARNING, not a note"
+# That combination is a defect rather than a limitation: a consistent capture
+# was possible and was not taken.
+rm -rf "$TMP/out/cap-unp2"
+out="$(probe 'sqlite_helper_image() { printf sha256:aaaabbbbccccdddd; }
+service_state_capture_mode() { printf unproven; }' \
+  "service_state_capture jellyfin '$TMP/out/cap-unp2'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the capture failed: $out"
+grep -q 'WARN' <<< "$out" \
+  || fail "a consistent capture was possible and not taken, and nothing warned: $out"
+grep -q 'was possible and was not taken' <<< "$out" || fail "the warning does not say what happened: $out"
+grep -q '^SQLITE_HELPER=sha256:aaaabbbbccccdddd$' "$TMP/out/cap-unp2/MANIFEST" \
+  || fail "the manifest does not record which helper was available"
+echo "  warned, and the available helper is named in the manifest"
+
+sect "a CONSISTENT capture records which sqlite answered"
+build_calibre_web
+rm -rf "$TMP/out/cap-insitu"
+out="$(probe 'sqlite_helper_image() { printf sha256:aaaabbbbccccdddd; }
+service_sqlite_backup() { cp -p -- "$2" "$3"; }' \
+  "service_state_capture calibre-web '$TMP/out/cap-insitu'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the capture failed: $out"
+grep -q '^SQLITE_IN_IMAGE=yes$' "$TMP/out/cap-insitu/MANIFEST" \
+  || fail "calibre-web ships sqlite3 and the manifest does not say so"
+grep -q 'capture mode UNPROVEN' <<< "$out" && fail "a consistent capture reported UNPROVEN: $out"
+echo "  SQLITE_IN_IMAGE=yes, and no unproven notice"
 
 echo "ALL STATE-CAPTURE CHECKS PASSED"
