@@ -4982,6 +4982,75 @@ restore disagree with the system it came from.
 
 ---
 
+**JELLYFIN AND KAVITA DO NOT NEED DOWNTIME, and the conclusion that they did
+was mine and wrong.** This file recorded that both ship no sqlite3, that the
+host has none, and that closing their `file-copy-unproven` capture mode
+therefore needed *"either a quiesce (stop, copy, start under the operation
+lock) or a writable `-shm`, not a cleverer read."* The operator pushed back on
+exactly that and asked for a helper to be tried against a disposable live
+database first. Measured 2026-11-04:
+
+```
+kavita    main   966,656   -wal 4,132,392  -> .backup 1,105,920  84 tables  ok
+jellyfin  main     4,096   -wal 3,188,912  -> .backup   475,136  33 tables  ok
+```
+
+Both services stayed **RUNNING**, neither logged `database is locked`, a disk
+I/O error or a malformed database, and nothing was written into either data
+directory. **jellyfin's main file was essentially empty**, so its 33 tables
+came out of the WAL -- which is precisely the content a plain copy loses, and
+the reason `unproven` was the honest word before.
+
+**THE LIVE DIRECTORY IS MOUNTED READ-ONLY, AND THAT IS SUFFICIENT -- measured,
+and it is the whole safety argument.** SQLite can read a WAL database
+read-only when the `-shm` already exists, and it does, because the service
+holds it open. So the earlier note that a read-only open fails *"because SQLite
+must create the `-shm`"* is true only when **no** connection is open; with the
+service running it does not apply. The helper therefore never needs write
+access to live application data, and the backup is written to a separate
+writable mount that is never inside the service's tree.
+
+**It NEVER pulls.** The helper is resolved from a RUNNING container of a
+service measured to ship sqlite3 -- navidrome 3.45.3, calibre-web 3.45.1,
+uptime-kuma 3.40.1 -- and pinned by image ID. **plex is deliberately not a
+helper source**: its binary is `Plex SQLite` at another path, and it is the one
+service that NEEDS its own, because only that binary registers the `collating`
+tokenizer. With no helper available the mode falls back to `unproven` exactly
+as before, so the capture never claims consistency it cannot deliver.
+
+**`sqlite-backup-helper` is a DIFFERENT label from `sqlite-backup`.**
+The latter means the application's own binary answered; the former means a
+stock sqlite3 from another image did. That is sound for an ordinary database
+and is not the same evidence, and two claims must not wear one label. The
+in-image binary is tried FIRST and the helper is not even reached for a service
+that has one -- asserted, because order is what keeps plex off the stock path.
+
+**A `.backup` of a WAL database is ITSELF in WAL mode.** So verifying a capture
+needs a writable copy: the first version of the rehearsal's check mounted the
+capture `:ro` and reported a perfectly sound database as unsound. That is why
+`service_state_restore` `docker cp`s the file INTO the container before
+checking it rather than mounting it.
+
+`QUIESCED_CAPTURE_ENABLED` and `--quiesce` remain, and remain gated -- they are
+now the fallback for a host with no helper image at all, rather than the only
+route for these two services.
+
+**`tests/reconcile-boundary-audit.py` CAUGHT THE NEW FUNCTION, and I had not
+run it.** `sqlite_backup_via_helper` contains a `docker run`, so the audit
+refused it as UNCLASSIFIED -- *"the boundary is not allowed to be implicit"* --
+and CI failed. It is `UTILITY`, the same shape as `htpasswd_hash`: a disposable
+`--rm --entrypoint` container started from an image already present, which
+touches no SERVICE container, resolves no service's image tag, and leaves the
+service whose database it reads running untouched.
+
+**The miss is the lesson, not the classification.** I ran four audits locally
+-- pipefail, find-abort, function-definition, captured-stdout-purity -- and
+reported "audits PASS", which was true of those four and not of the set. There
+are ten. Run `for f in tests/*.py` rather than a remembered list, because the
+one that matters is the one a change happens to touch.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

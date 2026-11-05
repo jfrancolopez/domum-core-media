@@ -8917,6 +8917,14 @@ service_essential_state() {  # $1 = service
 service_state_capture_mode() {  # $1 = service
   if service_sqlite_binary "$1" >/dev/null 2>&1; then
     printf 'consistent'
+  elif sqlite_helper_image >/dev/null 2>&1; then
+    # No sqlite3 in this service's image, but one is available in another
+    # image that is already present. Measured: a helper container with the
+    # database directory mounted READ-ONLY takes a sound `.backup` of a live
+    # WAL database while the service keeps running. So jellyfin and kavita are
+    # `consistent` too, with no downtime -- the conclusion that they needed
+    # `--quiesce` was wrong.
+    printf 'consistent'
   else
     printf 'unproven'
   fi
@@ -8932,6 +8940,88 @@ service_state_capture_mode() {  # $1 = service
 #
 # argv is passed directly to docker exec with no shell, so Plex's
 # space-containing `/usr/lib/plexmediaserver/Plex SQLite` needs no quoting.
+# An image that ships a stock sqlite3, for a service whose own image does not.
+#
+# WHY THIS EXISTS. jellyfin and kavita ship no sqlite3 and this host has none,
+# so their captures were `file-copy-unproven`: a copy of a WAL-mode database
+# taken while the service may be writing, i.e. torn rather than merely
+# crash-consistent. The stated remedy was to STOP the service (`--quiesce`),
+# which costs downtime and is gated.
+#
+# That conclusion was wrong, and the operator pushed back on it. Measured
+# 2026-11-04 against disposable live databases of the REAL images:
+#
+#   kavita    main 966,656  -wal 4,132,392  -> helper .backup 1,105,920, 84 tables, ok
+#   jellyfin  main   4,096  -wal 3,188,912  -> helper .backup   475,136, 33 tables, ok
+#
+# Both services stayed RUNNING, neither logged a database error, and jellyfin's
+# main file was essentially empty -- so the 33 tables came out of the WAL,
+# which is exactly the content a plain copy loses.
+#
+# **The database directory is mounted READ-ONLY and that is sufficient**, also
+# measured: SQLite can read a WAL database read-only when the `-shm` already
+# exists, and it does, because the service holds it open. So the helper never
+# needs write access to live application data. The backup is written to a
+# separate writable mount that is never inside the service's tree.
+#
+# It NEVER pulls. The helper must already be present, and it is resolved from a
+# RUNNING container of a service this project has measured to ship sqlite3 --
+# so it is pinned by image ID at capture time and recorded in the manifest.
+# With no helper available the capture falls back to `file-copy-unproven`
+# exactly as before.
+sqlite_helper_image() {  # -> an image ID that ships /usr/bin/sqlite3, or rc 1
+  if [[ -n "${SQLITE_HELPER_IMAGE:-}" ]]; then
+    printf '%s' "$SQLITE_HELPER_IMAGE"; return 0
+  fi
+  cmd_exists docker || return 1
+  local svc cid img
+  # Measured to ship /usr/bin/sqlite3: navidrome 3.45.3, calibre-web 3.45.1,
+  # uptime-kuma 3.40.1. plex is deliberately absent -- its binary is `Plex
+  # SQLite` at a different path, and it is the service that NEEDS its own.
+  for svc in navidrome calibre-web uptime-kuma; do
+    cid="$(tracked_service_container_id_any "$svc" 2>/dev/null || true)"
+    [[ -n "$cid" ]] || continue
+    [[ "$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null)" == "running" ]] || continue
+    img="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
+    [[ -n "$img" ]] || continue
+    printf '%s' "$img"; return 0
+  done
+  return 1
+}
+
+# A consistent copy of one live SQLite database through a HELPER image.
+#
+# The service's own container is not involved: it keeps the database open, and
+# that is what makes the read-only path work.
+sqlite_backup_via_helper() {  # $1 = host db path, $2 = destination file
+  local hostdb="$1" dest="$2" img dbdir dbname outdir rc=0
+  img="$(sqlite_helper_image)" || return 1
+  dbdir="$(dirname -- "$hostdb")"; dbname="$(basename -- "$hostdb")"
+  # The output directory is created beside the DESTINATION, never inside the
+  # service's data tree: a helper writing into live state is the one thing this
+  # path must not do.
+  outdir="$(dirname -- "$dest")"
+  [[ -d "$outdir" ]] || return 1
+  docker run --rm --network none --user 0:0 \
+    --entrypoint /usr/bin/sqlite3 \
+    -v "$dbdir:/dbsrc:ro" -v "$outdir:/dbout" "$img" \
+    "/dbsrc/$dbname" ".backup /dbout/$(basename -- "$dest").helper" \
+    >/dev/null 2>&1 || rc=$?
+  if (( rc != 0 )) || [[ ! -s "$dest.helper" ]]; then
+    rm -f -- "$dest.helper"; return 1
+  fi
+  # Integrity-checked by the SAME stock sqlite3 before anything trusts it.
+  local ic
+  ic="$(docker run --rm --network none --user 0:0 \
+    --entrypoint /usr/bin/sqlite3 -v "$outdir:/dbout" "$img" \
+    "/dbout/$(basename -- "$dest").helper" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+  if [[ "$ic" != "ok" ]]; then
+    rm -f -- "$dest.helper"; return 1
+  fi
+  mv -f -- "$dest.helper" "$dest" || { rm -f -- "$dest.helper"; return 1; }
+  [[ -s "$dest" ]]
+}
+
 service_sqlite_backup() {  # $1 = service, $2 = host db path, $3 = dest file
   local service="$1" hostdb="$2" dest="$3" bin cid cpath tmp check
   bin="$(service_sqlite_binary "$service" 2>/dev/null)" || return 1
@@ -9351,6 +9441,14 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
           itemmode="file-copy-quiesced"
         elif [[ "$mode" == "consistent" ]] && service_sqlite_backup "$service" "$src" "$out"; then
           itemmode="sqlite-backup"
+        elif [[ "$mode" == "consistent" ]] && sqlite_backup_via_helper "$src" "$out"; then
+          # A DIFFERENT claim from the line above, so it gets a different word.
+          # `sqlite-backup` means the application's own binary answered -- the
+          # only one that can read plex's `collating` FTS tables. This means a
+          # stock sqlite3 from another image did, which is sound for an
+          # ordinary database and is not the same evidence. Two claims must not
+          # wear one label.
+          itemmode="sqlite-backup-helper"
         elif cp -p -- "$src" "$out" 2>/dev/null; then
           # A copy of a database the service may be writing. Recorded as what
           # it is: this is the only option when no sqlite3 exists anywhere.

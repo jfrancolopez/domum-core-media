@@ -495,12 +495,17 @@ cat > "$TMP/mutate2.py" <<'PYMUT2'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '''  if service_sqlite_binary "$1" >/dev/null 2>&1; then
-    printf 'consistent'
-  else
+# Anchored on the FINAL arm only: the function grew an `elif
+# sqlite_helper_image` branch when the helper path landed, so the old
+# whole-body anchor matched zero times and the mutation silently stopped
+# applying. Forcing the fallback arm to claim consistency is what this section
+# is actually about.
+old = '''  else
     printf 'unproven'
   fi'''
-new = "  printf 'consistent'"
+new = '''  else
+    printf 'consistent'
+  fi'''
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT2
@@ -1177,5 +1182,146 @@ silently changing a production directory's mode is not this function's business"
 [[ "$(stat -c %a "$TMP/data/backups/state")" == "700" ]] \
   || fail "the capture's own root is not 0700, so this section proves nothing"
 echo "  shared paths untouched; the capture's own subtree still 0700"
+
+
+sect "a service with no sqlite3 reaches CONSISTENT when a helper image exists"
+# jellyfin and kavita ship no sqlite3 and this host has none, so their captures
+# were `file-copy-unproven` -- a copy of a WAL database taken while the service
+# may be writing -- and the stated remedy was to STOP the service. That was
+# wrong. Measured 2026-11-04 against disposable live databases of the REAL
+# images, with a helper container that ships sqlite3:
+#
+#   kavita    main 966,656  -wal 4,132,392  -> .backup 1,105,920, 84 tables, ok
+#   jellyfin  main   4,096  -wal 3,188,912  -> .backup   475,136, 33 tables, ok
+#
+# Both stayed RUNNING. jellyfin's main file was essentially empty, so its 33
+# tables came out of the WAL -- exactly what a plain copy loses.
+out="$(probe 'sqlite_helper_image() { printf sha256:helperimage; }' \
+  'service_state_capture_mode jellyfin')"
+[[ "$out" == "consistent" ]] \
+  || fail "with a helper available jellyfin must be consistent, got: $out"
+out="$(probe 'sqlite_helper_image() { printf sha256:helperimage; }' \
+  'service_state_capture_mode kavita')"
+[[ "$out" == "consistent" ]] || fail "kavita must be consistent too, got: $out"
+echo "  jellyfin and kavita are consistent when a helper is available"
+
+sect "and falls back to UNPROVEN when no helper is present -- never claims more"
+out="$(probe 'sqlite_helper_image() { return 1; }' 'service_state_capture_mode jellyfin')"
+[[ "$out" == "unproven" ]] \
+  || fail "with NO helper the mode must be unproven, not $out. A capture that
+claims consistency it cannot deliver is the defect this project exists to
+prevent"
+echo "  no helper -> unproven, as before"
+
+sect "the helper NEVER pulls, and resolves only from a RUNNING container"
+# Comments STRIPPED before asserting absence: the function's own comment
+# explains why plex is deliberately not a helper source, and the first version
+# of the assertion below flagged that explanation. Seventh recorded instance of
+# an assertion catching its author's own prose.
+body_raw="$(sed -n '/^sqlite_helper_image() {/,/^}/p' "$CLI")"
+body="$(sed 's/#.*//' <<< "$body_raw")"
+[[ -n "$body_raw" ]] || fail "sqlite_helper_image was not found"
+grep -qE 'docker (pull|image pull)' <<< "$body" \
+  && fail "the helper resolver pulls. What gets used must be what is already
+here -- the same rule verify-db-restore follows for the postgres image"
+grep -q "State.Status" <<< "$body" \
+  || fail "it does not require the container to be running, so it could name an
+image that is not actually present"
+grep -qE '\bnavidrome\b' <<< "$body" \
+  || fail "the helper list no longer names a service measured to ship sqlite3"
+grep -q 'plex' <<< "$body" \
+  && fail "plex is in the helper list. Its binary is 'Plex SQLite' at another
+path, and it is the service that NEEDS its own -- a stock sqlite3 cannot read
+its collating FTS tables"
+echo "  no pull, running containers only, and plex is not a helper source"
+
+sect "the live database is mounted READ-ONLY, and output goes elsewhere"
+# The safety property, measured 2026-11-04: SQLite can read a WAL database
+# read-only when the -shm already exists, and it does, because the service
+# holds it open. So the helper never needs write access to live application
+# data -- which is the one thing this path must not have.
+hbody="$(sed -n '/^sqlite_backup_via_helper() {/,/^}/p' "$CLI")"
+[[ -n "$hbody" ]] || fail "sqlite_backup_via_helper was not found"
+grep -q -- '-v "\$dbdir:/dbsrc:ro"' <<< "$hbody" \
+  || fail "the live database directory is NOT mounted read-only:
+$hbody"
+grep -q -- '--network none' <<< "$hbody" || fail "the helper is not network-isolated"
+grep -q -- '--rm' <<< "$hbody" || fail "the helper container is not disposable"
+echo "  db :ro, --network none, --rm, output to a separate mount"
+
+sect "a helper capture is labelled DIFFERENTLY from the application's own sqlite"
+# `sqlite-backup` means the application's own binary answered -- the only one
+# that can read plex's collating FTS tables. A stock sqlite3 from another image
+# is sound for an ordinary database and is NOT the same evidence. Two claims
+# must not wear one label.
+build_jellyfin
+rm -rf "$TMP/out/cap-helper"
+out="$(probe 'sqlite_helper_image() { printf sha256:helperimage; }
+sqlite_backup_via_helper() { cp -p -- "$1" "$2"; }' \
+  "service_state_capture jellyfin '$TMP/out/cap-helper'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the helper capture failed: $out"
+grep -q 'jellyfin.db|sqlite-backup-helper|' "$TMP/out/cap-helper/MANIFEST" \
+  || fail "the item is not labelled sqlite-backup-helper:
+$(cat "$TMP/out/cap-helper/MANIFEST")"
+grep -q 'jellyfin.db|sqlite-backup|' "$TMP/out/cap-helper/MANIFEST" \
+  && fail "a helper capture is labelled 'sqlite-backup', which claims the
+application's OWN binary answered. jellyfin has none"
+echo "  recorded as sqlite-backup-helper, distinct from sqlite-backup"
+
+sect "the application's OWN sqlite still wins where there is one"
+# Order matters: plex must never be captured through a stock sqlite3 while its
+# own binary is available.
+build_calibre_web
+rm -rf "$TMP/out/cap-own"
+out="$(probe 'sqlite_helper_image() { printf sha256:helperimage; }
+service_sqlite_backup() { cp -p -- "$2" "$3"; }
+sqlite_backup_via_helper() { echo "HELPER WAS USED" >&2; return 1; }' \
+  "service_state_capture calibre-web '$TMP/out/cap-own'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the capture failed: $out"
+grep -q 'HELPER WAS USED' <<< "$out" \
+  && fail "the helper was tried for a service that ships its own sqlite3"
+grep -q 'config/app.db|sqlite-backup|' "$TMP/out/cap-own/MANIFEST" \
+  || fail "calibre-web's own sqlite3 was not credited:
+$(cat "$TMP/out/cap-own/MANIFEST")"
+echo "  in-image sqlite3 is preferred, and the helper is not even tried"
+
+sect "MUTATION: removing the helper arm must send jellyfin back to UNPROVEN"
+MUTH="$TMP/mut-helper"; mkdir -p "$MUTH"; cp "$CLI" "$MUTH/domum-media"
+python3 -I - "$MUTH/domum-media" <<'PYMH' || fail "the helper mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "  elif sqlite_helper_image >/dev/null 2>&1; then"
+new = "  elif false; then"
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMH
+saved_cli="$CLI"; CLI="$MUTH/domum-media"
+mout="$(probe 'sqlite_helper_image() { printf sha256:helperimage; }' \
+  'service_state_capture_mode jellyfin')"
+CLI="$saved_cli"
+[[ "$mout" == "unproven" ]] \
+  || fail "the mutation changed no ANSWER -- without the helper arm jellyfin
+must report unproven, got: $mout"
+echo "  killed: without the arm, jellyfin is unproven and would need downtime"
+
+sect "MUTATION: a read-write live mount must be rejected"
+# The whole safety argument is that the helper cannot write to live application
+# data. If the :ro is dropped, the assertion above must fail.
+MUTR="$TMP/mut-rw"; mkdir -p "$MUTR"; cp "$CLI" "$MUTR/domum-media"
+python3 -I - "$MUTR/domum-media" <<'PYMR' || fail "the rw mutation did not apply"
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '-v "$dbdir:/dbsrc:ro"'
+new = '-v "$dbdir:/dbsrc"'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMR
+rwbody="$(sed -n '/^sqlite_backup_via_helper() {/,/^}/p' "$MUTR/domum-media")"
+grep -q -- '-v "\$dbdir:/dbsrc:ro"' <<< "$rwbody" \
+  && fail "the mutation changed no ANSWER -- dropping :ro must make the
+read-only assertion fail"
+echo "  killed: without :ro the helper could write to live application data"
 
 echo "ALL STATE-CAPTURE CHECKS PASSED"
