@@ -282,6 +282,25 @@ A declared item that is missing, that could not be copied, or whose stored name
 and exits 1. `verify-state` then refuses the capture outright. A partial
 capture presented as a backup is the defect this project keeps correcting.
 
+`verify-state` refuses on **four** grounds, not one, because the manifest
+records its own completeness and a verifier that reads only the `ITEM` lines
+cannot tell *every declared item verified* from *every item still listed
+verified*:
+
+| ground | what it catches |
+|---|---|
+| `RESULT=INCOMPLETE` | the capture itself reported a missing item |
+| no `RESULT` line at all | `RESULT` and `ITEMS` are written LAST, so this is a **truncated** manifest |
+| `ITEMS` ≠ the number of `ITEM` lines | an append that failed silently — `RESULT=COMPLETE` is still written truthfully by the writer's own counter |
+| `SCHEMA_VERSION` unrecognised or absent | the `ITEM` grammar is versioned; schema 2 added a file item's mode field, so a schema-1 line would land its checksum in the mode column |
+
+Measured before this was fixed: a 7-item jellyfin capture with the last `ITEM`
+line and the trailing `RESULT`/`ITEMS` lines removed reported
+`capture verified: 6 item(s)` and **exit 0** — and the item dropped was
+`device.txt`, the server identity. Because `verify-state` is the single gate
+`pack-state` and `restore-state` both consult, that verdict would have let a
+truncated capture be encrypted, pass `verify-pack`, and restore as a success.
+
 The collision case is real rather than defensive: the stored filename folds
 `/` and ` ` to `_`, and plex's declared paths contain spaces, so `a/b` and
 `a b` map to one name. Without the guard one item would have silently
@@ -416,16 +435,21 @@ After `pragma wal_checkpoint(TRUNCATE)`:
  runtime         : running (unchanged)
 [domum-media] quiesced capture complete
 
+SCHEMA_VERSION=2                         <- the ITEM grammar is versioned
 CAPTURE_MODE=quiesced
 IMAGE_ID=sha256:fd7dc98638c8…            <- read from docker inspect, not invented
+SQLITE_IN_IMAGE=no                       <- which sqlite answered, recorded not inferred
+SQLITE_HELPER=none
 ITEM=sqlite|config/kavita.db|file-copy-quiesced|8192|644|4a09165d98…
 ITEM=dir|config/templates|dir-copy|4|775|983409dc41…
 RESULT=COMPLETE
+ITEMS=2                                  <- compared against the ITEM lines present
 
-capture verified: 2 item(s) match their recorded digests
+capture verified: 2 of 2 item(s) match their recorded digests
 restored 2 item(s) …, all matching their recorded digests
 restored databases: 1 checked sound, 0 not checked
 capture mode: quiesced -- … This is the strongest capture mode.
+application that wrote this state: sha256:fd7dc98638c8…
 this proves the CAPTURE restores. It is not a proof that kavita runs against it.
 ```
 
