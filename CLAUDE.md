@@ -5501,6 +5501,65 @@ duplicate tooling.
 
 ---
 
+**I FIXED FOUR REASONLESS FAILURES IN THE VOLUME PATH AND DID NOT SWEEP FOR THE
+SHAPE, so five more were sitting in the encrypted-pack and image-archive
+paths.** The previous entry records `dump_volume_to_file` and
+`restore_volume_from_file` running `tar` and `find -delete` under
+`2>/dev/null` and then warning with no reason, and `first_error_line` being
+written as the one implementation. What it did not do was grep for the shape.
+Measured 2026-11-05 with a scan for a HANDLED failure (`if ! cmd … 2>/dev/null`
+with a `warn` within four lines) that does not reach `first_error_line`: **four
+sites in `bin/domum-media`, zero in the backup CLI.** All four were real, and
+the pack path is the artefact meant to leave this host:
+
+| site | one sentence covered |
+|---|---|
+| `service_state_pack`'s `tar` | permission denied, no space, an unreadable capture |
+| `service_state_pack`'s `age` | an unusable recipient, no space, a missing binary |
+| `service_state_unpack`'s `age -d` | a wrong identity, a corrupt pack, an unreadable identity file |
+| `service_state_unpack`'s `tar -x` | **by then the pack is DECRYPTED** -- the reason is all the operator has |
+| `archive_image_to_file`'s `docker save` | the only PROVEN copy of every recovery point's application half |
+
+The decrypt site was the subtler one: it did say something useful -- *"A pack
+encrypted to the operator's key cannot be opened by this host, which is the
+design"* -- and that **asserts one** of the reasons it can fail. A corrupt pack
+and an unreadable identity file are indistinguishable from a wrong key without
+the diagnostic, so the note is kept, age's own error is printed, and the text
+now says that is not the only reason. A true explanation of one cause is still
+a confident wrong cause when it is the only one offered.
+
+**One classification was deliberately NOT changed.**
+`migrate_sqlite_integrity`'s probe copy sets `bad=1`, which fails the recovery
+point, and the obvious reading of this file's *"I could not check it is not it
+is broken"* rule says that should become `not checked`. It should not: a copy
+that cannot read the file is ambiguous between a permission problem and an
+**unreadable extent**, i.e. the silent corruption a scrub exists to find, and
+on the migration path the safe reading is the second. What was missing was only
+the cause -- permission denied and an I/O error need opposite responses. Fixing
+the message without touching the verdict is the whole of the correct change
+here, and reclassifying would have weakened the highest-risk path in the
+project while looking like rule-following.
+
+**After fixing a defect SHAPE, grep for the shape** -- the same discipline this
+file already records for a false CLAIM, which turned up in five documents. A
+one-off fix leaves every sibling site with a neighbour vouching for it.
+
+`tests/state-capture-smoke.sh` gained four behaviour sections and a third
+mutant: the not-a-tar case is reached by encrypting a non-tar payload to the
+test recipient, which is the only way to get past `age` and fail at `tar`; the
+`docker save` case stubs a daemon error on stderr and asserts no partial
+archive is published. The mutation restores `2>/dev/null` and the reasonless
+warning, and the cause must disappear.
+
+**And one of those sections reused another section's fixture.** It unpacked
+`b.tar.age`, whose recorded checksum an earlier section deliberately corrupts
+to drive the MISMATCH state -- so the checksum refusal fired first and `age`
+was never reached, and the assertion failed against correct code. It builds its
+own pack now and asserts the checksum PASSED, so the section cannot silently
+stop testing the step it is about.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

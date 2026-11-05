@@ -1806,4 +1806,110 @@ grepF_q 'no helper image was' "$mout" \
 for a capture that recorded a helper: $mout"
 echo "  killed: the mutant blames the service for an avoidable unproven capture"
 
+# ---------------------------------------------------------------------------
+# A failed operation that cannot say WHY is an unactionable FAIL, and this
+# project already fixed four such sites in the volume dump/restore. The pack
+# path was not swept at the time -- and it is the artefact meant to leave the
+# host, so a failure there is the worst place for one identical sentence
+# covering permission denied, no space and an unusable key.
+sect "a FAILED pack names its cause, not just the fact"
+build_calibre_web
+rm -rf "$TMP/out/cap-cz" "$TMP/out/packsz"
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-cz'" >/dev/null
+printf 'not-a-key\n' > "$TMP/keys/bogus"
+out="$(probe "STATE_PACK_AGE_PUBKEY_FILE='$TMP/keys/bogus'" \
+  "service_state_pack '$TMP/out/cap-cz' '$TMP/out/packsz/z.tar.age'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "a bogus recipient still produced a pack: $out"
+grepF_q 'age could not encrypt' "$out" || fail "the pack did not report the encryption step: $out"
+# The point of the section: age's OWN diagnostic has to reach the operator.
+grepF_q 'no diagnostic was produced' "$out" \
+  && fail "age's stderr was discarded, so the cause is unavailable: $out"
+grep -qiE 'age could not encrypt the state pack: .*[a-z]' <<< "$out" \
+  || fail "no cause is attached to the failure: $out"
+echo "  cause attached"
+
+sect "a FAILED unpack names its cause, and keeps the design note"
+# The design note alone asserted ONE of the reasons this fails. A corrupt pack
+# and an unreadable identity look identical without the diagnostic.
+rm -rf "$TMP/out/unpz" "$TMP/out/cap-uz" "$TMP/out/packsuz"
+# Its OWN pack: an earlier section deliberately corrupts b.tar.age's recorded
+# checksum to drive the MISMATCH state, so reusing it means the checksum check
+# fires first and age is never reached.
+build_calibre_web
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-uz'" >/dev/null
+probe "$PACKENV" "service_state_pack '$TMP/out/cap-uz' '$TMP/out/packsuz/u.tar.age'" >/dev/null \
+  || fail "could not build the pack this section needs"
+age-keygen -o "$TMP/keys/wrong2" >/dev/null 2>&1 || fail "age-keygen failed"
+chmod 0600 "$TMP/keys/wrong2"
+out="$(probe '' "service_state_unpack '$TMP/out/packsuz/u.tar.age' '$TMP/keys/wrong2' '$TMP/out/unpz'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "the wrong identity opened the pack: $out"
+grepF_q 'matches its recorded sha256' "$out" \
+  || fail "this section needs the checksum to PASS so age is reached: $out"
+grepF_q 'is the design' "$out" || fail "the design note was dropped: $out"
+grepF_q 'not the only reason' "$out" \
+  || fail "the note must stop implying a wrong key is the only cause: $out"
+grepF_q 'no diagnostic was produced' "$out" \
+  && fail "age's stderr was discarded on the decrypt path: $out"
+echo "  cause attached, note kept, and no longer the only stated reason"
+
+sect "a pack that DECRYPTS but is not a tar names the extract failure"
+# By this point the plaintext exists, so a failure here leaves the operator
+# with nothing -- the same argument as the volume restore, where the volume has
+# already been cleared. Reaching it needs a pack whose payload is not a tar.
+rm -rf "$TMP/out/unpnt" "$TMP/out/packsnt"
+mkdir -p "$TMP/out/packsnt"
+recip="$(cat "$TMP/keys/pub")"
+printf 'this is not a tar archive at all\n' > "$TMP/notatar"
+age -r "$recip" -o "$TMP/out/packsnt/nt.tar.age" "$TMP/notatar" 2>/dev/null \
+  || fail "could not build the not-a-tar fixture"
+sha256sum "$TMP/out/packsnt/nt.tar.age" | awk '{print $1}' > "$TMP/out/packsnt/nt.tar.age.sha256"
+out="$(probe '' "service_state_unpack '$TMP/out/packsnt/nt.tar.age' '$TMP/keys/ident' '$TMP/out/unpnt'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "a non-tar payload unpacked successfully: $out"
+grepF_q 'could not unpack' "$out" || fail "the extract failure is not reported: $out"
+grepF_q 'no diagnostic was produced' "$out" \
+  && fail "tar's stderr was discarded, so the cause is unavailable: $out"
+echo "  extract failure reported with tar's own reason"
+
+sect "a failed docker save names its cause -- the archive is the only proven copy"
+# CLAUDE.md: the `docker save` archive is the only PROVEN copy of the
+# application half of every recovery point on this host.
+out="$(probe 'docker() {
+                case "$1" in
+                  save) echo "Error response from daemon: no space left on device" >&2; return 1 ;;
+                  *) return 0 ;;
+                esac
+              }' \
+  "archive_image_to_file sha256:deadbeef '$TMP/out/arch/x.tar'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" && fail "a failed docker save reported success: $out"
+grepF_q 'docker save failed' "$out" || fail "the failure is not reported: $out"
+grepF_q 'no space left on device' "$out" \
+  || fail "docker's own diagnostic did not reach the operator: $out"
+[[ ! -e "$TMP/out/arch/x.tar" ]] || fail "a partial archive was published"
+echo "  docker's own reason reported, and nothing published"
+
+sect "MUTATION: discarding the diagnostic makes every pack failure identical"
+build_calibre_web
+rm -rf "$TMP/out/cap-cz2" "$TMP/out/packsz2"
+probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-cz2'" >/dev/null
+cp "$CLI" "$TMP/cli.origcz"
+cat > "$TMP/mutate-cz.py" <<'PYMUTCZ'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '''  if ! age -r "$recipient" -o "$tmp" "$plain" 2>"$perr"; then
+    warn "age could not encrypt the state pack: $(first_error_line "$perr")"'''
+new = '''  if ! age -r "$recipient" -o "$tmp" "$plain" 2>/dev/null; then
+    warn "age could not encrypt the state pack"'''
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUTCZ
+( python3 -I "$TMP/mutate-cz.py" "$CLI" ) || { cp "$TMP/cli.origcz" "$CLI"; fail "the cause mutation did not apply"; }
+mout="$(probe "STATE_PACK_AGE_PUBKEY_FILE='$TMP/keys/bogus'" \
+  "service_state_pack '$TMP/out/cap-cz2' '$TMP/out/packsz2/z.tar.age'; echo RC=\$?")"
+cp "$TMP/cli.origcz" "$CLI"
+grep -qE 'age could not encrypt the state pack$' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- without the captured stderr the
+failure must carry no cause at all: $mout"
+echo "  killed: the mutant reports the fact with no cause"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"

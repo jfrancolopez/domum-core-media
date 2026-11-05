@@ -9724,8 +9724,12 @@ migrate_sqlite_integrity() {  # $1 = tree, $2 = stage label
     # In `.premigration` that would make the preserved original differ from the
     # proof snapshot, so the act of verifying the integrity claim would break it.
     # Against the read-only snapshot it would simply fail. Neither is acceptable.
-    if ! cp -- "$tree/$rel" "$tmp/probe.db" 2>/dev/null; then
-      warn "sqlite $rel: could not be copied for checking"
+    if ! cp -- "$tree/$rel" "$tmp/probe.db" 2>"$tmp/cp.err"; then
+      # Still a FAILURE, not a skip: a copy that cannot read the file is
+      # ambiguous between "could not check it" and an unreadable extent, and on
+      # this path the safe reading is the second. The CAUSE is what tells them
+      # apart -- permission denied and an I/O error need opposite responses.
+      warn "sqlite $rel: could not be copied for checking: $(first_error_line "$tmp/cp.err")"
       bad=1
       continue
     fi
@@ -10755,7 +10759,7 @@ state_pack_recipient() {
 # proven and whose contents cannot -- the shape of every reporting defect this
 # project has corrected.
 service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
-  local cap="$1" dest="${2:-}" recipient plain tmp sha size
+  local cap="$1" dest="${2:-}" recipient plain tmp sha size perr
   [[ -n "$cap" && -d "$cap" ]] || { warn "not a capture directory: $cap"; return 1; }
   [[ -f "$cap/MANIFEST" ]] || { warn "no MANIFEST in $cap"; return 1; }
   cmd_exists age || { warn "age is not installed; cannot encrypt a state pack"; return 1; }
@@ -10784,12 +10788,20 @@ service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
   plain="$(mktemp "$(dirname -- "$dest")/.pack.XXXXXX")" || return 1
   chmod 0600 "$plain" 2>/dev/null || true
   tmp="$plain.age"
-  if ! tar -C "$cap" -cf "$plain" . 2>/dev/null; then
-    rm -f -- "$plain" "$tmp"; warn "could not archive $cap"; return 1
+  # Permission denied, no space, and an unusable recipient produced ONE
+  # identical sentence each, and their remedies have nothing in common. Same
+  # shape as the volume dump/restore, which was fixed first; this path was not
+  # swept at the time, and this is the artefact meant to leave the host.
+  perr="$(mktemp)" || { rm -f -- "$plain" "$tmp"; return 1; }
+  if ! tar -C "$cap" -cf "$plain" . 2>"$perr"; then
+    warn "could not archive $cap: $(first_error_line "$perr")"
+    rm -f -- "$plain" "$tmp" "$perr"; return 1
   fi
-  if ! age -r "$recipient" -o "$tmp" "$plain" 2>/dev/null; then
-    rm -f -- "$plain" "$tmp"; warn "age could not encrypt the state pack"; return 1
+  if ! age -r "$recipient" -o "$tmp" "$plain" 2>"$perr"; then
+    warn "age could not encrypt the state pack: $(first_error_line "$perr")"
+    rm -f -- "$plain" "$tmp" "$perr"; return 1
   fi
+  rm -f -- "$perr"
   rm -f -- "$plain"
   chmod 0600 "$tmp" 2>/dev/null || true
   sync -f "$tmp" 2>/dev/null || sync 2>/dev/null || true
@@ -10902,15 +10914,27 @@ service_state_unpack() {  # $1 = pack .tar.age, $2 = identity file, $3 = target 
   local plain
   plain="$(mktemp "$target/.unpack.XXXXXX")" || return 1
   chmod 0600 "$plain" 2>/dev/null || true
-  if ! age -d -i "$ident" -o "$plain" "$pack" 2>/dev/null; then
-    rm -f -- "$plain"
-    warn "age could not decrypt $pack with $ident. A pack encrypted to the
-  operator's key cannot be opened by this host, which is the design."
+  local uerr
+  uerr="$(mktemp)" || { rm -f -- "$plain"; return 1; }
+  if ! age -d -i "$ident" -o "$plain" "$pack" 2>"$uerr"; then
+    # The design note is kept AND age's own error is printed: a wrong identity
+    # is only one of the reasons this fails, and stating it alone asserts a
+    # cause that may be false -- a corrupt pack and an unreadable identity look
+    # identical without the diagnostic.
+    warn "age could not decrypt $pack with $ident: $(first_error_line "$uerr")
+  A pack encrypted to the operator's key cannot be opened by this host, which
+  is the design; but that is not the only reason this can fail."
+    rm -f -- "$plain" "$uerr"
     return 1
   fi
-  if ! tar -C "$target" -xf "$plain" 2>/dev/null; then
-    rm -f -- "$plain"; warn "could not unpack $pack"; return 1
+  # By here the pack is DECRYPTED, so a failure now leaves the operator with
+  # nothing and the reason is the only thing they have -- the same argument as
+  # the volume restore, where the volume has already been cleared.
+  if ! tar -C "$target" -xf "$plain" 2>"$uerr"; then
+    warn "could not unpack $pack: $(first_error_line "$uerr")"
+    rm -f -- "$plain" "$uerr"; return 1
   fi
+  rm -f -- "$uerr"
   rm -f -- "$plain"
   [[ -f "$target/MANIFEST" ]] \
     || { warn "the pack decrypted but holds no MANIFEST, so it is not a capture"; return 1; }
@@ -10943,11 +10967,18 @@ archive_image_to_file() {  # $1 = image id, $2 = destination .tar
   install -d -m 0750 "$dir" || { warn "cannot create $dir"; return 1; }
   [[ -e "$dest" ]] && { warn "refusing to overwrite an existing archive: $dest"; return 1; }
   docker image inspect "$img" >/dev/null 2>&1     || { warn "image $img is not present locally; nothing to archive"; return 1; }
-  if ! docker save "$img" -o "$dest.partial" 2>/dev/null; then
+  local serr
+  serr="$(mktemp)" || { warn "cannot create a temporary file for docker's output"; return 1; }
+  if ! docker save "$img" -o "$dest.partial" 2>"$serr"; then
     rm -f -- "$dest.partial"
-    warn "docker save failed for $img"
+    # This archive is the only PROVEN copy of the application half of every
+    # recovery point on this host, so a failure here with no reason is the
+    # worst place for one.
+    warn "docker save failed for $img: $(first_error_line "$serr")"
+    rm -f -- "$serr"
     return 1
   fi
+  rm -f -- "$serr"
   # Checksum the partial, then publish atomically: an archive that exists under
   # its final name must always be complete.
   sha256sum "$dest.partial" | awk '{print $1}' > "$dest.sha256.partial"     || { rm -f -- "$dest.partial" "$dest.sha256.partial"; warn "could not checksum the archive"; return 1; }
