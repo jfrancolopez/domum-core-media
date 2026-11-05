@@ -5459,6 +5459,48 @@ service for an avoidable unproven capture.
 
 ---
 
+**`git checkout <file>` IS NOT AN UNDO FOR A MUTATION TEST, and I destroyed my
+own uncommitted work with it.** Verifying that the extended key audit really
+bites, I mutated `bin/domum-media`, confirmed the FAIL, restored the binary
+from a `cp` backup -- correctly -- and then reverted the *audit* with
+`git checkout tests/recovery-metadata-keys-audit.py`. The audit's extension was
+not committed yet, so that command did not undo the mutation; there was no
+mutation in that file. It threw away the feature.
+
+The recorded rule is *"take the backup before the mutation, unconditionally"*,
+and the reason it says `cp` is precisely this: a file backup restores the state
+the file was in, whereas `git checkout` restores the state the INDEX is in,
+which for uncommitted work is a different thing entirely. Use `cp` for both
+halves of a mutation test, and never mix the two mechanisms in one verification
+-- the `cp` half worked and the `git` half did not, in the same four lines.
+
+Cheap to recover here (the edit was scripted, so re-applying it was one
+re-run), which is itself the argument for making programmatic edits
+re-runnable.
+
+**The key audit now covers TWO conventions, and the vacuity guard had to be
+split to say anything.** `recovery-metadata-keys-audit.py` matched only the
+`.recovery` file's `KEY='value'` form, so the capture manifest's unquoted
+`KEY=value` was unaudited in both directions -- which is how its summary keys
+came to be written and read by nothing. Its original guard failed only when the
+MERGED sets were empty, so the quoted convention's 22 matches would have kept a
+rotted unquoted pattern invisible. Counted per convention now, and both
+directions were falsified: a typo'd unquoted read (`CAPTURE_MOED`) is reported
+as an orphan, and breaking the unquoted read pattern reports
+`the unquoted convention found nothing to compare` instead of passing.
+
+**Scope measured rather than assumed, as the cry-wolf rule requires.**
+`bin/domum-media-backup` writes **24** keys in the unquoted convention and
+reads **none** of them with that idiom, so widening the audit to both CLIs
+would report two dozen orphans that are not defects. It stays scoped to
+`bin/domum-media`. And the *written-but-never-read* direction is deliberately
+informational, not a failure: `CAPTURED_AT` and `STATE_ROOT` are written for
+the operator, and requiring every key to be consumed by code would reject
+them -- a third audit for that direction was considered and rejected as
+duplicate tooling.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
