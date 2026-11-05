@@ -5737,6 +5737,77 @@ description first.
 
 ---
 
+**`status` -- THE MOST-RUN COMMAND -- ASSERTED A UNIFORM PROTECTION PROPERTY
+THAT HOLDS FOR NEITHER GROUP OF SERVICES, AND IT WAS INVERTED BETWEEN THEM.**
+Found 2026-11-05 by sweeping for other places that CLAIM coverage rather than
+asking, which is the discipline the `storage archives` fix just taught: after
+fixing a defect shape, grep for the shape.
+
+`status_storage` printed:
+
+```
+  /srv/data   = durable / protected disk (snapshotted + backed up)
+  /srv/media  = disposable media on the OS disk (not backed up by default)
+```
+
+Measured read-only on this host with `stat -c '%i %d'`:
+
+| | own subvolume | in the cloud target's scope |
+|---|---|---|
+| `immich` | **NO** -- inode **273**, `st_dev` 45, same as its parent | **YES** |
+| plex, jellyfin, kavita, navidrome, calibre-web | **YES** -- inode 256, each its own `st_dev` (56/73/74/68/55) | **NO** |
+| `backups/images` | -- | **NO** |
+
+So **neither** group is both, and the two halves of the label are each true of
+exactly the group the other is false for. The irreplaceable photo library is
+the one thing that IS off-site and is NOT a subvolume; the five that ARE
+subvolumes with proof snapshots are the ones no scheduled run copies anywhere.
+
+And it is worse than optimistic: a nested subvolume is **omitted from a
+snapshot of its parent**, which this file already records as the meaning of
+`degraded`. So a snapshot of the tier root captures immich and **excludes all
+five**, while the per-service snapshots capture the five and not immich. There
+is no single operation to which "snapshotted" refers.
+
+The label now names what the tier is FOR and points at the two commands that
+answer per service -- `storage topology` and `dr-status` -- and says explicitly
+that it asserts neither. A report that admits the answer varies is correct; one
+that implies a uniform protection is the defect.
+
+**It must not acquire an ABSOLUTE claim instead, so the test forbids naming any
+service.** Which service is protected is live state this label does not
+control, and pinning it is exactly how the topology invariant went stale and
+aborted a correct deployment. Asserted for all six names.
+
+**"Disposable" was the wrong word and this file says so.** `/srv/media` is
+*replaceable/reacquirable*, and that is "a statement about recovery cost, **not**
+blanket permission to delete or restructure it" -- a rule §2 states outright
+while the most-run command called the tier disposable. Corrected, and the test
+requires the replacement to say that cheap-to-reacquire is not permission to
+delete.
+
+**A string disappearing is not a fix**, so the test asserts BOTH directions: the
+overclaim must be gone AND the replacement must say the answer varies per
+service and name where to ask. The same shape as the `image_archive_dir` comment
+fix, where asserting only the absence would have passed for any wording.
+
+**`status` had NO test coverage at all** -- no suite referenced
+`status_storage` or its output before this. The most-run command was the least
+tested, which is how a false protection claim sat in it unremarked. Reachability
+was verified rather than assumed: `main` -> `status` -> `status_storage`.
+
+**Two of my own mistakes, both already in this file as rules.** The first
+version indented the continuation lines to a fixed column, which aligned only
+for the production path -- a fixture with a longer root exposed it, and the test
+now renders at two widths and requires the explanation to be identical. And my
+assertion grepped `not permission to delete`, a phrase my own wording had
+wrapped mid-break, so it failed against correct output: the line-at-a-time trap
+for the THIRD time in this session. The sentence is reflowed rather than the
+grep loosened, because a sentence broken mid-phrase is worse for the operator
+too.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

@@ -268,4 +268,78 @@ grep -q 'domum_is_subvolume' <<< "$topo_fn" \
 grep -q 'inum 256' <<< "$topo_fn" \
   && fail "storage_topology reimplements subvolume detection with an inline inode test"
 
+# ---------------------------------------------------------------------------
+# `status` is the most-run command, and its tier label asserted a uniform
+# protection property that holds for NEITHER group of services -- and was
+# inverted between them. Measured read-only on this host:
+#
+#   immich       inode 273, st_dev 45 -- an ordinary DIRECTORY, not a subvolume
+#                ...and it is the one thing the cloud target's scope covers
+#   the five     inode 256, each with its own st_dev -- real subvolumes with
+#                proof snapshots ...and NONE is in the cloud target's scope
+#
+# A nested subvolume is also omitted from a snapshot of its parent, so a
+# snapshot of the tier root captures immich and EXCLUDES the five. So
+# "(snapshotted + backed up)" described a protection shape that does not exist.
+echo "== the tier label asserts no uniform protection property =="
+st_fn="$(awk '/^status_storage\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+[ -n "$st_fn" ] || fail "status_storage not found"
+
+# Direction 1: the overclaim is gone.
+grep -qiE 'snapshotted \+ backed up' <<< "$st_fn" \
+  && fail "status still claims the whole protected tier is 'snapshotted + backed up'.
+immich is an ordinary directory and the five migrated services are not in the
+cloud target's scope, so that is false for every service in both directions."
+
+# Direction 2: a string disappearing is not a fix -- the replacement has to say
+# something TRUE. It must say the answer varies per service and name where to
+# ask, rather than asserting an outcome.
+grep -qi 'vary per service' <<< "$st_fn" \
+  || fail "the tier line does not say that snapshotting and off-site coverage vary
+per service, so it has stopped overclaiming without starting to inform"
+grep -q 'storage topology' <<< "$st_fn" \
+  || fail "it does not name the command that answers what is snapshotted"
+grep -q 'dr-status' <<< "$st_fn" \
+  || fail "it does not name the command that answers what is off-site"
+
+# And it must not have acquired an ABSOLUTE claim about live state instead --
+# the stale-invariant family. No service may be named as protected or not.
+for svc in immich plex jellyfin kavita navidrome calibre-web; do
+  grep -qw "$svc" <<< "$st_fn" \
+    && fail "status_storage names '$svc'. Which service is protected is live state
+this label does not control; pinning it is how the topology invariant went stale."
+done
+
+# The reacquirable tier must not read as deletable. CLAUDE.md: that is a
+# statement about recovery COST, not permission to delete or restructure it.
+grep -qi 'disposable' <<< "$st_fn" \
+  && fail "status calls the media tier 'disposable', which invites deletion.
+It is replaceable/reacquirable -- a statement about recovery cost."
+grep -qi 'permission to delete or restructure' <<< "$st_fn" \
+  || fail "the media tier line does not say that cheap-to-reacquire is not
+permission to delete it"
+echo "  no uniform claim, no named service, and reacquirable is not 'disposable'"
+
+echo "== the tier explanation does not depend on the path's width =="
+# The first version indented continuation lines to a fixed column, which only
+# lined up for the production path. A fixture with a longer root exposed it.
+render_tiers() {  # $1 = data root, $2 = media root
+  ( # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media" >/dev/null 2>&1
+    set +e
+    DOMUM_DATA_ROOT="$1"; DOMUM_MEDIA_ROOT="$2"; DOMUM_SNAPSHOT_ROOT="$TMP_DIR/snapshots"
+    status_storage ) 2>&1 | sed -n '2,8p'
+}
+short="$(render_tiers /srv/data /srv/media)"
+long="$(render_tiers /mnt/some/much/longer/data /m)"
+# The explanation lines are identical regardless of the root, because they are
+# not trying to align under it.
+s_expl="$(grep -c '^      ' <<< "$short" || true)"
+l_expl="$(grep -c '^      ' <<< "$long" || true)"
+[ "$s_expl" = "$l_expl" ] && [ "$s_expl" -ge 4 ] \
+  || fail "the explanation lines differ with the path width ($s_expl vs $l_expl)"
+grep -q '/mnt/some/much/longer/data = protected tier' <<< "$long" \
+  || fail "a long data root does not render: $long"
+echo "  same explanation at any root width ($s_expl lines)"
+
 echo "PASS: storage topology smoke test"
