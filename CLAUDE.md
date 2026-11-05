@@ -5263,6 +5263,74 @@ line-at-a-time trap again, in a test rather than in an audit.
 
 ---
 
+**ALL FIVE SERVICES NOW CAPTURE `consistent`, AND THE WHOLE SET RECONSTRUCTS IN
+A FRESH ENVIRONMENT.** Measured 2026-11-05 by
+`operator/rehearsals/five-service-fresh-environment-recovery.sh`:
+
+```
+navidrome    consistent  1 item    pack  461,112 B
+calibre-web  consistent  4 items   pack  153,832 B
+kavita       consistent  3 items   pack  205,048 B
+jellyfin     consistent  7 items   pack  502,072 B
+plex         consistent  3 items   pack  758,136 B
+```
+
+jellyfin and kavita reaching `consistent` is the helper path on their real
+images -- those are the two that could previously only be `unproven` without
+downtime.
+
+Then, with **every source destroyed and asserted gone**, the only remaining
+inputs were 5 packs, 5 `.sha256` files and one identity. All five verified
+without decrypting, all five unpacked and restored with every digest and mode
+re-checked, and the credentials and identities were confirmed present:
+
+```
+calibre-web Fernet key         44 bytes, mode 600
+kavita JWT TokenKey           645 bytes, mode 644
+jellyfin DataProtection-Keys   dir,      mode 755
+jellyfin device identity       35 bytes, mode 644
+plex server token             320 bytes, mode 600
+```
+
+navidrome then started on state that came out of an encrypted pack --
+`Navidrome server is ready!` in 676.3 ms. Production untouched: 11 containers
+before and after, all five container ids unchanged.
+
+**The first run FAILED, and it failed in the right direction.** Step 3 refused
+to call the environment fresh while a source directory still existed, rather
+than restoring next to the originals and reporting success -- which is what
+makes the independence claim mean anything. The cause was mine: **kavita's
+image ignores `PUID`/`PGID`** and runs as root, so its tree is root-owned and
+`rm -rf` from the development account cannot remove it. The fix is the one the
+Jellyfin rehearsal already taught -- remove it through a disposable container,
+the same tool that created it. **`PUID`/`PGID` is a linuxserver.io convention,
+not a Docker one**, and assuming every image honours it is what left 39
+root-owned files behind once before.
+
+**WHAT THIS STILL DOES NOT PROVE, and the rehearsal says so in its own
+output:** that the OPERATOR's key opens a pack (this used a disposable one),
+that any pack exists anywhere but this SSD (none has been transferred), or that
+any service SERVES its library. **So the five applications still do not have
+off-site protection.** What exists is a set of artefacts, proven reconstructible
+from nothing but themselves and a key.
+
+---
+
+**A BACKTICK IN `gh pr merge -b "…"` EXECUTED AND DELETED A WORD FROM `main`.**
+The body contained `` `unproven` `` inside double quotes, so the shell ran it
+and the merge commit reads *"THE AUDIT FINDING.  had quietly acquired a second
+meaning"*. It cannot be amended -- force-pushing `main` is forbidden -- and the
+content survives in the PR body and in this file, so nothing was lost but the
+record on `main` is garbled.
+
+This file already records this defect family in a `--help` heredoc, in a `fail`
+message and in a `sect` title. **`gh pr merge -b` and `gh pr create --body` are
+the same surface**, and the fix is the one the commit messages already use: a
+quoted heredoc (`--body-file -` with `<<'BODY'`), never a double-quoted inline
+argument.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
