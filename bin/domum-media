@@ -9404,6 +9404,9 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
   : > "$manifest" || return 1
   chmod 0600 "$manifest" 2>/dev/null || true
 
+  local cap_helper
+  cap_helper="$(sqlite_helper_image 2>/dev/null || true)"
+
   {
     printf 'SCHEMA_VERSION=2\n'
     printf 'SERVICE=%s\n' "$service"
@@ -9411,6 +9414,18 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
     printf 'STATE_ROOT=%s\n' "$root"
     printf 'CAPTURE_MODE=%s\n' "$mode"
     printf 'IMAGE_ID=%s\n' "${img:-unknown}"
+    # WHICH sqlite3 was available, recorded so the evidence states it rather
+    # than leaving it to be inferred from the mode.
+    #
+    # `unproven` had exactly one meaning before the helper existed -- no
+    # sqlite3 anywhere. It now has two, and they call for different actions:
+    # the service genuinely has none and none is reachable, versus a helper
+    # image exists on this host and was not found. Auditing the jellyfin and
+    # kavita evidence is what surfaced it -- the mode degrades silently, and
+    # an operator reading `unproven` could not tell which case they were in.
+    printf 'SQLITE_IN_IMAGE=%s\n' \
+      "$(service_sqlite_binary "$service" >/dev/null 2>&1 && echo yes || echo no)"
+    printf 'SQLITE_HELPER=%s\n' "${cap_helper:-none}"
   } >> "$manifest"
 
   local kind rel src out sz sum itemmode fmode
@@ -9497,6 +9512,19 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
     printf 'RESULT=COMPLETE\n' >> "$manifest"
   fi
   printf 'ITEMS=%s\n' "$items" >> "$manifest"
+  if [[ "$mode" == "unproven" ]]; then
+    if [[ -n "$cap_helper" ]]; then
+      # A consistent capture was POSSIBLE and was not taken. That is a defect,
+      # not a limitation, so it is a warning rather than a note.
+      warn "$service was captured UNPROVEN although a helper sqlite3 is available
+  (${cap_helper:7:12}). A consistent capture was possible and was not taken."
+    else
+      echo "[domum-media] capture mode UNPROVEN: $service ships no sqlite3, and no"
+      echo "              other running service's image offers one either. A"
+      echo "              consistent capture needs one of navidrome, calibre-web"
+      echo "              or uptime-kuma running, or SQLITE_HELPER_IMAGE set."
+    fi
+  fi
   return "$rc"
 }
 
@@ -10679,6 +10707,64 @@ service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
   echo "              pack is only as recoverable as the operator's private key."
   echo "[domum-media] Nothing was transmitted. No backup target was touched."
   return 0
+}
+
+# Is a pack intact, and does it even look like a pack?
+#
+# This is the ONLY claim this host can make about a production pack, and the
+# command says so: it holds the public key, so it cannot decrypt what it wrote.
+# Three claims are kept apart deliberately --
+#
+#   verify-pack    the FILE matches its recorded sha256, and carries age's
+#                  header. It does NOT prove the pack decrypts, and says
+#                  nothing about what is inside it.
+#   unpack-state   it DECRYPTS with a given identity, and holds a manifest.
+#   restore-state  the capture inside it RESTORES.
+#
+# -- because collapsing them is how "the backup is verified" comes to mean
+# "a file exists". The same distinction `verify-archive` already makes for a
+# docker save archive.
+service_state_pack_verify() {  # $1 = pack .tar.age
+  local pack="$1" want got hdr rc=0
+  [[ -n "$pack" && -s "$pack" ]] || { warn "no such pack: $pack"; return 1; }
+  echo "pack          : $pack"
+  echo "size          : $(stat -c %s "$pack" 2>/dev/null || echo unknown) bytes"
+  echo "mode          : $(stat -c %a "$pack" 2>/dev/null || echo unknown)"
+
+  # age's header is the first line of the file. Reading 64 bytes is enough and
+  # cannot be confused with decrypting it.
+  hdr="$(head -c 64 "$pack" 2>/dev/null || true)"
+  if grep -q 'age-encryption.org' <<< "$hdr"; then
+    echo "format        : age-encrypted"
+  else
+    echo "format        : NOT RECOGNISED -- this does not carry age's header, so"
+    echo "                it is either not a pack or not encrypted"
+    rc=1
+  fi
+
+  if [[ -s "$pack.sha256" ]]; then
+    want="$(sed -n '1p' "$pack.sha256")"
+    got="$(sha256_of_file "$pack")"
+    if [[ "$want" == "$got" ]]; then
+      echo "file integrity: VERIFIED (${got:0:16}...)"
+    else
+      echo "file integrity: MISMATCH"
+      echo "                recorded: $want"
+      echo "                on disk : $got"
+      rc=1
+    fi
+  else
+    # Not a pass. A pack with no recorded checksum cannot be shown intact, and
+    # saying "verified" for it would be the weaker claim in the stronger
+    # claim's words.
+    echo "file integrity: UNKNOWN -- no .sha256 beside the pack"
+    rc=2
+  fi
+
+  echo "what this does NOT prove: that the pack DECRYPTS, or what is inside it."
+  echo "              This host holds only the public key. Proving a pack opens"
+  echo "              needs the operator's private key, off this host."
+  return "$rc"
 }
 
 # Unpack an encrypted state pack, with an identity file, into a scratch dir.
@@ -12660,6 +12746,13 @@ storage_cmd() {
       # operator decision.
       load_cfg
       service_state_pack "${1:-}" "${2:-}" ;;
+    verify-pack)
+      shift
+      # Read-only, and the only claim this host can make about a production
+      # pack: the FILE is intact and carries age's header. Exit 0 verified,
+      # 1 not a pack or a checksum mismatch, 2 no checksum recorded.
+      load_cfg
+      service_state_pack_verify "${1:-}" ;;
     unpack-state)
       shift
       # Decrypt a pack into a scratch directory, with an identity file the
@@ -12711,7 +12804,7 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|unpack-state <pack> <identity> <dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>}" ;;
   esac
 }
 

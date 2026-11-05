@@ -5203,6 +5203,66 @@ question and the answer is still no.
 
 ---
 
+**AUDITING MY OWN HELPER EVIDENCE FOUND THAT `unproven` HAD QUIETLY ACQUIRED A
+SECOND MEANING.** Before the helper existed it meant exactly one thing: no
+sqlite3 anywhere. It now means two, and they call for different actions -- the
+service genuinely has none and none is reachable, versus **a helper exists on
+this host and was not found**. The mode degraded SILENTLY, so an operator
+reading `unproven` could not tell which case they were in. That is the
+three-state discipline this file applies everywhere else, missing from the
+newest code.
+
+Measured on this host: `sqlite_helper_image` **does not resolve
+unprivileged**, because `tracked_service_container_id_any` is
+`compose_cmd ps -qa` and that needs the compose environment -- so jellyfin and
+kavita report `unproven` here and nothing said why.
+
+**AND THE REHEARSAL PROVED THE MECHANISM, NOT THE RESOLVER.** It set
+`SQLITE_HELPER_IMAGE` explicitly. So "jellyfin and kavita are consistent" is
+established for the `.backup`-through-a-helper path and NOT for the discovery
+that selects the helper in production, which needs root and is the same
+`compose_cmd` path every other capture already depends on. Stated rather than
+assumed, because the difference decides whether the feature works where it
+counts.
+
+The capture now records `SQLITE_IN_IMAGE` and `SQLITE_HELPER` in the manifest
+and says which case it is in. **An unproven capture WITH a helper available is
+a WARNING, not a note** -- a consistent capture was possible and was not taken,
+which is a defect rather than a limitation.
+
+**`storage verify-pack` is the ONLY claim this host can make about a production
+pack**, and it says so: the FILE matches its recorded sha256 and carries age's
+header. Four states, driven -- verified `0`, **UNKNOWN with no recorded
+checksum `2`**, MISMATCH `1`, not-a-pack `1` -- and the last reports file
+integrity SEPARATELY, because "intact" and "is a pack" are independent claims.
+A missing checksum is deliberately not a pass; the mutation that makes it one
+must bring the false verdict back.
+
+**`docs/OFFSITE-STATE-BACKUP-DESIGN.md` opens by stating what is NOT proven**,
+because off-site protection is the easiest claim here to overstate: the
+mechanism is proven with a **DISPOSABLE** key, no pack has left this SSD, and
+the real age key has never opened one. **The five applications do not have
+off-site protection** -- they have a tested way of producing artefacts that
+would provide it. It recommends a SEPARATE backup target rather than widening
+the immich-only cloud scope, so a coverage question keeps one unambiguous
+answer, and it says plainly that the step no work on this host can replace is
+the operator decrypting a real pack with their own key, elsewhere.
+
+**The documented-commands audit caught `verify-pack` being referenced in that
+plan before it existed.** *"A runbook command that does not exist is discovered
+during a recovery."* Implemented rather than removed from the doc -- the
+audit's whole purpose is to make that choice the easy one.
+
+**Two more anchor failures, both caught by the assertions written for them.**
+Adding `verify-pack` made an existing mutation's anchor match TWICE, because
+both functions contain `if [[ -s "$pack.sha256" ]]` -- the `matched %d times`
+assertion is what surfaced it, and the fix is an anchor unique to the function.
+And one new assertion grepped for `no other running service`, a phrase that
+STRADDLES an output line wrap, so it failed against correct output: the
+line-at-a-time trap again, in a test rather than in an audit.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
