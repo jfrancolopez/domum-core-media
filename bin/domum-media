@@ -4663,6 +4663,35 @@ service_named_volumes() {  # $1 = service
 #
 # Returns a value on stdout, so it logs nothing: `tests/captured-stdout-purity-smoke.sh`
 # exists because a progress line once became part of a caller's captured value.
+# Is a PATH inside an enabled backup target's scope? Asked, never inferred.
+#
+# Every scope resolver lives in the backup CLI, so this one cannot answer
+# locally without a second copy of the resolver. `storage archives` used to
+# infer it from $DOMUM_DATA_ROOT and printed `off-host copy: yes` for a file
+# the running target's scope does not include.
+#
+# The reply must PARSE and must carry a verdict this code has been taught. An
+# installed binary that predates `backup-scope` dies with a usage error, and
+# reading that as "in scope" or as "not in scope" would both be worse than
+# saying the question could not be asked -- the same reason
+# `checkup_recovery_pack_offhost` requires JSON rather than an exit status.
+backup_scope_of_path() {  # $1 = path -> "verdict targets"
+  local path="$1" cli out json verdict targets
+  cli="$(backup_cli_path 2>/dev/null || true)"
+  [[ -n "$cli" && -x "$cli" ]] || { printf 'could-not-ask '; return 0; }
+  out="$("$cli" backup-scope "$path" --json 2>/dev/null || true)"
+  # No pipe: `| head -1` here could take SIGPIPE under pipefail, and this
+  # function's answer decides whether a protection claim is printed.
+  json="$(sed -n '/^{/{p;q;}' <<< "$out" || true)"
+  [[ -n "$json" ]] || { printf 'could-not-ask '; return 0; }
+  verdict="$(jq -r '.verdict // empty' <<< "$json" 2>/dev/null || true)"
+  targets="$(jq -r '.in_scope // empty' <<< "$json" 2>/dev/null || true)"
+  case "$verdict" in
+    in-scope|not-in-scope|unknown) printf '%s %s' "$verdict" "$targets" ;;
+    *) printf 'could-not-ask ' ;;
+  esac
+}
+
 first_error_line() {  # $1 = a file holding captured stderr
   local line=""
   [[ -r "${1:-}" ]] \
@@ -12045,12 +12074,23 @@ storage_archives() {
       fi
       # Is it off-host yet?
       #
-      # Inferred from timestamps, NOT by querying restic: that needs the
-      # repository password, and a read-only inventory must not need secrets to
-      # answer a question about scheduling. The inference is sound because the
+      # Two questions, and this used to answer only the second while printing
+      # the first's conclusion. It said the inference was "sound because the
       # archive lives under $DOMUM_DATA_ROOT, which the backup includes and no
-      # exclude pattern covers -- so the only question is whether a successful
-      # run has happened SINCE the file appeared.
+      # exclude pattern covers" -- true of the GLOBAL include set and false of
+      # the target that runs. The cloud target's scope is three immich/pack
+      # roots, so NO scheduled run copies this directory off this host, and
+      # `off-host copy: yes` was printed directly beneath "this archive is the
+      # only copy". Measured by reading the installed binary: the claim is
+      # live in production.
+      #
+      # So SCOPE is asked of the CLI that owns the resolvers, and recency is
+      # only consulted where it can mean anything -- for a path no target
+      # covers, no run will ever change the answer.
+      #
+      # Still no restic call: scope is configuration and recency is the
+      # recorded per-target run evidence. A read-only inventory must not need
+      # the repository password.
       #
       # It matters: the first Plex archive was created at 08:15 while the night's
       # backup had run at 02:36, so for most of a day the only copies of that
@@ -12068,17 +12108,43 @@ storage_archives() {
       # and `date -d @202610080237270400` fails, which is why that line printed
       # with the timestamp missing. A check that cannot produce its alarming
       # answer is not a check.
-      local arch_mtime backup_at
+      local arch_mtime scope scope_verdict scope_targets run_row run_at t collected
       arch_mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
-      backup_at="$(backup_last_success_epoch || true)"
-      if [[ -z "$backup_at" ]]; then
-        echo "  off-host copy   : UNKNOWN -- no readable successful-backup marker to compare against"
-      elif (( backup_at > arch_mtime )); then
-        echo "  off-host copy   : yes -- a backup succeeded $(date -d "@$backup_at" '+%Y-%m-%d %H:%M') after this file appeared"
-      else
-        echo "  off-host copy   : NOT YET -- last successful backup $(date -d "@$backup_at" '+%Y-%m-%d %H:%M') predates this file."
-        echo "                    Both copies are on this host until the next scheduled run."
-      fi
+      scope="$(backup_scope_of_path "$f")"
+      scope_verdict="${scope%% *}"
+      scope_targets="${scope#* }"
+      case "$scope_verdict" in
+        not-in-scope)
+          echo "  off-host copy   : NO -- no enabled backup target's scope includes this path."
+          echo "                    No scheduled run will copy it off this host, so this file"
+          echo "                    and the local image object are both on one device." ;;
+        unknown)
+          echo "  off-host copy   : UNKNOWN -- backup scope could not be resolved for this path."
+          echo "                    An unread setting is not a setting of 'no'." ;;
+        could-not-ask)
+          echo "  off-host copy   : UNKNOWN -- the backup CLI could not be asked about backup"
+          echo "                    scope (it may predate 'backup-scope'). Not evidence either way." ;;
+        in-scope)
+          # Recency means something only now that scope is established, and it
+          # is read per TARGET: the aggregate heartbeat would let a success of
+          # some other target vouch for this one.
+          collected=0
+          for t in $scope_targets; do
+            if run_row="$(backup_run_last_success "$t" 2>/dev/null)"; then
+              run_at="${run_row##* }"
+              if (( run_at > arch_mtime )); then
+                echo "  off-host copy   : yes -- $t succeeded $(date -d "@$run_at" '+%Y-%m-%d %H:%M') after this file appeared"
+                collected=1
+                break
+              fi
+            fi
+          done
+          if (( collected == 0 )); then
+            echo "  off-host copy   : NOT YET -- in scope of $scope_targets, but no successful run"
+            echo "                    of those targets is recorded since this file appeared."
+            echo "                    Both copies are on this host until the next scheduled run."
+          fi ;;
+      esac
       echo "  safe to delete  : NO"
     else
       orphans=$(( orphans + 1 ))

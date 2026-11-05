@@ -5621,6 +5621,122 @@ the suite next door.
 
 ---
 
+**`storage archives` TOLD THE OPERATOR AN IMAGE ARCHIVE HAD AN OFF-HOST COPY
+WHEN NO ENABLED TARGET'S SCOPE INCLUDES IT -- and the claim is live in the
+installed binary.** Found 2026-11-05 by asking what reports on the archives,
+after the capability sweep showed how much of this subsystem nothing could ask
+about.
+
+The function justified itself in a comment:
+
+> *"The inference is sound because the archive lives under `$DOMUM_DATA_ROOT`,
+> which the backup includes and no exclude pattern covers -- so the only
+> question is whether a successful run has happened SINCE the file appeared."*
+
+That is the **same false claim** this file already records correcting in
+`image_archive_dir`'s comment: true of the GLOBAL `BACKUP_INCLUDE_PATHS` and
+false of the target that actually runs. The cloud target's scope is
+`immich_only_include_paths` -- three roots, `immich/library`,
+`immich/backup-staging` and the recovery pack -- and
+`/srv/data/backups/images` is not among them. The difference is that in
+`image_archive_dir` it was only a comment; here it drove a **verdict**, and the
+two lines printed together:
+
+```
+local object    : ABSENT -- this archive is the only copy
+off-host copy   : yes -- a backup succeeded 2026-11-05 02:36 after this file appeared
+```
+
+"The only copy is gone, but it is safe off-site", about a file no scheduled run
+will ever read. The archives are the thing this matters most for: a recovery
+point is service + state + the application that wrote it, two running images
+are still dangling with no registry reference, and the `docker save` archive is
+the only PROVEN copy of the application half for all seven.
+
+**Verified live in production, and the method matters because sudo is
+unobtainable here.** Read out of the installed `a63ad19` binaries: that
+`storage_archives` carries the claim and computes it from
+`backup_last_success_epoch` with no scope check, and that
+`immich_only_include_paths` excludes the directory. Driving the real function
+against a fixture reproduced the two lines above. **Not claimed: that the
+installed command was run** -- `storage archives` needs root. The fixture
+establishes the code path; the installed text and the cloud scope establish
+that the same path is what production runs.
+
+**The structural cause is the one the capability gap had.** Measured: every
+scope resolver -- `dr_path_configured`, `dr_target_roots`,
+`backup_target_include_paths`, `backup_exclude_patterns`,
+`immich_only_include_paths` -- exists **only** in `bin/domum-media-backup`, and
+`bin/domum-media` has none of them. So `storage_archives` could not ask, and
+inferred instead. The fix is this file's own rule: **if a script needs a fact,
+give the CLI a way to state it.**
+
+**`domum-media-backup backup-scope <path> [--json]`** answers SCOPE and
+deliberately nothing else: `0` in an enabled target's scope, `1` no enabled
+target covers it, `2` not answerable. Recency stays with `bin/domum-media`,
+which already owns `backup_run_last_success` -- two facts, two owners, rather
+than one command guessing at both, which is how the defect started.
+
+Rules it follows, each already recorded:
+
+- **three states, and the order of the tests matters.** "No enabled target
+  covers it" is a finding; "a target's scope could not be resolved" is a
+  different one and must never be reported as the first.
+  `dr_path_configured` grew a third return code for precisely this. **No
+  enabled target at all is UNKNOWN too** -- `not-in-scope` derived from an
+  empty list is a finding manufactured from nothing;
+- **the caller requires the JSON and a verdict it has been taught.** An
+  installed binary predating `backup-scope` exits non-zero with a usage error,
+  and reading that as either verdict is worse than saying the question could
+  not be asked -- the same reason `checkup_recovery_pack_offhost` requires
+  JSON. `could-not-ask` prints UNKNOWN;
+- **recency is read PER TARGET.** The aggregate heartbeat
+  (`backup_last_success_epoch`) is target-agnostic, so a successful run of a
+  target that does not cover the path would have vouched for it. The test
+  asserts the aggregate parser is no longer used here;
+- **configuration only**: no restic, docker, curl, ssh or sftp in
+  `do_backup_scope`, asserted. Scope is configuration and recency is recorded
+  evidence, so the honest answer never needs the repository password -- which
+  was the one true half of the original comment.
+
+**THE EXISTING TEST REQUIRED THE DEFECT, and its own comment carried the false
+premise.** `pre-upgrade-point-smoke` section 13b(a) demanded that a backup
+newer than the archive print `yes`, and section 13's prose repeated *"Sound
+because the archive lives under `$DOMUM_DATA_ROOT`"*. This is the recorded
+"a test can assert a defect" pattern, with the recorded shape of its reasoning:
+*"a read-only inventory must not need the repository password"* is **true**, and
+the conclusion -- infer from the timestamp -- does not follow. Before adapting a
+test to a change, ask which of the two is wrong; here it was the test, in six
+assertions. The valuable half was kept: no restic call, the `yes` answer must
+still name WHEN, and the one-parser rule now points at the per-target reader.
+
+**The mutation had to be made faithful before it proved anything.** Forcing
+only the verdict to `in-scope` left the target list empty, so the loop found no
+target and fell through to `NOT YET` -- the mutant looked safe for the wrong
+reason. Forcing the target list too reproduces the real defect, and case (a) --
+a path no enabled target covers -- reports `yes` again.
+
+**Eleventh instance of `cmd | grep -q` under pipefail, in an assertion I wrote
+minutes after reading about the family.** `sed -n '/^{/{p;q;}' <<< "$o" | grep
+-q .` in the "without `--json` it prints no JSON" section: `grep -q` exits at
+the first match, `sed` takes SIGPIPE, the pipeline reports 141, so a JSON line
+that WAS present would have read as absent and the assertion could never fire.
+`tests/pipefail-grep-audit.py` found it in seconds. Write the capture-first form
+the first time.
+
+**And shellcheck caught `[[ "$run_row" != done ]]`** -- SC1010, `done` being a
+keyword. The sentinel was clumsy regardless; it is a `collected=0/1` flag now.
+§9 promises shellcheck reports these in seconds and it did.
+
+**One self-inflicted splice: I inserted the new `--help` entry between
+`pack-offhost` and its own description**, so `pack-offhost` rendered as a bare
+line and the following text described `backup-scope`. Same shape as a comment
+between a warning and its remedy pushing the remedy out of the pairing window:
+to add an entry to a two-column usage block, skip the whole indented
+description first.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

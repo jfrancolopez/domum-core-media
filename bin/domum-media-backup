@@ -2908,6 +2908,101 @@ dr_remaining_risks() {  # $1 = target, $2 = library root, $3 = live population
 # With no target the in-set component asks the aggregate question, because the
 # pack needs to be in SOME set rather than in every one -- reporting per target
 # would alarm about `nas` for a pack sitting safely in `cloud`.
+# Which ENABLED backup target's scope includes a PATH?
+#
+# This is the one question `storage archives` could not answer, and it inferred
+# it wrongly: it printed `off-host copy: yes` for a file under
+# /srv/data/backups/images whenever any nightly backup had run since the file
+# appeared, justified in a comment by the archive living under
+# $DOMUM_DATA_ROOT "which the backup includes and no exclude pattern covers".
+# That is true of the GLOBAL include set and false of the target that actually
+# runs -- the cloud target's scope is three immich/pack roots. It is the same
+# false claim this project already corrected in `image_archive_dir`'s comment,
+# except it reached the operator as a VERDICT, printed directly beneath
+# "this archive is the only copy".
+#
+# Every scope resolver lives in THIS CLI, so the other one cannot answer
+# locally without a second copy of the resolver. Giving it a way to ASK is the
+# rule: if a script needs a fact, give the CLI a way to state it.
+#
+# SCOPE ONLY, deliberately. Whether a covered path has actually been collected
+# yet is a question about run recency, and `bin/domum-media` already owns the
+# per-target run evidence (`backup_run_last_success`). Two facts, two owners --
+# rather than one command guessing at both, which is how this defect started.
+#
+# Reads configuration only: no restic, no docker, no network. A report must do
+# no recovery work, and an inventory must not need the repository password to
+# answer a question about scheduling.
+do_backup_scope() {
+  local path="" json=0 a
+  while [[ $# -gt 0 ]]; do
+    a="$1"; shift
+    case "$a" in
+      --json) json=1 ;;
+      --*)    die "Unknown option for backup-scope: $a" ;;
+      *)      [[ -z "$path" ]] || die "backup-scope takes one path"
+              path="$a" ;;
+    esac
+  done
+  [[ -n "$path" ]] || die "Usage: domum-media-backup backup-scope <path> [--json]"
+
+  local target rc verdict any=0 unknown=0
+  local -a in_scope=() out_scope=() unresolved=()
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    any=1
+    dr_path_configured "$path" "$target"; rc=$?
+    case "$rc" in
+      0) in_scope+=("$target") ;;
+      2) unresolved+=("$target"); unknown=1 ;;
+      *) out_scope+=("$target") ;;
+    esac
+  done < <(enabled_backup_targets 2>/dev/null || true)
+
+  # Three states, and the order matters. "No enabled target covers it" is a
+  # finding; "I could not resolve a target's scope" is not the same finding and
+  # must never be reported as one -- the distinction `dr_path_configured` grew a
+  # third return code for.
+  if (( ${#in_scope[@]} > 0 )); then
+    verdict=in-scope
+  elif (( any == 0 )) || (( unknown == 1 )); then
+    verdict=unknown
+  else
+    verdict=not-in-scope
+  fi
+
+  # The JSON goes FIRST, so it is the first line beginning with `{` and a
+  # caller can extract it without a pipe that could short-circuit.
+  if (( json == 1 )); then
+    printf '{"path":"%s","verdict":"%s","in_scope":"%s","not_in_scope":"%s","unresolved":"%s"}\n' \
+      "$path" "$verdict" "${in_scope[*]:-}" "${out_scope[*]:-}" "${unresolved[*]:-}"
+  fi
+
+  echo "path            : $path"
+  case "$verdict" in
+    in-scope)
+      echo "verdict         : IN SCOPE of ${in_scope[*]}"
+      echo "                  Being in scope is not the same as having been collected;"
+      echo "                  that is a question about run recency, not configuration." ;;
+    not-in-scope)
+      echo "verdict         : NOT IN SCOPE of any enabled target (${out_scope[*]})"
+      echo "                  No scheduled run will ever copy this path off this host." ;;
+    *)
+      if (( any == 0 )); then
+        echo "verdict         : UNKNOWN -- no enabled backup target could be determined"
+      else
+        echo "verdict         : UNKNOWN -- scope unresolvable for ${unresolved[*]}"
+      fi
+      echo "                  An unread setting is not a setting of 'no'." ;;
+  esac
+
+  case "$verdict" in
+    in-scope)     return 0 ;;
+    not-in-scope) return 1 ;;
+    *)            return 2 ;;
+  esac
+}
+
 do_pack_offhost() {
   local json=0 target="" a t
   for a in "$@"; do
@@ -5099,6 +5194,7 @@ main() {
     immich-phase-b)       shift; do_immich_phase_a "$1" --serve "${@:2}" ;;
     dr-offhost-audit)     shift; do_dr_offhost_audit "$@" ;;
     pack-offhost)         shift; do_pack_offhost "$@" ;;
+    backup-scope)         shift; do_backup_scope "$@" ;;
     dr-status)            do_dr_status ;;
     -h|--help)
       cat <<EOF
@@ -5213,6 +5309,13 @@ Usage:
                                             restic, no network. Exit 0 a pack
                                             is delivered off-host, 1 none or
                                             CIRCULAR, 2 not answerable
+  domum-media-backup backup-scope <path> [--json]
+                                            Is PATH inside an enabled
+                                            backup target's scope? 0 in
+                                            scope, 1 no enabled target
+                                            covers it, 2 not answerable.
+                                            Scope only -- being in scope
+                                            is not proof it was collected
   domum-media-backup dr-offhost-audit [--probe] [--json]
                                             Could a NEW machine rebuild from
                                             Hetzner if this one were destroyed?
