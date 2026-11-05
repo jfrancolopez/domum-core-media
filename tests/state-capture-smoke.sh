@@ -1599,4 +1599,211 @@ grep -q '^SQLITE_IN_IMAGE=yes$' "$TMP/out/cap-insitu/MANIFEST" \
 grep -q 'capture mode UNPROVEN' <<< "$out" && fail "a consistent capture reported UNPROVEN: $out"
 echo "  SQLITE_IN_IMAGE=yes, and no unproven notice"
 
+# ---------------------------------------------------------------------------
+# The manifest records its own schema, completeness and item count. Nothing
+# read any of the three, so `service_state_verify` -- the single gate that
+# `restore-state` and `pack-state` both consult -- answered only from the ITEM
+# lines, and could not tell "every declared item verified" from "every item
+# still LISTED verified".
+sect "a WHOLE capture verifies, and says what the denominator was"
+build_jellyfin
+rm -rf "$TMP/out/vf-ok"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-ok'" >/dev/null 2>&1
+out="$(probe '' "service_state_verify '$TMP/out/vf-ok'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "an intact capture failed to verify: $out"
+# The denominator is stated: "7 item(s) match" cannot be falsified without
+# knowing how many there should have been.
+grep -qE 'capture verified: 7 of 7 item' <<< "$out" \
+  || fail "the clean verdict does not state its denominator: $out"
+echo "  7 of 7, rc=0"
+
+sect "a TRUNCATED manifest is refused -- the tail is where RESULT and ITEMS live"
+# Reproduced against the real writer before this was fixed: dropping the last
+# ITEM line plus the trailing RESULT and ITEMS lines from a 7-item jellyfin
+# capture reported "capture verified: 6 item(s)" and exit 0. The item dropped
+# here is device.txt, jellyfin's SERVER IDENTITY -- the artefact whose absence
+# makes a restored jellyfin a new server that every client must re-pair with.
+rm -rf "$TMP/out/vf-tr"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-tr'" >/dev/null 2>&1
+grepF_q 'device.txt' "$(cat "$TMP/out/vf-tr/MANIFEST")" \
+  || fail "the fixture capture does not contain the item this section removes"
+awk '/device\.txt/ {next} /^RESULT=|^ITEMS=/ {next} {print}' \
+  "$TMP/out/vf-tr/MANIFEST" > "$TMP/vf-tr.m"
+mv "$TMP/vf-tr.m" "$TMP/out/vf-tr/MANIFEST"
+out="$(probe '' "service_state_verify '$TMP/out/vf-tr'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a truncated manifest verified clean: $out"
+grepF_q 'TRUNCATED' "$out" || fail "the refusal does not name truncation: $out"
+# The gate is what pack and restore consult, so neither may proceed.
+out="$(probe '' "service_state_restore '$TMP/out/vf-tr' '$TMP/out/vf-tr-rst'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a restore accepted a truncated capture: $out"
+[[ -z "$(ls -A "$TMP/out/vf-tr-rst" 2>/dev/null || true)" ]] \
+  || fail "the restore wrote something from a truncated capture"
+echo "  refused, and the restore refused with it"
+
+sect "an ITEM line gone from the MIDDLE is refused by the COUNT, not by RESULT"
+# A distinct, independently reachable failure: the writer counts an item it
+# then fails to append, so RESULT=COMPLETE is written truthfully by its own
+# lights while the manifest is one line short. The RESULT check cannot see
+# this one, which is why both checks exist rather than either.
+rm -rf "$TMP/out/vf-mid"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-mid'" >/dev/null 2>&1
+grep -v 'device.txt' "$TMP/out/vf-mid/MANIFEST" > "$TMP/vf-mid.m"
+mv "$TMP/vf-mid.m" "$TMP/out/vf-mid/MANIFEST"
+grep -q '^RESULT=COMPLETE$' "$TMP/out/vf-mid/MANIFEST" \
+  || fail "this section needs RESULT=COMPLETE intact, or it tests the other check"
+out="$(probe '' "service_state_verify '$TMP/out/vf-mid'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a manifest one item line short verified clean: $out"
+grepF_q 'ITEMS=7' "$out" || fail "the refusal does not quote the recorded count: $out"
+echo "  6 lines against ITEMS=7, refused"
+
+sect "an unrecognised SCHEMA_VERSION is refused rather than parsed anyway"
+# The ITEM grammar is versioned -- schema 2 added a file item's MODE field, so
+# a schema-1 line parsed here would land its checksum in the mode column. A
+# version key nothing checks is a version gate that does not exist.
+rm -rf "$TMP/out/vf-sch"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-sch'" >/dev/null 2>&1
+sed -i 's/^SCHEMA_VERSION=2$/SCHEMA_VERSION=3/' "$TMP/out/vf-sch/MANIFEST"
+out="$(probe '' "service_state_verify '$TMP/out/vf-sch'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a manifest of an unknown schema was parsed anyway: $out"
+grepF_q 'schema is 3' "$out" || fail "the refusal does not name the schema it saw: $out"
+# An ABSENT version is not the current one either.
+rm -rf "$TMP/out/vf-sch0"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-sch0'" >/dev/null 2>&1
+sed -i '/^SCHEMA_VERSION=/d' "$TMP/out/vf-sch0/MANIFEST"
+out="$(probe '' "service_state_verify '$TMP/out/vf-sch0'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "a manifest with no schema line verified: $out"
+grepF_q 'unrecorded' "$out" || fail "an absent schema must read as unrecorded: $out"
+echo "  unknown and absent both refused"
+
+sect "RESULT=INCOMPLETE is refused by name, not merely via its bad item lines"
+rm -rf "$TMP/out/vf-inc"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-inc'" >/dev/null 2>&1
+sed -i 's/^RESULT=COMPLETE$/RESULT=INCOMPLETE/' "$TMP/out/vf-inc/MANIFEST"
+out="$(probe '' "service_state_verify '$TMP/out/vf-inc'; echo RC=\$?")"
+grep -q 'RC=1' <<< "$out" || fail "RESULT=INCOMPLETE verified clean: $out"
+grepF_q 'RESULT=INCOMPLETE' "$out" || fail "the refusal does not quote RESULT: $out"
+echo "  named explicitly"
+
+sect "the restore names the APPLICATION that wrote the state"
+# A recovery point is service + state + the application that wrote it. The
+# capture has always recorded IMAGE_ID; no reader surfaced it, so a restore
+# reported matching digests while withholding the state's provenance.
+build_calibre_web
+rm -rf "$TMP/out/vf-img" "$TMP/out/vf-img-rst"
+out="$(probe 'tracked_service_container_id_any() { printf "cid42"; }
+       docker() { case "$*" in *"{{.Image}}"*) printf "sha256:feedfacefeedface\n" ;; *) return 1 ;; esac; }' \
+  "service_state_capture calibre-web '$TMP/out/vf-img'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the capture failed: $out"
+img="$(sed -nE 's/^IMAGE_ID=(.*)$/\1/p' "$TMP/out/vf-img/MANIFEST" | head -1)"
+[[ -n "$img" && "$img" != unknown ]] || fail "the fixture recorded no image id: $img"
+out="$(probe '' "service_state_restore '$TMP/out/vf-img' '$TMP/out/vf-img-rst'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "the restore failed: $out"
+grepF_q "application that wrote this state: $img" "$out" \
+  || fail "the restore does not name the application half: $out"
+grepF_q 'half of a recovery point' "$out" \
+  && fail "an image WAS recorded, so nothing may call it half a point: $out"
+echo "  named: $img"
+
+sect "an UNRECORDED image is reported as half a recovery point, not omitted"
+rm -rf "$TMP/out/vf-noimg" "$TMP/out/vf-noimg-rst"
+probe '' "service_state_capture calibre-web '$TMP/out/vf-noimg'" >/dev/null 2>&1
+sed -i '/^IMAGE_ID=/d' "$TMP/out/vf-noimg/MANIFEST"
+out="$(probe '' "service_state_restore '$TMP/out/vf-noimg' '$TMP/out/vf-noimg-rst'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "deleting IMAGE_ID must not fail the restore: $out"
+grepF_q 'unrecorded' "$out" || fail "an absent image id must read as unrecorded: $out"
+grepF_q 'half of a recovery point' "$out" \
+  || fail "an unrecorded image must be reported as half a recovery point: $out"
+echo "  unrecorded, and said to be half a point"
+
+sect "the UNPROVEN restore states the recorded cause, never an assumed one"
+# `unproven` had one cause before the helper existed and has had two since.
+# The capture records which; the restore used to assert the first regardless.
+build_jellyfin
+rm -rf "$TMP/out/vf-up" "$TMP/out/vf-up-rst"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-up'" >/dev/null 2>&1
+grep -q '^CAPTURE_MODE=unproven$' "$TMP/out/vf-up/MANIFEST" \
+  || fail "this section needs an unproven capture: $(cat "$TMP/out/vf-up/MANIFEST")"
+# No helper recorded -- the genuine limitation.
+out="$(probe '' "service_state_restore '$TMP/out/vf-up' '$TMP/out/vf-up-rst'; echo RC=\$?")"
+grepF_q 'no helper image was' "$out" || fail "the genuine no-sqlite cause is not stated: $out"
+grepF_q 'WAS available' "$out" && fail "no helper was recorded, so none may be claimed: $out"
+# A helper recorded and the capture still unproven: a DEFECT in the capture
+# rather than a limitation of the service, and it must not borrow the
+# reassuring wording.
+rm -rf "$TMP/out/vf-up2" "$TMP/out/vf-up2-rst"
+cp -a "$TMP/out/vf-up" "$TMP/out/vf-up2"
+sed -i 's|^SQLITE_HELPER=none$|SQLITE_HELPER=sha256:deadbeefdeadbeef|' "$TMP/out/vf-up2/MANIFEST"
+out="$(probe '' "service_state_restore '$TMP/out/vf-up2' '$TMP/out/vf-up2-rst'; echo RC=\$?")"
+grepF_q 'WAS available' "$out" || fail "a recorded helper must change the stated cause: $out"
+grepF_q 'is a defect in' "$out" || fail "an avoidable unproven capture must read as a defect: $out"
+grepF_q 'no helper image was' "$out" && fail "the mutually exclusive cause is also claimed: $out"
+# An UNRECORDED fact is neither excused nor blamed.
+rm -rf "$TMP/out/vf-up3" "$TMP/out/vf-up3-rst"
+cp -a "$TMP/out/vf-up" "$TMP/out/vf-up3"
+sed -i '/^SQLITE_HELPER=/d' "$TMP/out/vf-up3/MANIFEST"
+out="$(probe '' "service_state_restore '$TMP/out/vf-up3' '$TMP/out/vf-up3-rst'; echo RC=\$?")"
+grepF_q 'not recorded by this capture' "$out" \
+  || fail "an absent SQLITE_HELPER must read as not recorded: $out"
+echo "  all three causes distinguished"
+
+sect "MUTATION: without the summary checks a truncated manifest verifies clean"
+build_jellyfin
+rm -rf "$TMP/out/vf-mut"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-mut'" >/dev/null 2>&1
+awk '/device\.txt/ {next} /^RESULT=|^ITEMS=/ {next} {print}' \
+  "$TMP/out/vf-mut/MANIFEST" > "$TMP/vf-mut.m"
+mv "$TMP/vf-mut.m" "$TMP/out/vf-mut/MANIFEST"
+cp "$CLI" "$TMP/cli.origvf"
+cat > "$TMP/mutate-vf.py" <<'PYMUTVF'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+# Neutralise the COMPARISONS. Never "&& false" inside [[ ]]: there the bare
+# word is a non-empty STRING, so the mutation applies and changes nothing.
+pairs = [
+    ('  case "$result" in\n    COMPLETE) ;;',
+     '  case "COMPLETE" in\n    COMPLETE) ;;'),
+    ('  if (( seen != declared )); then',
+     '  if (( seen != seen )); then'),
+    # The absent-count refusal fires before either of the above for this
+    # fixture, so it has to go too or the mutant is killed by the wrong check.
+    ('  if ! [[ "$declared" =~ ^[0-9]+$ ]]; then',
+     '  if ! [[ "0$declared" =~ ^[0-9]+$ ]]; then'),
+]
+for old, new in pairs:
+    assert s.count(old) == 1, "anchor %r matched %d times" % (old[:40], s.count(old))
+    s = s.replace(old, new, 1)
+io.open(p, "w", encoding="utf-8").write(s)
+PYMUTVF
+( python3 -I "$TMP/mutate-vf.py" "$CLI" ) || { cp "$TMP/cli.origvf" "$CLI"; fail "the verify mutation did not apply"; }
+mout="$(probe '' "service_state_verify '$TMP/out/vf-mut'; echo RC=\$?")"
+cp "$TMP/cli.origvf" "$CLI"
+grep -q 'RC=0' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- without the summary checks a
+truncated manifest must verify clean again: $mout"
+echo "  killed: the mutant reports a truncated capture as verified"
+
+sect "MUTATION: asserting the unproven cause brings the confident wrong cause back"
+build_jellyfin
+rm -rf "$TMP/out/vf-mut2" "$TMP/out/vf-mut2-rst"
+probe '' "service_state_capture jellyfin '$TMP/out/vf-mut2'" >/dev/null 2>&1
+sed -i 's|^SQLITE_HELPER=none$|SQLITE_HELPER=sha256:deadbeefdeadbeef|' "$TMP/out/vf-mut2/MANIFEST"
+cp "$CLI" "$TMP/cli.origvf2"
+cat > "$TMP/mutate-vf2.py" <<'PYMUTVF2'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '        case "$cap_in_image/$cap_helper" in'
+new = '        case "no/none" in'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMUTVF2
+( python3 -I "$TMP/mutate-vf2.py" "$CLI" ) || { cp "$TMP/cli.origvf2" "$CLI"; fail "the cause mutation did not apply"; }
+mout="$(probe '' "service_state_restore '$TMP/out/vf-mut2' '$TMP/out/vf-mut2-rst'; echo RC=\$?")"
+cp "$TMP/cli.origvf2" "$CLI"
+grepF_q 'no helper image was' "$mout" \
+  || fail "the mutation changed no ANSWER -- it must assert the no-sqlite cause
+for a capture that recorded a helper: $mout"
+echo "  killed: the mutant blames the service for an avoidable unproven capture"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"

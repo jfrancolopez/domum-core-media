@@ -9196,13 +9196,23 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
   [[ -n "$dir" && -n "$target" ]] || { warn "service_state_restore needs a capture directory and a target"; return 1; }
   [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
 
-  local service live rtarget rlive cap_mode
+  local service live rtarget rlive cap_mode cap_image cap_in_image cap_helper
   service="$(sed -nE "s/^SERVICE=(.*)$/\1/p" "$manifest" | head -1)"
   [[ -n "$service" ]] || { warn "the manifest does not name a service"; return 1; }
   # Read, not defaulted: a key the writer never emitted must not read as the
   # reassuring value. An old or hand-made manifest says `unrecorded`.
   cap_mode="$(sed -nE "s/^CAPTURE_MODE=(.*)$/\1/p" "$manifest" | head -1)"
   cap_mode="${cap_mode:-unrecorded}"
+  # A recovery point is service + state + THE APPLICATION THAT WROTE IT. The
+  # capture has always recorded the image id and no reader ever surfaced it, so
+  # a restore reported matching digests without naming the application half at
+  # all -- the state's provenance, recorded and then withheld.
+  cap_image="$(sed -nE "s/^IMAGE_ID=(.*)$/\1/p" "$manifest" | head -1)"
+  cap_image="${cap_image:-unrecorded}"
+  cap_in_image="$(sed -nE "s/^SQLITE_IN_IMAGE=(.*)$/\1/p" "$manifest" | head -1)"
+  cap_in_image="${cap_in_image:-unrecorded}"
+  cap_helper="$(sed -nE "s/^SQLITE_HELPER=(.*)$/\1/p" "$manifest" | head -1)"
+  cap_helper="${cap_helper:-unrecorded}"
 
   # The refusal is on resolved paths, because a symlink or a '..' would
   # otherwise walk straight into the live tree.
@@ -9324,10 +9334,25 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
         echo "[domum-media] capture mode: consistent -- each database was taken with its own"
         echo "              application's sqlite3 '.backup' and integrity-checked there." ;;
       unproven)
-        echo "[domum-media] capture mode: UNPROVEN -- $service ships no sqlite3 and this host has"
-        echo "              none, so its database was COPIED while the service could be writing."
-        echo "              The bytes restored are the bytes captured; whether they were a"
-        echo "              consistent point in time is not established." ;;
+        echo "[domum-media] capture mode: UNPROVEN -- its database was COPIED"
+        echo "              while the service could be writing. The bytes restored are"
+        echo "              the bytes captured; whether they were a consistent point in"
+        echo "              time is not established."
+        # `unproven` had one cause before the helper existed and has had two
+        # since, and they call for different actions. The capture records which
+        # case it was in; asserting the first here would be a confident wrong
+        # cause, which is the defect the recorded keys exist to prevent.
+        case "$cap_in_image/$cap_helper" in
+          unrecorded/*|*/unrecorded)
+            echo "              Cause: not recorded by this capture, so it is not stated here." ;;
+          no/none)
+            echo "              Cause: $service ships no sqlite3 and no helper image was"
+            echo "              available, so no consistent capture was possible." ;;
+          *)
+            echo "              Cause: a helper WAS available ($cap_helper), so a consistent"
+            echo "              capture was possible and was not taken. That is a defect in"
+            echo "              the capture, not a limitation of $service." ;;
+        esac ;;
       quiesced)
         echo "[domum-media] capture mode: quiesced -- the service was STOPPED and proved"
         echo "              quiescent (no open handles, no non-empty WAL, no hot journal)"
@@ -9336,10 +9361,21 @@ service_state_restore() {  # $1 = capture directory, $2 = scratch target
       *)
         echo "[domum-media] capture mode: $cap_mode -- not recorded, so consistency is unknown." ;;
     esac
+    echo "[domum-media] application that wrote this state: $cap_image"
+    if [[ "$cap_image" == unrecorded || "$cap_image" == unknown ]]; then
+      echo "              So the state restores and the application it pairs with is NOT"
+      echo "              established -- half of a recovery point."
+    fi
     echo "[domum-media] this proves the CAPTURE restores. It is not a proof that $service runs against it."
   fi
   return "$rc"
 }
+
+# The capture manifest's schema version. The ITEM line grammar is versioned --
+# schema 2 added a file item's MODE field, so a schema-1 line parsed here would
+# land its checksum in the mode column. One implementation, so the writer and
+# the verifier cannot disagree about which grammar is current.
+state_capture_schema() { printf '2'; }
 
 service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode override
   local service="$1" dest="$2" mode_override="${3:-}"
@@ -9408,7 +9444,7 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
   cap_helper="$(sqlite_helper_image 2>/dev/null || true)"
 
   {
-    printf 'SCHEMA_VERSION=2\n'
+    printf 'SCHEMA_VERSION=%s\n' "$(state_capture_schema)"
     printf 'SERVICE=%s\n' "$service"
     printf 'CAPTURED_AT=%s\n' "$(date -Iseconds)"
     printf 'STATE_ROOT=%s\n' "$root"
@@ -9535,6 +9571,54 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
 service_state_verify() {  # $1 = capture directory
   local dir="$1" manifest="$1/MANIFEST" line kind rel itemmode sz fmode sum out now nowmode rc=0 ok=0 bad=0
   [[ -f "$manifest" ]] || { warn "no manifest at $manifest"; return 1; }
+
+  # The manifest records its own schema, completeness and item count, and a
+  # verifier that answers only from the ITEM lines cannot tell "every declared
+  # item verified" from "every item still LISTED verified". Measured: dropping
+  # one ITEM line plus the trailing RESULT and ITEMS lines from a 7-item
+  # jellyfin capture -- the dropped item being device.txt, the server identity
+  # -- still reported `capture verified: 6 item(s)` and exit 0. This function
+  # is the single gate `restore-state` and `pack-state` both consult, so that
+  # clean verdict is what would let a truncated capture be encrypted, verified
+  # and restored as though it were whole.
+  #
+  # Fixed at the reader end as well as the writer end, deliberately: the writer
+  # has always recorded both facts.
+  local schema declared result seen
+  schema="$(sed -nE 's/^SCHEMA_VERSION=(.*)$/\1/p' "$manifest" | head -1)"
+  if [[ "$schema" != "$(state_capture_schema)" ]]; then
+    warn "capture schema is ${schema:-unrecorded}, not $(state_capture_schema). The ITEM line"
+    warn "grammar is versioned, so this manifest cannot be parsed safely here."
+    return 1
+  fi
+
+  # RESULT and ITEMS are written LAST, so their absence is the signature of a
+  # write that was cut short.
+  result="$(sed -nE 's/^RESULT=(.*)$/\1/p' "$manifest" | head -1)"
+  case "$result" in
+    COMPLETE) ;;
+    INCOMPLETE)
+      warn "the capture records RESULT=INCOMPLETE -- a declared item is missing."
+      warn "A partial capture is not a backup. See $manifest."
+      return 1 ;;
+    "")
+      warn "the manifest has no RESULT line. It is written last, so this manifest is"
+      warn "TRUNCATED: the capture did not finish, and the items it still lists are"
+      warn "not evidence that the rest were ever written."
+      return 1 ;;
+    *)
+      warn "the manifest records an unrecognised RESULT=$result, so completeness is"
+      warn "not established."
+      return 1 ;;
+  esac
+
+  declared="$(sed -nE 's/^ITEMS=(.*)$/\1/p' "$manifest" | head -1)"
+  if ! [[ "$declared" =~ ^[0-9]+$ ]]; then
+    warn "the manifest records no usable ITEMS count (${declared:-absent}), so the item"
+    warn "lines present cannot be compared against the number captured."
+    return 1
+  fi
+
   while IFS= read -r line; do
     [[ "$line" == ITEM=* ]] || continue
     IFS='|' read -r kind rel itemmode sz fmode sum <<< "${line#ITEM=}"
@@ -9559,11 +9643,25 @@ service_state_verify() {  # $1 = capture directory
     fi
     ok=$(( ok + 1 ))
   done < "$manifest"
+
+  # Exactly one of ok/bad is incremented per ITEM line, so this is the number
+  # of item lines the manifest actually carries. It catches damage the RESULT
+  # check cannot: an append that failed silently mid-capture still leaves
+  # RESULT=COMPLETE, because the writer's own counter counted the item it did
+  # not manage to write.
+  seen=$(( ok + bad ))
+  if (( seen != declared )); then
+    warn "the manifest lists $seen item line(s) but records ITEMS=$declared."
+    warn "Items are missing from the manifest itself, so this capture cannot be"
+    warn "shown to be complete whatever the listed items verify as."
+    rc=1
+  fi
+
   if (( bad > 0 )); then
     warn "capture verification FAILED: $ok intact, $bad not"
     rc=1
-  else
-    echo "[domum-media] capture verified: $ok item(s) match their recorded digests"
+  elif (( rc == 0 )); then
+    echo "[domum-media] capture verified: $ok of $declared item(s) match their recorded digests"
   fi
   return "$rc"
 }

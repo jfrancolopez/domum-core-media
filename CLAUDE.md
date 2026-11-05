@@ -5366,6 +5366,99 @@ direction (the quiesced capture, the archive cost) and right here.
 
 ---
 
+**THE CAPTURE MANIFEST RECORDED ITS OWN COMPLETENESS AND THE VERIFIER IGNORED
+IT, so a TRUNCATED capture verified clean.** Found 2026-11-05 by comparing the
+manifest keys the writer emits against the keys anything reads -- the
+"metadata key" family, in the direction this project had not swept. Of nine
+scalar keys, **two** were ever read back (`SERVICE`, `CAPTURE_MODE`).
+
+Measured against the real writer, a 7-item jellyfin capture with the last ITEM
+line and the trailing `RESULT`/`ITEMS` lines removed:
+
+```
+intact      7 ITEM lines, RESULT=COMPLETE, ITEMS=7  -> capture verified: 7 item(s)   rc=0
+truncated   6 ITEM lines, RESULT absent, ITEMS absent -> capture verified: 6 item(s)  rc=0
+```
+
+The dropped item was `config/data/data/device.txt` -- jellyfin's SERVER
+IDENTITY, declared the day before precisely because a restore without it is a
+new server every client must re-pair with. **`service_state_verify` is the
+single gate that `restore-state` and `pack-state` both consult**, so that clean
+verdict is what would let a truncated capture be encrypted, pass
+`verify-pack`, restore with every digest matching, and be reported a success.
+A safety verdict that cannot distinguish "every declared item verified" from
+"every item still LISTED verified" is not a safety verdict.
+
+**TWO checks, because they catch independently reachable failures and neither
+subsumes the other:**
+
+- **`RESULT`** catches a tail cut short -- it and `ITEMS` are written LAST, so
+  their absence is that signature. `INCOMPLETE` is now refused *by name*
+  instead of only via its bad item lines.
+- **the `ITEMS` count** catches damage `RESULT` cannot: an append that fails
+  silently mid-capture leaves `RESULT=COMPLETE` written truthfully *by the
+  writer's own lights*, because its counter counted the item it did not manage
+  to write. Driven in the suite with a MIDDLE line removed and
+  `RESULT=COMPLETE` deliberately intact, so the section cannot pass via the
+  other check.
+
+This is the fix already recorded for the Immich classification -- *"the writer
+sets `class_known=1` when nothing is missing, and the reader checks the COUNT
+before the classification"* -- applied at the end that was missing. The clean
+verdict now states its denominator (`7 of 7`), because a numerator alone cannot
+be falsified.
+
+**`SCHEMA_VERSION` was written as a literal and read by nothing, so the version
+gate did not exist.** The ITEM grammar IS versioned: schema 2 added a file
+item's MODE field, so a schema-1 line parsed by today's reader lands its
+checksum in the mode column. `state_capture_schema` is the one implementation
+now, consumed by the writer and the verifier, and an unrecognised **or absent**
+version is refused rather than parsed anyway. No v1 manifest exists -- the
+feature is not deployed -- so this is the next schema change made safe, not a
+live bug.
+
+**THE RESTORE NEVER NAMED THE APPLICATION THAT WROTE THE STATE.** `IMAGE_ID`
+was recorded from the first version of the capture and surfaced by no reader,
+so a restore reported matching digests while withholding the state's
+provenance -- against this file's single most-repeated rule, that a recovery
+point is service + state + **the application that wrote it**. It is printed
+now, and an `unrecorded` one is reported as **half of a recovery point** rather
+than omitted.
+
+**AND THE UNPROVEN RESTORE ASSERTED A CAUSE I HAD JUST FINISHED MAKING
+AMBIGUOUS.** It said *"$service ships no sqlite3 and this host has none"* --
+true when `unproven` had one meaning, and the helper path gave it two. The
+previous session recorded fixing exactly that at the capture end and added
+`SQLITE_IN_IMAGE`/`SQLITE_HELPER` to the manifest for it; the restore ignored
+both and kept the confident wrong cause, at the point an operator reads this
+during an actual recovery. Three states now: no sqlite anywhere (a limitation),
+**a helper WAS available and was not used (a defect in the capture, not a
+limitation of the service)**, and not recorded (neither excused nor blamed).
+Fixing one end of a report and not the other leaves the claim wrong in the
+place it is read.
+
+**MY REFLOWED WORDING BROKE A CORRECT ASSERTION, and the assertion was
+right.** An existing section greps for `while the service could be writing`,
+and my new text wrapped the line mid-phrase so it straddled a break. That is
+the line-at-a-time trap this file records in an audit and in a test, now in
+prose: the fix was to reflow the output so the phrase stays on one line, not to
+loosen the grep. Before adapting a test to a change, ask which of the two is
+wrong.
+
+**And my own fixture stubbed a function the capture does not call.** It
+overrode `domum_image_id_full` to plant an image id; the capture reads
+`docker inspect -f '{{.Image}}'`, so the stub did nothing and the assertion
+failed on the FIXTURE. "A stub of a function nobody calls is not a stub" --
+second recorded instance, and the suite already had a section using the right
+idiom ten screens above.
+
+`tests/state-capture-smoke.sh`, nine sections; 2 mutants, both killed --
+neutralising the summary comparisons must make a truncated manifest verify
+clean again, and asserting the unproven cause must bring back blaming the
+service for an avoidable unproven capture.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
