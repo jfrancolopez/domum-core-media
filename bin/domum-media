@@ -9270,6 +9270,45 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
   cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
   img="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
 
+  # EVERY directory on the way to the capture is 0700, not just `files/`.
+  #
+  # Measured 2026-11-04: `install -d -m 0700 "$dest/files"` applies the mode to
+  # the LEAF only. The parents it creates get install's own default of 0755 --
+  # NOT the invoking umask, which is what I first wrote: the mutation that
+  # drops `-m` returns 0755 under a umask of 0002, where a umask-derived mode
+  # would have been 0775. Either way it is not 0700. So a capture produced:
+  #
+  #   drwxr-xr-x  backups/  backups/state/  <service>/  <stamp>/
+  #   drwx------  <stamp>/files/            <- the ONLY protection
+  #   -rw-r--r--  files/config_.key         <- calibre-web's Fernet key
+  #
+  # The credential was shielded by a single directory with four
+  # world-traversable parents above it. A capture that now deliberately
+  # contains encryption keys, a JWT signing key and a server token must state
+  # its own modes rather than inherit a default from whatever created the
+  # path.
+  #
+  # The stored file keeps its SOURCE mode on purpose: the restore `cp -a`s it
+  # and then verifies the result against the mode recorded in the manifest, so
+  # normalising stored modes to 0600 would both break that check and make it
+  # circular -- it would assert a mode the restore had just set. Confidentiality
+  # belongs to the directory chain, which is also how
+  # `/srv/data/backups/images` does it.
+  #
+  # `<data>/backups` is created if absent and its mode is deliberately NOT
+  # changed: it is shared with `images/` and `volumes/`, and silently
+  # re-moding an existing production directory is not this function's business.
+  local cap_root
+  cap_root="$(state_capture_dir)"
+  [[ -d "${cap_root%/state}" ]] || install -d -- "${cap_root%/state}" || return 1
+  install -d -m 0700 -- "$cap_root" || return 1
+  local cap_walk="$cap_root" cap_part
+  while IFS= read -r cap_part; do
+    [[ -n "$cap_part" ]] || continue
+    cap_walk="$cap_walk/$cap_part"
+    install -d -m 0700 -- "$cap_walk" || return 1
+  done < <(printf '%s\n' "${dest#"$cap_root"/}" | tr '/' '\n')
+  install -d -m 0700 -- "$dest" || return 1
   install -d -m 0700 "$dest/files" || return 1
   manifest="$dest/MANIFEST"
   : > "$manifest" || return 1
