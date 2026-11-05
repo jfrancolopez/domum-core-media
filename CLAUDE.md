@@ -5035,6 +5035,20 @@ checking it rather than mounting it.
 now the fallback for a host with no helper image at all, rather than the only
 route for these two services.
 
+**`tests/reconcile-boundary-audit.py` CAUGHT THE NEW FUNCTION, and I had not
+run it.** `sqlite_backup_via_helper` contains a `docker run`, so the audit
+refused it as UNCLASSIFIED -- *"the boundary is not allowed to be implicit"* --
+and CI failed. It is `UTILITY`, the same shape as `htpasswd_hash`: a disposable
+`--rm --entrypoint` container started from an image already present, which
+touches no SERVICE container, resolves no service's image tag, and leaves the
+service whose database it reads running untouched.
+
+**The miss is the lesson, not the classification.** I ran four audits locally
+-- pipefail, find-abort, function-definition, captured-stdout-purity -- and
+reported "audits PASS", which was true of those four and not of the set. There
+are ten. Run `for f in tests/*.py` rather than a remembered list, because the
+one that matters is the one a change happens to touch.
+
 ---
 
 ## 15. Known open safety defects

@@ -82,6 +82,17 @@ DEPLOYING = {
 # project, and cannot change what is running.
 UTILITY = {
     "htpasswd_hash",          # docker run --rm --entrypoint htpasswd, prints a hash
+    # A disposable `docker run --rm --entrypoint /usr/bin/sqlite3` that takes a
+    # .backup of a live database. It is NOT preserving or deploying because it
+    # touches no SERVICE container at all: it starts a throwaway one from an
+    # image already present, resolves no service's image tag, and the service
+    # whose database it reads keeps running untouched -- that is the point, and
+    # it is what makes jellyfin and kavita consistent without downtime.
+    #
+    # The live directory is mounted READ-ONLY, so this cannot write to
+    # application state even by accident; the output goes to a separate mount
+    # that is never inside the service's tree.
+    "sqlite_backup_via_helper",
 }
 CLASSIFIED = PRESERVING | DEPLOYING | UTILITY
 
