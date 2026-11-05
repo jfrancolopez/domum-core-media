@@ -5051,6 +5051,72 @@ one that matters is the one a change happens to touch.
 
 ---
 
+**ONE COMPLETE WORKFLOW IS NOW PROVEN END TO END: live service -> capture ->
+ENCRYPTED pack -> independent restore -> the application STARTS.** The operator
+asked for this instead of more tests that inspect manifests, and the reasoning
+holds: every step before the last can pass while the application still fails to
+come up.
+
+`storage pack-state <capture-dir> [dest]` encrypts a VERIFIED capture into one
+`age` artefact; `storage unpack-state <pack> <identity> <dir>` opens it.
+Measured 2026-11-05 by `operator/rehearsals/navidrome-offsite-roundtrip.sh`:
+679,936-byte database with a 4,140,632-byte live `-wal` -> capture -> 696,680-byte
+pack -> unpack -> restore -> `----> Navidrome server is ready!` in **50 ms**,
+with the marker row read back out of the started service.
+
+**INDEPENDENCE IS ENFORCED, NOT DESCRIBED.** Before the restore half runs, the
+source capture, the source data directory and the source service are destroyed
+and the fixture asserts they are gone -- so the remaining inputs are exactly
+the pack, its `.sha256` and the identity file. A restore that could still read
+the original would prove nothing, and "it was isolated" is the kind of claim
+this project requires evidence for.
+
+**THE SAME RECIPIENT AS THE RECOVERY PACK, deliberately.** The operator already
+holds exactly one private key off-host, and this file already calls that key
+the single point of failure; a second key would double the custody problem
+rather than halve the risk. So `STATE_PACK_AGE_PUBKEY_FILE` defaults to
+`RECOVERY_PACK_AGE_PUBKEY_FILE`.
+
+**THIS HOST CANNOT DECRYPT WHAT IT WRITES, and the command says so.** Only the
+public key is here. The round trip therefore uses a keypair generated for the
+rehearsal, and that limit is stated rather than glossed: it proves the
+MECHANISM, and whether a production pack can be opened rests on the operator's
+key custody. A rehearsal that quietly used production's key would also be
+proving something nobody wants proven.
+
+**The pack REFUSES a capture that does not verify, and that gate is first.**
+Encrypting an unverifiable capture yields an artefact whose integrity can be
+proven and whose contents cannot -- the shape of every reporting defect here.
+The rehearsal drives it on purpose: it tampers with a captured byte, watches
+`pack-state` refuse, and only then re-captures cleanly.
+
+**The PLAINTEXT tar is staged inside the 0700 destination, never in `/tmp`.**
+It holds a decrypted Fernet key, a JWT signing key and a server token for as
+long as it exists. It is removed on every path out, and the suite asserts that
+on the failure path too -- a bogus recipient must leave neither plaintext nor a
+partial artefact.
+
+**Four claims, kept apart.** `pack-state` writes a file and stops: nothing is
+transmitted and no backup target, include path or exclusion is touched.
+`unpack-state` proves the pack OPENS; `restore-state` proves the capture
+RESTORES; only starting the service proves it RUNS against it. The commands say
+which one they just did, and none of them says the library is SERVED -- no
+music, no users, nothing fetched.
+
+`tests/state-capture-smoke.sh`: 7 pack/unpack sections, 2 mutants killed --
+removing the verify gate must let a tampered capture be encrypted, and removing
+the `.sha256` check must let a pack whose recorded checksum does not match
+unpack anyway. The sections SKIP cleanly where `age` is absent rather than
+failing for a missing tool.
+
+**An assertion that captured a binary artefact through `$( )` was silently
+weakened.** `grep -qF <key> "$(cat pack)"` warns `ignored null byte in input`:
+bash strips NULs, so the search ran over something other than the artefact. It
+greps the FILE with `-qa` now. A test that cannot see what it claims to search
+is the vacuity hole in a new shape.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
