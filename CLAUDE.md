@@ -5887,6 +5887,121 @@ the assertion that the harness had been repointed is what caught it.
 
 **Twelfth instance of `cmd | grep -q` under pipefail**, once again in an
 assertion of mine (`grep -cF … | grep -qx 3`). The audit found it in seconds.
+**TYPING `0` AT THE ROLLBACK MENU APPLIED THE NEWEST ROLLBACK POINT, because
+`0` IS NOT OUT OF RANGE TO BASH.** Found 2026-11-06 by asking which dispatcher
+arms no test referenced -- the question that had just exposed `status`.
+
+`rollback_cmd interactive` prints a numbered menu and then RESTORES the choice
+over live state. Its guard looked complete:
+
+```
+[[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
+selected="${snapshots[$((choice - 1))]:-}"
+[[ -n "$selected" ]] || die "Selection out of range."
+```
+
+Measured with three entries in bash 5.2:
+
+```
+choice=0 -> index -1 -> selected=third-id     <- the NEWEST point, applied
+choice=1 -> index  0 -> selected=first-id
+choice=3 -> index  2 -> selected=third-id
+choice=4 -> index  3 -> selected=''           <- correctly refused
+```
+
+`${arr[-1]}` is the LAST element since bash 4.3, so `0` -- a natural "none" or
+"cancel" at a prompt -- expanded to the newest entry, which is **not empty**
+and therefore passed the out-of-range check. **Only the low end was broken**,
+which is exactly why the guard read as sufficient: the high end genuinely does
+expand to nothing.
+
+Validate the RANGE, never rely on an empty expansion to catch an out-of-bounds
+index. `(( choice >= 1 && choice <= ${#snapshots[@]} ))`, and the refusal
+states the valid range, because a prompt that rejects input without saying what
+it wants is the unactionable-failure defect in an interactive form.
+
+**AND BOTH ROLLBACK LOOPS READ TWO KEYS THEY DID NOT UNSET.** The interactive
+selector unset `ID SERVICE EVENT STATUS`; `immich rollback` unset `ID SERVICE
+STATUS`. Both then read `SNAPSHOT_NAME` and `SNAPSHOT` in the effective-status
+check. Demonstrated:
+
+```
+entry-a   SNAPSHOT_NAME=plex-snap-A
+entry-b   SNAPSHOT_NAME=plex-snap-A     <- entry-b declares none
+```
+
+So an entry lacking the keys is judged available against **another service's
+snapshot** -- in the two loops that exist precisely to keep an unusable entry
+out of the menu, and one of which already carries a comment about a past bug of
+this class ("permanently unusable, even with older genuinely restorable
+snapshots present").
+
+**Severity stated honestly: latent, not live.** `rollback_record` always emits
+both keys through `write_env_kv`, so every entry the current writer produces
+has them. The live case is an entry that lacks one -- an older format, a
+hand-written file, or a truncated write -- which is the same shape as the
+unchecked `SCHEMA_VERSION`: the next format change makes it real. The fix is
+the discipline `restic_op_last_success` already follows, and the test asserts
+BOTH that the incomplete list leaks and that the shipped one does not, so it
+cannot pass by measuring nothing.
+
+**THE SWEEP FOUND THE FAMILY BEFORE THE FIX, FOR ONCE.** Scanning all three
+CLIs for an `unset` preceding a `source` whose body reads keys the `unset`
+omits returned eight candidates, and **six were false positives** -- config
+variables from `load_cfg` (`ENABLE_IMMICH`, `SECRETS_DIR`,
+`IMMICH_LIBRARY_DIR`), and two where a 20-line window had merged either two
+branches of one `if` (`report_update_candidate` unsets exactly what each branch
+reads) or two adjacent functions (`backup_run_last_success`, which is also
+inside a subshell). Checking each rather than trusting the count is what kept
+this to the two real sites.
+
+**The applier is RECORDED, not run.** The selector test stubs
+`rollback_apply_entry` to echo its argument: the question is WHICH entry the
+arithmetic picks, and performing a real restore would prove something else
+while making the section slow and destructive.
+
+---
+
+**A TEST THAT NEEDED TWO OPERATIONS TO LAND IN THE SAME WALL-CLOCK SECOND
+FAILED IN CI AND PASSED HERE, IN THE FALSE DIRECTION.** Found 2026-11-06 when
+rebasing onto a newer `main` reran CI: `two-migrated-services-smoke` section 9
+reported `FIRST=0 SECOND=0`, and the identical code had passed on the same
+branch minutes earlier.
+
+The section pins a real invariant -- a second restore that computes the same
+`<path>.rollback-<YYYYMMDD-HHMMSS>` must REFUSE rather than overwrite the
+preserved copy, which is the only way back. But it produced the collision by
+calling the restore twice and *hoping* both calls fell inside one second. On a
+slower, loaded runner they straddled a boundary, the two names differed, no
+collision occurred, and the refusal it exists to prove simply never happened.
+So the suite failed while the code was correct -- 3/3 passes locally.
+
+The timestamp is stubbed now, and **only the one format this path uses**:
+
+```
+date() { case "$*" in '+%Y%m%d-%H%M%S') printf '20260101-000000' ;; *) command date "$@" ;; esac; }
+```
+
+Every other `date` call stays real, so the stub cannot quietly change anything
+else. The section then tests what it is actually about -- two restores
+computing the SAME name -- instead of testing the clock.
+
+**Its teeth were re-proved rather than assumed**: neutralising
+`[[ -e "$current_backup" ]] && die` makes the section fail, and restoring it
+makes it pass. A deterministic fixture that no longer catches the defect would
+be worse than the flaky one.
+
+The failure message said "in the same second", which stopped being what the
+test does, so it says "computing the SAME preserved-copy name" now. A test
+whose message describes a mechanism it no longer uses is the same defect this
+file keeps correcting in operator output.
+
+**"Passes locally, fails in CI" is this file's own rule arriving from the other
+direction.** The recorded form is "a test that depends on host state is not a
+test", and every previous instance was a fixture reading a host PATH or device.
+This one depended on host SPEED, which no amount of redirecting roots would
+have caught -- and it is intermittent, so it will have passed many times before
+today.
 
 ---
 

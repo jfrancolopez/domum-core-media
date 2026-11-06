@@ -4511,7 +4511,12 @@ rollback_cmd() {
       local idx=1
       while IFS= read -r file; do
         [[ -n "$file" ]] || continue
-        unset ID SERVICE EVENT STATUS
+        # Every key the body reads, or an entry that lacks one inherits the
+        # PREVIOUS entry's value: SNAPSHOT_NAME and SNAPSHOT were left set, so
+        # an entry missing them was judged available against another service's
+        # snapshot -- and this loop exists precisely to stop an unusable entry
+        # being offered in the menu.
+        unset ID SERVICE EVENT STATUS SNAPSHOT SNAPSHOT_NAME
         # shellcheck disable=SC1090
         source "$file"
         # Effective, not recorded: prune deletes snapshots without touching the
@@ -4527,6 +4532,18 @@ rollback_cmd() {
       local choice selected
       read -r -p "Select rollback number to restore: " choice
       [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
+      # 0 IS NOT OUT OF RANGE TO BASH. `${arr[-1]}` is the LAST element since
+      # bash 4.3, so `0` -- a natural "none" or "cancel" at a prompt -- made
+      # $((choice - 1)) == -1 and silently selected the newest rollback point,
+      # which then PASSED the emptiness check below because it is not empty.
+      # Measured: with three entries, choice=0 selected the third. Only the low
+      # end was broken, which is why the guard looked sufficient: choice=4 does
+      # expand to nothing and was refused correctly.
+      #
+      # Validate the RANGE rather than relying on an empty expansion to catch
+      # it. This is a restore over live state, so a mistyped digit must refuse.
+      (( choice >= 1 && choice <= ${#snapshots[@]} )) \
+        || die "Selection out of range: choose 1 to ${#snapshots[@]}."
       selected="${snapshots[$((choice - 1))]:-}"
       [[ -n "$selected" ]] || die "Selection out of range."
       rollback_apply_entry "$selected" 0
@@ -8142,7 +8159,10 @@ immich_cmd() {
     rollback)
       local rollback_id
       rollback_id="$(rollback_entries | while IFS= read -r file; do
-        unset ID SERVICE STATUS
+        # Same completeness as the interactive selector: SNAPSHOT_NAME and
+        # SNAPSHOT were read without being unset, so a leaked value from the
+        # previous entry decided this one.
+        unset ID SERVICE STATUS SNAPSHOT SNAPSHOT_NAME
         # shellcheck disable=SC1090
         source "$file"
         # Same as the interactive selector. This one also does `| tail -n 1`, so a
