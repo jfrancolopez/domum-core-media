@@ -13,9 +13,12 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-05** against `origin/main` = `1bbab11`. The delta has
-grown from 16 commits to **30**, and the installable surface is unchanged in
-shape -- which is the point of re-measuring rather than assuming.
+Reconciled **2026-11-06** against `origin/main` = `a8cb9ad`. The delta has
+grown 16 -> 30 -> **38 commits**, and this time the installable surface DID
+change shape: `bin/domum-media-report` is now modified, where the previous
+reconciliation recorded it as unchanged since 2026-10-11. That is exactly what
+re-measuring is for -- the previous table would have told an operator that file
+did not need deploying.
 
 ---
 
@@ -28,30 +31,52 @@ a file that could have been edited.
 ```
 installed domum-media         sha256 5e65f06c8a7a…
 installed domum-media-backup  sha256 08a81ba20658…
-                              -> both equal bin/* at a63ad19, found by
+installed domum-media-report  sha256 d813ae0e4181…   (/usr/local/lib/domum-media/)
+                              -> all three equal bin/* at a63ad19, found by
                                  searching the last 60 commits of main by hash
-/opt/.../bin/domum-media        == /usr/local/bin/domum-media        (byte-identical)
-/opt/.../bin/domum-media-backup == /usr/local/bin/domum-media-backup (byte-identical)
+
+/opt/.../bin/domum-media        == /usr/local/bin/domum-media                    (MATCH)
+/opt/.../bin/domum-media-backup == /usr/local/bin/domum-media-backup             (MATCH)
+/opt/.../bin/domum-media-report == /usr/local/lib/domum-media/domum-media-report (MATCH)
 ```
+
+Re-measured 2026-11-06, all three. The report library is checked explicitly
+now because it is installed to a **different directory** from the two
+binaries: a verification that assumes `/usr/local/bin/<name>` reports it as
+ABSENT and reads as drift. That is not hypothetical -- it happened while
+writing this refresh.
 
 The installed-vs-checkout equality is the deployment script's own invariant,
 and it holds right now — so a run of it starts from a clean base.
 
 ## 2. What would change
 
-30 commits, of which the **installable** surface is still small. Re-measured
-2026-11-05 with `git diff --name-status a63ad19..main -- bin/ systemd/ operator/
-install.sh`:
+38 commits, of which the **installable** surface is still small. Re-measured
+2026-11-06 with `git diff --name-only a63ad19..main -- bin systemd install.sh`:
 
 | repository path | installed as | changes? | note |
 |---|---|---|---|
 | `bin/domum-media` | `/usr/local/bin/domum-media` | **yes** | |
 | `bin/domum-media-backup` | `/usr/local/bin/domum-media-backup` | **yes** | |
-| `bin/domum-media-report` | `/usr/local/lib/domum-media/domum-media-report` | no | unchanged since 2026-10-11 |
+| `bin/domum-media-report` | `/usr/local/lib/domum-media/domum-media-report` | **yes — new in this delta** | the pack-contents reader; see §2a |
 | `systemd/domum-media-btrfs-scrub.timer` | `/etc/systemd/system/…` | **yes, COMMENT-ONLY** | see §3 |
 | `systemd/auto-enable.timers` | read from the **checkout**, never installed | **yes, COMMENT-ONLY** | see §3a |
 | `operator/rehearsals/*` (9 new files) | **nothing** — checkout only | new | see §3a |
 | `domum-media-weekly-report.service` / `.timer` | `/etc/systemd/system/…` | no | |
+
+### 2a. The report library is now in the delta
+
+`bin/domum-media-report` carries the recovery-pack contents reader: the report
+used to gate "covered by the recovery pack" on the pack being *available*,
+which means the archive exists and not that the item is inside it. It now
+distinguishes **confirmed** from **declared** from **absent-and-escalated**,
+and a pack that recorded no contents reads as *declared* rather than as
+uncovered — so deploying the CLI without the report library would leave the
+`PACK_ITEMS` the CLI writes with nothing reading them.
+
+The deployment script already covers it: its `TARGETS` lists
+`$LIB_DIR/domum-media-report:bin/domum-media-report`, so no change is needed
+there. Only this document was wrong.
 
 Both `systemd/` changes were verified comment-only by diffing with comments and
 blank lines stripped: **no directive changed in either**. `bin/domum-media-report`
@@ -203,6 +228,26 @@ non-latent item is §4.
 | capture / verify / restore / pack / unpack / verify-pack / archive identity / `pack-offhost` | new subcommands; nothing invokes them, and no timer references any |
 | helper-based consistent capture for jellyfin and kavita | only reachable through `storage capture-state`, which nothing schedules |
 | the visible `UNPROVEN` reason, and `SQLITE_HELPER` in the manifest | same: capture-only |
+| the capture manifest's `RESULT`/`ITEMS`/`SCHEMA_VERSION` checks | capture-only, and no capture exists on this host |
+| `backup-scope`, and `storage archives` asking it | new subcommand; `storage archives` needs root and is operator-run |
+| the recovery-pack contents gate in the report | the installed report cannot write `PACK_ITEMS`, so it reads `null` → *declared*, which is the pre-existing wording |
+| `config_set`'s atomic publish | needs an interruption **during** `configure`, which is operator-run and rare |
+| `config_set`'s `ENVIRON` quoting fix | **this host's `awk` is mawk 1.3.4, which does not strip the escapes** — measured; the defect is live only on a different `awk` |
+| `prompt_choice`'s EOF guard | needs `configure` with stdin at EOF **and** a config value outside its option list |
+
+**Two of those deserve a sharper note, because "latent" is doing real work.**
+
+`status`'s tier label and the `storage archives` off-host claim were **not**
+latent: both were false statements the installed binary makes today. They are
+reporting defects rather than data risks -- nothing is destroyed by them -- but
+an operator reading `off-host copy: yes` beneath `this archive is the only
+copy`, or `/srv/data = (snapshotted + backed up)`, is being told the wrong
+thing right now. That is the strongest argument in this document for deploying.
+
+And the **rollback menu** fix is latent only in the sense that nobody has typed
+`0` at it. `domum-media rollback` with no subcommand drops straight into that
+menu, and `0` applied the newest rollback point -- a restore over live state.
+There is no timer involved; it needs an operator at a prompt.
 
 **`health-notify`'s two reporting fixes are already deployed** — they landed in
 `a63ad19` itself (#145/#146 are in production). This plan is not carrying them,
