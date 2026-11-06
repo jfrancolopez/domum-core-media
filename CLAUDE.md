@@ -5887,6 +5887,78 @@ the assertion that the harness had been repointed is what caught it.
 
 **Twelfth instance of `cmd | grep -q` under pipefail**, once again in an
 assertion of mine (`grep -cF … | grep -qx 3`). The audit found it in seconds.
+**TYPING `0` AT THE ROLLBACK MENU APPLIED THE NEWEST ROLLBACK POINT, because
+`0` IS NOT OUT OF RANGE TO BASH.** Found 2026-11-06 by asking which dispatcher
+arms no test referenced -- the question that had just exposed `status`.
+
+`rollback_cmd interactive` prints a numbered menu and then RESTORES the choice
+over live state. Its guard looked complete:
+
+```
+[[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection."
+selected="${snapshots[$((choice - 1))]:-}"
+[[ -n "$selected" ]] || die "Selection out of range."
+```
+
+Measured with three entries in bash 5.2:
+
+```
+choice=0 -> index -1 -> selected=third-id     <- the NEWEST point, applied
+choice=1 -> index  0 -> selected=first-id
+choice=3 -> index  2 -> selected=third-id
+choice=4 -> index  3 -> selected=''           <- correctly refused
+```
+
+`${arr[-1]}` is the LAST element since bash 4.3, so `0` -- a natural "none" or
+"cancel" at a prompt -- expanded to the newest entry, which is **not empty**
+and therefore passed the out-of-range check. **Only the low end was broken**,
+which is exactly why the guard read as sufficient: the high end genuinely does
+expand to nothing.
+
+Validate the RANGE, never rely on an empty expansion to catch an out-of-bounds
+index. `(( choice >= 1 && choice <= ${#snapshots[@]} ))`, and the refusal
+states the valid range, because a prompt that rejects input without saying what
+it wants is the unactionable-failure defect in an interactive form.
+
+**AND BOTH ROLLBACK LOOPS READ TWO KEYS THEY DID NOT UNSET.** The interactive
+selector unset `ID SERVICE EVENT STATUS`; `immich rollback` unset `ID SERVICE
+STATUS`. Both then read `SNAPSHOT_NAME` and `SNAPSHOT` in the effective-status
+check. Demonstrated:
+
+```
+entry-a   SNAPSHOT_NAME=plex-snap-A
+entry-b   SNAPSHOT_NAME=plex-snap-A     <- entry-b declares none
+```
+
+So an entry lacking the keys is judged available against **another service's
+snapshot** -- in the two loops that exist precisely to keep an unusable entry
+out of the menu, and one of which already carries a comment about a past bug of
+this class ("permanently unusable, even with older genuinely restorable
+snapshots present").
+
+**Severity stated honestly: latent, not live.** `rollback_record` always emits
+both keys through `write_env_kv`, so every entry the current writer produces
+has them. The live case is an entry that lacks one -- an older format, a
+hand-written file, or a truncated write -- which is the same shape as the
+unchecked `SCHEMA_VERSION`: the next format change makes it real. The fix is
+the discipline `restic_op_last_success` already follows, and the test asserts
+BOTH that the incomplete list leaks and that the shipped one does not, so it
+cannot pass by measuring nothing.
+
+**THE SWEEP FOUND THE FAMILY BEFORE THE FIX, FOR ONCE.** Scanning all three
+CLIs for an `unset` preceding a `source` whose body reads keys the `unset`
+omits returned eight candidates, and **six were false positives** -- config
+variables from `load_cfg` (`ENABLE_IMMICH`, `SECRETS_DIR`,
+`IMMICH_LIBRARY_DIR`), and two where a 20-line window had merged either two
+branches of one `if` (`report_update_candidate` unsets exactly what each branch
+reads) or two adjacent functions (`backup_run_last_success`, which is also
+inside a subshell). Checking each rather than trusting the count is what kept
+this to the two real sites.
+
+**The applier is RECORDED, not run.** The selector test stubs
+`rollback_apply_entry` to echo its argument: the question is WHICH entry the
+arithmetic picks, and performing a real restore would prove something else
+while making the section slow and destructive.
 
 ---
 
