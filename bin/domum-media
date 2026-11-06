@@ -2772,8 +2772,8 @@ config_set() {
   # Carry the live mode across rather than relying on mktemp's 0600 happening
   # to match it. The production config is 0600 root.
   mode="$(stat -c %a "$CFG_FILE" 2>/dev/null || echo 600)"
-  awk -v key="$key" -v val="$rendered" '
-    BEGIN { updated = 0 }
+  DOMUM_CFG_RENDERED="$rendered" awk -v key="$key" '
+    BEGIN { updated = 0; val = ENVIRON["DOMUM_CFG_RENDERED"] }
     $0 ~ "^" key "=" {
       print key "=" val
       updated = 1

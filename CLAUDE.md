@@ -6087,6 +6087,57 @@ gate function rather than the dispatcher arm.
 
 ---
 
+**`awk -v val=...` ESCAPE-PROCESSES THE ASSIGNMENT, SO IT SILENTLY UNDID THE
+`%q` QUOTING ON THE PRODUCTION CONFIG -- and which awk you have decides
+whether it does.** Found 2026-11-06 because a test I had just written passed
+here and failed in CI, and the failure was real rather than flaky.
+
+`config_set` renders the value with `printf -v rendered '%q'` and then passed
+that through `awk -v val="$rendered"`. Measured:
+
+```
+this host   mawk 1.3.4 (and /usr/bin/nawk is a symlink to it)
+            -> DOMUM_DOMAIN=new\ value\ with\ spaces
+CI runner   a different awk
+            -> DOMUM_DOMAIN=new value with spaces
+```
+
+**`load_cfg` SOURCES that file.** An unquoted value with spaces assigns only
+the first word and runs the rest as a command; a value containing `$( )` or a
+backtick would be EXECUTED on the next load. `%q` is applied a few lines
+earlier precisely to prevent that, and `-v` threw the protection away.
+
+Stated at its real size: the value comes from the operator at an interactive
+prompt, so this is not a privilege boundary -- it is an intentional quoting
+measure being defeated, which corrupts the config for any ordinary value
+containing a space and would become a genuine hole the moment a value arrived
+from anywhere less trusted.
+
+`ENVIRON` holds the actual environment strings and is not escape-processed, so
+the rendered value survives byte for byte in every awk.
+
+**THE TEST I FIRST WROTE WAS THE WRONG TEST.** It matched the `%q` text
+(`DOMUM_DOMAIN=new\ value\ with\ spaces`), which is a claim about one awk's
+output rather than about the property that matters. The property is the ROUND
+TRIP: whatever the operator typed must come back byte for byte when the config
+is sourced, and nothing in it may execute. That form is implementation-
+independent and is what the suite asserts now, with a sentinel file as the
+negative control -- it must not exist afterwards.
+
+**And the limitation is recorded rather than hidden.** On an awk that does not
+strip these escapes the round trip passes either way, so on THIS host no
+behavioural test can tell the two implementations apart -- which is exactly why
+CI caught it and a local run could not. A source-level guard sits beside the
+behavioural one for that reason, and says so.
+
+**This is the third time in two days that "passes locally, fails in CI" was the
+code and not the fixture.** The recorded rule is "a test that depends on host
+state is not a test"; the instances keep arriving from new directions -- a host
+PATH, then host SPEED, now the host's **awk implementation**. A green local run
+is evidence about this machine.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

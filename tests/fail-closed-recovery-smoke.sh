@@ -701,9 +701,35 @@ ino_after="$(stat -c %i "$cfg")"
 place rather than replaced by a rename -- an interruption would truncate it"
 [ "$(stat -c %a "$cfg")" = "600" ] \
   || fail "10: the mode was not preserved: $(stat -c %a "$cfg")"
-grep -q 'ENABLE_PLEX=1' "$cfg" || fail "10: an unrelated key was lost"
-grep -qF 'DOMUM_DOMAIN=new\ value\ with\ spaces' "$cfg" \
-  || fail "10: the value was not written with %q quoting: $(cat "$cfg")"
+# THE ROUND TRIP IS THE PROPERTY, not the exact quoting style: `load_cfg`
+# SOURCES this file, so whatever the operator typed must come back byte for
+# byte, and nothing in it may execute.
+#
+# The earlier version of this assertion matched the %q text and was
+# implementation-specific -- it passed here on mawk 1.3.4 and FAILED in CI,
+# where the config read `DOMUM_DOMAIN=new value with spaces`. The cause was
+# real: `awk -v val=...` escape-processes the assignment and silently undid the
+# %q quoting. An unquoted value with spaces assigns only the first word and runs
+# the rest as a command; one containing `$( )` would be executed on the next
+# load.
+sentinel="$cfg_dir/EXECUTED-ON-SOURCE"
+printf 'KEEP=1\n' > "$cfg"; chmod 0600 "$cfg"
+tricky="x\$(touch $sentinel)y with spaces"
+( # shellcheck disable=SC1090
+  source "$REPO_ROOT/bin/domum-media" >/dev/null 2>&1
+  set +e
+  die() { exit 3; }
+  CFG_FILE="$cfg"
+  config_set DOMUM_DOMAIN "$tricky" ) >/dev/null 2>&1
+got_back="$( set +u; unset DOMUM_DOMAIN; . "$cfg"; printf '%s' "$DOMUM_DOMAIN" )"
+[ "$got_back" = "$tricky" ] \
+  || fail "10: the value did not survive a source round trip.
+   wrote : $tricky
+   got   : $got_back
+   file  : $(cat "$cfg")"
+[ ! -e "$sentinel" ] \
+  || fail "10: sourcing the config EXECUTED the value's command substitution"
+grep -q 'KEEP=1' "$cfg" || fail "10: an unrelated key was lost"
 # Nothing half-written may be left beside it.
 leftover="$(find "$cfg_dir" -name '.domum-media.conf.*' | wc -l)"
 [ "$leftover" = "0" ] || fail "10: $leftover temporary file(s) left behind"
@@ -723,6 +749,31 @@ grep -q 'rm -f -- "$tmp"' <<< "$cs_code" \
   || fail "10b: a failed render does not remove the temp file, so a truncated
 config could be published under its final name"
 echo "   temp file beside the config, and a failed render is not published"
+
+echo "== 10c. the rendered value does not pass through awk -v =="
+# `awk -v var=value` performs ESCAPE PROCESSING on the assignment, so it undoes
+# the %q quoting applied a few lines earlier -- and it does so differently per
+# implementation. Measured: mawk 1.3.4 (this host, and /usr/bin/nawk is a
+# symlink to it) keeps `new\ value\ with\ spaces`, while the CI runner's awk
+# wrote `DOMUM_DOMAIN=new value with spaces` into the config. ENVIRON holds the
+# actual environment strings and is not escape-processed, so it survives in
+# every awk.
+#
+# THE LIMITATION IS STATED: on an awk that does not strip these escapes the
+# round-trip above passes either way, so on THIS host the behavioural test
+# cannot distinguish the two -- which is precisely why CI caught this and a
+# local run did not. Hence a source-level guard as well.
+cs2="$(awk '/^config_set\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+cs2_code="$(grep -vE '^\s*#' <<< "$cs2" || true)"
+grep -qE -- '-v +val=' <<< "$cs2_code" \
+  && fail "10c: config_set passes the rendered value through 'awk -v', which
+escape-processes it and throws away the %q quoting. Use ENVIRON."
+grep -q 'ENVIRON\["DOMUM_CFG_RENDERED"\]' <<< "$cs2_code" \
+  || fail "10c: the rendered value does not reach awk through ENVIRON"
+# And it must still be rendered at all.
+grep -qE "printf -v rendered '%q'" <<< "$cs2_code" \
+  || fail "10c: the value is no longer %q-rendered before being written"
+echo "   rendered with %q and passed via ENVIRON, not -v"
 
 echo "== MUTATION: without the EOF guard the prompt spins forever =="
 mut_a="$TMP_DIR/cli-mut-prompt"
