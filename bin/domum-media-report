@@ -231,12 +231,28 @@ state_class_is_protected_tier_concern() {
 # Emits one entry as JSON. `covered_by` names the mechanism that protects this
 # state when it is not the protected tier -- null when nothing does.
 state_emit_entry() {
-  local name="$1" class="$2" src="$3" dst="$4" covered
+  local name="$1" class="$2" src="$3" dst="$4" covered item
   covered="$(state_recovery_coverage "$name:$dst")"
+  # WHICH item in the pack this depends on. `covered_by` names the mechanism;
+  # the pack being "available" says the archive exists, not that this item is
+  # inside it, and both of its inclusions are conditional on a live container.
+  item="$(state_recovery_pack_item "$name:$dst")"
   jq -cn --arg class "$class" --arg source "$src" --arg destination "$dst" \
-    --arg covered "$covered" \
+    --arg covered "$covered" --arg item "$item" \
     '{class:$class, source:$source, destination:$destination,
-      covered_by:(($covered|select(length>0)) // null)}'
+      covered_by:(($covered|select(length>0)) // null),
+      pack_item:(($item|select(length>0)) // null)}'
+}
+
+# The token `recovery_pack_item_tokens` records when the item is really staged.
+# One mapping, beside the coverage declaration it qualifies, so the two cannot
+# drift apart unnoticed.
+state_recovery_pack_item() {
+  case "$1" in
+    traefik:/letsencrypt)  printf 'traefik-acme' ;;
+    uptime-kuma:/app/data) printf 'uptime-kuma' ;;
+    *) printf '' ;;
+  esac
 }
 
 state_recovery_coverage() {
@@ -833,10 +849,19 @@ report_generate_json() {
   local recovery_json dump_json library_json
   recovery_json="$(report_file_details "$(recovery_pack_state_file)")"
   if [[ -f "$(recovery_pack_state_file)" ]]; then
-    unset TS SIZE ARCHIVE_PATH VERIFIED_TS
+    unset TS SIZE ARCHIVE_PATH VERIFIED_TS PACK_ITEMS
     # shellcheck disable=SC1090
     source "$(recovery_pack_state_file)"
-    recovery_json="$(jq -cn --argjson at "$(report_iso_from_epoch "${TS:-}")" --argjson age "$(report_age_seconds "${TS:-}")" --argjson size "${SIZE:-null}" '{state:"available",created_at:$at,age_seconds:$age,size_bytes:$size}')"
+    # items:null means the pack did not RECORD its contents (it predates the
+    # record). That is a third state: not confirmed, and not "contained
+    # nothing". Defaulting it to an empty list would turn every covered item
+    # into a finding the first time this runs against an older pack, which is
+    # a false alarm manufactured on purpose.
+    local items_json=null
+    if [[ -n "${PACK_ITEMS+x}" ]]; then
+      items_json="$(jq -cn --arg s "${PACK_ITEMS:-}" '$s | split(" ") | map(select(length>0))')"
+    fi
+    recovery_json="$(jq -cn --argjson at "$(report_iso_from_epoch "${TS:-}")" --argjson age "$(report_age_seconds "${TS:-}")" --argjson size "${SIZE:-null}" --argjson items "$items_json" '{state:"available",created_at:$at,age_seconds:$age,size_bytes:$size,items:$items}')"
   fi
   library_json="$(report_file_details "${IMMICH_LIBRARY_DIR:-$DOMUM_DATA_ROOT/immich/library}")"
   dump_json="$(report_file_details "$DOMUM_DATA_ROOT/immich/backup-staging/immich-postgres.dump.sql.gz")"
@@ -963,27 +988,56 @@ report_generate_json() {
     # missing pack must not launder an uncovered gap into a covered one, so the
     # live recovery-pack state decides.
     # (No apostrophes in this block: it lives inside a single-quoted jq program.)
-    (.recovery_pack.state as $rp | .container_state[] as $c | $c.state[] |
+    # A pack being "available" says the ARCHIVE exists, not that this item is
+    # inside it: both of the packs inclusions are conditional on a live
+    # container, and a failure only warns at creation time. So a declared item
+    # the recorded contents do NOT list is treated as uncovered.
+    #
+    # items == null means the pack did not RECORD its contents. That is a third
+    # state -- not confirmed, and not "contained nothing" -- and it keeps the
+    # previous behaviour rather than escalating, because a pack written before
+    # the record existed must not turn every covered item into an alert.
+    (.recovery_pack.state as $rp | .recovery_pack.items as $items |
+      .container_state[] as $c | $c.state[] |
+      .pack_item as $pi |
+      ($items != null and $pi != null
+        and (($items | index($pi)) == null)) as $absent |
       select(.class == "irreplaceable") |
-      select(.covered_by == null or $rp != "available") |
+      select(.covered_by == null or $rp != "available" or $absent) |
       {level:"critical",
-       message:($c.container+" keeps IRREPLACEABLE state outside the protected tier, so it is neither snapshotted nor backed up: "+.source+" -> "+.destination),
+       message:($c.container+" keeps IRREPLACEABLE state outside the protected tier, so it is neither snapshotted nor backed up: "+.source+" -> "+.destination+
+                (if $absent then " (the last recovery pack did NOT contain "+.pack_item+")" else "" end)),
        action:"Bind-mount it under the data root, or add it to a backup target include path"}),
-    (.recovery_pack.state as $rp | .container_state[] as $c | $c.state[] |
+    (.recovery_pack.state as $rp | .recovery_pack.items as $items |
+      .container_state[] as $c | $c.state[] |
+      .pack_item as $pi |
+      ($items != null and $pi != null
+        and (($items | index($pi)) == null)) as $absent |
       select(.class == "reconstructable") |
-      select(.covered_by == null or $rp != "available") |
+      select(.covered_by == null or $rp != "available" or $absent) |
       {level:"warning",
        message:($c.container+" keeps durable state outside the protected tier: "+.source+" -> "+.destination+
                 (if .covered_by == null
                  then " (reconstructable, but only by re-issuing or re-entering it by hand)"
+                 elif $absent
+                 then " (the last recovery pack did NOT contain "+.pack_item+", so nothing holds it)"
                  else " (normally covered by the "+.covered_by+", but that is not available)" end)),
        action:"Bind-mount it under the data root, or add it to a backup target include path"}),
     # Covered state is reported, not warned about -- the operator should be able
-    # to see WHY it is not a finding without having to remember.
-    (.recovery_pack.state as $rp | .container_state[] as $c | $c.state[] |
-      select(.covered_by != null and $rp == "available") |
+    # to see WHY it is not a finding without having to remember. CONFIRMED and
+    # merely DECLARED are distinguished, because the second is a claim about
+    # configuration and the first is an observation of what the pack held.
+    (.recovery_pack.state as $rp | .recovery_pack.items as $items |
+      .container_state[] as $c | $c.state[] |
+      .pack_item as $pi |
+      ($items != null and $pi != null
+        and (($items | index($pi)) == null)) as $absent |
+      select(.covered_by != null and $rp == "available" and ($absent | not)) |
       {level:"info",
-       message:($c.container+" keeps durable state outside the protected tier, covered by the "+.covered_by+": "+.source+" -> "+.destination),
+       message:($c.container+" keeps durable state outside the protected tier, covered by the "+.covered_by+": "+.source+" -> "+.destination+
+                (if .pack_item == null then ""
+                 elif $items == null then " (declared; the last pack did not record its contents)"
+                 else " (confirmed: the last pack contained "+.pack_item+")" end)),
        action:"No action needed; verify with: domum-media recovery-pack status"}),
     (.backups.restore_verification | select(.state == "failed") | {level:"critical",message:"The most recent restore verification did not pass",action:"Run: domum-media backup verify-restore <target>"}),
     (.backups.restore_verification | select(.state == "unknown") | {level:"warning",message:"No successful restore verification has been recorded",action:"Run: domum-media backup verify-restore <target>"}),
