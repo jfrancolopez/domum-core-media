@@ -6005,6 +6005,88 @@ today.
 
 ---
 
+**A PROMPT THAT HANGS FOREVER, AND A CONFIG WRITE THAT IS NOT ATOMIC.** Both
+found 2026-11-06 in the interactive `configure` path, which the "which
+dispatcher arms does no test reference" question had surfaced.
+
+**`prompt_choice` spun in a BUSY LOOP at EOF.** It loops until the reply
+matches one of the offered options, and at EOF `read` returns immediately with
+an empty reply, which then defaults to `$current`. When `$current` is itself
+not one of the options, nothing ever matches and the loop never waits for
+anything -- measured, `timeout 5` returned **124**, so it is a spin rather than
+a block.
+
+Reachable via `configure` with stdin at EOF and a config value outside its
+option list -- a legacy or typo'd value. The effect is a hung process burning
+CPU, not a data risk, and that is stated rather than inflated.
+
+**The EOF test has to come AFTER the option test, and my first version had it
+before.** At EOF the reply defaults to `$current`, and when that IS a valid
+option, returning it is the useful non-interactive behaviour. Checking EOF
+first broke exactly that, which the four-way behaviour test caught: EOF with an
+invalid current must die, EOF with a valid one must return it, a typed answer
+must be accepted, and invalid-then-valid must still re-prompt. Two of those
+four are behaviours that had to be PRESERVED, and a fix verified only against
+the broken case would have shipped the regression.
+
+**`config_set` wrote the production config NON-ATOMICALLY, and the reason is
+the filesystem layout.** It rendered into `mktemp` and then `mv`-ed over
+`$CFG_FILE`. Measured on this host:
+
+```
+/tmp                            tmpfs   st_dev 42
+/opt/domum-core-media/config    ext4    st_dev 2066
+```
+
+Different filesystems, so `mv` is a copy-then-unlink, not a rename.
+Demonstrated directly rather than argued from `mv(1)`:
+
+```
+same-fs   tmp inode=26086953  target 26086952 -> 26086953   RENAMED (atomic)
+cross-fs  tmp inode=2622633   target 26086952 -> 26086952   COPIED IN PLACE
+```
+
+The destination's inode is UNCHANGED across a cross-filesystem `mv`, which is
+the proof that the live file is rewritten in place. An interruption therefore
+truncates the production config -- and `load_cfg` on a truncated file silently
+falls back to DEFAULTS, where this file already records that
+`backup_target_default_enabled` returns **1 for both `nas` and `cloud`**. So a
+torn write could silently change which backup targets are considered enabled.
+
+The temp file now lives in the config's own directory, so the `mv` is a
+same-filesystem rename; the live mode is carried across with `stat -c %a`
+rather than relying on `mktemp`'s 0600 happening to match the production
+config's 0600; and a failed `awk` removes the temp instead of publishing it.
+That last part is the rule this codebase already states for image archives:
+**a file that exists under its final name must always be complete.**
+
+**Exactly one site had that shape** -- swept, no siblings -- which is why the
+fix is three lines rather than a helper.
+
+**The mutation had to stop observing the INODE.** Proving a bare `mktemp`
+rewrites in place requires `$TMPDIR` and the fixture to be on DIFFERENT
+filesystems, and a fixture built with `mktemp -d` is on tmpfs exactly like
+`$TMPDIR` -- so that section skipped itself, which is a mutation proving
+nothing. It records what `mktemp` is ASKED for instead: the real one names the
+config's own directory, a bare one passes no argument at all. Observable on any
+filesystem, and it is the call that the fix actually changes.
+
+**Two paths checked and found CLEAN, recorded so they are not re-derived.**
+`immich reset-db` is the most dangerous arm in the CLI and its gates are
+stronger than expected: a typed `wipe immich` confirmation, and a pre-reset
+snapshot that must COVER the exact paths about to be deleted
+(`assert_service_snapshot_covers`), with `snapshot_protection_unavailable`
+dying by default and `SNAPSHOT_POLICY=WARN` as the documented override. Two
+suites pin it. And the `doctor_*` family -- 520 lines that no test references
+-- makes no unbacked claim: `doctor_secrets` prints basenames and `set`/`empty`
+but never contents, and `ssh key auth: batch-mode OK` is backed by a real
+`sftp_key_auth_works` probe with a hedged negative branch. The
+"uncovered arm" heuristic is useful for FINDING candidates and is a poor
+verdict on its own: both of those are covered by suites that reference the
+gate function rather than the dispatcher arm.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

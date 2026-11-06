@@ -609,4 +609,191 @@ storage_block="$(awk '/^storage_cmd\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")
 grep -q 'protection)' <<< "$storage_block" || fail "8: 'storage protection' is not dispatched"
 grep -q 'storage_protection' <<< "$storage_block" || fail "8: the arm does not call storage_protection"
 
+# ---------------------------------------------------------------------------
+# 9. A PROMPT WITH NOBODY TO ANSWER IT MUST FAIL, NOT SPIN.
+#
+# `prompt_choice` loops until the reply matches an offered option. At EOF `read`
+# returns immediately with an empty reply, which defaults to $current -- so when
+# $current is itself not one of the options, nothing ever matches and the loop
+# never waits for anything. Measured before the fix: `timeout 5` returned 124,
+# i.e. a busy loop rather than a block.
+#
+# All four directions are driven, because two of them are behaviours that had to
+# be PRESERVED and a fix verified only against the broken case would have
+# shipped a regression. The first attempt put the EOF test BEFORE the option
+# test and broke the EOF-with-a-valid-current case exactly that way.
+# ---------------------------------------------------------------------------
+echo "== 9. prompt_choice fails at EOF instead of spinning =="
+pc() {  # $1 = current value, $2 = stdin ("" = /dev/null) -> output, or TIMEOUT
+  local out
+  if [ -z "$2" ]; then
+    out="$(timeout 5 bash -c "
+      source '$REPO_ROOT/bin/domum-media' >/dev/null 2>&1; set +e
+      die() { echo \"DIE: \$*\"; exit 3; }
+      prompt_choice mode '$1' yes no" < /dev/null 2>&1)"
+  else
+    out="$(printf '%s\n' "$2" | timeout 5 bash -c "
+      source '$REPO_ROOT/bin/domum-media' >/dev/null 2>&1; set +e
+      die() { echo \"DIE: \$*\"; exit 3; }
+      prompt_choice mode '$1' yes no" 2>&1)"
+  fi
+  [ $? -eq 124 ] && { echo TIMEOUT; return; }
+  printf '%s' "$out" | tail -1
+}
+
+got="$(pc bogus-value '')"
+[ "$got" = "TIMEOUT" ] && fail "9: EOF with an invalid current value still spins forever"
+case "$got" in
+  DIE:*) : ;;
+  *) fail "9: EOF with an invalid current value gave '$got', expected a refusal" ;;
+esac
+# ...and the refusal must say what it wanted, or it is unactionable.
+case "$got" in
+  *"not one of"*) : ;;
+  *) fail "9: the refusal does not name the valid options: $got" ;;
+esac
+echo "   EOF + invalid current -> refused, options named"
+
+# PRESERVED: at EOF the reply defaults to $current, and when that IS valid,
+# returning it is the useful non-interactive behaviour.
+got="$(pc no '')"
+[ "$got" = "no" ] || fail "9: EOF with a VALID current value gave '$got', expected no.
+Checking EOF before the option test breaks exactly this."
+echo "   EOF + valid current -> still resolves to it"
+
+# PRESERVED: a typed answer, and an invalid one followed by a valid one.
+got="$(pc no yes)"
+[ "$got" = "yes" ] || fail "9: a typed answer gave '$got', expected yes"
+got="$(printf 'nope\nyes\n' | timeout 5 bash -c "
+  source '$REPO_ROOT/bin/domum-media' >/dev/null 2>&1; set +e
+  die() { echo \"DIE: \$*\"; exit 3; }
+  prompt_choice mode no yes no" 2>&1 | tail -1)"
+[ "$got" = "yes" ] || fail "9: invalid-then-valid gave '$got', expected yes (it must re-prompt)"
+echo "   typed answer accepted, and invalid-then-valid still re-prompts"
+
+# ---------------------------------------------------------------------------
+# 10. THE CONFIG IS PUBLISHED BY RENAME, NOT REWRITTEN IN PLACE.
+#
+# `config_set` rendered into `mktemp` and then `mv`-ed over $CFG_FILE. Measured
+# on this host: /tmp is tmpfs (st_dev 42) and the config is on ext4 (st_dev
+# 2066), and a cross-filesystem `mv` leaves the DESTINATION'S INODE UNCHANGED --
+# it copies in place. An interruption therefore truncates the live config, and
+# `load_cfg` on a truncated file silently falls back to DEFAULTS, where
+# `backup_target_default_enabled` returns 1 for BOTH nas and cloud. So a torn
+# write could change which backup targets are considered enabled.
+#
+# The inode is the observable: a rename replaces it, a copy does not.
+# ---------------------------------------------------------------------------
+echo "== 10. config_set publishes atomically and preserves the mode =="
+cfg_dir="$TMP_DIR/cfgdir"; rm -rf "$cfg_dir"; mkdir -p "$cfg_dir"
+cfg="$cfg_dir/domum-media.conf"
+printf 'DOMUM_DOMAIN=old\nENABLE_PLEX=1\n' > "$cfg"; chmod 0600 "$cfg"
+ino_before="$(stat -c %i "$cfg")"
+( # shellcheck disable=SC1090
+  source "$REPO_ROOT/bin/domum-media" >/dev/null 2>&1
+  set +e
+  die() { echo "DIE: $*"; exit 3; }
+  CFG_FILE="$cfg"
+  config_set DOMUM_DOMAIN 'new value with spaces' ) >/dev/null 2>&1
+ino_after="$(stat -c %i "$cfg")"
+[ "$ino_before" != "$ino_after" ] \
+  || fail "10: the config's inode is unchanged ($ino_after), so it was rewritten in
+place rather than replaced by a rename -- an interruption would truncate it"
+[ "$(stat -c %a "$cfg")" = "600" ] \
+  || fail "10: the mode was not preserved: $(stat -c %a "$cfg")"
+grep -q 'ENABLE_PLEX=1' "$cfg" || fail "10: an unrelated key was lost"
+grep -qF 'DOMUM_DOMAIN=new\ value\ with\ spaces' "$cfg" \
+  || fail "10: the value was not written with %q quoting: $(cat "$cfg")"
+# Nothing half-written may be left beside it.
+leftover="$(find "$cfg_dir" -name '.domum-media.conf.*' | wc -l)"
+[ "$leftover" = "0" ] || fail "10: $leftover temporary file(s) left behind"
+echo "   renamed (inode $ino_before -> $ino_after), mode 0600, no leftovers"
+
+echo "== 10b. the temp file is created beside the config, not in \$TMPDIR =="
+# This is the whole fix: a temp file on another filesystem makes the mv a copy.
+cs="$(awk '/^config_set\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")"
+[ -n "$cs" ] || fail "10b: config_set not found"
+cs_code="$(grep -vE '^\s*#' <<< "$cs" || true)"
+grep -qE 'mktemp "\$dir/' <<< "$cs_code" \
+  || fail "10b: config_set does not create its temp file in the config's directory"
+grep -qE 'mktemp\)' <<< "$cs_code" \
+  && fail "10b: config_set still uses a bare mktemp, which lands in \$TMPDIR"
+# And a failed render must not be published.
+grep -q 'rm -f -- "$tmp"' <<< "$cs_code" \
+  || fail "10b: a failed render does not remove the temp file, so a truncated
+config could be published under its final name"
+echo "   temp file beside the config, and a failed render is not published"
+
+echo "== MUTATION: without the EOF guard the prompt spins forever =="
+mut_a="$TMP_DIR/cli-mut-prompt"
+cp "$REPO_ROOT/bin/domum-media" "$mut_a"
+python3 - "$mut_a" <<'PYMA'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+# Neutralise the EOF detection itself: at_eof can then never be 1, which is
+# exactly the pre-fix behaviour.
+old = '    read -r -p "$label [$current] ($(printf \'%s \' "$@")): " reply || at_eof=1'
+new = '    read -r -p "$label [$current] ($(printf \'%s \' "$@")): " reply || at_eof=0'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMA
+grep -qF 'reply || at_eof=0' "$mut_a" || fail "the EOF mutation did not apply"
+timeout 5 bash -c "
+  source '$mut_a' >/dev/null 2>&1; set +e
+  die() { echo 'DIE'; exit 3; }
+  prompt_choice mode bogus-value yes no" < /dev/null >/dev/null 2>&1
+[ $? -eq 124 ] \
+  || fail "the mutation changed no ANSWER -- without the EOF guard, a prompt with
+an invalid current value and no input must spin until the timeout kills it"
+echo "  killed: the mutant spins until timeout"
+
+echo "== MUTATION: a bare mktemp no longer asks for the config's directory =="
+# Observing the INODE needs $TMPDIR and the fixture to be on different
+# filesystems, and a fixture built with `mktemp -d` is on tmpfs just like
+# $TMPDIR -- so that observation skipped itself, which is a mutation proving
+# nothing. The call is observable instead, and on any filesystem: record what
+# `mktemp` is ASKED for. The real one names the config's directory; a bare
+# mktemp passes no argument at all and lands wherever $TMPDIR points.
+mktemp_target() {  # $1 = cli to source -> the arguments mktemp received
+  local rec="$TMP_DIR/mktemp.args"; : > "$rec"
+  local c="$TMP_DIR/cfgdir/probe.conf"
+  printf 'DOMUM_DOMAIN=old\n' > "$c"; chmod 0600 "$c"
+  ( # shellcheck disable=SC1090
+    source "$1" >/dev/null 2>&1
+    set +e
+    die() { exit 3; }
+    mktemp() { printf '%s\n' "$*" >> "$rec"; command mktemp "$@"; }
+    CFG_FILE="$c"
+    config_set DOMUM_DOMAIN new ) >/dev/null 2>&1
+  tr '\n' ' ' < "$rec"
+}
+
+real_args="$(mktemp_target "$REPO_ROOT/bin/domum-media")"
+case "$real_args" in
+  *"$TMP_DIR/cfgdir"*) : ;;
+  *) fail "config_set did not ask mktemp for the config's own directory; it got: '$real_args'" ;;
+esac
+
+mut_b="$TMP_DIR/cli-mut-cfg"
+cp "$REPO_ROOT/bin/domum-media" "$mut_b"
+python3 - "$mut_b" <<'PYMB'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  tmp="$(mktemp "$dir/.domum-media.conf.XXXXXX")" \\\n    || die "cannot create a temporary config in $dir"'
+new = '  tmp="$(mktemp)"'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMB
+grep -qE 'tmp="\$\(mktemp\)"' "$mut_b" || fail "the mktemp mutation did not apply"
+mut_args="$(mktemp_target "$mut_b")"
+[ "$real_args" != "$mut_args" ] \
+  || fail "the mutation changed no ANSWER -- a bare mktemp must stop naming the
+config's directory (real: '$real_args', mutant: '$mut_args')"
+case "$mut_args" in
+  *"$TMP_DIR/cfgdir"*) fail "the mutant still names the config directory: '$mut_args'" ;;
+esac
+echo "  killed: the mutant asks mktemp for nothing, so the file lands in \$TMPDIR"
+
 echo "PASS: fail-closed recovery smoke test"

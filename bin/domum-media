@@ -2754,9 +2754,24 @@ sync_timer_overrides() {
 config_set() {
   local key="$1"
   local value="${2:-}"
-  local rendered tmp
+  local rendered tmp dir mode
   printf -v rendered '%q' "$value"
-  tmp="$(mktemp)"
+  # The temp file must live in the CONFIG'S OWN DIRECTORY so the mv below is a
+  # same-filesystem rename -- atomic -- rather than a copy over the live file.
+  #
+  # Measured on this host: /tmp is tmpfs (st_dev 42) while the config is on
+  # ext4 (st_dev 2066), and a cross-filesystem mv leaves the destination's
+  # inode UNCHANGED -- it rewrites it in place. So an interruption truncated
+  # the production config, and `load_cfg` then silently falls back to
+  # DEFAULTS, where `backup_target_default_enabled` returns 1 for BOTH nas and
+  # cloud. The codebase already states this rule for archives: a file that
+  # exists under its final name must always be complete.
+  dir="$(dirname -- "$CFG_FILE")"
+  tmp="$(mktemp "$dir/.domum-media.conf.XXXXXX")" \
+    || die "cannot create a temporary config in $dir"
+  # Carry the live mode across rather than relying on mktemp's 0600 happening
+  # to match it. The production config is 0600 root.
+  mode="$(stat -c %a "$CFG_FILE" 2>/dev/null || echo 600)"
   awk -v key="$key" -v val="$rendered" '
     BEGIN { updated = 0 }
     $0 ~ "^" key "=" {
@@ -2770,8 +2785,12 @@ config_set() {
         print key "=" val
       }
     }
-  ' "$CFG_FILE" > "$tmp"
-  mv "$tmp" "$CFG_FILE"
+  ' "$CFG_FILE" > "$tmp" || {
+    rm -f -- "$tmp"
+    die "could not render $CFG_FILE; it is unchanged"
+  }
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$CFG_FILE"
 }
 
 prompt_with_default() {
@@ -2802,9 +2821,10 @@ prompt_choice() {
   local label="$1"
   local current="$2"
   shift 2
-  local reply
+  local reply at_eof
   while true; do
-    read -r -p "$label [$current] ($(printf '%s ' "$@")): " reply
+    at_eof=0
+    read -r -p "$label [$current] ($(printf '%s ' "$@")): " reply || at_eof=1
     reply="${reply:-$current}"
     for option in "$@"; do
       if [[ "$reply" == "$option" ]]; then
@@ -2812,6 +2832,11 @@ prompt_choice() {
         return 0
       fi
     done
+    # Nothing matched. With an operator present, ask again; with stdin at EOF
+    # there is nobody to ask and re-reading returns instantly, so a prompt with
+    # no answer must FAIL rather than hang.
+    (( at_eof == 0 )) \
+      || die "$label: no input available, and the current value ($current) is not one of: $*"
   done
 }
 
