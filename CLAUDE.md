@@ -5808,6 +5808,88 @@ too.
 
 ---
 
+**THE RECOVERY PACK RECORDED NOTHING ABOUT WHAT IT CONTAINED, so the report
+vouched for items a pack may never have held.** Found 2026-11-05 by continuing
+the "claims coverage rather than asks" sweep into the report CLI.
+
+`state_recovery_coverage` declares that traefik's `/letsencrypt` and
+uptime-kuma's `/app/data` are covered by the recovery pack, and the report
+gates that on `.recovery_pack.state == "available"` -- which means **the
+archive exists**, not that the item is inside it. Both inclusions are
+conditional, and a failure only WARNS at creation time. Measured,
+`uptime_kuma_dump` returns 1 in five situations:
+
+```
+cmd_exists docker || return 1                 docker absent
+grep -qFx "$container" <<< "$running"         NOT in `docker ps`
+docker exec … sqlite3 ".backup …"             the in-container backup fails
+PRAGMA integrity_check                        the dump is not sound
+docker cp "$container:…" "$dest"              the copy out fails
+```
+
+The realistic one is the second: **a container that is stopped, restarting or
+unhealthy at 02:3x**. The pack is then written, reports `available`, and the
+report still says uptime-kuma's state is covered -- and `/app/data` is its
+ENTIRE configuration, a WAL-mode SQLite database in a Docker volume no snapshot
+can reach, so the pack is its only protection. "Warn and continue" producing a
+false coverage claim in a DIFFERENT command is the combination this file
+forbids twice over.
+
+**`PACK_ITEMS` is derived from the STAGE DIRECTORY, not tracked in a
+variable.** The stage dir is the ground truth of what was archived; a counter
+the staging code has to remember to update is the thing that goes stale. It
+emits TOKENS only -- never a path, never a byte of content -- and a test
+asserts no `/` appears in them, because this evidence sits beside a pack full
+of secrets.
+
+**Three states, and the third is what makes it deployable.** `items == null`
+means the pack did not RECORD its contents, which is true of every pack written
+before this existed. That is **not** "contained nothing": defaulting it to an
+empty list would turn every covered item into a finding the first time the
+report ran, which is a false alarm manufactured on purpose -- and this project
+has already refused to ship one for exactly that reason (the standalone
+retention check). So an unrecorded pack keeps the previous verdict and the
+message says `declared; the last pack did not record its contents`, while a
+recorded pack says `confirmed: the last pack contained <token>`. Configuration
+claim and observation, stated separately, as `dr-status` already does for the
+Immich library.
+
+An item the pack demonstrably did **not** contain escalates: `critical` for
+`irreplaceable`, `warning` for `reconstructable`, both naming the missing
+token, and it is no longer ALSO reported as covered -- two answers to one
+question is the defect, not the wording.
+
+**A real jq bug, and the test is what found it.** `$items | index(.pack_item)`
+rebinds `.` to `$items` -- an ARRAY -- so jq raised
+`Cannot index array with string "pack_item"` and the whole report failed to
+generate. Capture the token first (`.pack_item as $pi`, then `index($pi)`).
+Reading the diff would not have shown it; generating the report did.
+
+**The harness discarded its stderr, which turned that into an unactionable
+FAIL.** The assertion printed `the recorded contents were not parsed:` with
+nothing after it, while jq's own message was sitting right there. It shows the
+first five lines of stderr on failure now -- the rule this file states for
+operator messages, applied to a test.
+
+**My section inherited another section's `docker` stub.** Sections replace
+`$FAKE_BIN/docker` in turn, so by the end of the file it returned
+`immich_server`'s mounts and my section asserted on a container it was not
+about -- and it PASSED its first assertion while doing so. It builds its own
+stub now. Second instance this session of reusing a fixture a later section had
+changed; the first was `b.tar.age`'s deliberately corrupted checksum.
+
+**And I invented a `REPORT_LIB_OVERRIDE` seam that does not exist**, which is
+the `domum_release_lock` family: the harness carries a literal `source` line,
+so the seam is a rewrite of that line. The first attempt also matched
+`$REPO_ROOT` in the pattern while the generated harness has it **already
+expanded** -- the heredoc is unquoted -- so the sed silently did nothing and
+the assertion that the harness had been repointed is what caught it.
+
+**Twelfth instance of `cmd | grep -q` under pipefail**, once again in an
+assertion of mine (`grep -cF … | grep -qx 3`). The audit found it in seconds.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

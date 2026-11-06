@@ -601,4 +601,170 @@ jq -e '[.findings[]|select(.message|test("retained pre-migration|leftover .new")
   "$TMP_DIR/report-clean.json" >/dev/null \
   || fail "leftover findings appeared with no leftovers present"
 
+# ---------------------------------------------------------------------------
+# A pack being "available" says the ARCHIVE exists, not that a given item is
+# inside it. Both of the pack's declared-coverage inclusions are conditional on
+# a live container, and failure only WARNS at creation time:
+# `uptime_kuma_dump` returns 1 when docker is absent, when the container is not
+# in `docker ps` (stopped, restarting, unhealthy), when the in-container
+# `.backup` fails, when the integrity check fails, or when `docker cp` fails.
+# The realistic one is simply not running at 02:3x -- and uptime-kuma's
+# /app/data is its entire configuration, a WAL-mode database in a Docker volume
+# no snapshot can reach, so the pack is its only protection.
+#
+# Three states, driven through the real report.
+pack_report() {  # $1 = PACK_ITEMS line ("" = absent), $2 = class, $3 = lib path
+  local env="$TMP_DIR/pack-last.env" lib="${3:-$REPO_ROOT/bin/domum-media-report}"
+  # Its OWN docker stub. Sections earlier in this file replace $FAKE_BIN/docker
+  # in turn, so inheriting whatever the last one left behind made this section
+  # assert on immich_server mounts rather than the /letsencrypt volume it is
+  # about -- a fixture-ordering dependency, and it passed its first assertion
+  # while testing the wrong container.
+  cat > "$FAKE_BIN/docker" <<DOCKEOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "volume" ]; then echo "$TMP_DIR/vol-full"; exit 0; fi
+if [ "\${1:-}" = "inspect" ]; then
+  case "\$*" in
+    *Mounts*) printf 'volume|acme-vol|/letsencrypt|true\n' ;;
+    *) printf 'running|healthy|0|sha256:x\n' ;;
+  esac
+  exit 0
+fi
+exit 1
+DOCKEOF
+  chmod +x "$FAKE_BIN/docker"
+  {
+    printf 'ARCHIVE_PATH=/tmp/pack.age\n'
+    printf 'SHA256=deadbeef\n'
+    printf 'SIZE=4096\n'
+    printf 'TS=%s\n' "$(date +%s)"
+    printf 'VERIFIED_TS=%s\n' "$(date +%s)"
+    [ -n "$1" ] && printf '%s\n' "$1"
+  } > "$env"
+  awk -v cls="$2" -v envf="$env" '/^report_generate_json$/ {
+         print "state_class_declared() { case \"$1\" in *:/letsencrypt) printf \"" cls "\" ;; *) printf \"\" ;; esac; }"
+         print "state_recovery_coverage() { case \"$1\" in *:/letsencrypt) printf recovery-pack ;; *) printf \"\" ;; esac; }"
+         print "state_recovery_pack_item() { case \"$1\" in *:/letsencrypt) printf traefik-acme ;; *) printf \"\" ;; esac; }"
+         print "recovery_pack_state_file() { printf %s \"" envf "\"; }"
+       } { print }' "$TMP_DIR/harness-exposure.sh" > "$TMP_DIR/harness-pack.sh"
+  grep -q 'state_recovery_pack_item' "$TMP_DIR/harness-pack.sh" \
+    || fail "the pack-item override was not injected"
+  if [ "$lib" != "$REPO_ROOT/bin/domum-media-report" ]; then
+    sed -i "s|$REPO_ROOT/bin/domum-media-report|$lib|" "$TMP_DIR/harness-pack.sh"
+    grep -qF "source \"$lib\"" "$TMP_DIR/harness-pack.sh" \
+      || fail "the harness was not repointed at $lib"
+  fi
+  # Its stderr is SHOWN on failure. Discarding it left `out` empty and the
+  # assertion below printed its message with nothing after it -- an
+  # unactionable FAIL, which cost a hunt for a jq error that was sitting right
+  # there ("Cannot index array with string").
+  bash "$TMP_DIR/harness-pack.sh" 2>"$TMP_DIR/pack.err" \
+    || { echo "report generation failed (rc=$?):" >&2
+         sed -n '1,5p' "$TMP_DIR/pack.err" >&2; }
+}
+
+echo "== a pack that RECORDED the item reports it as confirmed, not merely declared =="
+out="$(pack_report "PACK_ITEMS='traefik-acme uptime-kuma'" reconstructable)"
+jq -e '.recovery_pack.items == ["traefik-acme","uptime-kuma"]' >/dev/null <<< "$out" \
+  || fail "the recorded contents were not parsed: $(jq -c .recovery_pack <<< "$out")"
+jq -e '[.findings[]|select(.message|test("letsencrypt"))|select(.level=="info")]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "a confirmed item must stay an info finding: $(jq -c '[.findings[]|select(.message|test("letsencrypt"))]' <<< "$out")"
+jq -e '[.findings[]|select(.message|test("confirmed: the last pack contained traefik-acme"))]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "it does not say the coverage was CONFIRMED: $(jq -c '[.findings[]|.message]' <<< "$out")"
+echo "  info, and stated as confirmed"
+
+echo "== a pack that did NOT contain the item escalates, and names it =="
+# The whole point: the archive exists, so the old gate said covered.
+out="$(pack_report "PACK_ITEMS='uptime-kuma'" reconstructable)"
+jq -e '[.findings[]|select(.message|test("letsencrypt"))|select(.level=="warning")]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "a declared item absent from the pack must escalate: $(jq -c '[.findings[]|select(.message|test("letsencrypt"))]' <<< "$out")"
+jq -e '[.findings[]|select(.message|test("did NOT contain traefik-acme"))]|length >= 1' \
+  >/dev/null <<< "$out" \
+  || fail "the finding does not name the missing item: $(jq -c '[.findings[]|.message]' <<< "$out")"
+jq -e '[.findings[]|select(.message|test("letsencrypt"))|select(.level=="info")]|length == 0' \
+  >/dev/null <<< "$out" \
+  || fail "it is still ALSO reported as covered, so the operator gets both answers"
+echo "  warning that names the missing item, and no covered line"
+
+echo "== an IRREPLACEABLE item absent from the pack is CRITICAL =="
+out="$(pack_report "PACK_ITEMS='uptime-kuma'" irreplaceable)"
+jq -e '[.findings[]|select(.message|test("letsencrypt"))|select(.level=="critical")]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "an irreplaceable item the pack did not contain must be critical: $(jq -c '[.findings[]|select(.message|test("letsencrypt"))]' <<< "$out")"
+echo "  critical"
+
+echo "== a pack with NO recorded contents is UNKNOWN, not uncovered =="
+# A pack written before the contents record exists must not turn every covered
+# item into an alert the first time this runs -- that is a false alarm
+# manufactured on purpose, and this project has refused to ship one before.
+out="$(pack_report "" reconstructable)"
+jq -e '.recovery_pack.items == null' >/dev/null <<< "$out" \
+  || fail "an absent PACK_ITEMS must read as null, never as an empty list: $(jq -c .recovery_pack <<< "$out")"
+jq -e '[.findings[]|select(.message|test("letsencrypt"))|select(.level=="info")]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "an unrecorded pack must not escalate: $(jq -c '[.findings[]|select(.message|test("letsencrypt"))]' <<< "$out")"
+jq -e '[.findings[]|select(.message|test("did not record its contents"))]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "it must say the coverage is declared rather than confirmed: $(jq -c '[.findings[]|.message]' <<< "$out")"
+jq -e '[.findings[]|select(.message|test("confirmed: the last pack"))]|length == 0' \
+  >/dev/null <<< "$out" \
+  || fail "an unrecorded pack must not claim confirmation"
+echo "  info, stated as declared-not-confirmed, and no escalation"
+
+echo "== the tokens are derived from the STAGE DIR, not from bookkeeping =="
+# Ground truth: what was actually staged. A variable the staging code has to
+# remember to update is the thing that goes stale.
+tok() {  # $1 = stage dir
+  ( # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media" >/dev/null 2>&1
+    set +e
+    recovery_pack_item_tokens "$1" )
+}
+stage="$TMP_DIR/stage"; rm -rf "$stage"
+mkdir -p "$stage/state/traefik" "$stage/state/uptime-kuma"
+[ -z "$(tok "$stage")" ] || fail "an empty stage dir reported items: $(tok "$stage")"
+printf 'x\n' > "$stage/state/traefik/acme.json"
+[ "$(tok "$stage")" = "traefik-acme" ] || fail "acme only: got $(tok "$stage")"
+printf 'x\n' > "$stage/state/uptime-kuma/kuma.db"
+[ "$(tok "$stage")" = "traefik-acme uptime-kuma" ] || fail "both: got $(tok "$stage")"
+rm -f "$stage/state/traefik/acme.json"
+[ "$(tok "$stage")" = "uptime-kuma" ] || fail "kuma only: got $(tok "$stage")"
+# It must emit TOKENS, never a path or a byte of content.
+all="$(tok "$stage")"
+case "$all" in */*) fail "the tokens contain a path: $all" ;; esac
+echo "  derived from the files actually staged"
+
+echo "== MUTATION: without the contents gate, a pack that lacked the item reads as covered =="
+# The whole defect: the archive EXISTS, so the old gate said covered. Neutralise
+# the comparison -- never `and false` on a jq expression, mutate the comparison
+# itself into one that cannot hold -- and require the escalation to disappear.
+mut_lib="$TMP_DIR/report-lib-mut"
+cp "$REPO_ROOT/bin/domum-media-report" "$mut_lib"
+python3 - "$mut_lib" <<'PYMUT'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "        and (($items | index($pi)) == null)) as $absent |"
+new = "        and (($items | index($pi)) == null) and ($pi != $pi)) as $absent |"
+assert s.count(old) == 3, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PYMUT
+mut_hits="$(grep -cF 'index($pi)) == null) and ($pi != $pi)' "$mut_lib" || true)"
+[ "$mut_hits" = "3" ] \
+  || fail "the contents-gate mutation applied $mut_hits time(s), expected 3"
+out="$(pack_report "PACK_ITEMS='uptime-kuma'" reconstructable "$mut_lib")"
+# With the gate neutralised the item is reported as covered again, which is the
+# false claim this change exists to remove.
+jq -e '[.findings[]|select(.message|test("letsencrypt"))|select(.level=="info")]|length == 1' \
+  >/dev/null <<< "$out" \
+  || fail "the mutation changed no ANSWER -- without the contents gate a pack that
+did not contain the item must be reported as covering it again: $(jq -rc '[.findings[]|.level+"|"+.message]' <<< "$out")"
+jq -e '[.findings[]|select(.message|test("did NOT contain"))]|length == 0' \
+  >/dev/null <<< "$out" \
+  || fail "the mutant still names the missing item"
+echo "  killed: the mutant reports an item the pack never held as covered"
+
 echo "PASS: operational report smoke test"

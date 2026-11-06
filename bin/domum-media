@@ -5106,6 +5106,35 @@ traefik_acme_source() {
   printf '%s' "$mp/acme.json"
 }
 
+# Which declared-coverage items did this pack actually CONTAIN?
+#
+# `state_recovery_coverage` in the report declares that traefik's /letsencrypt
+# and uptime-kuma's /app/data are covered by the recovery pack, and the report
+# gates that on the pack being "available" -- which means the archive EXISTS,
+# not that this item is inside it. The two inclusions are conditional and
+# failure is a warning:
+#
+#   uptime_kuma_dump returns 1 when docker is absent, when the container is not
+#   in `docker ps` (stopped, restarting or unhealthy), when the in-container
+#   .backup fails, when the integrity check fails, or when docker cp fails.
+#
+# The realistic one is the container simply not running at 02:3x. The pack is
+# then still written and still "available", and the report still reports
+# uptime-kuma's state as covered -- its ENTIRE configuration, a WAL-mode
+# database in a Docker volume no snapshot can reach, so the pack is its only
+# protection. "Warn and continue" producing a false coverage claim in another
+# command is the combination this project forbids.
+#
+# Derived from the stage directory, which is the ground truth of what was
+# archived, rather than from a variable the staging code has to remember to
+# update. TOKENS only -- never a file's contents, and never a rendered secret.
+recovery_pack_item_tokens() {  # $1 = stage dir -> space-separated tokens
+  local stage="$1" out=()
+  [[ -f "$stage/state/traefik/acme.json" ]]     && out+=(traefik-acme)
+  [[ -f "$stage/state/uptime-kuma/kuma.db" ]]   && out+=(uptime-kuma)
+  printf '%s' "${out[*]:-}"
+}
+
 recovery_pack_manifest() {
   local stage_dir="$1"
   local manifest="$stage_dir/MANIFEST.txt"
@@ -5411,6 +5440,9 @@ recovery_pack_create() {
   compose_cmd config > "$stage_dir/meta/rendered-compose.yml" 2>/dev/null || true
   recovery_pack_restore_instructions "$stage_dir"
   recovery_pack_manifest "$stage_dir"
+  # While the stage dir still exists: what went in, not what was intended.
+  local pack_items
+  pack_items="$(recovery_pack_item_tokens "$stage_dir")"
 
   tar -C "$stage_dir" -czf "$archive_plain" .
   age -r "$recipient" -o "$archive_tmp" "$archive_plain"
@@ -5425,7 +5457,8 @@ recovery_pack_create() {
     SHA256 "$sha" \
     SIZE "$size" \
     TS "$(date +%s)" \
-    VERIFIED_TS "$(date +%s)"
+    VERIFIED_TS "$(date +%s)" \
+    PACK_ITEMS "$pack_items"
   rm -rf "$stage_dir"
   rm -f "$archive_plain"
   trap - EXIT HUP INT TERM
@@ -5444,7 +5477,7 @@ recovery_pack_status() {
     echo "[domum-media] No recovery pack has been created yet."
     return 1
   fi
-  unset ARCHIVE_PATH SHA256 SIZE TS VERIFIED_TS
+  unset ARCHIVE_PATH SHA256 SIZE TS VERIFIED_TS PACK_ITEMS
   # shellcheck disable=SC1090
   source "$state_file"
   archive_path="${ARCHIVE_PATH:-}"
@@ -5457,6 +5490,16 @@ recovery_pack_status() {
   echo "  size: ${size} bytes"
   echo "  sha256: ${sha:-unknown}"
   echo "  verified age: $(human_age_from_epoch "${VERIFIED_TS:-$ts}")"
+  # A key read but never written is silently empty, so the absent case is named
+  # rather than rendered as an empty list -- a pack written before this was
+  # recorded is not a pack that contained nothing.
+  if [[ -z "${PACK_ITEMS+x}" ]]; then
+    echo "  contents: NOT RECORDED -- this pack predates the contents record"
+  elif [[ -z "${PACK_ITEMS:-}" ]]; then
+    echo "  contents: none of the declared-coverage items were included"
+  else
+    echo "  contents: ${PACK_ITEMS}"
+  fi
 }
 
 recovery_pack_cmd() {
