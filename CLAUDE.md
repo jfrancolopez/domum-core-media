@@ -5962,6 +5962,49 @@ while making the section slow and destructive.
 
 ---
 
+**A TEST THAT NEEDED TWO OPERATIONS TO LAND IN THE SAME WALL-CLOCK SECOND
+FAILED IN CI AND PASSED HERE, IN THE FALSE DIRECTION.** Found 2026-11-06 when
+rebasing onto a newer `main` reran CI: `two-migrated-services-smoke` section 9
+reported `FIRST=0 SECOND=0`, and the identical code had passed on the same
+branch minutes earlier.
+
+The section pins a real invariant -- a second restore that computes the same
+`<path>.rollback-<YYYYMMDD-HHMMSS>` must REFUSE rather than overwrite the
+preserved copy, which is the only way back. But it produced the collision by
+calling the restore twice and *hoping* both calls fell inside one second. On a
+slower, loaded runner they straddled a boundary, the two names differed, no
+collision occurred, and the refusal it exists to prove simply never happened.
+So the suite failed while the code was correct -- 3/3 passes locally.
+
+The timestamp is stubbed now, and **only the one format this path uses**:
+
+```
+date() { case "$*" in '+%Y%m%d-%H%M%S') printf '20260101-000000' ;; *) command date "$@" ;; esac; }
+```
+
+Every other `date` call stays real, so the stub cannot quietly change anything
+else. The section then tests what it is actually about -- two restores
+computing the SAME name -- instead of testing the clock.
+
+**Its teeth were re-proved rather than assumed**: neutralising
+`[[ -e "$current_backup" ]] && die` makes the section fail, and restoring it
+makes it pass. A deterministic fixture that no longer catches the defect would
+be worse than the flaky one.
+
+The failure message said "in the same second", which stopped being what the
+test does, so it says "computing the SAME preserved-copy name" now. A test
+whose message describes a mechanism it no longer uses is the same defect this
+file keeps correcting in operator output.
+
+**"Passes locally, fails in CI" is this file's own rule arriving from the other
+direction.** The recorded form is "a test that depends on host state is not a
+test", and every previous instance was a fixture reading a host PATH or device.
+This one depended on host SPEED, which no amount of redirecting roots would
+have caught -- and it is intermittent, so it will have passed many times before
+today.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

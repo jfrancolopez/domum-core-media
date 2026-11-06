@@ -322,22 +322,32 @@ for bad in "../$J" "." ".." "kavita-20260101-000000-../../../etc"; do
     || fail "9: '$bad' was refused, but not as an invalid name: $out"
 done
 
-# A second restore in the SAME SECOND must refuse rather than overwrite the
-# preserved copy: `<path>.rollback-<YYYYMMDD-HHMMSS>` has one-second resolution.
-# Refusing is correct -- the preserved copy is the only way back -- so this is
-# pinned so nobody "fixes" it by overwriting.
+# A second restore that computes the SAME preserved-copy name must refuse rather
+# than overwrite it: `<path>.rollback-<YYYYMMDD-HHMMSS>` has one-second
+# resolution. Refusing is correct -- the preserved copy is the only way back --
+# so this is pinned so nobody "fixes" it by overwriting.
+#
+# THE TIMESTAMP IS STUBBED, because hoping both restores land in the same
+# wall-clock second is not a test. It passed here and FAILED in CI with
+# `FIRST=0 SECOND=0`: the slower runner straddled a second boundary, the two
+# names differed, no collision occurred, and a correct refusal simply never
+# happened. That is a host-dependent fixture failing in the FALSE direction.
+#
+# Only the one format this path uses is pinned; every other `date` call stays
+# real, so the stub cannot quietly change anything else.
 rm -rf "$DATA" "$SNAPS"; mkdir -p "$DATA/kavita" "$SNAPS/$K"
 twice="$(run "$BOTH" "
 service_data_path() { printf '%s' '$DATA'/\"\$1\"; }
 service_compose_services() { printf 'x'; }
 stop_compose_services_verified() { return 0; }
 compose_cmd() { :; }
+date() { case \"\$*\" in '+%Y%m%d-%H%M%S') printf '20260101-000000' ;; *) command date \"\$@\" ;; esac; }
 btrfs() { mkdir -p \"\${!#}\"; }
 ( restore_snapshot_for_service kavita $K >/dev/null ) && echo FIRST=0 || echo FIRST=1
 ( restore_snapshot_for_service kavita $K >/dev/null ) && echo SECOND=0 || echo SECOND=1")"
 grep -q 'FIRST=0' <<< "$twice" || fail "9: the first restore failed: $twice"
 grep -q 'SECOND=1' <<< "$twice" \
-  || fail "9: a second restore in the same second overwrote the preserved copy: $twice"
+  || fail "9: a second restore computing the SAME preserved-copy name overwrote it: $twice"
 grep -q 'already exists' <<< "$twice" || fail "9: not explained: $twice"
 
 # Restore the shared fixture the later cases expect.
