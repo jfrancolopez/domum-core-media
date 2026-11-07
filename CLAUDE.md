@@ -6226,6 +6226,69 @@ anchor does not match. `cat -A` showed that in one look.
 
 ---
 
+**"NEEDS ROOT" AND "NOT PERMITTED" ARE DIFFERENT BLOCKERS, AND I HAD FILED ONE
+AS THE OTHER.** P1.16 -- calibre-web's Fernet key being 0644 -- sat in the
+backlog as an operator action requiring root. Re-measured 2026-11-06:
+
+```
+-rw-r--r-- jfranco:jfranco /srv/data/calibre-web/config/.key
+[ -O <file> ]  ->  true        the agent RUNS as jfranco, which OWNS it
+```
+
+`chmod 600` would therefore succeed with **no sudo at all**. What blocks it is
+the explicit standing instruction *do not chmod production files without
+approval*, plus the production-change boundary -- not a missing privilege.
+
+**The distinction is not pedantic: it changes the instruction the operator
+gets.** Filed as "needs root" it reads as `sudo chmod …`; filed correctly it is
+`chmod 600 /srv/data/calibre-web/config/.key` run as jfranco, with no
+escalation at all. A blocker recorded as the wrong KIND of blocker sends the
+next reader down the wrong path, which is the same defect as a report naming
+the wrong cause.
+
+Re-measured in the same pass, and genuinely privilege-blocked:
+`domum-media-backup verify-snapshot-coverage cloud` answers
+`ERROR: Run as root (use sudo).`, and `sudo -n true` still answers
+`a password is required` with zero NOPASSWD entries. So P5.6 is root-blocked
+and P1.16 is not, where both had been filed the same way.
+
+**AND THE STORAGE AND SQLITE THREADS WERE RE-VERIFIED RATHER THAN QUOTED.**
+Both were measured in earlier sessions and the backlog's claims were being
+repeated, which this file forbids -- *verify claims against live evidence before
+repeating them*. Re-driven 2026-11-06 against the current code:
+
+| claim | re-verified |
+|---|---|
+| a scrub already running is not a failure | `SKIPPED`, rc **0** |
+| an unrecognised scrub error stays a failure | rc **1** |
+| uncorrectable errors escalate | rc **3**, names it, says do NOT repair, points at the kernel log |
+| exit 3 fails the unit | `ExecStart` carries no `-` prefix |
+| SMART permission failure is not a disk failure | **WARNING**, 0 critical |
+| a genuine failed self-assessment | **CRITICAL** |
+| a passing drive | healthy |
+| non-zero `corruption_errs` | **CRITICAL**, named |
+| unreadable counters | **WARNING**, never a clean pass |
+
+And the journal modes, read from bytes 18/19 of the live files (a pure read):
+jellyfin **WAL**, kavita **WAL**, navidrome **WAL** with a live 20,632-byte
+`-wal`, calibre-web **rollback journal**. Unchanged, including the subtle part
+-- jellyfin and kavita are WAL-mode with **no `-wal` present**, which is why
+absence of that file is not evidence of a non-WAL database.
+
+**FOUR FIXTURE MISTAKES IN ONE SITTING, ALL THE SAME ONE: I STUBBED SEAMS
+WITHOUT READING THEM.** A `btrfs` stub that printed "uncorrectable" in its
+output while returning 0 -- the code classifies on btrfs's **exit status**, so
+it was right and the fixture was wrong, and for a moment it looked like
+corruption failing to escalate. A `cmd_exists` stub that admitted only
+`smartctl`, so `jq` read as absent and the function short-circuited. An `lsblk`
+stub printing `sda` without the TYPE column, so `awk '$2=="disk"'` matched
+nothing and the check recorded silently nothing at all. Each was a probe
+reporting a problem that did not exist. **Read the seam before stubbing it** --
+`awk '/^fn/,/^}/'` on the function takes one command and would have prevented
+all four.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
