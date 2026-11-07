@@ -13,12 +13,18 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-06** against `origin/main` = `a8cb9ad`. The delta has
-grown 16 -> 30 -> **38 commits**, and this time the installable surface DID
-change shape: `bin/domum-media-report` is now modified, where the previous
-reconciliation recorded it as unchanged since 2026-10-11. That is exactly what
-re-measuring is for -- the previous table would have told an operator that file
-did not need deploying.
+Reconciled **2026-11-06** against `origin/main` = `302e26d`. The delta has
+grown 16 -> 30 -> 38 -> **44 commits**. The installable surface is the same
+FIVE paths as at 38 -- all three binaries plus the two comment-only
+`systemd/` files -- so nothing new has to be carried; what changed is the
+content of the three binaries.
+
+An earlier reconciliation recorded `bin/domum-media-report` as *unchanged since
+2026-10-11*, which by then was false: it carries the recovery-pack contents
+reader. That is exactly what re-measuring is for -- the stale table would have
+told an operator that file did not need deploying. It is checked on its own
+path every time now, because it installs to `/usr/local/lib/domum-media/`
+rather than `/usr/local/bin/`.
 
 ---
 
@@ -51,8 +57,9 @@ and it holds right now — so a run of it starts from a clean base.
 
 ## 2. What would change
 
-38 commits, of which the **installable** surface is still small. Re-measured
-2026-11-06 with `git diff --name-only a63ad19..main -- bin systemd install.sh`:
+44 commits, of which the **installable** surface is still small and
+UNCHANGED IN SHAPE since the 38-commit reconciliation. Re-measured 2026-11-06
+with `git diff --name-only a63ad19..main -- bin systemd install.sh`:
 
 | repository path | installed as | changes? | note |
 |---|---|---|---|
@@ -234,6 +241,11 @@ non-latent item is §4.
 | `config_set`'s atomic publish | needs an interruption **during** `configure`, which is operator-run and rare |
 | `config_set`'s `ENVIRON` quoting fix | **this host's `awk` is mawk 1.3.4, which does not strip the escapes** — measured; the defect is live only on a different `awk` |
 | `prompt_choice`'s EOF guard | needs `configure` with stdin at EOF **and** a config value outside its option list |
+
+| `list_latest_snapshots` keeping "cannot tell" apart from "none" | only `--snapshots`, which is operator-run and read-only |
+| `traefik_acme_source` / `do_verify_restore` behavioural coverage | tests only; no production code changed |
+| the compose `container_name` guard | a test; it asserts an invariant production already satisfies (all 13 services) |
+| the stop verification's behavioural test | a test; the function itself is unchanged |
 
 **Two of those deserve a sharper note, because "latent" is doing real work.**
 
