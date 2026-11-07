@@ -711,8 +711,14 @@ restic_check_for() {
 }
 
 list_latest_snapshots() {
-  local any=0
+  local any=0 targets
+  if ! targets="$(enabled_backup_targets)"; then
+    echo "(the enabled backup targets could not be determined -- this is NOT the"
+    echo " same as none being enabled, and no conclusion about coverage follows)"
+    return 1
+  fi
   while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
     any=1
     echo "-- $target --"
     local out rc=0
@@ -725,7 +731,7 @@ list_latest_snapshots() {
       echo "(failed to query snapshots for $target)"
       printf '%s\n' "$out"
     fi
-  done < <(enabled_backup_targets)
+  done <<< "$targets"
   (( any == 1 )) || echo "(no enabled backup targets)"
 }
 

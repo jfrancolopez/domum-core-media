@@ -6329,6 +6329,44 @@ suspicion as old code.
 
 ---
 
+**THE NEVER-EXECUTED COUNT IS NOW ZERO, and the last one had a real defect of
+a recorded family.** The instrumentation pass left three functions no test had
+ever run; `do_verify_restore` was covered first, and these are the other two.
+
+**`list_latest_snapshots` conflated "cannot tell" with "none".** It read the
+target list from a **process substitution**, which hides the producer's exit
+status, so a FAILURE to determine the enabled targets printed
+`(no enabled backup targets)` -- indistinguishable from none being enabled.
+That is the exact conflation the five DR levels exist to prevent and the one
+`dr_path_configured` grew a third return code for. Low stakes on its own (an
+operator listing, not a gate), and the fix is to capture the list and check the
+status: unreadable now exits **1** and says it is *not* the same as none being
+enabled, empty reports none, and a populated list is listed. One mutant:
+restoring the status-blind form must make a failure report as "none enabled".
+
+**`traefik_acme_source`** (8 lines) decides WHERE the ACME account private key
+is read from, so a silent wrong answer means the recovery pack omits the one
+artefact that makes Traefik's certificates recoverable. Driven in four
+directions: no docker, an unresolvable volume, a volume with no `acme.json`
+(all refuse), and a present one (resolves to a path that exists).
+
+**THE SAFETY CHECK CAUGHT A HAZARD IN MY OWN FIXTURE, and it was right.** The
+first version did `rm -rf "$vroot"` where `$vroot="$TMP_DIR/acme/$sc"` -- and
+`$sc` was the very variable turning up unbound, which is precisely the shape
+that turns a cleanup into a disaster. Rewritten to take a fresh `mktemp -d` per
+scenario: a unique directory needs no removal at all, so the dangerous line
+simply does not exist. **Prefer `mktemp -d` over constructing a path and
+deleting it.**
+
+**And two fixtures assumed the wrong local names.** The acme probe shadowed
+with `local sc` across a subshell boundary and came apart under `set -u`; and
+the snapshots mutation wrote `$TMP_DIR` in a suite whose scratch directory is
+called `$TMP`. Both failed loudly rather than silently, which is the only
+reason they cost minutes instead of being wrong quietly -- but the lesson is
+the one already recorded: read the harness before writing into it.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
