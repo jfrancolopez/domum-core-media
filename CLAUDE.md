@@ -6145,8 +6145,11 @@ function runs"*, the lesson from `service_upgrade` shipping with a call to an
 undefined helper while 41 suites passed. Nothing had ever swept for it
 mechanically.
 
-Measured: **62** functions have their source extracted and grepped by a suite,
-and **11** of those are never executed by any suite. The sharpest was
+Measured: **62** functions have their source extracted and grepped by a suite.
+A first pass concluded **11** of those are never executed, and that figure was
+WRONG -- it came from grepping the suites for call shapes, which cannot see a
+function reached indirectly. Corrected by instrumentation (below): **7 of the
+11 do execute**, and only **3** genuinely never run. The sharpest was
 `stop_compose_services_verified`: text-asserted in `operation-lock-smoke` and
 **stubbed to `return 0`** in the three other suites that touch it. Its real
 logic had run in no test at all -- and a false "stopped" from it lets a
@@ -6184,16 +6187,42 @@ service, and `docker ps --format …` makes `$2` the format flag. The suite
 failed with `return: plex: numeric argument required`, which named the cause
 precisely. Stubs read named variables now.
 
-**The other ten text-only functions are recorded rather than swept into one
-change**: `create_upgrade_rollback_point`, `do_verify_restore`,
-`domum_capability_specs`, `image_archive_dir`, `list_latest_snapshots`,
-`migrate_process_group`, `mreport_render_text`,
-`recovery_pack_restore_instructions`, `traefik_acme_source`, `updates_cmd`.
-Several are reached indirectly by integration suites, and
-`function-definition-audit.py` already catches the specific
-undefined-helper failure that started this family -- so the remaining exposure
-is narrower than the count suggests, and each needs its own judgement rather
-than a bulk pass.
+**THE REMAINING TEN WERE MEASURED, NOT GUESSED, AND SEVEN OF THEM DO RUN.**
+A grep for call shapes said eleven functions never execute. That method cannot
+see a function reached indirectly -- through the real dispatcher, or from
+another function a suite does call -- so it over-reported. Each of the ten was
+instrumented with a marker that appends its name to a file (never stdout:
+several are captured functions, and polluting their stdout would change
+behaviour), the whole suite plus the integration suite was run, and the markers
+were collected: **47,722 writes**.
+
+Executed: `create_upgrade_rollback_point`, `domum_capability_specs`,
+`image_archive_dir`, `migrate_process_group`, `mreport_render_text`,
+`recovery_pack_restore_instructions`, `updates_cmd`.
+
+Never executed, all three read and found CLEAN:
+
+- `traefik_acme_source` (8 lines) -- returns 1 on every failure path, and needs
+  root because it resolves a `/var/lib/docker/volumes/...` mountpoint;
+- `list_latest_snapshots` (18 lines) -- captures restic's combined output before
+  matching, so no pipefail hazard. It does conflate "no enabled targets" with
+  "the target list could not be read", which is the three-state family -- but it
+  is an interactive listing rather than a gate, and `load_cfg` would have died
+  first;
+- `do_verify_restore` (78 lines) -- records failure evidence on EVERY failure
+  path before dying; its `gzip -dc | tail -5` is safe because `tail` must read
+  all input and cannot exit early; and a failed success-record warns rather than
+  failing, which is the SAFE direction here -- an unrecorded verification makes
+  `dr-status` report a WEAKER tier, not a stronger one, so it is not the
+  "warn and continue" defect.
+
+**Two method notes worth keeping.** Instrumenting the real binaries means the
+tree briefly holds code that must never be committed, so the pristine copies
+were taken with `cp` and restored from those -- not with `git checkout`, which
+this file already records destroying uncommitted work. And four of the ten were
+not where the first pattern looked: two live in `bin/domum-media-backup`, and
+two carry a trailing comment on the definition line, which a `"name() {\n"`
+anchor does not match. `cat -A` showed that in one look.
 
 ---
 
