@@ -6289,6 +6289,46 @@ all four.
 
 ---
 
+**`do_verify_restore` IS NOW EXECUTED, AND IT IS THE FUNCTION WHOSE EVIDENCE
+`dr-status` PROMOTES INTO A TIER.** It was one of only three functions that the
+instrumentation pass found no test ever runs, and the only consequential one:
+`verify-restore` earns the `RESTORE TESTED` claim, so the code deciding
+success-from-failure had never been observed, only read.
+
+Driven through the real function, with every seam read first:
+
+| case | required |
+|---|---|
+| sound artefact | success, `checks=gzip,size,footer`, snapshot id recorded |
+| restic restore fails | failure RECORDED, then dies |
+| snapshot lacks the file | failure recorded, named |
+| corrupt gzip | failure, `checks=gzip` |
+| implausibly small | failure, `checks=gzip` -- it got past gzip first |
+| no completion footer | failure, `checks=gzip,size` |
+| scratch inside a live data root | refused, naming the reason |
+
+**Every failure path must RECORD before dying, and that is the point of the
+loop over all five.** `dr-status` reads that evidence, so a failure which
+records nothing is indistinguishable from a run that never happened -- and the
+accumulated `checks` value is what separates a corrupt archive from a truncated
+one. One mutant: removing the footer check must make a footerless dump verify
+as a success.
+
+**The function rejected my first fixture, correctly.** 4000 identical bytes
+gzip to **79**, far under the 1024-byte floor it enforces, so the "sound"
+artefact was reported implausibly small. The payload has to be INCOMPRESSIBLE
+for the size check to pass on its own terms rather than by accident --
+`head -c 8192 /dev/urandom | base64`. A fixture that squeaked past a size floor
+by luck would have proven nothing about the floor.
+
+**And I left two vacuous shapes in my own new section before noticing.** A
+`grep -q … || true` asserts nothing at all -- it is the no-op assertion this
+file warns about, written by hand this time -- and an override variable the
+mutation never read. Both removed. A new test section deserves the same
+suspicion as old code.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
