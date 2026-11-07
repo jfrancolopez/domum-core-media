@@ -264,4 +264,162 @@ grep -q 'running="\$(docker ps' <<< "$fn_stop" \
 grep -q 'grep -qFx -- "\$svc" <<< "\$running"' <<< "$fn_stop" \
   || fail "the stop verification does not match against the captured output"
 
+# ---------------------------------------------------------------------------
+# AND NOW IT IS EXECUTED, not merely read.
+#
+# The assertions above are about the function's TEXT. This project already
+# records why that is not enough -- `service_upgrade` shipped calling an
+# undefined helper while 41 suites passed, because every assertion about it
+# read its source and none ran it. Swept 2026-11-06: `stop_compose_services_
+# verified` was in exactly that state. It is text-asserted here and STUBBED to
+# `return 0` in the three other suites that touch it, so its real logic had
+# never been executed by any test -- and it is the check the whole migration
+# safety argument rests on, since a false "stopped" lets a migration copy a
+# live database.
+# ---------------------------------------------------------------------------
+echo "== the stop verification, EXECUTED =="
+stopv() {  # $1 = services, $2 = docker ps output, $3 = compose stop rc
+  local SV_SVCS="$1" SV_PS="$2" SV_RC="$3"
+  (
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media" >/dev/null 2>&1
+    set +e
+    # NAMED variables, not positionals: inside these stubs $2 and $3 are the
+    # STUB's own arguments -- `docker ps --format ...` would make $2 the format
+    # flag and `compose_cmd stop kavita plex` would make $3 the second service.
+    compose_cmd() { return "$SV_RC"; }
+    docker() { [[ "${1:-}" == "ps" ]] && printf '%s\n' "$SV_PS"; return 0; }
+    stop_compose_services_verified "$SV_SVCS"
+    echo "rc=$?"
+  ) 2>&1
+}
+
+# Nothing to stop is success, and it must not consult docker at all.
+out="$(stopv "" "" 0)"
+grep -q 'rc=0' <<< "$out" || fail "an empty service list did not succeed: $out"
+
+# Everything stopped -> success.
+out="$(stopv "kavita plex" "traefik
+immich_server" 0)"
+grep -q 'rc=0' <<< "$out" || fail "all services stopped did not succeed: $out"
+
+# ONE still running -> refuse, and NAME it. This is the direction that matters.
+out="$(stopv "kavita plex" "traefik
+plex
+immich_server" 0)"
+grep -q 'rc=1' <<< "$out" || fail "a still-running container was declared stopped: $out"
+grep -q 'Still running after stop: plex' <<< "$out" \
+  || fail "the refusal does not name the service still running: $out"
+grep -qF 'kavita' <<< "$(sed -n '/Still running/p' <<< "$out")" \
+  && fail "it names a service that HAD stopped: $out"
+
+# A failed `compose stop` refuses before any verification.
+out="$(stopv "kavita" "" 1)"
+grep -q 'rc=1' <<< "$out" || fail "a failed compose stop did not refuse: $out"
+grep -q 'Could not stop: kavita' <<< "$out" || fail "the stop failure is not reported: $out"
+
+# A SUBSTRING must not count as stopped or as running: the match is whole-line.
+# `kavita` must not be satisfied by a running `kavita-extra`, and must not be
+# excused by one either.
+out="$(stopv "kavita" "kavita-extra" 0)"
+grep -q 'rc=0' <<< "$out" \
+  || fail "a running container whose name merely CONTAINS the service name was
+treated as that service still running: $out"
+out="$(stopv "kavita-extra" "kavita" 0)"
+grep -q 'rc=0' <<< "$out" \
+  || fail "a prefix of the service name was treated as the service itself: $out"
+echo "   empty / all-stopped / one-running(named) / stop-failed / whole-line match"
+
+echo "== MUTATION: an inverted match declares a running container stopped =="
+mut="$TMP_DIR/cli-stopmut"
+cp "$REPO_ROOT/bin/domum-media" "$mut"
+python3 - "$mut" <<'PYSM'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    if grep -qFx -- "$svc" <<< "$running"; then'
+new = '    if ! grep -qFx -- "$svc" <<< "$running"; then'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYSM
+grep -qF 'if ! grep -qFx -- "$svc"' "$mut" || fail "the inversion mutation did not apply"
+mout="$( ( source "$mut" >/dev/null 2>&1; set +e
+           compose_cmd() { return 0; }
+           docker() { [[ "${1:-}" == "ps" ]] && printf 'plex\n'; return 0; }
+           stop_compose_services_verified "plex"; echo "rc=$?" ) 2>&1 )"
+grep -q 'rc=0' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- an inverted match must declare the
+RUNNING container stopped: $mout"
+echo "  killed: the mutant lets a migration proceed over a running container"
+
+# ---------------------------------------------------------------------------
+# The check compares COMPOSE SERVICE names against `docker ps --format
+# '{{.Names}}'`, which lists CONTAINER names. Those are only the same because
+# every service sets `container_name` equal to its key -- measured 2026-11-06,
+# all 13 do. Nothing enforced it, and that is the invariant the verification
+# silently depends on: without `container_name`, compose names the container
+# `<project>-<service>-1`, the whole-line match never fires, `still` stays
+# empty, and a RUNNING container is declared stopped.
+# ---------------------------------------------------------------------------
+echo "== every compose service sets container_name equal to its key =="
+cat > "$TMP_DIR/cnguard.py" <<'PYCN'
+import glob, os, re, sys
+root = sys.argv[1]
+bad, n = [], 0
+for f in sorted(glob.glob(os.path.join(root, "compose/**/*.yml"), recursive=True)):
+    section = None
+    for line in open(f):
+        m = re.match(r"^([a-z]+):\s*$", line)
+        if m:
+            section = m.group(1); continue
+        k = re.match(r"^  ([A-Za-z][A-Za-z0-9_.-]*):", line)
+        if k and section == "services":
+            cur = k.group(1); n += 1
+            bad.append([f, cur, None])
+        elif section == "services" and bad:
+            cn = re.match(r"^\s+container_name:\s*(\S+)\s*$", line)
+            if cn:
+                bad[-1][2] = cn.group(1)
+offenders = [(f, s, c) for f, s, c in bad if c != s]
+print("   %d service(s) checked" % n)
+for f, s, c in offenders:
+    print("   !! %s: service %r has container_name %r" % (os.path.relpath(f, root), s, c))
+sys.exit(1 if offenders else 0)
+PYCN
+python3 -I "$TMP_DIR/cnguard.py" "$REPO_ROOT" \
+  || fail "a compose service does not set container_name == its key"
+
+# NEGATIVE CONTROL: the same guard, against a tree that breaks the invariant.
+# Without this the check has only ever seen a passing tree, which is the
+# vacuity hole -- it would pass just as happily if its parser matched nothing.
+bad_tree="$TMP_DIR/badcompose"; rm -rf "$bad_tree"; mkdir -p "$bad_tree/compose/media"
+cat > "$bad_tree/compose/media/ok.yml" <<'OKY'
+services:
+  goodsvc:
+    image: x
+    container_name: goodsvc
+OKY
+python3 -I "$TMP_DIR/cnguard.py" "$bad_tree" >/dev/null 2>&1 \
+  || fail "the guard rejects a tree that SATISFIES the invariant"
+cat > "$bad_tree/compose/media/bad.yml" <<'BADY'
+services:
+  nocontainername:
+    image: x
+BADY
+if python3 -I "$TMP_DIR/cnguard.py" "$bad_tree" >/dev/null 2>&1; then
+  fail "the guard ACCEPTED a service with no container_name, so it proves nothing
+about the real tree either"
+fi
+cat > "$bad_tree/compose/media/bad.yml" <<'BADY2'
+services:
+  mismatched:
+    image: x
+    container_name: something-else
+BADY2
+if python3 -I "$TMP_DIR/cnguard.py" "$bad_tree" >/dev/null 2>&1; then
+  fail "the guard ACCEPTED a container_name that differs from the service key"
+fi
+echo "   the invariant the stop verification rests on is enforced, and the guard
+   rejects both a missing and a mismatched container_name"
+
 echo "PASS: operation lock smoke test"

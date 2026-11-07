@@ -6138,6 +6138,65 @@ is evidence about this machine.
 
 ---
 
+**THE CHECK THE WHOLE MIGRATION SAFETY ARGUMENT RESTS ON HAD NEVER BEEN
+EXECUTED BY A TEST.** Swept 2026-11-06 for the family this file already
+records -- *"a test that asserts on a function's TEXT does not prove the
+function runs"*, the lesson from `service_upgrade` shipping with a call to an
+undefined helper while 41 suites passed. Nothing had ever swept for it
+mechanically.
+
+Measured: **62** functions have their source extracted and grepped by a suite,
+and **11** of those are never executed by any suite. The sharpest was
+`stop_compose_services_verified`: text-asserted in `operation-lock-smoke` and
+**stubbed to `return 0`** in the three other suites that touch it. Its real
+logic had run in no test at all -- and a false "stopped" from it lets a
+migration copy a live database, which is the failure the stop verification
+exists to prevent.
+
+It is executed now, in six directions: nothing to stop, everything stopped, one
+still running (and the refusal must NAME it and not name the one that did
+stop), a failed `compose stop` refusing before any verification, and both
+substring directions -- a running `kavita-extra` must not satisfy `kavita`, and
+must not excuse it either. One mutant: inverting the match must declare the
+RUNNING container stopped.
+
+**AND THE CHECK SILENTLY DEPENDS ON AN INVARIANT NOTHING ENFORCED.** It
+compares COMPOSE SERVICE names from `$svcs` against
+`docker ps --format '{{.Names}}'`, which lists CONTAINER names. Those are the
+same only because every service sets `container_name` equal to its key --
+measured, **all 13 do**. Without it compose names the container
+`<project>-<service>-1`, the whole-line match never fires, `still` stays empty,
+and a running container reads as stopped. That is the dangerous direction, and
+it would arrive with an ordinary new service rather than with a code change.
+A guard now asserts the invariant across every fragment.
+
+**The guard has a negative control, because one that has only seen a passing
+tree is not a guard.** It is run against a fixture that satisfies the invariant
+(must pass), one with a service lacking `container_name` (must fail), and one
+whose `container_name` differs from its key (must fail). Without that, a parser
+which quietly matched nothing would have reported `13 service(s) checked`
+exactly the same way.
+
+**My fixture's stubs read POSITIONAL parameters, which belong to the stubs.**
+`compose_cmd() { return "$3"; }` and `docker() { … printf '%s\n' "$2"; }` read
+their OWN arguments -- `compose_cmd stop kavita plex` makes `$3` the second
+service, and `docker ps --format …` makes `$2` the format flag. The suite
+failed with `return: plex: numeric argument required`, which named the cause
+precisely. Stubs read named variables now.
+
+**The other ten text-only functions are recorded rather than swept into one
+change**: `create_upgrade_rollback_point`, `do_verify_restore`,
+`domum_capability_specs`, `image_archive_dir`, `list_latest_snapshots`,
+`migrate_process_group`, `mreport_render_text`,
+`recovery_pack_restore_instructions`, `traefik_acme_source`, `updates_cmd`.
+Several are reached indirectly by integration suites, and
+`function-definition-audit.py` already catches the specific
+undefined-helper failure that started this family -- so the remaining exposure
+is narrower than the count suggests, and each needs its own judgement rather
+than a bulk pass.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
