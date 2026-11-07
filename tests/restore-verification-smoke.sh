@@ -223,4 +223,147 @@ jq -e '.state == "sampled" and .last_sampled_at != null' <<< "$out" >/dev/null \
   || fail "a manifest with unusable timestamps must still be reported: $out"
 rm -f "$SAMPLE"
 
+# ---------------------------------------------------------------------------
+# AND NOW IT IS EXECUTED.
+#
+# Everything above asserts on this function's TEXT. Measured 2026-11-06 by
+# instrumenting the binaries and running the whole suite: `do_verify_restore`
+# was one of only three functions that no test ever ran. It is the function
+# whose recorded evidence `dr-status` promotes into a DR tier, so its
+# classification deciding success-vs-failure had never been observed.
+#
+# Every seam was read before being stubbed -- four fixture mistakes in one
+# earlier sitting all came from guessing at seams.
+# ---------------------------------------------------------------------------
+echo "== do_verify_restore, EXECUTED =="
+vr() {  # $1 = how the fixture behaves, rest unused -> output then rc=N
+  local mode="$1"
+  local root="$TMP_DIR/vr/$mode"
+  rm -rf "$root"; mkdir -p "$root/state" "$root/data/immich/backup-staging"
+  (
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+    set +e
+    DOMUM_DATA_ROOT="$root/data"
+    DOMUM_MEDIA_ROOT="$root/media"
+    DOMUM_STATE_ROOT="$root/state"
+    VR_MODE="$mode"
+    VR_REL="$root/data/immich/backup-staging/immich-postgres.dump.sql.gz"
+    die() { echo "DIE: $*"; exit 1; }
+    log() { :; }
+    backup_target_enabled() { return 0; }
+    record_restore_verification() {
+      # $1 target $2 result $3 snapshot $4 rel $5 bytes $6 checks $7 reason
+      printf 'RECORDED result=%s snapshot=%s bytes=%s checks=%s reason=%s\n' \
+        "$2" "$3" "$5" "$6" "$7"
+      return 0
+    }
+    restic_for_target() {
+      local tgt="$1"; shift
+      case "${1:-}" in
+        snapshots) printf '[{"short_id":"abc1234","id":"abc1234def"}]\n'; return 0 ;;
+        restore)
+          [[ "$VR_MODE" == restore-fails ]] && return 1
+          # Mirror restic: the artefact lands at <scratch><absolute rel>.
+          local scratch=""
+          while [[ $# -gt 0 ]]; do [[ "$1" == --target ]] && { scratch="$2"; break; }; shift; done
+          [[ -n "$scratch" ]] || return 1
+          [[ "$VR_MODE" == absent ]] && return 0
+          mkdir -p "$scratch$(dirname "$VR_REL")"
+          case "$VR_MODE" in
+            badgzip) printf 'not gzip at all' > "$scratch$VR_REL" ;;
+            tiny)    printf 'x' | gzip -c > "$scratch$VR_REL" ;;
+            nofooter) { head -c 8192 /dev/urandom | base64; echo "no footer here"; } \
+                        | gzip -c > "$scratch$VR_REL" ;;
+            *)       { head -c 8192 /dev/urandom | base64
+                       echo "-- PostgreSQL database dump complete"; } | gzip -c > "$scratch$VR_REL" ;;
+          esac
+          return 0 ;;
+        *) return 0 ;;
+      esac
+    }
+    do_verify_restore cloud
+    echo "rc=$?"
+  ) 2>&1
+}
+
+out="$(vr ok)"
+grep -q 'rc=0' <<< "$out" || fail "a sound artefact did not verify: $out"
+grep -q 'RECORDED result=success' <<< "$out" || fail "success was not recorded: $out"
+grep -q 'checks=gzip,size,footer' <<< "$out" \
+  || fail "the three checks are not all recorded on success: $out"
+grep -q 'snapshot=abc1234' <<< "$out" || fail "the snapshot id was not recorded: $out"
+echo "   sound artefact -> success, checks=gzip,size,footer, snapshot recorded"
+
+# Every failure path must RECORD before dying: dr-status reads that evidence,
+# and a failure that records nothing is indistinguishable from never having run.
+for mode in restore-fails absent badgzip tiny nofooter; do
+  out="$(vr "$mode")"
+  grep -q 'rc=0' <<< "$out" && fail "$mode verified successfully: $out"
+  grep -q 'RECORDED result=failure' <<< "$out" \
+    || fail "$mode did not RECORD a failure before dying: $out"
+  grep -q 'DIE: Restore verification FAILED' <<< "$out" \
+    || fail "$mode did not fail loudly: $out"
+done
+echo "   all five failure paths record evidence and then die"
+
+# The checks accumulate, so the recorded value says HOW FAR it got -- which is
+# what distinguishes a corrupt archive from a truncated one.
+out="$(vr badgzip)";  grep -q 'checks=gzip reason=restored artifact failed gzip' <<< "$out" \
+  || fail "a bad gzip does not record checks=gzip: $out"
+out="$(vr tiny)";     grep -q 'checks=gzip reason=restored artifact is implausibly small' <<< "$out" \
+  || fail "a tiny artefact does not record that it passed gzip first: $out"
+out="$(vr nofooter)"; grep -q 'checks=gzip,size reason=restored dump is missing' <<< "$out" \
+  || fail "a footerless dump does not record gzip,size: $out"
+echo "   the recorded checks say how far it got: gzip / gzip / gzip,size"
+
+echo "== it refuses a scratch location inside a live data root =="
+# The isolation is structural, and this is the assertion that proves the guard
+# fires rather than that the comment exists.
+out="$( ( source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1; set +e
+  DOMUM_DATA_ROOT="$TMP_DIR/vr/live"; DOMUM_MEDIA_ROOT="$TMP_DIR/vr/media"
+  mkdir -p "$DOMUM_DATA_ROOT/restore-verification"
+  die() { echo "DIE: $*"; exit 1; }
+  log() { :; }
+  backup_target_enabled() { return 0; }
+  restore_verification_dir() { printf '%s' "$DOMUM_DATA_ROOT/restore-verification"; }
+  do_verify_restore cloud ) 2>&1 )"
+grep -q 'inside a live data root' <<< "$out" \
+  || fail "a scratch directory inside the data root was accepted: $out"
+echo "   refused, naming the reason"
+
+echo "== MUTATION: without the footer check a footerless dump verifies =="
+mutv="$TMP_DIR/backup-cli-mut"
+cp "$REPO_ROOT/bin/domum-media-backup" "$mutv"
+python3 - "$mutv" <<'PYMV'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "  if ! grep -Fqx -- '-- PostgreSQL database dump complete' <<< \"$artifact_tail\"; then"
+new = "  if false; then"
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYMV
+grep -qF 'if false; then' "$mutv" || fail "the footer mutation did not apply"
+mout="$(bash -c '
+  root="'"$TMP_DIR"'/vr/mut"; rm -rf "$root"; mkdir -p "$root/state" "$root/data/immich/backup-staging"
+  source "'"$mutv"'" >/dev/null 2>&1; set +e
+  DOMUM_DATA_ROOT="$root/data"; DOMUM_MEDIA_ROOT="$root/media"; DOMUM_STATE_ROOT="$root/state"
+  VR_REL="$root/data/immich/backup-staging/immich-postgres.dump.sql.gz"
+  die(){ echo "DIE: $*"; exit 1; }; log(){ :; }
+  backup_target_enabled(){ return 0; }
+  record_restore_verification(){ printf "RECORDED result=%s checks=%s\n" "$2" "$6"; return 0; }
+  restic_for_target(){ local t="$1"; shift
+    case "${1:-}" in
+      snapshots) printf "[{\"short_id\":\"abc1234\"}]\n" ;;
+      restore) local sc=""; while [[ $# -gt 0 ]]; do [[ "$1" == --target ]] && { sc="$2"; break; }; shift; done
+               mkdir -p "$sc$(dirname "$VR_REL")"
+               { head -c 8192 /dev/urandom | base64; echo "no footer here"; } | gzip -c > "$sc$VR_REL" ;;
+    esac; return 0; }
+  do_verify_restore cloud; echo "rc=$?"' 2>&1)"
+grep -q 'RECORDED result=success' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- without the footer check a dump with
+no completion footer must verify as a success: $mout"
+echo "  killed: the mutant accepts a dump with no completion footer"
+
 echo "PASS: restore verification smoke test"
