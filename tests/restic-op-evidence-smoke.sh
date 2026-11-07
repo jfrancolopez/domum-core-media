@@ -325,4 +325,66 @@ cp "$TMP/backup.orig" "$BACKUP_CLI"
   || fail "the mutation changed no ANSWER -- a locked repository must stop failing: got $rc"
 echo "  caught: a locked repository would have left the unit green"
 
+# ---------------------------------------------------------------------------
+# `list_latest_snapshots` was the last function no test ever ran (measured by
+# instrumentation 2026-11-06), and it conflated two answers: the target list
+# was read from a process substitution, which HIDES the producer's exit status,
+# so a failure to determine the enabled targets printed "(no enabled backup
+# targets)" -- indistinguishable from none being enabled.
+#
+# Low stakes on its own (an operator listing, not a gate) but it is the exact
+# conflation the five DR levels exist to prevent and the one
+# `dr_path_configured` grew a third return code for.
+# ---------------------------------------------------------------------------
+echo "== list_latest_snapshots keeps 'cannot tell' apart from 'none' =="
+lls() {  # $1 = how enabled_backup_targets behaves -> "rc=N|first line"
+  ( # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media-backup" >/dev/null 2>&1
+    set +e
+    eval "$1"
+    restic_for_target() { printf 'snapshot line for %s\n' "$1"; return 0; }
+    local out rc
+    out="$(list_latest_snapshots 2>&1)"; rc=$?
+    printf 'rc=%s|%s\n' "$rc" "$(head -1 <<< "$out")" ) 2>&1
+}
+
+got="$(lls 'enabled_backup_targets() { return 1; }')"
+[[ "$got" == rc=1\|* ]] || fail "an unreadable target list did not fail: $got"
+grep -q 'could not be determined' <<< "$got" \
+  || fail "an unreadable target list must say so, not report none: $got"
+grep -q 'NOT the' <<< "$got" \
+  || fail "it must say this is not the same as none being enabled: $got"
+
+got="$(lls 'enabled_backup_targets() { : ; }')"
+[[ "$got" == rc=0\|* ]] || fail "an empty target list should not fail: $got"
+grep -q 'no enabled backup targets' <<< "$got" \
+  || fail "an empty list must report none enabled: $got"
+
+got="$(lls 'enabled_backup_targets() { printf "cloud\nnas\n"; }')"
+[[ "$got" == rc=0\|* ]] || fail "two targets should not fail: $got"
+grep -q -- '-- cloud --' <<< "$got" || fail "the first target is not listed: $got"
+echo "   unreadable -> rc=1 and says so; empty -> none enabled; two -> listed"
+
+echo "== MUTATION: reading the list from a process substitution hides the failure =="
+mutl="$TMP/backup-cli-lls-mut"
+cp "$REPO_ROOT/bin/domum-media-backup" "$mutl"
+python3 - "$mutl" <<'PYML'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '''  if ! targets="$(enabled_backup_targets)"; then'''
+new = '''  targets="$(enabled_backup_targets)"; if false; then'''
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYML
+grep -qF 'if false; then' "$mutl" || fail "the status-check mutation did not apply"
+mgot="$( ( source "$mutl" >/dev/null 2>&1; set +e
+           enabled_backup_targets() { return 1; }
+           restic_for_target() { return 0; }
+           out="$(list_latest_snapshots 2>&1)"; printf 'rc=%s|%s\n' "$?" "$(head -1 <<< "$out")" ) 2>&1 )"
+grep -q 'no enabled backup targets' <<< "$mgot" \
+  || fail "the mutation changed no ANSWER -- without the status check a FAILURE to
+read the target list must report 'no enabled backup targets': $mgot"
+echo "  killed: the mutant reports a failure as 'none enabled'"
+
 echo "ALL RESTIC-OP-EVIDENCE CHECKS PASSED"

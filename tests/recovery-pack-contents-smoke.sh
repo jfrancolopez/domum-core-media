@@ -181,4 +181,37 @@ grep -q 'acme.json' <<< "$notes" || fail "restore notes do not mention the ACME 
 grep -qi 'account key' <<< "$notes" || fail "restore notes must explain why the account key matters"
 grep -q '0600' <<< "$notes" || fail "restore notes must state the required mode"
 
+# ---------------------------------------------------------------------------
+# AND NOW IT IS EXECUTED. The assertions above read this resolver's source.
+# Measured by instrumentation 2026-11-06, it was one of the last two functions
+# no test ever ran -- and it decides WHERE the ACME account private key is read
+# from, so a silent wrong answer means the recovery pack omits the one artefact
+# that makes Traefik's certificates recoverable.
+# ---------------------------------------------------------------------------
+echo "== traefik_acme_source, EXECUTED =="
+acme() {  # $1 = scenario -> resolved path, or "rc=N"
+  local AC_SC="$1" AC_MP
+  AC_MP="$(mktemp -d "$TMP_DIR/acme.XXXXXX")/_data"
+  mkdir -p "$AC_MP"
+  [[ "$AC_SC" == present ]] && printf 'acme\n' > "$AC_MP/acme.json"
+  ( # shellcheck disable=SC1090
+    source "$REPO_ROOT/bin/domum-media" >/dev/null 2>&1
+    set +e
+    cmd_exists() { [[ "$1" == docker && "$AC_SC" != nodocker ]]; }
+    docker() {
+      [[ "$AC_SC" == novolume ]] && return 1
+      printf '%s\n' "$AC_MP"
+    }
+    local out rc
+    out="$(traefik_acme_source)"; rc=$?
+    if (( rc == 0 )); then printf '%s\n' "$out"; else printf 'rc=%s\n' "$rc"; fi ) 2>&1
+}
+[[ "$(acme nodocker)" == "rc=1" ]] || fail "no docker did not refuse: $(acme nodocker)"
+[[ "$(acme novolume)" == "rc=1" ]] || fail "an unresolvable volume did not refuse: $(acme novolume)"
+[[ "$(acme missing)"  == "rc=1" ]] || fail "a volume with no acme.json did not refuse: $(acme missing)"
+got="$(acme present)"
+[[ "$got" == */acme.json ]] || fail "a present acme.json did not resolve: $got"
+[[ -f "$got" ]] || fail "the resolved path does not exist: $got"
+echo "   no docker / no volume / no acme.json all refuse; a present one resolves"
+
 echo "PASS: recovery-pack contents and restore ordering smoke test"
