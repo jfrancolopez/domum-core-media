@@ -116,17 +116,17 @@ sect "the weekly unit's ExecStart prefixes make failures VISIBLE"
 #   meant "could not tell you".
 UNIT="$REPO_ROOT/systemd/domum-media-weekly-report.service"
 [[ -f "$UNIT" ]] || fail "the weekly unit is missing"
-grep -qx 'ExecStart=-/usr/local/bin/domum-media report --write' "$UNIT" \
+grep -qE '^ExecStart=-/usr/local/bin/domum-media report --write( |$)' "$UNIT" \
   || fail "the report step must be prefixed with '-' so a failed report cannot
 suppress the alert:
 $(grep ExecStart "$UNIT")"
-grep -qx 'ExecStart=/usr/local/bin/domum-media health-notify' "$UNIT" \
+grep -qE '^ExecStart=/usr/local/bin/domum-media health-notify( |$)' "$UNIT" \
   || fail "the notify step must NOT be prefixed, so an undeliverable alert
 fails the unit and becomes visible in systemctl --failed:
 $(grep ExecStart "$UNIT")"
 # Order matters too: the report must come first, or `-` on it is pointless.
-[[ "$(grep -n 'ExecStart=-.*report --write' "$UNIT" | cut -d: -f1)" \
-   -lt "$(grep -n 'ExecStart=/usr/local/bin/domum-media health-notify' "$UNIT" | cut -d: -f1)" ]] \
+[[ "$(grep -n '^ExecStart=-.*report --write' "$UNIT" | cut -d: -f1)" \
+   -lt "$(grep -n '^ExecStart=/usr/local/bin/domum-media health-notify' "$UNIT" | cut -d: -f1)" ]] \
   || fail "the report step must precede the notify step"
 echo "  report tolerated, notify failure fatal, report first"
 

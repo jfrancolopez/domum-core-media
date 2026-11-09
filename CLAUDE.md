@@ -6367,6 +6367,114 @@ the one already recorded: read the harness before writing into it.
 
 ---
 
+**THE OPERATOR DID NOT RECEIVE SUNDAY'S REPORT, AND THE JOB HAD RUN
+PERFECTLY.** Diagnosed 2026-11-09 from the production journal the operator
+supplied. The decisive evidence, in order:
+
+```
+domum-media-weekly-report.service  Main PID 646759 (code=exited, status=0/SUCCESS)
+                                   finished Sun 2026-11-08 08:02:14 EST
+report generated 08:01:56 -> 08:02:08, every section present
+[domum-media] health-notify: nothing needs attention; no mail sent
+```
+
+So: **not SMTP, not a missed timer, not a failure.** The run succeeded and
+delivery was suppressed by policy -- 2 warnings, 0 actions, 0 critical, and the
+silence gate held exactly as designed.
+
+**The real defect was that NO UNIT EVER INVOKED THE HTML REPORT.** The weekly
+unit ran `report --write` (the report LIBRARY, which writes evidence to disk)
+and then `health-notify`. The comprehensive multipart report existed only
+behind a manual `report weekly --email`. This file already recorded half of
+that -- *"`mreport_append_history` is called only by `mreport_weekly_cmd`; the
+weekly unit runs `report --write` and never appends"* -- without noticing the
+consequence: the operator could never receive the report the feature was built
+for.
+
+**SILENCE IS THE ALERT POLICY, NOT THE REPORT POLICY.** That is the distinction
+the design was missing. A weekly report that arrives only when something is
+wrong cannot be told apart from a report that is broken, so the absence of mail
+carried no information at all. Two behaviours now:
+
+| | when | content |
+|---|---|---|
+| REPORT | every Sunday, healthy or not | the full multipart HTML/text report |
+| ALERT | only action or critical | the findings, unchanged |
+
+**`--scheduled` is the timer's path and a manual `--email` is not affected by
+it.** It does two things a manual run must never do: it records the outcome, and
+it refuses a SECOND send on the same day. The second is what keeps
+`Persistent=true` from mailing twice when a missed Sunday fires at boot and the
+machine is rebooted again that day -- the operator asked for exactly that
+guarantee. An explicit `report weekly --email` still sends unconditionally and
+records nothing, so it can never silence a later alert.
+
+**The de-duplication is keyed on systemd's `INVOCATION_ID`, which is exact.**
+It is identical for every `ExecStart` of one activation and EMPTY for a manual
+run, so no time window is needed and an operator typing `health-notify` is
+never silenced by a report the timer sent. Only a recorded **success**
+suppresses: if the report could not be delivered, the alert is the only message
+left and it must go.
+
+**THE `-` PREFIXES ARE THE WHOLE DESIGN, AND THEY ARE NOT THE OBVIOUS
+READING.** This file already records getting them backwards once. The weekly
+send takes `-` for ONE reason: without it a failed send would stop the unit and
+the alert below would never run, which is the *"a failed report must not
+suppress the alert"* defect. That tolerance is only safe because the failure is
+not swallowed -- `--scheduled` records it and
+`checkup_weekly_report_delivery` raises it as a **CRITICAL**, so it mails and
+appears in the report. `health-notify` stays last and unprefixed, so an
+undeliverable alert still fails the unit and reaches `systemctl --failed`.
+
+**An ABSENT delivery record is ADVICE, not a warning.** It is the honest state
+of every host where the scheduled report has not run yet, and alarming on it
+would be a false alarm manufactured on purpose -- which this project has
+refused to ship before. Whether the timer runs at all is a different question
+that `checkup_systemd_health` already answers.
+
+**THERE IS NO SMTP RETRY TO PRESERVE, and saying so matters more than
+preserving it.** Measured: `smtp_send_message` makes a single `curl` attempt --
+`smtps://` with `--ssl-reqd`, credentials read from files rather than argv, and
+**no `--retry` and no loop**. The request was to preserve retry behaviour,
+which presumes it exists. It does not, so a transient SMTP failure means
+waiting a week for the next report. That is a real gap; it is named in the
+deployment plan with the exact flags (`--retry 2 --retry-delay 10
+--retry-connrefused`, which curl applies only to transient errors and never to
+an auth failure) rather than bundled into a notification-policy change nobody
+could then review separately.
+
+**Three of my own mistakes in the fixture, each already a rule here.** Stubbing
+`load_cfg` left `DOMUM_DATA_ROOT` unbound and then `BACKUP_POLICY` -- chasing
+the defaults one at a time is the wrong fix, and the recorded answer is to run
+the REAL `load_cfg` against a real config, which is what the suite does now.
+Four sections asserted the flagged behaviour while never passing
+`--unless-reported`, so they were testing the unflagged path. And an assertion
+on `ExecStart` ORDER grepped an unanchored string that the explanatory comment
+also contains, returning two line numbers and breaking the arithmetic -- the
+comment-vs-code trap, for the seventh recorded time.
+
+---
+
+**`grep -qx` ON A UNIT'S ExecStart PINS THE ARGV, SO ADDING A FLAG BROKE AN
+ASSERTION WHOSE INTENT STILL HELD.** `health-checks-smoke` asserted
+`grep -qx 'ExecStart=/usr/local/bin/domum-media health-notify'` to prove that
+step is NOT `-`-prefixed. Appending `--unless-reported` failed it, while the
+property it exists to protect -- an undeliverable alert must fail the unit --
+was untouched.
+
+Anchored on the structural property instead:
+`^ExecStart=/usr/local/bin/domum-media health-notify( |$)`. A `-` prefix makes
+the line `ExecStart=-/...`, which cannot match `^ExecStart=/`, so flags are
+allowed and a prefix is still caught.
+
+**The strictness was re-proved rather than assumed**: adding the `-` back
+produces exactly one failure, and removing it passes. Loosening an assertion
+without demonstrating it still bites is how a guard quietly becomes decoration
+-- and this project has three production aborts caused by assertions that were
+*too* specific, so the fix is to assert the PROPERTY, not to delete the check.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
