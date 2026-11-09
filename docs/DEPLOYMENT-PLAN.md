@@ -318,3 +318,178 @@ The first is the one that proves the deployment did something observable: on
 backup CLI and reports `A recovery pack is delivered off-host…`. Before the
 deployment the same check correctly reports *"could not be checked: …
 pack-offhost did not answer (exit 1)"* — measured today, with zero criticals.
+
+---
+
+## 9. THE WEEKLY NOTIFICATION CHANGE, and the timer activation
+
+### 9.1 Why the operator received no report on 2026-11-08
+
+Diagnosed from the production journal, not inferred:
+
+```
+domum-media-weekly-report.service  Main PID 646759 (code=exited, status=0/SUCCESS)
+                                   finished Sun 2026-11-08 08:02:14 EST
+report generated 08:01:56 -> 08:02:08, every section present
+[domum-media] health-notify: nothing needs attention; no mail sent
+```
+
+**The job ran and succeeded; delivery was suppressed by policy** — 2 warnings,
+0 actions, 0 critical, and the silence gate held as designed. Not SMTP, not a
+missed timer.
+
+The defect underneath is larger: **no unit has ever invoked the HTML report.**
+The installed unit runs `report --write` (the report *library*, which writes
+evidence to disk) and then `health-notify`. The comprehensive multipart report
+exists only behind a manual `report weekly --email`. Raising an alert threshold
+would not have delivered it.
+
+### 9.2 What this deployment changes about notifications
+
+| | before | after |
+|---|---|---|
+| weekly report | never sent by any timer | sent **every Sunday**, healthy or not |
+| health alert | silent unless action/critical | **unchanged** |
+| both in one run | n/a | one message, not two |
+| a failed report | would stop the unit and suppress the alert | tolerated, recorded, raised as CRITICAL |
+| a missed Sunday replayed at boot | n/a | one report; a second same-day send is refused |
+
+### 9.3 Exact hashes — measured, and how to re-derive them
+
+Measured at `a5c3578`. **A hash baked into a document goes stale exactly like a
+baked-in revision**, so the command that re-derives it is given with it and is
+what should be trusted at deploy time:
+
+```sh
+for p in bin/domum-media:/usr/local/bin/domum-media \
+         bin/domum-media-backup:/usr/local/bin/domum-media-backup \
+         bin/domum-media-report:/usr/local/lib/domum-media/domum-media-report; do
+  printf '%-26s installed=%s  new=%s\n' "${p%%:*}" \
+    "$(sha256sum "${p#*:}" 2>/dev/null | cut -c1-16)" \
+    "$(sha256sum "${p%%:*}" | cut -c1-16)"
+done
+```
+
+| file | installed at `a63ad19` | new at `a5c3578` |
+|---|---|---|
+| `bin/domum-media` → `/usr/local/bin/domum-media` | `5e65f06c8a7a4bf4` | `644358a0dcf32ec5` |
+| `bin/domum-media-backup` → `/usr/local/bin/domum-media-backup` | `08a81ba2065850c4` | `d5aa2fb56cb11ae3` |
+| `bin/domum-media-report` → `/usr/local/lib/domum-media/domum-media-report` | `d813ae0e4181a7d5` | `14a5f7334adf68e0` |
+
+Unit files, compared with comments and blank lines stripped:
+
+| unit | directives |
+|---|---|
+| `domum-media-weekly-report.service` | **CHANGED** — the three `ExecStart` lines. Must be installed. |
+| `domum-media-weekly-report.timer` | identical |
+| `domum-media-btrfs-scrub.timer` | identical (comment-only) |
+| `systemd/auto-enable.timers` | identical (comment-only), and never installed — read from the checkout |
+
+`operator/domum-media-deploy-reporting-fixes.sh` already carries all four
+paths it needs: its `TARGETS` lists the three binaries (the report library at
+`$LIB_DIR`, **not** `$BIN_DIR`) and its `UNIT_TARGETS` lists both
+weekly-report units.
+
+### 9.4 THE TIMER NEEDS NO `enable` — only a reload
+
+```
+domum-media-weekly-report.timer   enabled, active (waiting)
+                                  next: Sun 2026-11-15 08:15:21 EST
+```
+
+It has been enabled since 2026-10-20. So this is **not** a timer activation in
+the usual sense: the schedule is already live and has been firing weekly. What
+changes is what the unit *does* when it fires. systemd reads the service unit
+at activation time, so `daemon-reload` is sufficient and **no restart and no
+`enable` is required**.
+
+Consequence worth stating plainly: once deployed, the **first automatic report
+arrives Sun 2026-11-15 at ~08:15 EST** with no further operator action.
+
+### 9.5 Deployment
+
+```sh
+# 0. Preserve what is about to be replaced. The deploy script keeps no .bak and
+#    relies on git, so this is what makes rollback a straight copy rather than
+#    a checkout dance.
+sudo install -d -m 0700 /root/domum-rollback-$(date +%F)
+sudo cp -a /usr/local/bin/domum-media \
+           /usr/local/bin/domum-media-backup \
+           /usr/local/lib/domum-media/domum-media-report \
+           /etc/systemd/system/domum-media-weekly-report.service \
+           /root/domum-rollback-$(date +%F)/
+
+# 1. Dry run. It says what it WOULD do and mutates nothing.
+sudo /opt/domum-core-media/operator/domum-media-deploy-reporting-fixes.sh
+
+# 2. Deploy, pinning the revision the operator reviewed.
+sudo /opt/domum-core-media/operator/domum-media-deploy-reporting-fixes.sh \
+     --confirm --expect-revision=<the sha you reviewed>
+```
+
+The script fast-forwards the checkout, installs only files whose hash differs,
+runs `daemon-reload`, enables nothing, and asserts that each installed file's
+sha256 equals that file in the checkout.
+
+### 9.6 Verification — all read-only
+
+```sh
+# the unit now has THREE ExecStart lines, with the prefixes the design needs
+sudo systemctl cat domum-media-weekly-report.service | grep -n '^ExecStart'
+#   expect: -report --write / -report weekly --email --scheduled /
+#           health-notify --unless-reported   (only the last is unprefixed)
+
+# the schedule is untouched and still enabled
+systemctl list-timers domum-media-weekly-report.timer
+
+# the report renders, WITHOUT sending anything
+sudo domum-media report weekly --stdout | head -40
+
+# what a real run would do, still without sending
+sudo domum-media report weekly --dry-run
+sudo domum-media health-notify --dry-run
+
+# the new delivery check, before any scheduled run has happened:
+#   expect ADVICE ("no SCHEDULED weekly report is recorded yet"), never a critical
+sudo domum-media checkup | grep -iA1 'weekly report'
+```
+
+### 9.7 Rollback
+
+```sh
+R=/root/domum-rollback-<date>
+sudo install -m 0755 "$R/domum-media"        /usr/local/bin/domum-media
+sudo install -m 0755 "$R/domum-media-backup" /usr/local/bin/domum-media-backup
+sudo install -m 0755 "$R/domum-media-report" /usr/local/lib/domum-media/domum-media-report
+sudo install -m 0644 "$R/domum-media-weekly-report.service" \
+                     /etc/systemd/system/domum-media-weekly-report.service
+sudo systemctl daemon-reload
+```
+
+Nothing else needs undoing: no timer state changed, no data was written outside
+`$DOMUM_STATE_ROOT/weekly-report.env`, and that file is only read by the new
+code — an older binary ignores it.
+
+### 9.8 Two things that need an explicit decision
+
+1. **A real delivery test sends a real email.**
+   `sudo domum-media report weekly --email` would prove end-to-end delivery and
+   is the only way to do so. It is NOT in the verification list above and was
+   not run: sending external mail needs operator approval.
+
+2. **There is no SMTP retry, and there never was.**
+   Measured: `smtp_send_message` makes a single `curl` attempt — `smtps://`
+   with `--ssl-reqd`, credentials read from files rather than argv — and has
+   **no `--retry` and no loop**. A transient SMTP failure therefore costs a
+   week, because the next attempt is the next Sunday.
+
+   Deliberately NOT bundled into this change, so the notification policy can be
+   reviewed on its own. The one-line form, if wanted:
+
+   ```
+   curl --retry 2 --retry-delay 10 --retry-connrefused ...
+   ```
+
+   curl applies `--retry` only to transient failures (timeouts, 5xx,
+   connection refused with that flag) and **never** to an authentication
+   failure, so it cannot turn a bad credential into repeated login attempts.
