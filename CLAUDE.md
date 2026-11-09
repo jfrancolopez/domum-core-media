@@ -6474,6 +6474,100 @@ without demonstrating it still bites is how a guard quietly becomes decoration
 *too* specific, so the fix is to assert the PROPERTY, not to delete the check.
 
 ---
+---
+
+**THE ONE PLACE MAIL LEAVES THIS HOST HAD NEVER BEEN EXECUTED BY A TEST, AND IT
+CARRIED THREE DEFECTS.** `smtp_send_message` is referenced by five suites:
+**FOUR stub it whole and the fifth names it only in a comment**, so nothing ran
+its twenty lines and nothing even asserted their text. That is
+the recorded family -- *"a test that asserts on a function's TEXT does not prove
+the function runs"* -- in its weakest form yet, because nothing asserted even the
+text.
+
+- **NO RETRY, and the caller's cadence set the cost.** One `curl` attempt. The
+  weekly report's next attempt is the next Sunday, so one refused connection
+  cost a week of reporting; the alert path is worse in kind, because it sends
+  only when something needs attention, so a transient failure lost the one
+  message that mattered. curl's own `--retry 2 --retry-delay 10
+  --retry-connrefused` is used rather than a shell loop **because curl retries
+  only transient failures** -- timeouts, 5xx, and a refused connection -- and
+  never a 4xx or an authentication failure, so a bad credential cannot become
+  repeated login attempts against the provider. A hand-rolled loop would have to
+  re-derive that distinction and would get it wrong.
+  `RECOVERY_PACK_SMTP_RETRIES=0` restores the single attempt, defaulted at the
+  USE SITE as `DISK_WEAR_WARN_PERCENT` already is, and honoured from the config
+  file because `load_cfg` sources it into the current shell -- verified, not
+  assumed.
+
+  **ADDING RETRIES REQUIRED BOUNDING EACH ATTEMPT FIRST, and I nearly shipped
+  it without that.** curl sets no connect timeout of its own, so a black-holed
+  SMTP port hangs for the OS TCP timeout (~130s). Three such attempts, in a unit
+  whose other `ExecStart` may ALSO send, could approach
+  `TimeoutStartSec=10m` and have systemd kill the job mid-way -- a transient
+  network fault converted into a failed report, which is the opposite of the
+  point. `--max-time` alone is NOT sufficient: curl(1) states its counter "is
+  reset each time the transfer is retried", so the retry WINDOW needs
+  `--retry-max-time`. Bounded at `--connect-timeout 15 --max-time 60
+  --retry-max-time 60`: no new attempt starts after 60s and one in flight may
+  run 60s more, so a send is ~120s worst case and two senders ~240s against a
+  600s timeout. The per-attempt bounds are outside the retry block on purpose,
+  because `RETRIES=0` is the configuration where one unbounded attempt would
+  hang the unit by itself. **A retry is a change to how long a failure takes,
+  so its interaction with the caller's timeout is part of the change, not a
+  detail.**
+
+- **THE CREDENTIAL WAS IN curl's ARGV.** Measured 2026-11-09: `/proc` is mounted
+  with no `hidepid` option and **75 root-owned processes' argv read fine as
+  `jfranco`**, while `/etc/domum-core-media/secrets` is `drwx------ root root`
+  -- unreadable and unlistable by that account. So `--user user:password` took a
+  secret that is otherwise root-only and made it readable by any local account
+  for as long as each send took. `curl --config <0600 file>` takes the same
+  option from a file that never appears in argv. **This is NOT the
+  `export_compose_env` case**, where hardening would have removed an assignment
+  and not a value: here the account demonstrably cannot reach the secret by any
+  other route, so the argv form was a real widening.
+
+- **A DEFAULT `.curlrc` WAS HONOURED.** curl(1): the default config file is read
+  *"even when --config is used"*. Measured with one planted:
+  `CURLOPT_SSL_VERIFYPEER` and `VERIFYHOST` both went to **0** and an **extra
+  `CURLOPT_MAIL_RCPT`** appeared -- certificate verification on the mail send
+  defeated, and a second recipient added for a report full of host state,
+  without a line of this file changing. `-q` as the FIRST argument suppresses
+  it, and `--config` precedes the security flags so nothing read from a file can
+  override `--ssl-reqd`.
+
+**THE CREDENTIAL WAS NEVER WHAT `-q` PROTECTS, and my first version of that
+assertion claimed it was.** A command-line `--config` is parsed AFTER the
+default config and wins, so the planted `user` could never take effect --
+measured. The section asserted a property that holds for the wrong reason, which
+is indistinguishable from a passing test. Corrected to the observable that
+actually changes: `insecure` and the extra recipient.
+
+**THE PROOF IS A ROUND TRIP THROUGH curl's OWN PARSER, not the escaping text.**
+`--libcurl /dev/stdout` prints `CURLOPT_USERPWD` verbatim, so the stub replays
+production's own argv against the real curl and the credential is compared byte
+for byte with what was written -- eight passwords, including `"`, `\`, `\"`,
+`$`, a backtick, `:`/`=`/`#` and a space. That also makes `-q` a BEHAVIOURAL
+observable rather than a text assertion. Per curl(1) the only escapes inside a
+quoted config value are `\\ \" \t \n \r \v`, so a backslash and a double quote
+are the two characters to escape, **backslashes first** or the added escapes are
+themselves escaped. `--libcurl` must never be used on a real send: it would
+write the credential to a file.
+
+**`local a="$1" b="$a"` FAILS UNDER `set -u`.** Measured: bash creates every
+name in one `local` as an unset local BEFORE running the assignments, so the
+earlier name is shadowed-and-unbound while the later initialiser reads it.
+Without `set -u` it expands to EMPTY, which is the silent direction. Swept all
+three CLIs and `install.sh` for the shape: **zero sites**, and the detector was
+negative-controlled against a fixture rather than trusted. The only instance was
+in the suite I had just written.
+
+**My extractor regex was one escaping layer wrong and the section failed against
+correct code.** An inline `python3 -c` inside shell single quotes turned `\\.`
+into `\\\\.`, which demands TWO literal backslashes where a C-string escape has
+one -- so every password containing a quote or a backslash read as "no match".
+The fix is the rule this file already states for mutations: put it in a FILE
+with a quoted heredoc, and the shell-quoting layer disappears.
 
 ## 15. Known open safety defects
 
