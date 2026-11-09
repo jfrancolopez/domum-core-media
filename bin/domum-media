@@ -5387,12 +5387,96 @@ smtp_send_message() {  # $1 = a complete RFC-822 message file
     || die "SMTP credential files are missing."
   smtp_user="$(read_secret_file_value "$RECOVERY_PACK_SMTP_USERNAME_FILE")"
   smtp_pass="$(read_secret_file_value "$RECOVERY_PACK_SMTP_PASSWORD_FILE")"
-  curl --silent --show-error --ssl-reqd \
+  # ONE attempt was all this ever made, and the CALLER's cadence sets the cost of
+  # that: the weekly report's next attempt is the next Sunday, so a single
+  # refused connection costs a week of reporting. The alert path is worse in
+  # kind -- it sends only when something needs attention, so a transient failure
+  # there loses the one message that mattered.
+  #
+  # curl's own retry is used rather than a shell loop because it retries ONLY
+  # transient failures (timeouts, 5xx, and a refused connection with
+  # --retry-connrefused) and never a 4xx or an authentication failure -- so a bad
+  # credential cannot become repeated login attempts against the provider. A
+  # hand-rolled loop would have to re-derive that distinction and would get it
+  # wrong. Bounded deliberately: 2 retries at 10s is at most ~20s of added delay
+  # on a dead transport, well inside the unit's start timeout, while covering the
+  # fault that actually happens (a brief DNS or TLS hiccup).
+  # RECOVERY_PACK_SMTP_RETRIES=0 restores the old single-attempt behaviour.
+  #
+  # FAILURE PROPAGATION IS UNCHANGED: curl still returns non-zero once the
+  # retries are exhausted, so every caller that died on a failed send still dies.
+  # What changed is how many chances a transient fault gets, not what happens
+  # when the fault is real.
+  # EVERY ATTEMPT IS BOUNDED, and that is a condition of adding retries rather
+  # than a nicety. curl sets no connect timeout of its own, so a black-holed
+  # SMTP port hangs for the OS TCP timeout (~130s); three such attempts, in a
+  # unit whose other ExecStart may also send, could approach the unit's
+  # TimeoutStartSec=10m and have systemd kill the job mid-way -- turning a
+  # transient network fault into a failed report, which is the opposite of the
+  # point. `--max-time` alone is NOT enough: curl(1) says its counter "is reset
+  # each time the transfer is retried", so the retry WINDOW needs
+  # --retry-max-time.
+  #
+  # The arithmetic, worst case: no new attempt starts after 60s, and an attempt
+  # already in flight may run 60s more, so one send is bounded at ~120s. Two
+  # senders in one unit is ~240s against a 600s TimeoutStartSec, leaving the
+  # report generation ample room. A legitimate send of a small message takes
+  # seconds.
+  local retries="${RECOVERY_PACK_SMTP_RETRIES:-2}"
+  local retry_delay="${RECOVERY_PACK_SMTP_RETRY_DELAY:-10}"
+  local -a retry_opts=()
+  if (( retries > 0 )); then
+    retry_opts=(--retry "$retries" --retry-delay "$retry_delay" --retry-connrefused
+                --retry-max-time 60)
+  fi
+
+  # THE CREDENTIAL MUST NOT BE PASSED ON curl's COMMAND LINE. Measured on this
+  # host: /proc is mounted with no hidepid option and 75 root-owned processes'
+  # argv read fine as the unprivileged account -- so `--user user:password` made
+  # a secret that is otherwise root-only (/etc/domum-core-media/secrets is
+  # drwx------ root root, unreadable and unlistable by that account) readable by
+  # any local account for as long as a send takes. `curl --config` takes the same
+  # option from a file, which never appears in argv.
+  #
+  # Quoting follows curl(1)'s documented config grammar: inside double quotes the
+  # escapes are \\, \", \t, \n, \r and \v, so a backslash and a double quote
+  # are the two characters that must be escaped -- backslashes FIRST, or the
+  # escapes we add would themselves be escaped. Everything else passes through
+  # literally, and read_secret_file_value has already trimmed surrounding
+  # whitespace.
+  local curl_cfg u_esc p_esc rc=0
+  curl_cfg="$(mktemp "${TMPDIR:-/tmp}/domum-smtp-cfg.XXXXXX")" \
+    || die "smtp_send_message: could not create a credential file for curl"
+  chmod 600 "$curl_cfg" 2>/dev/null || { rm -f "$curl_cfg"; die "smtp_send_message: could not secure the credential file"; }
+  u_esc="${smtp_user//\\/\\\\}"; u_esc="${u_esc//\"/\\\"}"
+  p_esc="${smtp_pass//\\/\\\\}"; p_esc="${p_esc//\"/\\\"}"
+  if ! printf 'user = "%s:%s"\n' "$u_esc" "$p_esc" > "$curl_cfg"; then
+    rm -f "$curl_cfg"
+    die "smtp_send_message: could not write the credential file"
+  fi
+
+  # -q FIRST, and --config before the security flags. curl(1) states the default
+  # config file is read "even when --config is used", and measured here with one
+  # planted, that is not theoretical: CURLOPT_SSL_VERIFYPEER and VERIFYHOST both
+  # went to 0 and an EXTRA CURLOPT_MAIL_RCPT appeared -- certificate verification
+  # on the mail send defeated, and a second recipient added for a report full of
+  # host state, without a line of this file changing. -q suppresses the default
+  # config entirely. The CREDENTIAL was never the exposure there: a command-line
+  # --config is parsed after the default config and wins. Our own flags come
+  # after --config so nothing read from a file can override --ssl-reqd.
+  curl -q --config "$curl_cfg" \
+    --silent --show-error --ssl-reqd \
+    --connect-timeout 15 --max-time 60 \
+    "${retry_opts[@]}" \
     --url "smtps://${RECOVERY_PACK_SMTP_HOST}:${RECOVERY_PACK_SMTP_PORT}" \
-    --user "${smtp_user}:${smtp_pass}" \
     --mail-from "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}" \
     --mail-rcpt "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}" \
-    --upload-file "$message"
+    --upload-file "$message" || rc=$?
+  # Removed on EVERY path out, success or failure: a failed send must not leave
+  # the credential on disk. $TMPDIR is tmpfs on this host, so it never reaches
+  # the SSD either.
+  rm -f "$curl_cfg"
+  return "$rc"
 }
 
 recovery_pack_create() {

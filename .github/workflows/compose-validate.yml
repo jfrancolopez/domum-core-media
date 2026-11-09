@@ -175,6 +175,13 @@ jobs:
       - name: Selective state capture smoke test
         run: tests/state-capture-smoke.sh
 
+      # `smtp_send_message` is the ONE place mail leaves this host and no test
+      # had ever executed it -- five suites stub it whole. It drives the real
+      # function and compares the credential curl parses back, byte for byte,
+      # with what was written.
+      - name: SMTP transport smoke test
+        run: tests/smtp-transport-smoke.sh
+
       # An archive must state its own identity read-only: `docker load` proves
       # it and is a mutation, so a verification that needs it cannot be run
       # freely.
