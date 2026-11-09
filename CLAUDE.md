@@ -6455,6 +6455,26 @@ comment-vs-code trap, for the seventh recorded time.
 
 ---
 
+**`grep -qx` ON A UNIT'S ExecStart PINS THE ARGV, SO ADDING A FLAG BROKE AN
+ASSERTION WHOSE INTENT STILL HELD.** `health-checks-smoke` asserted
+`grep -qx 'ExecStart=/usr/local/bin/domum-media health-notify'` to prove that
+step is NOT `-`-prefixed. Appending `--unless-reported` failed it, while the
+property it exists to protect -- an undeliverable alert must fail the unit --
+was untouched.
+
+Anchored on the structural property instead:
+`^ExecStart=/usr/local/bin/domum-media health-notify( |$)`. A `-` prefix makes
+the line `ExecStart=-/...`, which cannot match `^ExecStart=/`, so flags are
+allowed and a prefix is still caught.
+
+**The strictness was re-proved rather than assumed**: adding the `-` back
+produces exactly one failure, and removing it passes. Loosening an assertion
+without demonstrating it still bites is how a guard quietly becomes decoration
+-- and this project has three production aborts caused by assertions that were
+*too* specific, so the fix is to assert the PROPERTY, not to delete the check.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
