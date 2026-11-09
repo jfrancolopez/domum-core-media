@@ -6279,6 +6279,40 @@ checkup_recovery_pack_offhost() {
 # off -- and the production config is 0600 root, so the two cannot be told apart
 # from an unprivileged account. That ambiguity is exactly why this check exists,
 # and why it states configuration rather than inferring delivery.
+# Did the last SCHEDULED weekly report actually go out?
+#
+# The weekly unit tolerates a failed send (`-` prefix) so that a broken report
+# cannot suppress the alert that follows it. That tolerance is only safe if the
+# failure is reported somewhere, which is this check: otherwise an undeliverable
+# weekly report would leave the unit green and the operator would receive
+# nothing and be told nothing -- silence meaning "could not tell you" rather
+# than "healthy", which is the defect this project keeps correcting.
+#
+# Three states. An ABSENT record is deliberately ADVICE, not a warning: it is
+# the honest state of every host where the scheduled report has not run yet,
+# and manufacturing an alert for that is the false alarm this project has
+# refused to ship before. Whether the timer is running at all is a different
+# question, already answered by checkup_systemd_health.
+checkup_weekly_report_delivery() {
+  local rec result sent_date
+  if ! rec="$(read_weekly_report)"; then
+    checkup_add advice "sudo domum-media report weekly --stdout   # read-only: no SCHEDULED weekly report is recorded yet on this host"
+    return 0
+  fi
+  result="${rec%% *}"
+  sent_date="$(awk '{print $2}' <<< "$rec")"
+  case "$result" in
+    success)
+      checkup_add healthy "The weekly report was emailed on ${sent_date}." ;;
+    failure)
+      checkup_add critical "The scheduled weekly report could NOT be emailed (last attempt ${sent_date}). You are receiving no weekly report, and nothing else would have told you."
+      checkup_add action "sudo domum-media report weekly --stdout   # read-only: does the report itself render? Then check RECOVERY_PACK_SMTP_* in the config" ;;
+    *)
+      checkup_add warning "The last scheduled weekly report recorded an unrecognised result (${result}), so whether it was delivered is UNKNOWN."
+      checkup_add advice "sudo cat $(weekly_report_evidence_file)   # read-only: the recorded evidence" ;;
+  esac
+}
+
 checkup_notification_path() {
   local notifier
   notifier="$(systemctl is-enabled domum-media-weekly-report.timer 2>/dev/null || true)"
@@ -7118,12 +7152,58 @@ mreport_build_mime() {  # $1 = subject, $2 = text, $3 = html, $4 = out
 #
 # PREVIEW NEVER SENDS. --email is the only form that mails, and it refuses
 # unless email is configured.
+# Evidence for the SCHEDULED weekly report, so three separate questions can be
+# answered without guessing:
+#
+#   has a report already gone out today?   -> the scheduled path must not send twice
+#   did the last scheduled send SUCCEED?   -> checkup must surface a failure
+#   was it sent in THIS unit activation?   -> health-notify must not duplicate it
+#
+# The third is keyed on systemd's INVOCATION_ID, which is identical for every
+# ExecStart of one activation and empty for a manual run. That is exact: it
+# needs no time window, and a manual `health-notify` is never silenced by a
+# report someone emailed earlier.
+weekly_report_evidence_file() {
+  printf '%s/weekly-report.env' "${DOMUM_STATE_ROOT:-/var/lib/domum-media}"
+}
+
+# "success" only when the message actually left; a failure is recorded too,
+# because a scheduled report that could not be delivered is exactly what the
+# operator must be told about, and silence would mean "healthy".
+record_weekly_report() {  # $1 = success|failure, $2 = subject
+  local f
+  f="$(weekly_report_evidence_file)"
+  install -d -m 0700 -- "$(dirname -- "$f")" 2>/dev/null || true
+  write_env_kv "$f" \
+    RESULT "$1" \
+    SUBJECT "$2" \
+    TS "$(date +%s)" \
+    SENT_DATE "$(date -I)" \
+    INVOCATION_ID "${INVOCATION_ID:-}" || return 1
+  chmod 0600 "$f" 2>/dev/null || true
+}
+
+# -> "result date invocation" for the last recorded scheduled send, or rc 1.
+# Read, never defaulted: a key the writer never emitted must not read as the
+# reassuring value.
+read_weekly_report() {
+  local f
+  f="$(weekly_report_evidence_file)"
+  [[ -f "$f" ]] || return 1
+  (
+    unset RESULT SENT_DATE INVOCATION_ID
+    # shellcheck disable=SC1090
+    . "$f" >/dev/null 2>&1 || exit 1
+    printf '%s %s %s' "${RESULT:-unknown}" "${SENT_DATE:-unknown}" "${INVOCATION_ID:-}"
+  )
+}
+
 mreport_weekly_cmd() {
   need_root
   load_cfg
   export_env_for_compose
   ensure_dirs
-  local mode="stdout" arg
+  local mode="stdout" arg scheduled=0
   while (( $# )); do
     arg="$1"; shift
     case "$arg" in
@@ -7131,7 +7211,15 @@ mreport_weekly_cmd() {
       --html)    mode="html" ;;
       --email)   mode="email" ;;
       --dry-run) mode="dry" ;;
-      *) die "Usage: domum-media report weekly [--stdout|--html|--email|--dry-run]" ;;
+      # The TIMER's path. Two behaviours a manual run must not have:
+      #   * it records the outcome, so `checkup` can surface a failed send;
+      #   * it refuses a SECOND send on the same day, which is what keeps a
+      #     Persistent=true timer from mailing twice when a missed Sunday
+      #     fires at boot and the machine is then rebooted again that day.
+      # A manual --email always sends: an explicit operator action is never
+      # silenced by a report the timer already delivered.
+      --scheduled) scheduled=1 ;;
+      *) die "Usage: domum-media report weekly [--stdout|--html|--email|--dry-run] [--scheduled]" ;;
     esac
   done
 
@@ -7170,6 +7258,20 @@ mreport_weekly_cmd() {
       rm -f "$text" "$html"
       ;;
     email)
+      if (( scheduled == 1 )); then
+        local prev prev_result prev_date
+        if prev="$(read_weekly_report)"; then
+          prev_result="${prev%% *}"
+          prev_date="$(awk '{print $2}' <<< "$prev")"
+          if [[ "$prev_result" == success && "$prev_date" == "$(date -I)" ]]; then
+            echo "[domum-media] a weekly report was already emailed today ($prev_date);"
+            echo "              not sending a second one. A manual 'report weekly --email'"
+            echo "              still sends unconditionally."
+            rm -f "$text"
+            return 0
+          fi
+        fi
+      fi
       if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" != "1" ]]; then
         rm -f "$text"
         die "Email is disabled (RECOVERY_PACK_EMAIL_ENABLED is not 1). Use --stdout or --html to preview."
@@ -7179,8 +7281,14 @@ mreport_weekly_cmd() {
       mreport_build_mime "$subject" "$text" "$html" "$msg"
       if smtp_send_message "$msg"; then
         echo "[domum-media] weekly report emailed -- $subject"
+        (( scheduled == 1 )) && { record_weekly_report success "$subject" \
+          || warn "the report was sent but the send could not be recorded"; }
       else
         rm -f "$text" "$html" "$msg"
+        # Recorded BEFORE dying, so `checkup` can report it. A scheduled
+        # report that could not be delivered must not be silent -- silence is
+        # this project's healthy signal.
+        (( scheduled == 1 )) && record_weekly_report failure "$subject"
         die "The weekly report could not be sent."
       fi
       rm -f "$text" "$html" "$msg"
@@ -7237,12 +7345,23 @@ health_notify_cmd() {
   need_root
   load_cfg
   export_env_for_compose
-  local force=0 dry=0 a
+  local force=0 dry=0 unless_reported=0 a
   for a in "$@"; do
     case "$a" in
       --force)   force=1 ;;
       --dry-run) dry=1 ;;
-      *) die "Usage: domum-media health-notify [--force] [--dry-run]" ;;
+      # Used by the weekly unit. The comprehensive report that ran a moment
+      # earlier in the SAME activation already carries the verdict and every
+      # finding, so mailing an alert as well would be two messages about one
+      # state -- which this project treats as a defect, not a nicety.
+      #
+      # Keyed on systemd's INVOCATION_ID, identical across every ExecStart of
+      # one activation and EMPTY for a manual run, so an operator typing
+      # `health-notify` is never silenced by an earlier report. And only a
+      # RECORDED SUCCESS suppresses: if the report could not be delivered,
+      # the alert is the only thing left and must go.
+      --unless-reported) unless_reported=1 ;;
+      *) die "Usage: domum-media health-notify [--force] [--dry-run] [--unless-reported]" ;;
     esac
   done
 
@@ -7293,6 +7412,19 @@ health_notify_cmd() {
     fi
     rm -f "$body"
     return 0
+  fi
+
+  if (( unless_reported == 1 )) && [[ -n "${INVOCATION_ID:-}" ]]; then
+    local wr wr_result wr_inv
+    if wr="$(read_weekly_report)"; then
+      wr_result="${wr%% *}"
+      wr_inv="$(awk '{print $3}' <<< "$wr")"
+      if [[ "$wr_result" == success && -n "$wr_inv" && "$wr_inv" == "${INVOCATION_ID}" ]]; then
+        echo "[domum-media] the weekly report was emailed in this same run and carries"
+        echo "              every finding, so no separate alert is sent. Verdict: $(health_verdict)."
+        return 0
+      fi
+    fi
   fi
 
   # Silence IS the healthy signal. Same decision the dry run reported, so a
@@ -7679,6 +7811,10 @@ checkup_collect_all() {
   # Whether the credentials that open the off-site backup exist anywhere but
   # here. Reported by dr-status and dr-offhost-audit, neither of which notifies.
   checkup_recovery_pack_offhost
+  # Whether the SCHEDULED weekly report reached the operator. The weekly unit
+  # tolerates a failed send so it cannot suppress the alert; this is what stops
+  # that tolerance turning into silence.
+  checkup_weekly_report_delivery
   # Whether a warranted alert can leave the host at all. Last, because it is
   # the check that decides whether any of the above would ever be seen.
   checkup_notification_path

@@ -333,6 +333,9 @@ jobs:
       - name: Weekly report render smoke test
         run: tests/weekly-report-render-smoke.sh
 
+      - name: Weekly notification policy smoke test
+        run: tests/weekly-notification-policy-smoke.sh
+
       # checkup, health-notify and report weekly must evaluate the SAME
       # complete set of checks. health-notify ran only a four-check SUBSET, so
       # an unhealthy container could appear in checkup and never be mailed.

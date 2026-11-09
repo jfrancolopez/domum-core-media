@@ -23,6 +23,39 @@ Type=oneshot
 #                    it. With `-` an undeliverable alert left the unit green and
 #                    nothing surfaced it: silence would have meant "healthy"
 #                    when it actually meant "could not tell you".
+#
+# THREE steps now, and the order and prefixes are the whole design:
+#
+#   report --write            evidence/history on disk. Tolerated: a failed
+#                             evidence write must not stop the report or the
+#                             alert.
+#
+#   report weekly --email     the COMPREHENSIVE multipart HTML report, sent
+#                             --scheduled EVERY Sunday, including when the host is
+#                             healthy. Silence is the alert policy, NOT the
+#                             report policy: a weekly report that only arrives
+#                             when something is wrong cannot be distinguished
+#                             from a report that is broken.
+#                             TOLERATED (`-`) for one reason only -- without it a
+#                             failed send would stop the unit and the alert below
+#                             would never run, which is the "a failed report must
+#                             not suppress the alert" defect. The failure is NOT
+#                             swallowed: --scheduled records it and
+#                             checkup_weekly_report_delivery raises it as a
+#                             CRITICAL, so it mails on the next run and shows in
+#                             the report.
+#                             --scheduled also refuses a second send on the same
+#                             day, which is what keeps Persistent=true from
+#                             mailing twice when a missed Sunday fires at boot.
+#
+#   health-notify             the ALERT path, unchanged: silent unless something
+#                             needs action. NO prefix, so an undeliverable alert
+#                             fails the unit -- that is what puts it in
+#                             `systemctl --failed`, where checkup_systemd_health
+#                             finds it. --unless-reported stops it duplicating a
+#                             report that just went out in this same activation,
+#                             keyed on systemd's INVOCATION_ID.
 ExecStart=-/usr/local/bin/domum-media report --write
-ExecStart=/usr/local/bin/domum-media health-notify
+ExecStart=-/usr/local/bin/domum-media report weekly --email --scheduled
+ExecStart=/usr/local/bin/domum-media health-notify --unless-reported
 TimeoutStartSec=10m
