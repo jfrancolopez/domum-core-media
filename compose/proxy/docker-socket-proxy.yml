@@ -3,6 +3,7 @@ services:
     image: ${DOCKER_SOCKET_PROXY_IMAGE}
     container_name: docker-socket-proxy
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     environment:
       - CONTAINERS=1
       - EVENTS=1

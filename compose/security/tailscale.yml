@@ -6,6 +6,7 @@ services:
     image: ${TAILSCALE_IMAGE}
     container_name: tailscale
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     network_mode: host
     cap_add:
       - NET_ADMIN

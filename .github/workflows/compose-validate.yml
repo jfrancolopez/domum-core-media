@@ -261,6 +261,9 @@ jobs:
       - name: Traefik socket proxy smoke test
         run: tests/socket-proxy-smoke.sh
 
+      - name: Compose no-new-privileges smoke test
+        run: tests/compose-no-new-privileges-smoke.sh
+
       # A recovery point for volume-backed state: dump, checksum, metadata,
       # restore, and the file modes a private key depends on.
       - name: Volume recovery point smoke test

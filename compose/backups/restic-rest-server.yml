@@ -7,6 +7,7 @@ services:
     image: ${RESTIC_REST_SERVER_IMAGE}
     container_name: restic-rest-server
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     networks:
       - domum-internal
     environment:

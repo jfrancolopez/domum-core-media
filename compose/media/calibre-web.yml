@@ -3,6 +3,7 @@ services:
     image: ${CALIBRE_WEB_IMAGE}
     container_name: calibre-web
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     networks:
       - domum-proxy
       - domum-internal

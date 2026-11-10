@@ -3,6 +3,7 @@ services:
     image: ${TRAEFIK_IMAGE}
     container_name: traefik
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
 
     networks:
       - domum-proxy
