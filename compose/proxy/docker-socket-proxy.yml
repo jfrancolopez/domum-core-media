@@ -1,0 +1,24 @@
+services:
+  docker-socket-proxy:
+    image: ${DOCKER_SOCKET_PROXY_IMAGE}
+    container_name: docker-socket-proxy
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - EVENTS=1
+      - NETWORKS=1
+      - PING=1
+      - POST=0
+      - VERSION=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik-docker
+    read_only: true
+    tmpfs:
+      - /run
+
+networks:
+  traefik-docker:
+    name: domum-traefik-docker
+    internal: true

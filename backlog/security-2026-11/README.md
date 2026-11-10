@@ -43,7 +43,7 @@ gaps are at the edges rather than in the applications:
 |---|---|---|---|---|
 | [SEC-04](tasks/SEC-04-ssh-hardening.md) SSH key-only | owner (root) | 10 min | P1 | The LAN is trusted by decision D-2, so SSH is the control that matters |
 | [SEC-06](tasks/SEC-06-reboot-patched-kernel.md) reboot into the patched kernel | owner (root) | 15 min | P1 | The fix is already installed and not running |
-| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) CI guard for identifiers and secrets | worker | 45 min | P2 | Keeps D-1 true and detects future secret commits |
+| [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) Traefik Docker socket proxy (repo half) | worker | 90 min | P2 | Removes broad Docker API access from the public-facing proxy |
 
 ## All tasks
 
@@ -53,13 +53,13 @@ Status lives in each task file; this table is a summary.
 |---|---|---|---|---|
 | [SEC-00](tasks/SEC-00-scrub-domain-from-docs.md) | Real domain removed from `docs/` | DONE (`e53adf2`; PR #196, CI green) | P1 | — |
 | [SEC-01](tasks/SEC-01-scrub-config-and-cli-defaults.md) | Scrub config example and CLI defaults | DONE (`364a8d1`; PR #197, CI green) | P1 | SEC-00 |
-| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | PR_OPEN (owner review/merge pending) | P2 | SEC-01 |
+| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | DONE (`6307047`; PR #198, CI green) | P2 | SEC-01 |
 | [SEC-03](tasks/SEC-03-github-hardening.md) | Protect `main`, narrow the token on this host | BLOCKED (approval) | P1 | — |
 | [SEC-04](tasks/SEC-04-ssh-hardening.md) | SSH key-only, no root, no X11 | BLOCKED (owner, root) | P1 | — |
 | [SEC-05](tasks/SEC-05-tailscale-acl-review.md) | Tailscale ACL review | BLOCKED (owner, admin console) | P1 | — |
 | [SEC-06](tasks/SEC-06-reboot-patched-kernel.md) | Reboot into the patched kernel | BLOCKED (owner, root) | P1 | — |
 | [SEC-07](tasks/SEC-07-disable-rpcbind.md) | Close the unused RPC port | BLOCKED (owner, root) | P2 | — |
-| [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) | Traefik behind a Docker socket proxy | READY (repo half) | P2 | — |
+| [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) | Traefik behind a Docker socket proxy | PR_OPEN (#199; CI green, owner review pending) | P2 | — |
 | [SEC-09](tasks/SEC-09-no-new-privileges.md) | `no-new-privileges` on every container | QUEUED | P3 | SEC-08 |
 | [SEC-10](tasks/SEC-10-docker-group-boundary.md) | Docker group: state the real boundary | BLOCKED (D-3) | P2 | D-3 |
 | [SEC-11](tasks/SEC-11-plex-remote-access-check.md) | Plex relay and remote access check | BLOCKED (owner, Plex UI) | P2 | D-4 may supersede |

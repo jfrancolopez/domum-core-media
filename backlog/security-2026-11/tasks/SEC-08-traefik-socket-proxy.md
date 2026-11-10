@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Status | READY (repository half); deployment BLOCKED on the owner |
+| Status | PR_OPEN (#199; CI green, owner review pending); deployment BLOCKED on the owner |
 | Priority and reason | P2 — removes host control from the one container every request passes through |
 | Effort and change risk | 90 min for the repo change and rehearsal; medium. Deployment recreates Traefik |
-| Target and baseline | `domum-core-media`, branch off `origin/main`, inspected at `e0754a8` (2026-11-10) |
+| Target and baseline | `domum-core-media`, branch off current `origin/main` = `6307047`; security audit baseline `e0754a8` (2026-11-10) |
 | Owner and evidence | worker for the repo half, owner for deployment; finding F-08 |
 | Dependencies | First task on the compose-hardening track |
 
@@ -21,7 +21,7 @@ network nothing else joins.
 
 - Repo half only: compose fragments, config example, CI env, service registration, tests. Nothing in production.
 - Read `docs/add-new-service.md` and `docs/service-template.md` first; the proxy is a new managed service and the same registration applies.
-- Change `compose/proxy/traefik.yml` (remove the socket mount; add the new network), `compose/proxy/traefik/traefik.yml` (`providers.docker.endpoint` becomes `tcp://<proxy>:2375`), `compose/base.yml` (a new network with `internal: true`), plus a fragment for the proxy with the socket mounted read-only and only `CONTAINERS`, `NETWORKS` and `EVENTS` reads enabled.
+- Change `compose/proxy/traefik.yml` (remove the socket mount; add the new network), `compose/proxy/traefik/traefik.yml` (`providers.docker.endpoint` becomes `tcp://<proxy>:2375`), `compose/base.yml` (a new network with `internal: true`), plus a fragment for the proxy with the socket mounted read-only and only `CONTAINERS`, `NETWORKS` and `EVENTS` API sections enabled. The proxy also needs the non-privileged Docker `PING` and `VERSION` metadata endpoints for Traefik's API negotiation; all other API sections remain disabled, and `POST=0` rejects writes.
 - The proxy must: set `container_name` equal to its service key (a guard enforces this), be declared in `service_state_models` as `stateless` (undeclared services fail closed), have an image variable in `config/domum-media.conf.example` and `config/ci.env`, and publish no port.
 - Pick a maintained proxy image and record why. Pin by tag in the example like the others.
 - Preserve: every existing router label, the ACME volume, the dashboard auth file mount.
@@ -41,7 +41,7 @@ network nothing else joins.
    - **Expected** exit 0, with the new service reported `stateless`
    - **Time and failure action** 15 min; if the suite pins a service count, ask which is wrong before changing the assertion (`CLAUDE.md`, "a test can assert a defect")
 3. Repoint Traefik and remove its socket mount.
-   - **Check** `git grep -n 'docker.sock' -- compose`
+    - **Check** `git grep -F -n '/var/run/docker.sock' -- compose`
    - **Expected** exactly one hit, in the proxy fragment
    - **Time and failure action** 10 min
 4. Rehearse in a disposable compose project, following `operator/rehearsals/README.md`: Traefik pinned by the running container's image ID, the proxy, and one throwaway labelled container. No production network, volume or name.
@@ -65,8 +65,8 @@ network nothing else joins.
 
 ## Verification handoff
 
-- **Result** _not started_
-- **References** _base, commit, PR_
-- **Evidence** _per checkpoint: PASS / FAIL / BLOCKED / NOT RUN_
-- **Next model** `git grep -c 'docker.sock' -- compose` prints one file; next is SEC-09
-- **Open items** the Beszel agent also reads the socket (SEC-10); the same proxy could serve it
+- **Result** PR_OPEN — implementation, local checks, disposable rehearsal, and GitHub CI PASS; owner review pending.
+- **References** base `6307047`; implementation `a82387b`; evidence handoff `aa90848`; branch `task/sec-08-traefik-docker-socket-proxy`; PR [#199](https://github.com/jfrancolopez/domum-core-media/pull/199).
+- **Evidence** Read `docs/add-new-service.md`, `docs/service-template.md`, and the rehearsal contract. Baseline state-model, monitoring-completeness, and workflow Compose `config -q` PASS. Upstream LinuxServer image is active (release `3.4.7-r0-ls105`, published 2026-11-06); only CONTAINERS, NETWORKS and EVENTS API sections plus required PING/VERSION metadata are enabled, with `POST=0`. The disposable rehearsal used the local Unix-socket context and pinned Traefik image `sha256:9c3b91d5fb7770853ca5c1124a23c34bf2d9b47ffaebeab2614cbaf410dcb2ac`; labeled whoami route returned HTTP 200, container-create POST returned 403, no target container was created, and teardown verified the full container ID/name inventory unchanged and no project containers/networks remained. The rehearsal uses unique internal networks, no production volumes/ports, and did not recreate Traefik. Focused socket-proxy, state-model, monitoring, update-path, service-upgrade, upgrade-protection, volume-recovery-point, operation-lock, reporting, CI-coverage (91 tests), pipefail, identifier, conflict-marker, documented-command, Bash syntax, ShellCheck and Compose checks PASS. Current-tree redacted Gitleaks scan PASS (0 findings). GitHub push and pull-request `compose-validate` runs for `aa90848` PASS (`42893762295`, `42893773728`); the new commit below only records this handoff.
+- **Next model** owner review/merge; keep deployment owner-gated.
+- **Open items** owner review/merge. Owner deployment gate: preserve previous Traefik compose/image ID, pin the currently running Traefik image ID for deployment, and respect Queue P3.5 because Traefik state is in a Docker volume. The Beszel agent also reads the socket (SEC-10); no production paths, networks, volumes, names, or services were changed or deployed.

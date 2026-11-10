@@ -8,6 +8,10 @@ networks:
     name: domum-internal
     driver: bridge
     internal: false
+  traefik-docker:
+    name: domum-traefik-docker
+    driver: bridge
+    internal: true
 
 volumes:
   traefik-letsencrypt:
