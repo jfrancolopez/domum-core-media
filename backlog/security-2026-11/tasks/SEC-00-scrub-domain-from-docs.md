@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | READY_FOR_REVIEW |
+| Status | READY_FOR_OWNER_REVIEW |
 | Priority and reason | P1 — decision D-1; the repository is public |
 | Effort and change risk | Done; docs only, no behaviour change |
 | Target and baseline | `domum-core-media`, branch off `origin/main`, inspected at `e0754a8` (2026-11-10) |
@@ -40,8 +40,8 @@ Nothing further to edit. To re-check from the repo root: `git grep -c 'example.t
 
 ## Verification handoff
 
-- **Result** READY_FOR_REVIEW, 2026-11-10
-- **References** base `e0754a8`; implementation commit `3163086` on local branch `backlog/security-and-apps-2026-11`; not pushed, no PR
-- **Evidence** occurrence count PASS (8 → 0); documented-commands-audit PASS (exit 0); no-conflict-markers-audit PASS (exit 0); repo-hygiene-smoke PASS (exit 0). Full CI NOT RUN (branch not pushed)
-- **Next model** `git grep -c 'example.test' -- docs | wc -l` prints `6`; next is SEC-01
-- **Open items** owner review and push; history still holds the domain (D-1a)
+- **Result** READY_FOR_OWNER_REVIEW — independent review PASS, 2026-11-10
+- **References** base `e0754a8`; implementation commit `3163086`; review evidence recorded on branch `backlog/security-and-apps-2026-11`
+- **Evidence** docs-only matching lines PASS (8 at baseline → 0 after); `example.test` appears in six docs; implementation diff is 6 files / 8 insertions / 8 deletions, all under `docs/`; `git diff --check` PASS. `python3 tests/documented-commands-audit.py` PASS (106 commands); `python3 tests/no-conflict-markers-audit.py` PASS (267 files); `tests/repo-hygiene-smoke.sh` PASS. Full CI NOT RUN.
+- **Next model** SEC-01 after SEC-00 lands; its dependency is not yet satisfied. `git grep -c 'example.test' -- docs | wc -l` prints `6`.
+- **Open items** owner review/PR merge; history still holds the domain (D-1a).
