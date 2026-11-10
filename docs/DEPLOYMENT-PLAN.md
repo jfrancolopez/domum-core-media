@@ -13,11 +13,13 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-06** against `origin/main` = `302e26d`. The delta has
-grown 16 -> 30 -> 38 -> **44 commits**. The installable surface is the same
-FIVE paths as at 38 -- all three binaries plus the two comment-only
-`systemd/` files -- so nothing new has to be carried; what changed is the
-content of the three binaries.
+Reconciled **2026-11-09** against `origin/main` = `896cac5`. The delta has
+grown 16 -> 30 -> 38 -> 44 -> **47 commits**, and the installable surface grew
+from FIVE paths to **SIX**: all three binaries, the two comment-only `systemd/`
+files, and now `systemd/domum-media-weekly-report.service`, whose **directives**
+changed. That sixth path is the only one of the three unit files the narrow
+script carries, and it already did -- see §9. Re-measure rather than trust this
+paragraph: the surface has changed shape twice in a week.
 
 An earlier reconciliation recorded `bin/domum-media-report` as *unchanged since
 2026-10-11*, which by then was false: it carries the recovery-pack contents
@@ -57,7 +59,7 @@ and it holds right now — so a run of it starts from a clean base.
 
 ## 2. What would change
 
-44 commits, of which the **installable** surface is still small and
+47 commits, of which the **installable** surface is still small and
 UNCHANGED IN SHAPE since the 38-commit reconciliation. Re-measured 2026-11-06
 with `git diff --name-only a63ad19..main -- bin systemd install.sh`:
 
@@ -95,7 +97,14 @@ draft of this plan quoted one that was wrong within the hour. Read the target
 side from the dry run, which computes it against the revision you are actually
 deploying.
 
-## 3. The unit file: changed, comment-only, and NOT carried by the script
+## 3. The SCRUB timer's unit: changed, comment-only, and NOT carried by the script
+
+This section is about one unit. There are now THREE changed unit files and they
+are not alike: `auto-enable.timers` and the scrub timer are comment-only and the
+narrow script does not carry them, while
+`systemd/domum-media-weekly-report.service` is a **directive** change that the
+script does carry (§9). The heading used to say "the unit file", which read as a
+statement about all of them.
 
 `systemd/domum-media-btrfs-scrub.timer` differs from the installed copy. Every
 **directive** is byte-identical — `Description`, `OnCalendar`,
@@ -166,7 +175,8 @@ change the operator made on 2026-11-03, not because of anything in the code.
 
 ```
 domum-media-btrfs-scrub.timer   enabled, active
-next elapse                     Sun 2026-12-06 05:34:39 EST
+OnCalendar                      Sun *-*-01..07 05:30:00
+RandomizedDelaySec              20m        -> fires 05:30-05:50
 LAST                            -   (never fired)
 ExecStart                       /usr/local/bin/domum-media storage scrub start --limit 150M
 ```
@@ -356,7 +366,7 @@ would not have delivered it.
 
 ### 9.3 Exact hashes — measured, and how to re-derive them
 
-Measured at `a5c3578`. **A hash baked into a document goes stale exactly like a
+Measured at `896cac5`. **A hash baked into a document goes stale exactly like a
 baked-in revision**, so the command that re-derives it is given with it and is
 what should be trusted at deploy time:
 
@@ -370,9 +380,9 @@ for p in bin/domum-media:/usr/local/bin/domum-media \
 done
 ```
 
-| file | installed at `a63ad19` | new at `a5c3578` |
+| file | installed at `a63ad19` | new at `896cac5` |
 |---|---|---|
-| `bin/domum-media` → `/usr/local/bin/domum-media` | `5e65f06c8a7a4bf4` | `644358a0dcf32ec5` |
+| `bin/domum-media` → `/usr/local/bin/domum-media` | `5e65f06c8a7a4bf4` | `a4d90a43382c8ffe` |
 | `bin/domum-media-backup` → `/usr/local/bin/domum-media-backup` | `08a81ba2065850c4` | `d5aa2fb56cb11ae3` |
 | `bin/domum-media-report` → `/usr/local/lib/domum-media/domum-media-report` | `d813ae0e4181a7d5` | `14a5f7334adf68e0` |
 
@@ -470,26 +480,53 @@ Nothing else needs undoing: no timer state changed, no data was written outside
 `$DOMUM_STATE_ROOT/weekly-report.env`, and that file is only read by the new
 code — an older binary ignores it.
 
-### 9.8 Two things that need an explicit decision
+### 9.8 One thing that needs an explicit decision
 
 1. **A real delivery test sends a real email.**
    `sudo domum-media report weekly --email` would prove end-to-end delivery and
    is the only way to do so. It is NOT in the verification list above and was
    not run: sending external mail needs operator approval.
 
-2. **There is no SMTP retry, and there never was.**
-   Measured: `smtp_send_message` makes a single `curl` attempt — `smtps://`
-   with `--ssl-reqd`, credentials read from files rather than argv — and has
-   **no `--retry` and no loop**. A transient SMTP failure therefore costs a
-   week, because the next attempt is the next Sunday.
+### 9.9 The SMTP transport: retry added, and two security claims corrected
 
-   Deliberately NOT bundled into this change, so the notification policy can be
-   reviewed on its own. The one-line form, if wanted:
+This section previously said *"there is no SMTP retry, and there never was"* and
+described the credentials as *"read from files rather than argv"*. The first is
+now out of date and **the second was wrong**: they were read from files into
+shell variables and then passed to curl on the COMMAND LINE. The plan asserted
+the exact property that was missing, which is why it is called out here rather
+than quietly edited.
 
-   ```
-   curl --retry 2 --retry-delay 10 --retry-connrefused ...
-   ```
+What landed, all in `smtp_send_message`, with the function driven by a test for
+the first time (`tests/smtp-transport-smoke.sh`, 17 sections, 4 mutants):
 
-   curl applies `--retry` only to transient failures (timeouts, 5xx,
-   connection refused with that flag) and **never** to an authentication
-   failure, so it cannot turn a bad credential into repeated login attempts.
+| before | now |
+|---|---|
+| one `curl` attempt | `--retry 2 --retry-delay 10 --retry-connrefused`, `RECOVERY_PACK_SMTP_RETRIES=0` restores the single attempt |
+| no bound on an attempt | `--connect-timeout 15 --max-time 60 --retry-max-time 60` |
+| `--user "$user:$pass"` in argv | a 0600 `--config` file, removed on every path out |
+| default `.curlrc` honoured | `-q` first, `--config` before the security flags |
+
+**Why the bounds are part of the retry, not a nicety.** curl sets no connect
+timeout of its own, so a black-holed SMTP port hangs for the OS TCP timeout
+(~130s). The weekly unit now has TWO senders, so three unbounded attempts each
+could approach `TimeoutStartSec=10m` and have systemd kill the job mid-way --
+a transient fault converted into a failed report. `--max-time` alone is not
+enough: curl(1) says its counter "is reset each time the transfer is retried".
+Worst case is now ~120s per send, ~240s for two, against 600s.
+
+**Why the argv change is not cosmetic.** Measured on this host: `/proc` carries
+no `hidepid` option and 75 root-owned processes' argv read fine as the
+unprivileged account, while `/etc/domum-core-media/secrets` is
+`drwx------ root root` -- unreadable and unlistable by it. So the argv form took
+a secret that account cannot otherwise reach and made it readable by any local
+account for the duration of each send.
+
+**Why `-q`.** curl(1): the default config file is read "even when `--config` is
+used". Measured with one planted, `CURLOPT_SSL_VERIFYPEER` and `VERIFYHOST` both
+went to 0 and an extra `CURLOPT_MAIL_RCPT` appeared -- certificate verification
+on the mail send defeated and a second recipient added for a report full of host
+state. The credential itself was never at risk there, because a command-line
+`--config` is parsed after the default config and wins.
+
+Failure propagation is unchanged and asserted: curl still returns non-zero once
+retries are exhausted, and every caller that died on a failed send still dies.
