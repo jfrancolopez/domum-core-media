@@ -1,5 +1,16 @@
 # Task 12 — CI: add yamllint and gitleaks  [shared-philosophy]
 
+## Reconciliation with SEC-02
+
+- The Gitleaks portion is implemented by
+  [SEC-02](security-2026-11/tasks/SEC-02-ci-identifier-and-secret-scan.md),
+  pending its PR merge: the v3.0.0 action is SHA-pinned and runs on branch
+  pushes and pull requests with full history available.
+- SEC-02 locally scanned the complete repository history with no findings and
+  confirmed a synthetic committed AWS credential is detected (match redacted).
+- Task 12 as a whole remains open for YAML linting and `.shellcheckrc`; SEC-02
+  does not add either or change Compose YAML.
+
 ## Objective
 Bring this repo's CI up to the sibling's coverage: YAML linting and secret
 scanning, alongside the existing bash-syntax, shellcheck, smoke-test, and
@@ -28,12 +39,12 @@ Not proposing anything heavier — no CD, no scheduled workflows.
 1. Copy `.yamllint.yml` from domum-core verbatim (200-char lines, 2-space
    indents); extend `ignore:` with `nimbalyst-local/` and `backlog/` if
    needed.
-2. Add a gitleaks job identical to domum-core's (`gitleaks/gitleaks-action@v2`,
-   `fetch-depth: 0`). Run it once locally first (`gitleaks detect`) — if
-   history is clean, no `.gitleaks.toml` allowlist is required; if it flags
-   something, STOP and report the finding instead of allowlisting it.
-3. Add both as jobs in the existing workflow (keep one workflow file — this
-   repo's style).
+2. **Gitleaks covered by SEC-02.** It uses
+   `gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e`
+   (v3.0.0) with `fetch-depth: 0`. The redacted local history scan was clean;
+   no `.gitleaks.toml` allowlist is required.
+3. Add YAML linting as a job/step in the existing workflow (keep one workflow
+   file — this repo's style).
 3b. Add `.shellcheckrc` so local runs match CI; the existing shellcheck job
    picks it up automatically.
 4. Fix any yamllint complaints in compose files (expect minor whitespace
@@ -42,7 +53,7 @@ Not proposing anything heavier — no CD, no scheduled workflows.
 ## Testing plan
 - Branch push: all jobs green.
 - Deliberately add a fake AWS key in a scratch commit locally and confirm
-  `gitleaks detect` catches it (do not push).
+  `gitleaks git` catches it (do not push). **Covered by SEC-02.**
 
 ## Rollback plan
 Delete the jobs/config files.

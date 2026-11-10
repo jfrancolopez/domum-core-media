@@ -43,7 +43,7 @@ gaps are at the edges rather than in the applications:
 |---|---|---|---|---|
 | [SEC-04](tasks/SEC-04-ssh-hardening.md) SSH key-only | owner (root) | 10 min | P1 | The LAN is trusted by decision D-2, so SSH is the control that matters |
 | [SEC-06](tasks/SEC-06-reboot-patched-kernel.md) reboot into the patched kernel | owner (root) | 15 min | P1 | The fix is already installed and not running |
-| [SEC-01](tasks/SEC-01-scrub-config-and-cli-defaults.md) scrub identifiers from config example and CLI defaults | worker | 45 min | P1 | Decision D-1; unblocks the CI guard in SEC-02 |
+| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) CI guard for identifiers and secrets | worker | 45 min | P2 | Keeps D-1 true and detects future secret commits |
 
 ## All tasks
 
@@ -52,8 +52,8 @@ Status lives in each task file; this table is a summary.
 | ID | Task | Status | Pri | Depends on |
 |---|---|---|---|---|
 | [SEC-00](tasks/SEC-00-scrub-domain-from-docs.md) | Real domain removed from `docs/` | DONE (`e53adf2`; PR #196, CI green) | P1 | — |
-| [SEC-01](tasks/SEC-01-scrub-config-and-cli-defaults.md) | Scrub config example and CLI defaults | PR_OPEN (owner review/merge pending) | P1 | SEC-00 |
-| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | QUEUED | P2 | SEC-01 |
+| [SEC-01](tasks/SEC-01-scrub-config-and-cli-defaults.md) | Scrub config example and CLI defaults | DONE (`364a8d1`; PR #197, CI green) | P1 | SEC-00 |
+| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | IN_PROGRESS | P2 | SEC-01 |
 | [SEC-03](tasks/SEC-03-github-hardening.md) | Protect `main`, narrow the token on this host | BLOCKED (approval) | P1 | — |
 | [SEC-04](tasks/SEC-04-ssh-hardening.md) | SSH key-only, no root, no X11 | BLOCKED (owner, root) | P1 | — |
 | [SEC-05](tasks/SEC-05-tailscale-acl-review.md) | Tailscale ACL review | BLOCKED (owner, admin console) | P1 | — |
