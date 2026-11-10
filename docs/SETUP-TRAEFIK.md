@@ -9,7 +9,7 @@ of truth and the host remains the secret source of truth.
 Set the dashboard host in `config/domum-media.conf`:
 
 ```bash
-TRAEFIK_DASHBOARD_HOST="traefik-media.ladomum.com"
+TRAEFIK_DASHBOARD_HOST="traefik-media.example.test"
 ```
 
 The default in `config/domum-media.conf.example` is
