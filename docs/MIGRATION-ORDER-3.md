@@ -100,7 +100,7 @@ credentials, no production change.
 
 Alternatives considered and not taken: a request from inside the proxy network
 (needs an HTTP client in some container, and the traefik image has neither curl
-nor wget); the existing Traefik route at `music.ladomum.com` (needs TLS and DNS
+nor wget); the existing Traefik route at `music.example.test` (needs TLS and DNS
 from the host, and routes through the proxy to prove a local fact); publishing a
 port (changes production networking for a test).
 

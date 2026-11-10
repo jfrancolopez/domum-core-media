@@ -130,7 +130,7 @@ traefik      volume domum-media_traefik-letsencrypt -> /letsencrypt
              acme.json 116,015 bytes mode 0600
              resolver cf: 9 certificates + the ACME ACCOUNT PRIVATE KEY
              (status, traefik-media, plex, kavita, books, media, music,
-              photos, status-media -- all .ladomum.com)
+              photos, status-media -- all .example.test)
              staged: v3.7.10 -> v3.7.12
 
 uptime-kuma  volume domum-media_uptime-kuma-data -> /app/data

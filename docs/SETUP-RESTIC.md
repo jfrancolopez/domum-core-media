@@ -298,7 +298,7 @@ Optional SMTP delivery (sends the pack to your inbox after each creation):
 ```bash
 RECOVERY_PACK_EMAIL_ENABLED=1
 RECOVERY_PACK_EMAIL_TO="you@gmail.com"
-RECOVERY_PACK_EMAIL_FROM="domum@ladomum.com"
+RECOVERY_PACK_EMAIL_FROM="domum@example.test"
 RECOVERY_PACK_SMTP_HOST="smtp.gmail.com"
 RECOVERY_PACK_SMTP_PORT="465"
 RECOVERY_PACK_SMTP_USERNAME_FILE="/etc/domum-core-media/secrets/recovery_pack_smtp_username"
