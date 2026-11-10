@@ -3,6 +3,7 @@ services:
     image: ${PLEX_IMAGE}
     container_name: plex
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     networks:
       - domum-proxy
       - domum-internal

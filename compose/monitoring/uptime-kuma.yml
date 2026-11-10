@@ -3,6 +3,7 @@ services:
     image: ${UPTIME_KUMA_IMAGE}
     container_name: uptime-kuma
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     networks:
       - domum-proxy
     volumes:

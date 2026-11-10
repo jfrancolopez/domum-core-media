@@ -3,6 +3,7 @@ services:
     image: ${KAVITA_IMAGE}
     container_name: kavita
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     networks:
       - domum-proxy
       - domum-internal
