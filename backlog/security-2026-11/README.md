@@ -60,7 +60,7 @@ Status lives in each task file; this table is a summary.
 | [SEC-06](tasks/SEC-06-reboot-patched-kernel.md) | Reboot into the patched kernel | BLOCKED (owner, root) | P1 | — |
 | [SEC-07](tasks/SEC-07-disable-rpcbind.md) | Close the unused RPC port | BLOCKED (owner, root) | P2 | — |
 | [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) | Traefik behind a Docker socket proxy | DONE (repo half merged `b094616`; deployment owner-gated) | P2 | — |
-| [SEC-09](tasks/SEC-09-no-new-privileges.md) | `no-new-privileges` on every container | IN_PROGRESS (repo change; deployment owner-gated) | P3 | SEC-08 |
+| [SEC-09](tasks/SEC-09-no-new-privileges.md) | `no-new-privileges` on every container | PR_OPEN (#200; CI pending, deployment owner-gated) | P3 | SEC-08 |
 | [SEC-10](tasks/SEC-10-docker-group-boundary.md) | Docker group: state the real boundary | BLOCKED (D-3) | P2 | D-3 |
 | [SEC-11](tasks/SEC-11-plex-remote-access-check.md) | Plex relay and remote access check | BLOCKED (owner, Plex UI) | P2 | D-4 may supersede |
 | [APP-01](tasks/APP-01-measure-usage-for-consolidation.md) | Measure real use of the overlapping apps | READY | P2 | — |
