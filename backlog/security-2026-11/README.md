@@ -51,7 +51,7 @@ Status lives in each task file; this table is a summary.
 
 | ID | Task | Status | Pri | Depends on |
 |---|---|---|---|---|
-| [SEC-00](tasks/SEC-00-scrub-domain-from-docs.md) | Real domain removed from `docs/` | READY_FOR_OWNER_REVIEW (technical checks pass) | P1 | — |
+| [SEC-00](tasks/SEC-00-scrub-domain-from-docs.md) | Real domain removed from `docs/` | PR_OPEN (owner review/merge pending) | P1 | — |
 | [SEC-01](tasks/SEC-01-scrub-config-and-cli-defaults.md) | Scrub config example and CLI defaults | READY | P1 | SEC-00 |
 | [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | QUEUED | P2 | SEC-01 |
 | [SEC-03](tasks/SEC-03-github-hardening.md) | Protect `main`, narrow the token on this host | BLOCKED (approval) | P1 | — |
