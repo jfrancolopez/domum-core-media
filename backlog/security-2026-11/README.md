@@ -53,7 +53,7 @@ Status lives in each task file; this table is a summary.
 |---|---|---|---|---|
 | [SEC-00](tasks/SEC-00-scrub-domain-from-docs.md) | Real domain removed from `docs/` | DONE (`e53adf2`; PR #196, CI green) | P1 | — |
 | [SEC-01](tasks/SEC-01-scrub-config-and-cli-defaults.md) | Scrub config example and CLI defaults | DONE (`364a8d1`; PR #197, CI green) | P1 | SEC-00 |
-| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | IN_PROGRESS | P2 | SEC-01 |
+| [SEC-02](tasks/SEC-02-ci-identifier-and-secret-scan.md) | CI guard: identifiers and secret scan | PR_OPEN (owner review/merge pending) | P2 | SEC-01 |
 | [SEC-03](tasks/SEC-03-github-hardening.md) | Protect `main`, narrow the token on this host | BLOCKED (approval) | P1 | — |
 | [SEC-04](tasks/SEC-04-ssh-hardening.md) | SSH key-only, no root, no X11 | BLOCKED (owner, root) | P1 | — |
 | [SEC-05](tasks/SEC-05-tailscale-acl-review.md) | Tailscale ACL review | BLOCKED (owner, admin console) | P1 | — |
