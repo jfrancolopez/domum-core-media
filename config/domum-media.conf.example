@@ -11,13 +11,13 @@
 # ============================================================
 
 # Base domain (Cloudflare zone with a DNS-01 token in secrets/cloudflare_api_token)
-DOMUM_DOMAIN=ladomum.com
+DOMUM_DOMAIN=example.test
 
 # ACME notification email (Let's Encrypt)
 DOMUM_EMAIL=
 
 # Optional — used by docs and dynamic routes for split-DNS notes
-DOMUM_LAN_IP=10.0.10.3
+DOMUM_LAN_IP=192.0.2.10
 DOMUM_TS_IP=''
 
 # ============================================================
@@ -71,13 +71,13 @@ ENABLE_RESTIC_REST_SERVER=0
 # SECTION: Service hostnames
 # ============================================================
 
-TRAEFIK_DASHBOARD_HOST=traefik-media.ladomum.com
-IMMICH_HOST=photos.ladomum.com
-JELLYFIN_HOST=media.ladomum.com
-PLEX_HOST=plex.ladomum.com
-NAVIDROME_HOST=music.ladomum.com
-CALIBRE_WEB_HOST=books.ladomum.com
-KAVITA_HOST=kavita.ladomum.com
+TRAEFIK_DASHBOARD_HOST=traefik-media.example.test
+IMMICH_HOST=photos.example.test
+JELLYFIN_HOST=media.example.test
+PLEX_HOST=plex.example.test
+NAVIDROME_HOST=music.example.test
+CALIBRE_WEB_HOST=books.example.test
+KAVITA_HOST=kavita.example.test
 
 # ============================================================
 # SECTION: Update policy — Class A (infrastructure, low-risk)
@@ -281,7 +281,7 @@ BACKUP_TARGET_CLOUD_RETENTION="weekly"
 # Only used when BACKUP_TARGET_CLOUD_REPOSITORY starts with "sftp:".
 # Use sftp:user@host:/absolute/path. Keep the port out of the repository string;
 # BACKUP_TARGET_CLOUD_SFTP_PORT supplies it through the explicit SSH command.
-# Example: sftp:b11@b11.your-storagebox.de:/home/domum-core-media-restic
+# Example: sftp:uNNNNNN@uNNNNNN.your-storagebox.de:/home/domum-core-media-restic
 # SSH key must be authorized on the remote host. Port must match the SFTP server.
 BACKUP_TARGET_CLOUD_SFTP_KEY_FILE="/etc/domum-core-media/secrets/hetzner_storagebox_ed25519"
 BACKUP_TARGET_CLOUD_SFTP_KNOWN_HOSTS_FILE="/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts"

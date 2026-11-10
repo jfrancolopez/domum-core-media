@@ -36,6 +36,45 @@ BACKUP_TARGETS=cloud
 ENABLE_IMMICH=1
 CFG
 
+# Exercise the real config loader and both CLI environment exporters with no
+# DOMUM_DOMAIN line. The only default must be the documentation-safe placeholder.
+cat > "$TMP/domain-default.conf" <<CFG
+DOMUM_DATA_ROOT=$TMP/data
+DOMUM_MEDIA_ROOT=$TMP/media
+DOMUM_SNAPSHOT_ROOT=$TMP/snapshots
+DOMUM_STATE_ROOT=$TMP/state
+CFG
+
+assert_domain_default() {  # $1 = CLI, $2 = exporter name
+  local cli="$1" exporter="$2" actual
+  actual="$(
+    (
+      export DOMUM_DIR="$REPO_ROOT" CFG_FILE="$TMP/domain-default.conf"
+      export DOMUM_DATA_ROOT="$TMP/data" DOMUM_MEDIA_ROOT="$TMP/media"
+      export DOMUM_SNAPSHOT_ROOT="$TMP/snapshots" DOMUM_STATE_ROOT="$TMP/state"
+      export SECRETS_DIR="$TMP/secrets"
+      unset DOMUM_DOMAIN
+      # shellcheck disable=SC1090
+      source "$cli" >/dev/null 2>&1
+      load_cfg >/dev/null 2>&1
+      if [[ "$exporter" == "domum-media" ]]; then
+        load_runtime_secrets() { :; }
+        export_env_for_compose >/dev/null 2>&1
+      else
+        export_compose_env >/dev/null 2>&1
+      fi
+      printf '%s\n' "$DOMUM_DOMAIN"
+    )
+  )" || fail "$exporter failed to load the no-domain fixture"
+  [[ "$actual" == "example.test" ]] \
+    || fail "$exporter defaulted a missing DOMUM_DOMAIN to an unexpected value"
+  echo "  $exporter uses example.test when the config omits DOMUM_DOMAIN"
+}
+
+sect "missing DOMUM_DOMAIN uses the safe default in both CLIs"
+assert_domain_default "$REPO_ROOT/bin/domum-media" domum-media
+assert_domain_default "$REPO_ROOT/bin/domum-media-backup" domum-media-backup
+
 # Externals are stubbed so nothing can reach the host, and each returns
 # something plausible rather than failing -- a check that aborts because its
 # tool is missing is a different defect, covered elsewhere.

@@ -78,7 +78,7 @@ immich_only_include_paths() {
 }
 
 export_compose_env() {
-  export DOMUM_DOMAIN="${DOMUM_DOMAIN:-ladomum.com}"
+  export DOMUM_DOMAIN="${DOMUM_DOMAIN:-example.test}"
   export DOMUM_DATA_ROOT
   export IMMICH_DB_USERNAME="${IMMICH_DB_USERNAME:-postgres}"
   export IMMICH_DB_DATABASE_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"

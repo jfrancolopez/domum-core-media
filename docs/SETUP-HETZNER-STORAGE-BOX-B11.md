@@ -1,8 +1,8 @@
-# Hetzner Storage Box b11 setup
+# Hetzner Storage Box uNNNNNN setup
 
 This guide configures the `cloud` backup target to use a Hetzner Storage Box over restic + SFTP.
 
-The example below uses box user `b11`. Replace the host/path values with your real Storage Box details.
+The example below uses box user `uNNNNNN`. Replace the host/path values with your real Storage Box details.
 
 ## 1. Open the backup wizard
 
@@ -14,7 +14,7 @@ Use these answers for the `cloud` target:
 
 - `Enable cloud backup target?` -> `yes`
 - `Target type for cloud` -> `repository`
-- `Restic repository string for cloud` -> `sftp:b11@b11.your-storagebox.de:/home/domum-core-media-restic`
+- `Restic repository string for cloud` -> `sftp:uNNNNNN@uNNNNNN.your-storagebox.de:/home/domum-core-media-restic`
 - `Password file for cloud` -> keep the default unless you have a reason to change it
 - `Optional backend credential env file for cloud` -> keep the default or set a path, but leave the file empty/comment-only for SFTP targets
 - `Use SSH key authentication` -> `yes`
@@ -45,21 +45,21 @@ sudo cat /etc/domum-core-media/secrets/hetzner_storagebox_ed25519.pub
 Then in Hetzner Robot:
 
 1. Open `Storage Box`.
-2. Select your `b11` box.
+2. Select your `uNNNNNN` box.
 3. Open `SSH Keys`.
 4. Add a new key and paste the public key.
 
 ## 4. Save the server host key locally
 
 ```bash
-ssh-keyscan -p 23 b11.your-storagebox.de | sudo tee /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts >/dev/null
+ssh-keyscan -p 23 uNNNNNN.your-storagebox.de | sudo tee /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts >/dev/null
 sudo chmod 600 /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts
 ```
 
 Verify the captured fingerprint against a trusted Hetzner source before using
 it. `ssh-keyscan` retrieves a key but does not authenticate it.
 
-If your box uses a username-specific host like `u612125.your-storagebox.de`, use that exact hostname in both the repository URL and `ssh-keyscan`.
+If your box uses a username-specific host like `uNNNNNN.your-storagebox.de`, use that exact hostname in both the repository URL and `ssh-keyscan`.
 
 ## 5. Verify passwordless SSH access
 
@@ -71,7 +71,7 @@ printf 'pwd\nquit\n' | sudo sftp -F /dev/null \
   -o PasswordAuthentication=no \
   -o StrictHostKeyChecking=yes \
   -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-  -P 23 b11@b11.your-storagebox.de
+  -P 23 uNNNNNN@uNNNNNN.your-storagebox.de
 ```
 
 This should not prompt for a password.
@@ -115,7 +115,7 @@ An absent file is also fine.
 
 ## Troubleshooting & maintenance
 
-Replace `b11` and `b11.your-storagebox.de` with your actual Storage Box user and host wherever they appear below.
+Replace `uNNNNNN` and `uNNNNNN.your-storagebox.de` with your actual Storage Box user and host wherever they appear below.
 
 ### Key auth still prompts for a password
 
@@ -157,7 +157,7 @@ When an approved remote reset has occurred, recreate it from scratch:
        -o PasswordAuthentication=no \
        -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
        -o StrictHostKeyChecking=yes -P 23 \
-       b11@b11.your-storagebox.de
+       uNNNNNN@uNNNNNN.your-storagebox.de
     # at the sftp prompt:
     #   rm -r /home/domum-core-media-restic
    ```

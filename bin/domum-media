@@ -1485,7 +1485,7 @@ compose_files_for_enabled_services() {
 
 export_env_for_compose() {
   export DOMUM_DIR
-  export DOMUM_DOMAIN="${DOMUM_DOMAIN:-ladomum.com}"
+  export DOMUM_DOMAIN="${DOMUM_DOMAIN:-example.test}"
   export DOMUM_EMAIL="${DOMUM_EMAIL:-admin@${DOMUM_DOMAIN}}"
   export DOMUM_LAN_IP="${DOMUM_LAN_IP:-}"
   export DOMUM_TS_IP="${DOMUM_TS_IP:-}"

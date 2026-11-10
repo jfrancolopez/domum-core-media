@@ -47,7 +47,7 @@ sudo chmod 600 /etc/domum-core-media/secrets/hetzner_storagebox_ed25519
 ### 3. Capture `known_hosts`
 
 ```bash
-ssh-keyscan -p 23 u612125.your-storagebox.de | sudo tee /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts
+ssh-keyscan -p 23 uNNNNNN.your-storagebox.de | sudo tee /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts
 sudo chmod 600 /etc/domum-core-media/secrets/hetzner_storagebox_known_hosts
 ```
 
@@ -62,7 +62,7 @@ printf 'pwd\nquit\n' | sudo sftp -F /dev/null \
     -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
     -o PasswordAuthentication=no -o StrictHostKeyChecking=yes \
     -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-    -P 23 u612125@u612125.your-storagebox.de
+    -P 23 uNNNNNN@uNNNNNN.your-storagebox.de
 ```
 
 Should work without a password prompt.
@@ -182,7 +182,7 @@ to preserved historical repositories as routine cleanup.
        -o PasswordAuthentication=no \
        -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
        -o StrictHostKeyChecking=yes -P 23 \
-       u612125@u612125.your-storagebox.de
+       uNNNNNN@uNNNNNN.your-storagebox.de
    # at the sftp prompt:
    #   rm -r /home/domum-core-media-restic
    ```
@@ -235,7 +235,7 @@ restic -o sftp.command='ssh -F /dev/null \
   -o PasswordAuthentication=no \
   -o StrictHostKeyChecking=yes \
   -o UserKnownHostsFile=/etc/domum-core-media/secrets/hetzner_storagebox_known_hosts \
-  -p 23 u612125@u612125.your-storagebox.de -s sftp' …
+  -p 23 uNNNNNN@uNNNNNN.your-storagebox.de -s sftp' …
 ```
 
 Do **not** hand-edit this into shell-quoted form anywhere — the option is
