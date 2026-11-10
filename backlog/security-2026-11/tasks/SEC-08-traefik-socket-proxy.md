@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | IN_PROGRESS (repository half); deployment BLOCKED on the owner |
+| Status | PR_OPEN (#199; repository review/CI pending); deployment BLOCKED on the owner |
 | Priority and reason | P2 — removes host control from the one container every request passes through |
 | Effort and change risk | 90 min for the repo change and rehearsal; medium. Deployment recreates Traefik |
 | Target and baseline | `domum-core-media`, branch off current `origin/main` = `6307047`; security audit baseline `e0754a8` (2026-11-10) |
@@ -65,8 +65,8 @@ network nothing else joins.
 
 ## Verification handoff
 
-- **Result** IN_PROGRESS — repository implementation and disposable rehearsal PASS; PR/CI pending.
-- **References** base `6307047`; branch `task/sec-08-traefik-docker-socket-proxy`.
-- **Evidence** Read `docs/add-new-service.md`, `docs/service-template.md`, and the rehearsal contract. Baseline state-model, monitoring-completeness, and workflow Compose `config -q` PASS. Upstream LinuxServer image is active (release `3.4.7-r0-ls105`, published 2026-11-06); only CONTAINERS, NETWORKS and EVENTS API sections plus required PING/VERSION metadata are enabled, with `POST=0`. The disposable rehearsal used the local Unix-socket context and pinned Traefik image `sha256:9c3b91d5fb7770853ca5c1124a23c34bf2d9b47ffaebeab2614cbaf410dcb2ac`; labeled whoami route returned HTTP 200, container-create POST returned 403, no target container was created, and teardown verified the full container ID/name inventory unchanged and no project containers/networks remained. The rehearsal uses unique internal networks, no production volumes/ports, and did not recreate Traefik. Focused socket-proxy, state-model, monitoring, update-path, service-upgrade, upgrade-protection, volume-recovery-point, CI-coverage (91 tests), pipefail, identifier, conflict-marker, documented-command, Bash syntax, ShellCheck and Compose checks PASS. Current-tree redacted Gitleaks scan PASS (0 findings).
-- **Next model** commit and open the repository-only PR; verify GitHub `compose-validate` before marking the repository half done.
-- **Open items** PR/CI pending. Owner deployment gate: preserve previous Traefik compose/image ID, pin the currently running Traefik image ID for deployment, and respect Queue P3.5 because Traefik state is in a Docker volume. The Beszel agent also reads the socket (SEC-10); no production paths, networks, volumes, names, or services were changed or deployed.
+- **Result** PR_OPEN — implementation, local checks, and disposable rehearsal PASS; owner review and PR CI pending.
+- **References** base `6307047`; implementation `a82387b`; branch `task/sec-08-traefik-docker-socket-proxy`; PR [#199](https://github.com/jfrancolopez/domum-core-media/pull/199).
+- **Evidence** Read `docs/add-new-service.md`, `docs/service-template.md`, and the rehearsal contract. Baseline state-model, monitoring-completeness, and workflow Compose `config -q` PASS. Upstream LinuxServer image is active (release `3.4.7-r0-ls105`, published 2026-11-06); only CONTAINERS, NETWORKS and EVENTS API sections plus required PING/VERSION metadata are enabled, with `POST=0`. The disposable rehearsal used the local Unix-socket context and pinned Traefik image `sha256:9c3b91d5fb7770853ca5c1124a23c34bf2d9b47ffaebeab2614cbaf410dcb2ac`; labeled whoami route returned HTTP 200, container-create POST returned 403, no target container was created, and teardown verified the full container ID/name inventory unchanged and no project containers/networks remained. The rehearsal uses unique internal networks, no production volumes/ports, and did not recreate Traefik. Focused socket-proxy, state-model, monitoring, update-path, service-upgrade, upgrade-protection, volume-recovery-point, operation-lock, reporting, CI-coverage (91 tests), pipefail, identifier, conflict-marker, documented-command, Bash syntax, ShellCheck and Compose checks PASS. Current-tree redacted Gitleaks scan PASS (0 findings). PR push and pull-request `compose-validate` runs `42893611138` and `42893650573` are pending.
+- **Next model** verify both PR #199 `compose-validate` runs; keep the deployment owner-gated.
+- **Open items** owner review/merge and CI pending. Owner deployment gate: preserve previous Traefik compose/image ID, pin the currently running Traefik image ID for deployment, and respect Queue P3.5 because Traefik state is in a Docker volume. The Beszel agent also reads the socket (SEC-10); no production paths, networks, volumes, names, or services were changed or deployed.
