@@ -18,7 +18,7 @@ prune, repair, or deletion was performed.
 ## Accepted cloud repository
 
 ```text
-Repository: sftp:u612125@u612125.your-storagebox.de:/home/domum-core-media-restic
+Repository: sftp:uNNNNNN@uNNNNNN.your-storagebox.de:/home/domum-core-media-restic
 Repository ID: c1d39ac9c8296eb6c7daae479bec239c79553be69383644cf25dccc5beb7c50d
 SFTP port: 23, supplied separately by the explicit SSH command
 ```

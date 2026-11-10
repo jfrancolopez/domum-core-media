@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | PR_OPEN — owner review/merge pending |
+| Status | DONE — merged 2026-11-10 via PR #196 |
 | Priority and reason | P1 — decision D-1; the repository is public |
 | Effort and change risk | Done; docs only, no behaviour change |
 | Target and baseline | `domum-core-media`, branch off `origin/main`, inspected at `e0754a8` (2026-11-10) |
@@ -40,8 +40,8 @@ Nothing further to edit. To re-check from the repo root: `git grep -c 'example.t
 
 ## Verification handoff
 
-- **Result** PR_OPEN — independent review PASS; owner review/merge pending, 2026-11-10
-- **References** base `e0754a8`; implementation commit `3163086`; review record `94885bf`; branch `backlog/security-and-apps-2026-11`; PR [#196](https://github.com/jfrancolopez/domum-core-media/pull/196)
-- **Evidence** docs-only matching lines PASS (8 at baseline → 0 after); `example.test` appears in six docs; implementation diff is 6 files / 8 insertions / 8 deletions, all under `docs/`; `git diff --check` PASS. `python3 tests/documented-commands-audit.py` PASS (106 commands); `python3 tests/no-conflict-markers-audit.py` PASS (267 files); `tests/repo-hygiene-smoke.sh` PASS. Full CI NOT RUN.
-- **Next model** SEC-01 after SEC-00 lands; its dependency is not yet satisfied. `git grep -c 'example.test' -- docs | wc -l` prints `6`.
-- **Open items** owner review/PR merge; history still holds the domain (D-1a).
+- **Result** DONE — merged 2026-11-10; independent review and PR CI PASS.
+- **References** implementation `3163086`; review record `94885bf`; PR [#196](https://github.com/jfrancolopez/domum-core-media/pull/196); merge commit `e53adf2`.
+- **Evidence** docs-only matching lines PASS (8 at baseline → 0 after); `example.test` appears in six docs; implementation diff is 6 files / 8 insertions / 8 deletions, all under `docs/`. `documented-commands-audit` PASS (106); `no-conflict-markers-audit` PASS (267); `repo-hygiene-smoke` PASS; GitHub `compose-validate` PASS on `42865dd`.
+- **Next model** SEC-01; `git grep -c 'example.test' -- docs | wc -l` prints `6`.
+- **Open items** history still holds the domain as selected by D-1a.

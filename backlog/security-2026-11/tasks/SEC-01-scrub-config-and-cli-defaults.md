@@ -2,16 +2,16 @@
 
 | Field | Value |
 | --- | --- |
-| Status | READY |
+| Status | PR_OPEN — owner review/merge pending |
 | Priority and reason | P1 — decision D-1; the largest remaining disclosure in tracked files |
 | Effort and change risk | 45–60 min; medium, because a CLI default changes |
-| Target and baseline | `domum-core-media`, branch off `origin/main`, inspected at `e0754a8` (2026-11-10) |
+| Target and baseline | `domum-core-media`, branch off current `origin/main` = `e53adf2` (2026-11-10); security audit baseline `e0754a8` |
 | Owner and evidence | worker; finding F-01, decision D-1 |
 | Dependencies | SEC-00 landed |
 
 ## Outcome
 
-Today `config/domum-media.conf.example` carries the real domain (nine lines), a
+Today `config/domum-media.conf.example` carries the real domain (eight occurrences: the base domain and seven service hosts), a
 real LAN address, and the real off-site backup account and host; and both CLIs
 default `DOMUM_DOMAIN` to the real domain. After this task the example uses
 `example.test`, a documentation-range address and a placeholder account, and
@@ -43,11 +43,12 @@ the CLIs carry no real domain.
 
 1. Replace the domain, address and backup account in `config/domum-media.conf.example`.
    - **Check** `git grep -nE 'example\.test|192\.0\.2\.' -- config/domum-media.conf.example`
-   - **Expected** the nine host lines and the LAN line show placeholders; no real value remains in the file
+    - **Expected** all eight domain occurrences and the LAN line show placeholders; the SFTP example uses a placeholder account and host; no real value remains in the file
    - **Time and failure action** 10 min; if a test fixture copies real values from the example, stop and list the fixtures
 2. Change the two CLI defaults to `example.test`.
-   - **Check** `git grep -n 'DOMUM_DOMAIN:-' -- bin`
-   - **Expected** two lines, both `example.test`
+    - **Check** `git grep -n 'export DOMUM_DOMAIN="${DOMUM_DOMAIN:-' -- bin`
+    - **Expected** two lines, both `example.test`
+    - **Note** the broader `DOMUM_DOMAIN:-` search also matches three empty-value probes; those are not defaults and must remain unchanged.
    - **Time and failure action** 5 min
 3. Replace the backup account and host in the three docs with `uNNNNNN` and a placeholder host.
    - **Check** `git grep -cE 'u[0-9]{5,}' -- docs config`
@@ -71,8 +72,8 @@ the CLIs carry no real domain.
 
 ## Verification handoff
 
-- **Result** _not started_
-- **References** _base, commit, PR_
-- **Evidence** _each checkpoint: PASS / FAIL / BLOCKED / NOT RUN_
-- **Next model** `git grep -c 'DOMUM_DOMAIN:-example.test' -- bin` prints two files; next is SEC-02
-- **Open items** the owner gate above
+- **Result** PR_OPEN — implementation and local checks PASS; owner review/merge pending, 2026-11-10
+- **References** base `e53adf2`; implementation `6e945c3`; branch `task/sec-01-scrub-config-cli`; PR [#197](https://github.com/jfrancolopez/domum-core-media/pull/197)
+- **Evidence** SEC-00 merge prerequisite PASS (`e53adf2` is an ancestor); SEC-00 docs-only identifier check PASS (0 matches); pre-edit `repo-hygiene-smoke` PASS. Step 1: 8 domain occurrences and 1 LAN address replaced; no test fixture contained the source values. Step 2: exactly 2 CLI domain default assignments now use `example.test`; the three empty-value probes are unchanged. Step 3: account/host placeholders applied in all three docs; no `u[0-9]{5,}` remains in `docs/` or `config/`. Step 4: `checkup-produces-output-smoke`, `immich-secret-propagation-smoke`, and `repo-hygiene-smoke` PASS; the new test exercises real `load_cfg` and both CLI exporters. `ci-coverage-audit` PASS (88 tests); documented-commands audit PASS (106); conflict-marker audit PASS (267); Bash syntax and Compose config validation PASS; whole-tree source-domain and source-IP scans PASS (0); `git diff --check` PASS. ShellCheck rerun via `koalaman/shellcheck:stable` PASS (`--severity=warning` for entrypoints/operators; `--severity=error` for tests). The first local attempt timed out at 120 seconds; the unrestricted rerun completed without findings. GitHub `compose-validate` is running on PR #197.
+- **Next model** SEC-02 after SEC-01 lands; the dependency is not met until PR #197 merges. `git grep -c 'DOMUM_DOMAIN:-example.test' -- bin` prints two files.
+- **Open items** owner review/merge; before any deployment, the owner must confirm production explicitly sets `DOMUM_DOMAIN` as described above. No production change was made.
