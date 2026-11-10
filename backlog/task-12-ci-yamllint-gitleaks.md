@@ -4,8 +4,8 @@
 
 - The Gitleaks portion is implemented by
   [SEC-02](security-2026-11/tasks/SEC-02-ci-identifier-and-secret-scan.md),
-  pending its PR merge: the v3.0.0 action is SHA-pinned and runs on branch
-  pushes and pull requests with full history available.
+  merged in PR #198: the v3.0.0 action is SHA-pinned and runs on branch pushes
+  and pull requests with full history available.
 - SEC-02 locally scanned the complete repository history with no findings and
   confirmed a synthetic committed AWS credential is detected (match redacted).
 - Task 12 as a whole remains open for YAML linting and `.shellcheckrc`; SEC-02

@@ -258,6 +258,9 @@ jobs:
       - name: State model smoke test
         run: tests/state-model-smoke.sh
 
+      - name: Traefik socket proxy smoke test
+        run: tests/socket-proxy-smoke.sh
+
       # A recovery point for volume-backed state: dump, checksum, metadata,
       # restore, and the file modes a private key depends on.
       - name: Volume recovery point smoke test

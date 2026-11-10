@@ -62,14 +62,16 @@ STUB_VOLUME='docker() {
 }'
 
 echo "== 1. the three classes are distinguished on the REAL declarations =="
-out="$(probe "$STUB_VOLUME" 'for s in traefik uptime-kuma plex tailscale immich; do printf "%s=%s\n" "$s" "$(service_state_model "$s")"; done')"
+out="$(probe "$STUB_VOLUME" 'for s in traefik docker-socket-proxy uptime-kuma plex tailscale immich; do printf "%s=%s\n" "$s" "$(service_state_model "$s")"; done')"
 grep -q '^traefik=docker-volume' <<< "$out" || fail "traefik is not docker-volume: $out"
 grep -q '^uptime-kuma=docker-volume' <<< "$out" || fail "uptime-kuma is not docker-volume: $out"
 grep -q '^plex=protected-tier' <<< "$out" || fail "plex is not protected-tier: $out"
 grep -q '^tailscale=stateless' <<< "$out" || fail "tailscale is not stateless: $out"
+grep -q '^docker-socket-proxy=stateless' <<< "$out" \
+  || fail "docker-socket-proxy is not stateless: $out"
 # immich's /cache and /data are DECLARED benign, so they must not make it unknown.
 grep -q '^immich=protected-tier' <<< "$out" || fail "immich is not protected-tier: $out"
-echo "  docker-volume x2, protected-tier x2, stateless x1"
+echo "  docker-volume x2, protected-tier x2, stateless x2 (including socket proxy)"
 
 echo "== 2. the reason NAMES the volume, so the finding is actionable =="
 grep -q 'traefik=docker-volume.*letsencrypt' <<< "$out" \

@@ -791,6 +791,7 @@ htpasswd_hash() {
 managed_image_specs() {
   cat <<'EOF'
 traefik|ENABLE_TRAEFIK|TRAEFIK_IMAGE|TRAEFIK_AUTO_UPDATE|TRAEFIK_AUTO_UPDATE_DELAY_DAYS|traefik
+docker-socket-proxy|ENABLE_TRAEFIK|DOCKER_SOCKET_PROXY_IMAGE|DOCKER_SOCKET_PROXY_AUTO_UPDATE|DOCKER_SOCKET_PROXY_AUTO_UPDATE_DELAY_DAYS|docker-socket-proxy
 tailscale|ENABLE_TAILSCALE|TAILSCALE_IMAGE|TAILSCALE_AUTO_UPDATE|TAILSCALE_AUTO_UPDATE_DELAY_DAYS|tailscale
 jellyfin|ENABLE_JELLYFIN|JELLYFIN_IMAGE|JELLYFIN_AUTO_UPDATE|JELLYFIN_AUTO_UPDATE_DELAY_DAYS|jellyfin
 plex|ENABLE_PLEX|PLEX_IMAGE|PLEX_AUTO_UPDATE|PLEX_AUTO_UPDATE_DELAY_DAYS|plex
@@ -819,6 +820,7 @@ is_managed_service() {  # $1 = service name
 service_lifecycle_specs() {
   cat <<'EOF'
 traefik|ENABLE_TRAEFIK|A|14|traefik|TRAEFIK_IMAGE|
+docker-socket-proxy|ENABLE_TRAEFIK|A|14|docker-socket-proxy|DOCKER_SOCKET_PROXY_IMAGE|
 tailscale|ENABLE_TAILSCALE|A|14|tailscale|TAILSCALE_IMAGE|
 uptime-kuma|ENABLE_UPTIME_KUMA|A|14|uptime-kuma|UPTIME_KUMA_IMAGE|
 jellyfin|ENABLE_JELLYFIN|B|21|jellyfin|JELLYFIN_IMAGE|
@@ -1447,6 +1449,7 @@ compose_files_for_enabled_services() {
 
   if [[ "${ENABLE_TRAEFIK:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/proxy/traefik.yml")
+    files+=("$DOMUM_DIR/compose/proxy/docker-socket-proxy.yml")
   fi
   if [[ "${ENABLE_TAILSCALE:-0}" == "1" ]]; then
     files+=("$DOMUM_DIR/compose/security/tailscale.yml")
@@ -1495,6 +1498,9 @@ export_env_for_compose() {
   export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:latest}"
   export TRAEFIK_AUTO_UPDATE="${TRAEFIK_AUTO_UPDATE:-0}"
   export TRAEFIK_AUTO_UPDATE_DELAY_DAYS="${TRAEFIK_AUTO_UPDATE_DELAY_DAYS:-7}"
+  export DOCKER_SOCKET_PROXY_IMAGE="${DOCKER_SOCKET_PROXY_IMAGE:-lscr.io/linuxserver/socket-proxy:3.4.7-r0-ls105}"
+  export DOCKER_SOCKET_PROXY_AUTO_UPDATE="${DOCKER_SOCKET_PROXY_AUTO_UPDATE:-0}"
+  export DOCKER_SOCKET_PROXY_AUTO_UPDATE_DELAY_DAYS="${DOCKER_SOCKET_PROXY_AUTO_UPDATE_DELAY_DAYS:-14}"
   export TRAEFIK_DASHBOARD_HOST="${TRAEFIK_DASHBOARD_HOST:-traefik-media.${DOMUM_DOMAIN}}"
   export TRAEFIK_DASHBOARD_USERS_FILE="${TRAEFIK_DASHBOARD_USERS_FILE:-$SECRETS_DIR/traefik_dashboard_users}"
   export DOMUM_DATA_ROOT
@@ -3084,10 +3090,12 @@ apply_update_delay_profile() {
   esac
 
   config_set TRAEFIK_AUTO_UPDATE 1
+  config_set DOCKER_SOCKET_PROXY_AUTO_UPDATE 1
   config_set TAILSCALE_AUTO_UPDATE 1
   config_set UPTIME_KUMA_AUTO_UPDATE 1
   config_set RESTIC_REST_SERVER_AUTO_UPDATE 1
   config_set TRAEFIK_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
+  config_set DOCKER_SOCKET_PROXY_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
   config_set TAILSCALE_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
   config_set UPTIME_KUMA_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
   config_set RESTIC_REST_SERVER_AUTO_UPDATE_DELAY_DAYS "$class_a_delay"
@@ -3986,6 +3994,7 @@ init_host() {
 service_state_models() {
   cat <<'EOF'
 traefik|docker-volume|
+docker-socket-proxy|stateless|
 tailscale|stateless|
 uptime-kuma|docker-volume|
 jellyfin|protected-tier|

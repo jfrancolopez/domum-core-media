@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | PR_OPEN — owner review/merge pending |
+| Status | DONE — merged 2026-11-10 via PR #198 |
 | Priority and reason | P2 — keeps D-1 true after SEC-01 |
 | Effort and change risk | 45 min; low |
 | Target and baseline | `domum-core-media`, branch off current `origin/main` = `364a8d1`; security audit baseline `e0754a8` (2026-11-10) |
@@ -60,8 +60,8 @@ secret scanner runs on every push.
 
 ## Verification handoff
 
-- **Result** PR_OPEN — implementation and local verification PASS; owner review/merge pending, 2026-11-10.
-- **References** base `364a8d1`; implementation `4202561`; branch `task/sec-02-ci-identifier-secret-scan`; PR [#198](https://github.com/jfrancolopez/domum-core-media/pull/198); Gitleaks Action v3.0.0 SHA `e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e`.
-- **Evidence** SEC-01 dependency PASS (`364a8d1` is an ancestor); `tests/ci-coverage-audit.sh` baseline PASS before edits. Gitleaks v8.30.1 binary checksum verified against the upstream release; redacted full-history scan across all refs PASS (0 findings), and redacted current-tree scan PASS (0 findings). A scratch committed synthetic AWS access key was detected as `aws-access-token` with its value redacted. Baseline identifier scan: 267 text files, 0 actionable matches, 1 narrowly classified inline product-version false positive in `docs/RECOVERY-POINT-IDENTITY.md`; the audit exception is path/context-scoped. Audit now scans 269 tracked text files with 0 findings. Smoke test PASS: a committed doc fixture catches RFC1918, tailnet, and account patterns with redacted locations; documented `10.0.0.x` and labeled product-version examples pass; empty scans fail. CI coverage PASS (90 files wired); `pipefail-grep-audit.py` PASS; workflow YAML parses and includes both audit steps and pinned action; Bash syntax, ShellCheck, and `git diff --check` PASS.
-- **Next model** check PR #198's `compose-validate` runs; record merge evidence after CI and review.
-- **Open items** GitHub CI is running and owner review/merge is pending; no deployment or production changes.
+- **Result** DONE — merged 2026-11-10 via PR #198; PR CI PASS.
+- **References** base `364a8d1`; implementation `4202561`; handoff `e66b39a`; merge `6307047`; PR [#198](https://github.com/jfrancolopez/domum-core-media/pull/198); Gitleaks Action v3.0.0 SHA `e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e`.
+- **Evidence** SEC-01 dependency PASS. Gitleaks v8.30.1 binary checksum verified against upstream; redacted all-ref history scan PASS (0 findings), current-tree scan PASS (0 findings), and synthetic committed AWS access key detected as `aws-access-token` with its value redacted. Baseline identifier scan: 267 text files, 0 actionable matches and 1 scoped product-version exception; audit now scans 269 tracked text files with 0 findings. Smoke fixtures PASS for private/tailnet/account hits with redacted locations, documented examples, and empty-scan failure. CI coverage PASS (90 tests wired); pipefail, documented-command (106 commands), conflict-marker (269 files), workflow YAML, Bash syntax, ShellCheck, and diff checks PASS. PR #198 push and pull-request runs PASS (`42884870134`, `42884881382`); post-merge `main` run `42886629843` also PASS.
+- **Next model** SEC-08; task order is updated in the backlog.
+- **Open items** none for the repository task; no deployment or production changes.
