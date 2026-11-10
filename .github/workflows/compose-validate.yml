@@ -2,14 +2,24 @@ name: compose-validate
 
 on:
   push:
-    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -377,6 +387,14 @@ jobs:
 
       - name: No conflict markers smoke test
         run: tests/no-conflict-markers-smoke.sh
+
+      # Prevent private/tailnet addresses and backup account IDs from returning
+      # to tracked text. The audit redacts matched values in its CI output.
+      - name: Infrastructure identifier audit
+        run: python3 tests/identifier-audit.py
+
+      - name: Infrastructure identifier audit smoke test
+        run: tests/identifier-audit-smoke.sh
 
       # A runbook command that does not exist is discovered during a recovery.
       - name: Documented commands audit
