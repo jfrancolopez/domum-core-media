@@ -19,6 +19,15 @@ rather than being deleted.
 
 ---
 
+## Security review and app plan — separate track
+
+A security review and an app plan were written on 2026-11-10 and live in
+[`security-2026-11/`](security-2026-11/README.md), with their own IDs (`SEC-nn`,
+`APP-nn`), audit and decisions. They do not reorder this queue. Two of their
+tasks wait on rows here: Paperless-ngx on P1.7 and P5.2.
+
+---
+
 ## Why the remaining items are unavailable to an agent — MEASURED
 
 **`sudo` requires interactive authentication that this account cannot supply.**
