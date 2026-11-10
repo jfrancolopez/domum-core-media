@@ -242,6 +242,66 @@ grep -q 'SUBVOL-ASKED' <<< "$out" \
 blanket skip, so nothing would prove the recovery point survived: $out"
 echo "  protected-tier still asserted"
 
+sect "readiness is UNPROVEN for a service that can answer NOTHING"
+# The UNPROVEN sentence is BUILT from what is actually absent, and the branch
+# where NOTHING is declared had never been driven. Every existing assertion on it
+# uses a service that DECLARES a log pattern and stayed silent
+# (service-upgrade-integration-smoke, section N+3), so the all-absent wording --
+# the one the message was written for -- was unasserted.
+#
+# traefik is exactly that service, and it is a docker-volume one: measured, it has
+# no container healthcheck, logs no definitive readiness line, and
+# service_ready_log_pattern deliberately leaves it undeclared, because declaring
+# one of the `Starting provider` lines would assert readiness from evidence that
+# only shows a provider beginning to start.
+READY_STUBS='
+  service_health_state() { printf none; }
+  service_ready_probe() { return 1; }
+  service_ready_log_pattern() { return 1; }
+'
+out="$(phase4 traefik docker-volume "$READY_STUBS")"
+grep -q 'readiness       : UNPROVEN' <<< "$out" \
+  || fail "a service with no healthcheck, no probe and no declared pattern was not reported UNPROVEN -- a started container read as a working one: $out"
+grep -q 'no container healthcheck, no readiness probe and no declared log pattern' <<< "$out" \
+  || fail "the UNPROVEN message does not name what is actually absent: $out"
+# The two wordings that would be FALSE here. Each belongs to a different absent
+# thing, so printing either describes a service this is not.
+grep -q 'a readiness probe that did not answer' <<< "$out" \
+  && fail "it claims a probe did not answer, for a service that declares none: $out"
+grep -q 'a declared log pattern that did not appear' <<< "$out" \
+  && fail "it claims a declared pattern was silent, for a service that declares none: $out"
+grep -q 'RUNNING is the whole claim' <<< "$out" \
+  || fail "UNPROVEN does not say RUNNING is the whole claim: $out"
+grep -qi 'Upgrade INCOMPLETE' <<< "$out" \
+  && fail "unproven readiness must be REPORTED, never a failure: $out"
+echo "  UNPROVEN names all three absences, claims neither false one, and does not fail"
+
+sect "MUTATION: a fixed 'pattern did not appear' must become false here"
+# The recorded defect is that a FIXED sentence is false for one of the two cases.
+# This mutation makes the silent-pattern wording unconditional: correct for a
+# service that declares a pattern, wrong for traefik.
+MUT="$TMP/cli-readiness-mutant"
+cp "$CLI" "$MUT"
+cat > "$TMP/mut-readiness.py" <<'PYMUT'
+import io, sys
+
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    case "$ready_log_state" in\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+i = s.index(old)
+j = s.index("    esac\n", i) + len("    esac\n")
+new = '    ready_missing="$ready_missing, and a declared log pattern that did not appear"\n'
+io.open(p, "w", encoding="utf-8").write(s[:i] + new + s[j:])
+PYMUT
+python3 -I "$TMP/mut-readiness.py" "$MUT" || fail "the readiness mutation did not apply"
+grep -q 'ready_log_state" in' "$MUT" \
+  && fail "the mutation did not remove the case -- it changed nothing"
+mout="$(CLI="$MUT" phase4 traefik docker-volume "$READY_STUBS")"
+grep -q 'a declared log pattern that did not appear' <<< "$mout" \
+  || fail "the mutant did not produce the false wording -- the mutation changed no ANSWER: $mout"
+echo "  the mutant describes a declared pattern traefik does not have"
+
 sect "MUTATION: removing the model guard breaks the volume upgrade again"
 cp "$CLI" "$TMP/cli.orig.p4"
 cat > "$TMP/mutate-p4.py" <<'PYMUT'

@@ -6569,6 +6569,32 @@ one -- so every password containing a quote or a backslash read as "no match".
 The fix is the rule this file already states for mutations: put it in a FILE
 with a quoted heredoc, and the shell-quoting layer disappears.
 
+---
+
+**A SENTENCE BUILT FROM CONDITIONS NEEDS EVERY BRANCH DRIVEN, and only one of
+this one's two was.** This file already records that phase 4's readiness message
+is BUILT from what is actually absent, because a fixed *"no declared log
+pattern"* would be false for a service that declares one and stayed silent. What
+it did not record is that the test added with that fix drives only the SILENT
+branch -- a protected-tier service that declares a pattern -- so the
+**all-absent** wording, the case the message was originally written for, was
+unasserted.
+
+traefik is that case and it is a **docker-volume** service: no container
+healthcheck, no readiness probe, and `service_ready_log_pattern` deliberately
+leaves it undeclared, because declaring a `Starting provider` line would assert
+readiness from evidence that only shows a provider beginning to start. Driven now
+through the real `service_upgrade` in `volume-upgrade-dispatch-smoke`, asserting
+that it names all three absences and claims **neither** false one -- not
+*"a readiness probe that did not answer"*, not *"a declared log pattern that did
+not appear"*. The mutation makes the silent-pattern wording unconditional, which
+is correct for a declaring service and wrong for traefik.
+
+**And I read the mutation's indentation off `sed`-prefixed output**, so the
+anchor was six spaces where the file has four and `matched 0 times` fired. `cat -A`
+settles it in one look. That is the same family as every other anchor failure here:
+the anchor must come from the file, not from a rendering of it.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
