@@ -9742,6 +9742,12 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
   # accident, and the caller that passes it is the one that took the lock and
   # proved quiescence.
   mode="${mode_override:-$(service_state_capture_mode "$service")}"
+  # How many sqlite items FELL BACK to a plain copy. `mode` above is decided
+  # UP FRONT from the declaration -- does this service ship an sqlite3 -- and
+  # recording it as CAPTURE_MODE made the manifest claim `consistent` for a
+  # capture whose every database was copied while the service could be writing.
+  # The recorded mode is derived from what the items ACHIEVED instead.
+  local sq_fellback=0
   cid="$(tracked_service_container_id_any "$service" 2>/dev/null || true)"
   img="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
 
@@ -9797,7 +9803,6 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
     printf 'SERVICE=%s\n' "$service"
     printf 'CAPTURED_AT=%s\n' "$(date -Iseconds)"
     printf 'STATE_ROOT=%s\n' "$root"
-    printf 'CAPTURE_MODE=%s\n' "$mode"
     printf 'IMAGE_ID=%s\n' "${img:-unknown}"
     # WHICH sqlite3 was available, recorded so the evidence states it rather
     # than leaving it to be inferred from the mode.
@@ -9853,6 +9858,7 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
           # A copy of a database the service may be writing. Recorded as what
           # it is: this is the only option when no sqlite3 exists anywhere.
           itemmode="file-copy-unproven"
+            sq_fellback=$(( sq_fellback + 1 ))
         else
           printf 'ITEM=%s|%s|FAILED%s||\n' "$kind" "$rel" "${why:+:$why}" >> "$manifest"; bad=$(( bad + 1 )); continue
         fi
@@ -9888,6 +9894,14 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
     printf 'ITEM=%s|%s|%s|%s|%s|%s\n' "$kind" "$rel" "$itemmode" "${sz:-0}" "${fmode:-}" "${sum:-}" >> "$manifest"
   done < <(service_essential_state "$service")
 
+  # THE ACHIEVED MODE, not the declared one. `mode` says whether a consistent
+  # capture was POSSIBLE; this says whether one HAPPENED. Recording the former
+  # made a manifest claim `consistent` while every database in it had been
+  # copied with the service free to write -- and the restore reports this value
+  # to the operator as the strong claim. The weakest result governs, as
+  # `storage scrub` already does across filesystems.
+  local recorded_mode="$mode"
+  if (( sq_fellback > 0 )); then recorded_mode="unproven"; fi
   if (( bad > 0 )); then
     printf 'RESULT=INCOMPLETE\n' >> "$manifest"
     warn "$service state capture is INCOMPLETE: $bad of $items declared item(s) could not be captured."
@@ -9897,8 +9911,17 @@ service_state_capture() {  # $1 = service, $2 = destination directory, $3 = mode
     printf 'RESULT=COMPLETE\n' >> "$manifest"
   fi
   printf 'ITEMS=%s\n' "$items" >> "$manifest"
-  if [[ "$mode" == "unproven" ]]; then
-    if [[ -n "$cap_helper" ]]; then
+  printf 'CAPTURE_MODE=%s\n' "$recorded_mode" >> "$manifest"
+  if [[ "$recorded_mode" == "unproven" ]]; then
+    if [[ "$mode" == "consistent" ]]; then
+      # Declared possible, and it did not happen. NEITHER existing branch
+      # covered this, because the gate read the DECLARED mode -- so a capture
+      # that fell back was recorded `consistent` and warned about nothing.
+      warn "$service was DECLARED capable of a consistent capture and $sq_fellback
+database(s) still fell back to a plain copy, so the capture mode is UNPROVEN.
+Those bytes were read while the service could be writing. Check that the
+service's own sqlite3 and the helper image are both reachable."
+    elif [[ -n "$cap_helper" ]]; then
       # A consistent capture was POSSIBLE and was not taken. That is a defect,
       # not a limitation, so it is a warning rather than a note.
       warn "$service was captured UNPROVEN although a helper sqlite3 is available
