@@ -7439,6 +7439,25 @@ Each of those three would have caused real damage if believed: corrupted
 backlog rows, a false "no more instances", and either deleted work or a
 fabricated alarm about 48 branches.
 
+**AND THE ADJACENT FAILURE, COMMITTED IN THE SAME SITTING: I PRINTED A COUNT I
+HAD NOT MEASURED.** A verification loop ended with
+`[ $fails -eq 0 ] && echo "  all 17 audits ok"` -- the number is a STRING in the
+echo, not a count of anything. There are **16** audits under `tests/`
+(`ls -1 tests/*.py | wc -l`), plus one helper under `tests/fixtures/`. So "all
+17 audits pass" was wrong by one and asserted with exactly the confidence of the
+measured figures beside it. **It reached `main`'s commit message for `02e7b9c`
+and cannot be amended, because force-pushing `main` is forbidden** -- the same
+position as the squash-subject defect already recorded here, with the same
+remedy: this entry is the record, and the authority on that commit's evidence is
+this file.
+
+A loop that checks N things must PRINT the N it counted -- `echo "all $n audits
+ok"` after incrementing -- never a literal. The two failures are one mistake
+pointing in opposite directions: a count believed without asking what it
+measured, and a count stated without measuring it at all. The existing rule
+covers it -- *"two numbers in one report that must agree are ONE number,
+computed once"* -- and the degenerate case is a number computed ZERO times.
+
 ---
 
 ## 15. Known open safety defects
