@@ -7228,6 +7228,32 @@ prescribes for `cmd | grep -q`, for the same reason:
 output, so the value is jq's alone. The banned shape is specifically a fallback
 that PRINTS.
 
+**`A || B | C` IS NOT THE SHAPE**, and the distinction is what keeps the sweep
+usable. `||` binds looser than `|`, so that parses as `A || (B | C)`: the
+branches are exclusive and only one can produce a value -- verified by running
+it both ways rather than by reasoning about precedence. The defect needs the
+pipe and the printing fallback in the SAME branch.
+
+**SWEPT AND NEGATIVE-CONTROLLED: 1,785 command substitutions across both CLIs,
+`bin/domum-media-report` and `install.sh`; the four real sites were the only
+ones.** That claim is worth something only because the scanner was first
+required to FIND them: run against the pre-fix files it reports all four, and
+the two `A || B | C` sites are the whole of its over-reporting.
+
+**MY FIRST SCANNER SAID "none" AND WAS STRUCTURALLY BLIND TO A WHOLE CLASS OF
+SITES.** It matched `\$\([^()]*\|[^()]*\|\|\s*echo[^()]*\)` -- a character
+class that cannot cross a parenthesis -- so it could not see
+`jq -Rn '...{(.[1]): ...}...'` and missed the backup CLI's `cov_loc` site
+entirely while reporting the file clean. Parentheses are matched by BALANCE
+now, and a `|` inside a quoted jq filter or awk program is excluded by
+stripping quoted spans first, which took the noise from 62 hits to 6.
+
+That is the **second** verifier in one sitting whose verdict was decided by
+what it could not see -- the first being the escape-unaware `awk -F` that
+flagged three correct backlog rows. Both directions are dangerous and the
+false-clean one is worse, because nothing contradicts it. **A sweep's "none" is
+a claim about the scanner until the scanner has been shown finding the thing.**
+
 **AND THE REPORT BLAMED VENDOR PLACEHOLDERS FOR A TABLE IT COULD NOT READ.**
 `mreport_smart_interpretable` returns three states -- `0` interpretable, `1`
 placeholders, `2` could not be read -- and the report tested it with
