@@ -7188,6 +7188,82 @@ pass by tripping the vacuity floor instead. 9 sections.
 
 ---
 
+**`x="$(cmd | jq ... || echo fallback)"` BUILDS A VALUE OUT OF *BOTH*
+FALLBACKS, and it does so exactly when something is wrong.** Found 2026-11-11
+by rendering the weekly report unprivileged. Under `pipefail` the pipeline
+reports the LEFT side's status, so when `cmd` fails while still printing
+parseable output, jq succeeds and prints its own default **and** the non-zero
+pipeline fires `|| echo fallback` on top of it. Measured against the real host:
+
+```
+smartctl -j -i /dev/sda   exits 2 (permission denied) and still emits JSON
+model = $'unknown\nunknown'
+  rendered:   SMART /dev/sda         unknown
+            unknown: UNKNOWN no verdict
+```
+
+**The report's line grammar is load-bearing** -- this file already records that
+the HTML renderer wraps the text line by line keyed on PREFIX -- so a line that
+breaks in half mis-renders BOTH MIME parts. And it breaks precisely when a
+drive cannot be read, i.e. when the operator most needs the line.
+
+Three sites, all fixed by **capturing first** -- the same remedy this file
+prescribes for `cmd | grep -q`, for the same reason:
+
+- `model` and `passed` in the weekly report's DRIVE HEALTH block. Capturing
+  also HALVED the invocations: `smartctl -j -i` was being run twice per device,
+  once for the model and once for the power-on hours;
+- `mreport_smart_interpretable`'s attribute count. This one reached the right
+  verdict by accident -- the `^[0-9]+$` regex rejects a two-line value and
+  returns 2 -- which is the worst kind of safe, because nothing would ever have
+  surfaced it;
+- **the backup CLI's coverage evidence.** `cov_loc` became two JSON documents,
+  which `--argjson` rejects with `invalid JSON text`, so the whole evidence
+  write failed and the line reported `coverage : NOT RECORDED -- could not
+  write <file>`. The DIRECTION is safe (absent coverage evidence makes
+  `dr-status` report a WEAKER tier, never a stronger one) and the ATTRIBUTION
+  was wrong: nothing was unwritable.
+
+`|| true` as the fallback is safe and is deliberately NOT flagged -- it adds no
+output, so the value is jq's alone. The banned shape is specifically a fallback
+that PRINTS.
+
+**AND THE REPORT BLAMED VENDOR PLACEHOLDERS FOR A TABLE IT COULD NOT READ.**
+`mreport_smart_interpretable` returns three states -- `0` interpretable, `1`
+placeholders, `2` could not be read -- and the report tested it with
+`if ! f`, which cannot tell 1 from 2. So an unreadable table rendered as
+`NOT INTERPRETABLE -- vendor attributes`: a confident wrong CAUSE in the
+document the operator reads. This file already records fixing exactly that in
+`checkup_disk_wear`, and notes approvingly that "both non-zero values stay
+falsy, so every existing `if ! f` caller is unaffected" -- **"unaffected" was
+the defect**. Fixing one end of a report and leaving the other is a family this
+file records twice; this is the third.
+
+**A SECOND COPY OF A LINE BREAKS A MUTATION ANCHOR IN A DIFFERENT FUNCTION.**
+Adding the three-state guard to the report created an 8-space copy of
+`mreport_smart_interpretable "$dev"; interp=$?`, and `health-checks-smoke`'s
+wear mutation anchors on `checkup_disk_wear`'s 2-space copy as a SUBSTRING --
+so it matched twice and the suite failed against correct code. Newline-anchored,
+the indentation is exact. That is the third occurrence of the substring-anchor
+trap in two sittings, and the `matched %d times` assertion caught all three.
+
+**A RESTORE MUST NOT BE CHAINED BEHIND COMMANDS WHOSE STATUS YOU HAVE NOT
+REASONED ABOUT.** My first attempt at this fix over-escaped the shell quoting
+(`'"'"'` is a trick for use INSIDE a single-quoted shell string and is
+meaningless when python writes the file directly), so the jq FILTER leaked into
+the rendered value. The repair was `cp <backup> <file> && ... && python3 fix.py`
+in one `&&` chain -- and the chain broke before the restore took effect, so the
+"fixed" run operated on the already-broken file and reported six edits applied.
+Re-running the identical steps SEPARATELY worked. This is the recorded mutation
+rule -- "take the backup before the mutation, unconditionally... not chained
+after the command being tested" -- in its mirror image: the RESTORE needs the
+same unconditional treatment, and a multi-step repair gets one step per command.
+
+`tests/health-checks-smoke.sh`; the three render cases (unreadable,
+placeholders, a real wear figure) were each driven against the real renderer.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
