@@ -168,3 +168,27 @@ This is the single highest remaining risk in the whole recovery story.
 
 Measured: `sudo -n true` answers `a password is required` with **zero** NOPASSWD
 entries, so none of the first four can be attempted here.
+
+### How that is demonstrated rather than asserted
+
+The three CLI entry points cannot be invoked from this session at all -- the
+harness refuses them, because with privilege they would start a scrub, stop a
+production service, and write credential-bearing artefacts. So the claim is
+assembled from observations that could each be made:
+
+| observation | result |
+|---|---|
+| `id -u` | **1000**, and `need_root` requires 0 |
+| `need_root` driven in isolation | `REFUSED: Run as root (use sudo).` |
+| `need_root` in `storage_scrub_start` | statement **2** |
+| `need_root` in `storage_volume_pre_upgrade_point` | statement **2** |
+| the `capture-all-state` dispatcher arm | contains `need_root` |
+| `sudo -n true` | `a password is required`, **0** NOPASSWD |
+
+The guard refuses for this uid, the guard runs first, and uid 0 is
+unobtainable -- so each command refuses before acting.
+
+`service_state_capture` has no `need_root` of its own: the guard is in the
+dispatcher arm, and separately at the top of the `--quiesce` path, where it was
+added after a rehearsal found that an unprivileged operator could otherwise
+take real downtime for a capture that could never succeed.
