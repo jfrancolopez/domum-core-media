@@ -13,10 +13,36 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-10** against `origin/main` = `bddab55`, **61 commits**
-ahead of production. The count is recorded once, here, and is re-derived with
+Reconciled **2026-11-11**, **68 commits** ahead of production. The count is
+recorded once, here, and is re-derived with
 `git rev-list --count a63ad19..origin/main` -- a running tally in prose rots the
-same way a baked hash does, and this paragraph had grown one.
+same way a baked hash does, and this paragraph had grown one. The `origin/main`
+hash is deliberately no longer quoted beside it: two values that go stale
+together are two chances to be wrong, and `git rev-parse origin/main` is the
+authority.
+
+**What the 2026-11-11 reconciliation found: the SHAPE is unchanged.** The delta
+grew four commits that touch two installable paths -- `bin/domum-media` and
+`bin/domum-media-backup` -- and **both were already in the surface**. Measured
+on the branch: **zero** files under `systemd/`, `compose/` or `config/`. So the
+six-path table in §2 still holds, `UNIT_TARGETS` still needs nothing added, and
+§10's second deployment KIND is untouched. That is the statement worth
+recording; the count is the part that rots.
+
+§1's drift measurement was **re-verified the same day** and still holds: all
+three installed files match the production checkout byte for byte
+(`domum-media` 5e65f06c8a7a, `domum-media-backup` 08a81ba20658,
+`domum-media-report` d813ae0e4181), 11 containers running, none unhealthy.
+
+**Those four commits change no production behaviour**, which is why they do not
+move any latency claim in §9. The `smartctl` resolver returns, under root's
+PATH, exactly the binary `command -v` already validated -- verified -- so
+`checkup` under sudo is byte-identical; what changes is the unprivileged path,
+which production never takes. The three capture-first fixes alter a value only
+when a producer FAILS, which on this host means a drive that cannot be read or
+an unreadable Immich inventory. The one case an operator would notice is the
+weekly report's DRIVE HEALTH block no longer breaking a line in half when
+smartctl cannot read a device.
 
 What matters is not the count but the SHAPE, which has changed twice in a week:
 the installable surface went from five paths to **six** when
