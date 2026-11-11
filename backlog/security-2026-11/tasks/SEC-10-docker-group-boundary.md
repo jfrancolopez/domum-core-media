@@ -2,12 +2,12 @@
 
 | Field | Value |
 | --- | --- |
-| Status | BLOCKED — decision D-3 |
+| Status | IN_PROGRESS (repository documentation; deployment unchanged) |
 | Priority and reason | P2 — the documented boundary (sudo) is not the real one |
 | Effort and change risk | 30 min for the documentation option; low |
-| Target and baseline | `domum-core-media`, branch off `origin/main`, inspected at `e0754a8` (2026-11-10) |
-| Owner and evidence | worker after D-3; finding F-07 |
-| Dependencies | D-3 |
+| Target and baseline | `domum-core-media`, branch off `origin/main` = `758833d`; security audit baseline `e0754a8` (2026-11-10) |
+| Owner and evidence | worker for repository documentation, owner for deployment; finding F-07 |
+| Dependencies | D-3 selected (2026-11-10); SEC-08 repository change landed |
 
 ## Outcome
 
@@ -15,18 +15,22 @@
 production. The operator account is in the `docker` group, so it can already
 mount any host path into a container as root. The rule is honoured by
 instruction, not enforced by privilege. After this task the document says so,
-and the monitoring account's membership is justified or removed.
+and the operator account's membership is documented. The owner has determined
+that Beszel needs per-container statistics, so its current membership remains
+until the separate SEC-12 proxy migration is designed and owner-approved.
 
 ## Scope and setup
 
-Depends on the option chosen in [D-3](../DECISIONS.md). For option 1
-(recommended): edit `CLAUDE.md` §10 only, and review the `beszel` account.
-Do not demonstrate the escalation; the group membership is the evidence.
+The owner selected option 1 in [D-3](../DECISIONS.md): keep and document the
+operator account's membership. Edit `CLAUDE.md` §10 only for that boundary; do
+not demonstrate the escalation. `getent group docker` is the evidence. The
+owner also confirmed Beszel needs per-container stats. Leave host memberships
+unchanged; SEC-12 tracks moving Beszel to a constrained proxy path.
 
 ## Before editing
 
-- D-3 has a **Selected** line. If not, stop.
-- `getent group docker` lists two members (observed 2026-11-10).
+- D-3 has a **Selected** line: option 1, with Beszel retaining access for stats.
+- `getent group docker` lists two members: the operator account and `beszel` (observed 2026-11-10); PASS.
 
 ## Implementation and checkpoints
 
@@ -34,11 +38,9 @@ Do not demonstrate the escalation; the group membership is the evidence.
    - **Check** `python3 tests/no-conflict-markers-audit.py`
    - **Expected** exit 0
    - **Time and failure action** 15 min
-2. Owner: decide whether Beszel needs per-container statistics. If not, `sudo gpasswd -d beszel docker && sudo systemctl restart beszel-agent`.
-   - **Check** `getent group docker`
-   - **Expected** one member; the Beszel dashboard still shows host metrics
-   - **Failure action** re-add with `sudo gpasswd -a beszel docker`
-3. If it does need them, point the agent at the socket proxy from SEC-08 instead of the group. Write that as its own task once SEC-08 has landed.
+2. Owner decided Beszel needs per-container statistics and selected to retain its membership for now. No group or service action is authorized by this repository task.
+    - **Evidence** read-only `getent group docker` check listed the operator account and `beszel`; PASS.
+3. SEC-08 has landed in the repository. Since its proxy is internal-network-only and Beszel is a host service, track a host-reachable, read-only proxy design as separate SEC-12. Do not expose a TCP port, change the host service, or remove group membership here.
 
 ## Acceptance
 
@@ -51,8 +53,8 @@ Do not demonstrate the escalation; the group membership is the evidence.
 
 ## Verification handoff
 
-- **Result** _not started_
-- **References** _base, commit, PR_
-- **Evidence** _per checkpoint: PASS / FAIL / BLOCKED / NOT RUN_
-- **Next model** `getent group docker`
-- **Open items** options 2 and 3 of D-3 are larger and need their own tasks
+- **Result** IN_PROGRESS — D-3 resolved; repository documentation and SEC-12 follow-up task drafted; no host changes.
+- **References** base `758833d`; branch `task/sec-10-docker-group-boundary`; PR pending.
+- **Evidence** read-only `getent group docker` listed two members (operator account and `beszel`). Owner selected D-3 option 1 and confirmed Beszel needs per-container statistics. `tests/no-conflict-markers-audit.py`, `tests/no-conflict-markers-smoke.sh`, `tests/ci-coverage-audit.sh` (92 files), and documented-command audit (106 commands) PASS; redacted Gitleaks scan PASS (0 findings); `git diff --check` PASS. The CLAUDE diff states Docker access is root-equivalent, preserves §5/§11 approval rules, and adds no escalation command. No group membership or service was changed.
+- **Next model** open a repository-only PR and verify its CI; keep deployment owner-gated.
+- **Open items** SEC-12 must design a host-reachable read-only path through the SEC-08 proxy before Beszel can safely leave the Docker group; owner approval is required for any host-side deployment.

@@ -61,8 +61,9 @@ Status lives in each task file; this table is a summary.
 | [SEC-07](tasks/SEC-07-disable-rpcbind.md) | Close the unused RPC port | BLOCKED (owner, root) | P2 | — |
 | [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) | Traefik behind a Docker socket proxy | DONE (repo half merged `b094616`; deployment owner-gated) | P2 | — |
 | [SEC-09](tasks/SEC-09-no-new-privileges.md) | `no-new-privileges` on every container | DONE (repo merged `6328bc1`; deployment owner-gated) | P3 | SEC-08 |
-| [SEC-10](tasks/SEC-10-docker-group-boundary.md) | Docker group: state the real boundary | BLOCKED (D-3) | P2 | D-3 |
+| [SEC-10](tasks/SEC-10-docker-group-boundary.md) | Docker group: state the real boundary | IN_PROGRESS (docs; deployment owner-gated) | P2 | D-3 resolved |
 | [SEC-11](tasks/SEC-11-plex-remote-access-check.md) | Plex relay and remote access check | BLOCKED (owner, Plex UI) | P2 | D-4 may supersede |
+| [SEC-12](tasks/SEC-12-beszel-socket-proxy.md) | Move Beszel container stats off Docker group | QUEUED (host endpoint design; deployment owner-gated) | P2 | SEC-08 deployment, SEC-10 |
 | [APP-01](tasks/APP-01-measure-usage-for-consolidation.md) | Measure real use of the overlapping apps | READY | P2 | — |
 | [APP-02](tasks/APP-02-audiobookshelf.md) | Add Audiobookshelf | QUEUED | P2 | D-4 |
 | [APP-03](tasks/APP-03-push-alerts.md) | Push alerts to phones | BLOCKED (D-5) | P2 | D-5 |
@@ -76,7 +77,7 @@ and network segmentation is [`task-40`](../task-40-future-network-segmentation.m
 ## Order
 
 - **Owner track (root or a console, any order):** SEC-04, SEC-06, SEC-05, SEC-07, SEC-11.
-- **Repo track:** SEC-00 → SEC-01 → SEC-02, then SEC-08 → SEC-09.
+- **Repo track:** SEC-00 → SEC-01 → SEC-02, then SEC-08 → SEC-09 → SEC-10. SEC-12 is a separate, owner-gated follow-up after SEC-08 deployment.
 - **Apps track:** APP-01 → decision D-4 → APP-02 → APP-05. APP-03 waits on D-5.
   APP-04 waits on off-site coverage for non-Immich state.
 
@@ -94,6 +95,5 @@ and network segmentation is [`task-40`](../task-40-future-network-segmentation.m
 
 | ID | Question | Blocks |
 |---|---|---|
-| D-3 | Keep the operator account in the `docker` group? | SEC-10 |
 | D-4 | Which of the overlapping apps stay? | APP-02, APP-05, SEC-11 |
 | D-5 | Where do phone alerts go? | APP-03 |
