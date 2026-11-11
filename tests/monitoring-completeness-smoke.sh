@@ -313,6 +313,96 @@ grep -q 'CRIT|domum-media-backup.service last exited non-zero (status 3)' <<< "$
 grep -qi 'could not LOCK' <<< "$out" && fail "the lock wording leaked to an unrelated failure: $out"
 echo "  status 3 on another unit still reported generically"
 
+sect "the SCRUB at exit 3 names DATA corruption, not a bare non-zero exit"
+# btrfs-scrub(8)'s exit 3 is UNCORRECTABLE errors. Metadata and System on this
+# filesystem are DUP and would have been repaired silently, so 3 can only be the
+# half with no second copy -- DATA, on the tier holding the irreplaceable
+# originals. `storage scrub start` says all of that when it runs; checkup and the
+# weekly report read the RECORDED status days later, and used to say only
+# "last exited non-zero (status 3)". The mirror of the check/11 case: that one
+# exists because a generic report OVERstates a lock as damage, this one because
+# it UNDERstates damage as an exit code.
+SCRUB3='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "" ;;
+      *list-timers*)    printf "x x x x domum-media-btrfs-scrub.service\n" ;;
+      *ExecMainStatus*) printf "3\n" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+out="$(probe_systemd "$CLI" "$SCRUB3")"
+grep -q 'CRIT|.*UNCORRECTABLE errors (exit 3)' <<< "$out" \
+  || fail "the scrub's exit 3 was not identified as uncorrectable: $out"
+grep -qi 'DATA corruption' <<< "$out" \
+  || fail "it did not say DATA, which is the half that cannot be repaired: $out"
+grep -q 'CRIT|.*last exited non-zero' <<< "$out" \
+  && fail "it fell through to the generic wording: $out"
+# The three captures, none of which mutates anything, and the instruction
+# that must not be missed.
+grep -q 'ACT|btrfs scrub status -R' <<< "$out" || fail "no scrub-status capture: $out"
+grep -q 'ACT|btrfs device stats'   <<< "$out" || fail "no device-stats capture: $out"
+grep -q 'ACT|journalctl -k'        <<< "$out" || fail "no kernel-log capture, which is what names the FILE: $out"
+grep -qi 'Do NOT run .btrfs check --repair' <<< "$out" \
+  || fail "it did not warn against a repair -- data here is single-profile, so a
+repair cannot fix it and can make recovery harder: $out"
+grep -qi 'restore THAT file from restic' <<< "$out" \
+  || fail "it did not name the actual remedy: $out"
+echo "  DATA corruption named, three captures that mutate nothing, repair explicitly refused"
+
+sect "the scrub at exit 1 stays GENERIC -- the special case must not swallow it"
+# 1 is "could not scrub": the check did not happen. A failed unit and a journal
+# are adequate for that, and it carries no do-not-repair instruction that must
+# not be missed. Reporting it as corruption would be a false alarm.
+out="$(probe_systemd "$CLI" "${SCRUB3//ExecMainStatus\*) printf \"3/ExecMainStatus*) printf \"1}")"
+grep -q 'CRIT|.*last exited non-zero (status 1)' <<< "$out" \
+  || fail "exit 1 from the scrub lost its generic reporting: $out"
+grep -qi 'UNCORRECTABLE\|DATA corruption' <<< "$out" \
+  && fail "exit 1 was reported as corruption -- the check did not happen, which
+is not the same as damage found: $out"
+echo "  generic, and not described as corruption"
+
+sect "exit 3 on a unit that is NOT the scrub is still generic"
+# 3 only means uncorrectable errors for the command that returns it. Any other
+# unit exiting 3 means whatever that unit means.
+OTHER3='
+  systemctl() {
+    case "$*" in
+      *--failed*)       printf "" ;;
+      *list-timers*)    printf "x x x x domum-media-backup.service\n" ;;
+      *ExecMainStatus*) printf "3\n" ;;
+      *)                return 1 ;;
+    esac
+  }
+'
+out="$(probe_systemd "$CLI" "$OTHER3")"
+grep -q 'CRIT|domum-media-backup.service last exited non-zero (status 3)' <<< "$out" \
+  || fail "a non-scrub unit lost its generic reporting: $out"
+grep -qi 'DATA corruption' <<< "$out" \
+  && fail "the corruption wording leaked to a unit where 3 does not mean that: $out"
+echo "  scoped to the scrub"
+
+sect "MUTATION: widening the branch to ANY unit at exit 3"
+cp "$CLI" "$TMP/cli.orig.scrub3"
+cat > "$TMP/mutate-scrub3.py" <<'PYS3'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '"$svc" == "domum-media-btrfs-scrub.service" && "$status" == "3"'
+new = '"$status" == "3"'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYS3
+( python3 -I "$TMP/mutate-scrub3.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.scrub3" "$CLI"; fail "the scrub3 mutation did not apply"; }
+mout="$(probe_systemd "$CLI" "$OTHER3")"
+cp "$TMP/cli.orig.scrub3" "$CLI"
+grep -qi 'DATA corruption' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- without the unit test, a backup
+exiting 3 must start claiming corruption of the photo tier: $mout"
+echo "  killed: unscoped, a backup exit 3 reports corruption of the photo tier"
+
 sect "exit 11 on a DIFFERENT unit is not described as a repository lock"
 WRONGUNIT='
   systemctl() {

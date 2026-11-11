@@ -7628,6 +7628,53 @@ the first unreadable path component at run time instead of hardcoding it, and
 if `tar -C` ever succeeds it FAILS with a message saying the documented claim
 must be re-measured. A blocker recorded as prose goes stale silently; this
 project has a dedicated rule about stale claims and a blocker is one.
+**THE SCRUB'S EXIT 3 -- THE WORST FINDING THIS HOST CAN PRODUCE -- REACHED THE
+OPERATOR AS "last exited non-zero (status 3)".** `storage scrub start` says it
+properly at the time it runs: `UNCORRECTABLE ERRORS FOUND`, the capture
+commands, and not to attempt a repair. But `checkup` and the weekly report read
+the RECORDED `ExecMainStatus` days or weeks later, and that path had no
+scrub-specific branch, so it fell through to the generic one with a single
+`journalctl` action.
+
+Driven 2026-11-11 against the real function with `ExecMainStatus=3` on
+`domum-media-btrfs-scrub.service`:
+
+```
+before  CRIT  domum-media-btrfs-scrub.service last exited non-zero (status 3).
+        ACT   journalctl -u ... -n 50 --no-pager   # read-only
+```
+
+**This is the exact mirror of the `check`/status-11 case**, which exists because
+a generic report OVERstates a repository lock as possible damage. Here the
+generic report UNDERstates damage as an exit code -- and on this filesystem
+Metadata and System are DUP and would have been repaired silently, so exit 3
+can only be the half with no second copy: DATA, on the tier holding the
+irreplaceable originals. The operator met the weakest possible wording for the
+most serious possible finding.
+
+It now names DATA corruption and that the kernel log names the FILE, and
+carries three captures that mutate nothing -- `btrfs scrub status -R`,
+`btrfs device stats`, and the kernel-log grep -- plus the instruction that must
+not be missed: **do NOT run `btrfs check --repair`**, because data here is
+single-profile, so a repair cannot fix it and can make recovery harder. The
+remedy is restoring the named file from restic.
+
+**Scoped to (scrub, 3) and asserted in all three directions.** Exit **1** from
+the scrub stays generic on purpose -- it means "could not scrub", i.e. the check
+did not happen, which is not damage found and carries no instruction that must
+not be missed. Exit 3 from any OTHER unit stays generic, because 3 only has that
+meaning for the command that returns it. The mutation removes the unit test and
+requires a `backup` unit exiting 3 to start claiming corruption of the photo
+tier.
+
+**My own test line then tripped the repository-wide read-only scan**, for the
+sixth recorded time that an assertion has flagged its author's prose: I wrote
+"three read-only captures", meaning the capture COMMANDS, and the window cannot
+tell that from "the scrub is read-only". Reworded to "captures that mutate
+nothing" rather than exempted -- the same resolution this file already records
+for "Use `scrub status` for the read-only question", and it reads better anyway.
+An exemption would have been the first step towards the scan not meaning
+anything.
 
 ---
 

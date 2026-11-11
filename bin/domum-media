@@ -5861,7 +5861,34 @@ checkup_systemd_health() {
     # An empty status means it has never run in this boot's journal, which is
     # not a failure; a non-zero one is.
     if [[ -n "$status" && "$status" != "0" ]]; then
-      if [[ "$svc" == "domum-media-check.service" && "$status" == "11" ]]; then
+      if [[ "$svc" == "domum-media-btrfs-scrub.service" && "$status" == "3" ]]; then
+        # Exit 3 from the scrub is btrfs-scrub(8)'s own meaning: UNCORRECTABLE
+        # errors. On this filesystem Metadata and System are DUP and would have
+        # been repaired silently, so 3 can only be the half with no second copy
+        # -- DATA. That is silent corruption on the tier holding the
+        # irreplaceable originals, and it is the most serious finding this host
+        # can produce.
+        #
+        # The generic branch below reported it as "last exited non-zero (status
+        # 3)" with a journalctl link. `storage scrub start` says all of this at
+        # the time it runs, but `checkup` and the weekly report read the
+        # RECORDED status days or weeks later, so the operator met the weakest
+        # possible wording for the worst possible finding. This is the mirror of
+        # the check/11 case: that one exists because a generic report OVERstates
+        # a lock as damage, and this one because a generic report UNDERstates
+        # damage as a non-zero exit.
+        #
+        # Status 1 (could not scrub) is deliberately left generic: a failed unit
+        # plus a journal is adequate for "the check did not happen", and it does
+        # not carry a do-not-repair instruction that must not be missed.
+        checkup_add critical "$svc found UNCORRECTABLE errors (exit 3). Metadata and System are DUP and would have been repaired silently, so this is DATA corruption -- on the tier holding the irreplaceable originals. The affected file is named in the kernel log."
+        # Read-only captures first, and NO repair: `btrfs check --repair` on a
+        # filesystem with single-profile data can make a recoverable situation
+        # unrecoverable. The remedy is restoring the named file from restic.
+        checkup_add action "btrfs scrub status -R /srv/data   # read-only: the error counts from the run that failed"
+        checkup_add action "btrfs device stats /srv/data   # read-only: per-device corruption/read/write/flush counters"
+        checkup_add action "journalctl -k --since -30d --grep 'csum|checksum|BTRFS error'   # read-only: names the FILE; restore THAT file from restic. Do NOT run 'btrfs check --repair' -- data here is single-profile, so a repair cannot fix it and can make recovery harder"
+      elif [[ "$svc" == "domum-media-check.service" && "$status" == "11" ]]; then
         verdict="$(check_unit_verdict "$svc")"
         if [[ "$verdict" == superseded* ]]; then
           # The lock is gone and the repository has been verified since. Saying
