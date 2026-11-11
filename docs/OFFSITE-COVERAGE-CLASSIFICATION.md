@@ -173,6 +173,17 @@ already answer:
 | retain the **newest** valid point per service, not all of them | a rollback target is the point you would actually roll back to | `storage archives` + the per-service recovery metadata |
 | an archive may be **dropped off-site but kept locally** | retention off-site and retention on disk are different decisions, and conflating them is how a local rollback artefact gets deleted to save cloud bytes | — |
 
+**The policy is now APPLIED, not just stated.**
+`domum-media storage archive-retention [--json]` selects against these five
+rules and says why, read-only: six verdicts of which only `retain` is off-site
+coverage, ranking taken from `CAPTURED_AT` rather than the filename or mtime,
+and an archive whose identity cannot be verified reported rather than counted.
+It deletes nothing and decides nothing about disk, because the last row of the
+table above is a separate decision. `tests/archive-retention-smoke.sh` drives it
+with mtime order deliberately INVERTED against `CAPTURED_AT` order, and with the
+unverifiable archive deliberately the NEWEST, so both of those rules have a
+mutation that fails without them.
+
 **What is still missing is only the size.** `du -sb /srv/data/backups/images`
 needs root. Until it is measured there is no recommendation, because
 recommending coverage without a size is how a nightly window grows silently —

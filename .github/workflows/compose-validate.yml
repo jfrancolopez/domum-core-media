@@ -204,6 +204,14 @@ jobs:
       - name: SMTP transport smoke test
         run: tests/smtp-transport-smoke.sh
 
+      # docs/OFFSITE-COVERAGE-CLASSIFICATION.md section 4b stated the off-site
+      # retention policy in prose and nothing applied it. The two rules with
+      # teeth -- never select by mtime, and an archive that does not
+      # demonstrably hold its image is not coverage -- are both negative
+      # controlled.
+      - name: Image archive retention smoke test
+        run: tests/archive-retention-smoke.sh
+
       # An archive must state its own identity read-only: `docker load` proves
       # it and is a mutation, so a verification that needs it cannot be run
       # freely.

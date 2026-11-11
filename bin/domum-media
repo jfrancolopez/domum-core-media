@@ -12476,6 +12476,196 @@ storage_archives() {
   echo "$n archive(s), $orphans orphan(s). Nothing was deleted."
   return 0
 }
+# ---------------------------------------------------------------------------
+#  Which archives does the off-site retention policy keep?
+#
+#  docs/OFFSITE-COVERAGE-CLASSIFICATION.md §4b states five rules and says the
+#  CLI "can already answer" each one. It could, and nothing APPLIED them -- so
+#  the policy existed as prose and an operator had no way to ask what it
+#  selects. This is that one decision function; the human report and --json are
+#  thin filters over it, so they cannot disagree (the cleanup_image_decisions
+#  pattern).
+#
+#  IT DECIDES NOTHING ABOUT DISK. §4b is explicit that off-site retention and
+#  on-disk retention are different decisions, "and conflating them is how a
+#  local rollback artefact gets deleted to save cloud bytes". So nothing here
+#  deletes, and `superseded` means "need not go off-site", never "remove".
+#
+#  SELECTION IS FROM METADATA, NEVER THE FILENAME OR mtime. The filename is a
+#  convenience; the record is `IMAGE_ARCHIVE=` in a point's .recovery file, and
+#  recency is `CAPTURED_AT` -- a required key, so a valid point always has one.
+#  This project has been bitten by reasoning from mtime three times, and the
+#  point NAME also carries a timestamp, which would be the same mistake wearing
+#  a different hat.
+#
+#  Each record: <verdict> <service> <archive> <point> <bytes> <detail>
+#  Verdicts, and only `retain` is off-site coverage:
+#    retain              the newest valid point for that service names it
+#    superseded          valid, but an older point for a service that has a newer one
+#    orphan              no retained recovery point names it at all
+#    checksum-mismatch   on disk is not what the record describes
+#    identity-unverified the archive does not demonstrably hold the image it claims
+#    recency-unknown     its point records no CAPTURED_AT, so it cannot be ranked
+archive_retention_decisions() {
+  local dir meta_dir f base point svc cap want_sha sha ident bytes
+  dir="$(image_archive_dir)"
+  meta_dir="$(snapshot_metadata_dir)"
+  [[ -d "$dir" ]] || return 0
+
+  # Pass one: describe every archive from the metadata that names it.
+  local -a rows=()
+  local archives
+  archives="$(compgen -G "$dir/*.tar" || true)"
+  [[ -n "$archives" ]] || return 0
+  while IFS= read -r f; do
+    [[ -e "$f" ]] || continue
+    base="$(basename "$f")"
+    bytes="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    point=""; svc=""; cap=""; want_sha=""
+    local m metas
+    metas="$(compgen -G "$meta_dir/*.recovery" || true)"
+    while IFS= read -r m; do
+      [[ -e "$m" ]] || continue
+      # The metadata names the archive by PATH. grep -F on a captured file, not
+      # a pipeline into grep -q: a match must not read as no-match.
+      local body
+      body="$(cat "$m" 2>/dev/null || true)"
+      if grep -qF "IMAGE_ARCHIVE='$f'" <<< "$body"; then
+        point="$(basename "$m" .recovery)"
+        svc="$(sed -nE "s/^SERVICE='(.*)'\$/\1/p" <<< "$body" | head -1)"
+        cap="$(sed -nE "s/^CAPTURED_AT='(.*)'\$/\1/p" <<< "$body" | head -1)"
+        want_sha="$(sed -nE "s/^IMAGE_ARCHIVE_SHA256='(.*)'\$/\1/p" <<< "$body" | head -1)"
+        break
+      fi
+    done <<< "$metas"
+
+    if [[ -z "$point" ]]; then
+      rows+=("orphan ${svc:-unknown} $base - $bytes no-retained-point-names-it")
+      continue
+    fi
+    sha="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    if [[ -n "$want_sha" && "$sha" != "$want_sha" ]]; then
+      rows+=("checksum-mismatch ${svc:-unknown} $base $point $bytes recorded-${want_sha:0:12}-on-disk-${sha:0:12}")
+      continue
+    fi
+    # Rule 2: containing the image it claims is a DIFFERENT claim from the file
+    # being intact, and only the former counts as coverage. Read-only -- no
+    # docker load, which would be a mutation.
+    ident="$(domum_archive_identity "$f" 2>/dev/null || printf 'undetermined')"
+    if [[ "$ident" != "verified" ]]; then
+      rows+=("identity-unverified ${svc:-unknown} $base $point $bytes identity-$ident")
+      continue
+    fi
+    if [[ -z "$cap" ]]; then
+      rows+=("recency-unknown ${svc:-unknown} $base $point $bytes no-CAPTURED_AT-cannot-rank")
+      continue
+    fi
+    rows+=("valid ${svc:-unknown} $base $point $bytes $cap")
+  done <<< "$archives"
+
+  # Pass two: among the VALID ones, the newest CAPTURED_AT per service is what
+  # goes off-site. Ties cannot be split by metadata, so the first is kept and
+  # the other is reported superseded rather than silently dropped.
+  local newest_svc="" r
+  local -a valid=() others=()
+  for r in "${rows[@]}"; do
+    case "$r" in valid\ *) valid+=("$r") ;; *) others+=("$r") ;; esac
+  done
+  if ((  ${#valid[@]} )); then
+    # Sort by service then CAPTURED_AT descending, so the first row per service
+    # is the newest. CAPTURED_AT is ISO-8601, which sorts lexically.
+    local sorted
+    sorted="$(printf '%s\n' "${valid[@]}" | sort -k2,2 -k6,6r)"
+    newest_svc=""
+    while IFS= read -r r; do
+      [[ -n "$r" ]] || continue
+      local s; s="$(awk '{print $2}' <<< "$r")"
+      if [[ "$s" != "$newest_svc" ]]; then
+        newest_svc="$s"
+        printf 'retain %s\n' "${r#valid }"
+      else
+        printf 'superseded %s\n' "${r#valid }"
+      fi
+    done <<< "$sorted"
+  fi
+  if (( ${#others[@]} )); then
+    printf '%s\n' "${others[@]}"
+  fi
+}
+
+# `storage archive-retention [--json]` -- what the policy selects, and why.
+# Read-only by construction: it reads the archive directory, the recovery
+# metadata and the archives' own blobs. It deletes nothing and starts nothing.
+storage_archive_retention() {
+  local json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      *) die "Usage: domum-media storage archive-retention [--json]" ;;
+    esac
+  done
+  need_root
+  load_cfg
+
+  local decisions
+  decisions="$(archive_retention_decisions || true)"
+
+  if (( json == 1 )); then
+    # The JSON line FIRST, then the human report, so the machine-readable line
+    # is the first beginning with '{' -- the recorded convention.
+    local first=1
+    printf '{"archives":['
+    while IFS= read -r a; do
+      [[ -n "$a" ]] || continue
+      (( first )) || printf ','
+      first=0
+      printf '{"verdict":"%s","service":"%s","archive":"%s","point":"%s","bytes":%s,"detail":"%s"}' \
+        "$(awk '{print $1}' <<< "$a")" "$(awk '{print $2}' <<< "$a")" \
+        "$(awk '{print $3}' <<< "$a")" "$(awk '{print $4}' <<< "$a")" \
+        "$(awk '{print $5}' <<< "$a")" "$(awk '{print $6}' <<< "$a")"
+    done <<< "$decisions"
+    printf ']}\n'
+  fi
+
+  echo "Image archive off-site retention -- what the policy selects"
+  echo "  policy   : docs/OFFSITE-COVERAGE-CLASSIFICATION.md section 4b"
+  echo "  directory: $(image_archive_dir)"
+  echo
+  if [[ -z "$decisions" ]]; then
+    echo "  No image archives, so the policy selects nothing."
+    echo "  This is NOT a finding: it is what an unarchived host looks like."
+    return 0
+  fi
+
+  local retain_n=0 retain_b=0 other_n=0 v s arch pt by de
+  while IFS= read -r a; do
+    [[ -n "$a" ]] || continue
+    v="$(awk '{print $1}' <<< "$a")"; s="$(awk '{print $2}' <<< "$a")"
+    arch="$(awk '{print $3}' <<< "$a")"; pt="$(awk '{print $4}' <<< "$a")"
+    by="$(awk '{print $5}' <<< "$a")"; de="$(awk '{print $6}' <<< "$a")"
+    printf '  %-20s %-14s %s\n' "$v" "$s" "$arch"
+    [[ "$pt" != "-" ]] && printf '  %-20s %-14s point %s\n' "" "" "$pt"
+    printf '  %-20s %-14s %s bytes, %s\n' "" "" "$by" "$de"
+    if [[ "$v" == "retain" ]]; then
+      retain_n=$(( retain_n + 1 )); retain_b=$(( retain_b + by ))
+    else
+      other_n=$(( other_n + 1 ))
+    fi
+  done <<< "$decisions"
+
+  echo
+  echo "  off-site set: $retain_n archive(s), $retain_b bytes"
+  echo "  not off-site: $other_n archive(s)"
+  echo
+  echo "  NOTHING WAS DELETED and nothing here is a disk decision. Off-site"
+  echo "  retention and on-disk retention are separate: a superseded archive is"
+  echo "  still the local rollback artefact for its own point."
+  echo
+  echo "  Only 'retain' counts as off-site coverage. 'identity-unverified' means"
+  echo "  the archive does not demonstrably hold the image its point names, which"
+  echo "  is a different claim from the file being intact -- so it is reported"
+  echo "  rather than counted."
+}
 
 # Upgrade ONE service, and prove it was one.
 #
@@ -12947,6 +13137,7 @@ verify-volume-dumps|storage verify-volume-dumps|storage_verify_volume_dumps
 archive-image|storage pre-upgrade-point --archive-image|archive_image_to_file
 verify-image-archive|storage verify-archive|storage_verify_archive
 image-archive-inventory|storage archives|storage_archives
+image-archive-retention|storage archive-retention|storage_archive_retention
 rollback-upgrade|rollback-upgrade|rollback_upgrade
 rollback-volume-upgrade|rollback-upgrade|rollback_volume_upgrade
 model-dispatched-upgrade|updates apply --service|create_upgrade_rollback_point
@@ -13327,7 +13518,14 @@ storage_cmd() {
         # Read-only inventory: which recovery point needs each archive, and
         # which are orphans. Deletes nothing.
         storage_archives ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>}" ;;
+      archive-retention)
+        shift
+        # Applies the OFF-SITE retention policy and says what it selects.
+        # Read-only, and deliberately not a disk decision: off-site retention
+        # and on-disk retention are different, and conflating them is how a
+        # local rollback artefact gets deleted to save cloud bytes.
+        storage_archive_retention "$@" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|archive-retention [--json]|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>}" ;;
   esac
 }
 
@@ -13439,6 +13637,11 @@ Usage:
   domum-media storage archives              Which recovery point needs each
                                             image archive, and which are
                                             orphans. Deletes nothing
+  domum-media storage archive-retention [--json]
+                                            What the OFF-SITE retention policy
+                                            selects, and why. Read-only; it is
+                                            not a disk decision and deletes
+                                            nothing
   domum-media storage verify-archive <point>
                                             Whether a recovery point's image
                                             archive is intact, and what that does

@@ -6772,6 +6772,69 @@ anchor matched **2**, because `TS "$(date +%s)"` appears in three recorders --
 so it had to be scoped inside `record_weekly_report`. The `matched %d` assertion
 caught both, which is the entire reason it exists.
 
+---
+
+**A POLICY STATED IN PROSE THAT NOTHING APPLIES IS NOT A POLICY, and "designed"
+was the whole of the evidence for a year.**
+`docs/OFFSITE-COVERAGE-CLASSIFICATION.md` §4b lists five off-site retention
+rules for the image archives and says, for each, how "the CLI can already
+answer" it. Every word of that is true, and nothing APPLIED them -- so an
+operator could not ask what the policy selects, and the backlog row read
+`designed`, which is indistinguishable from done when nobody re-reads the doc.
+
+`domum-media storage archive-retention [--json]` is that application: ONE
+decision function with the human report and `--json` as thin filters over it, so
+they cannot disagree -- the `cleanup_image_decisions` pattern. Six verdicts, and
+**only `retain` counts as off-site coverage**: `retain`, `superseded`, `orphan`,
+`checksum-mismatch`, `identity-unverified`, `recency-unknown`.
+
+**The two rules with teeth are NEGATIVE-CONTROLLED, which is what makes this
+evidence rather than code.**
+
+- **Ranking is `CAPTURED_AT`, never the filename or mtime.** This project has
+  reasoned from mtime wrongly three times, and the recovery point's NAME also
+  carries a timestamp, which is the same mistake wearing a different hat. The
+  fixture therefore sets mtime order OPPOSITE to `CAPTURED_AT` order -- the
+  retained archive's mtime is 2020 and the superseded one's is 2030 -- and
+  requires the answer not to move. A mutation that ranks by `stat -c %Y` flips
+  it. Without the inverted fixture that mutation would have passed.
+- **An archive that does not demonstrably hold its image is NOT coverage**, which
+  is a different claim from the file being intact. The unverifiable archive is
+  deliberately the **NEWEST** in the fixture, so neutralising the identity gate
+  promotes it into the off-site slot -- the actual harm, rather than a verdict
+  word changing somewhere.
+
+**IT IS A REPORT, NOT A DISK DECISION, and that is asserted rather than
+intended.** §4b says off-site retention and on-disk retention are different
+decisions and that conflating them "is how a local rollback artefact gets
+deleted to save cloud bytes". So `superseded` means "need not go off-site",
+never "remove", and the retention path is asserted to contain no `rm`, no
+`docker load`, no `restic`, no `compose_cmd` and no mtime read -- with comments
+stripped first, because a comment naming the banned form is how a fix documents
+itself. An empty archive directory reports "selects nothing" and says explicitly
+that this is NOT a finding: it is what an unarchived host looks like.
+
+**MY MUTATION FIRST NAMED AN OBSERVABLE IT ONLY TOUCHED.** Neutralising the
+identity gate made the unverifiable archive `superseded` rather than
+`retain`, because another archive was still newer -- so the assertion failed
+against a mutant that HAD genuinely got past the gate. The fix was to the
+FIXTURE, not the assertion: make the unverifiable archive the newest, so the
+gate's removal produces the harm the rule exists to prevent. "Name the
+observable the mutation actually changes" is not satisfied by naming one it
+merely disturbs.
+
+**And I read a mutation's indentation off `sed`-prefixed output for the THIRD
+time in one session.** `cat -A` shows four spaces where the `sed 's/^/  /'`
+display shows six; both anchors matched 0. The habit to build is `cat -A` on the
+target line BEFORE writing the anchor, not after the assertion fires.
+
+**The capability token names the SUBCOMMAND's function, not the inner decision
+function.** `tests/capabilities-contract-audit.py` refused
+`image-archive-retention|storage archive-retention|archive_retention_decisions`
+-- correctly: the dispatcher reaches `storage_archive_retention`, and the token
+is a promise that the SUBCOMMAND works. Pointing it at the inner helper
+advertised a path the dispatcher does not take.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
