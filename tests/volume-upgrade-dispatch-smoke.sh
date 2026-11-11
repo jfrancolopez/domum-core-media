@@ -404,3 +404,191 @@ grep -qi 'VOLUME_UPGRADE_ENABLED is not 1' <<< "$gate_out" \
 echo "  killed: the unmutated run refuses and the mutant does not"
 
 echo "PASS: volume upgrade dispatch smoke test"
+
+# ===========================================================================
+#  FAILURE INJECTION on the volume upgrade's three pre-deploy gates.
+#
+#  service_upgrade must not reach `compose up -d` unless the pre-upgrade point
+#  was created, is complete, and verified. Those are three separate `die`s, and
+#  the dispatch sections above test the VERIFIERS in isolation -- none of them
+#  drove service_upgrade with a gate failing and asked whether the deploy
+#  happened anyway. That is the question that matters: a volume service whose
+#  recovery point failed and which got upgraded regardless has had its state
+#  put under a new application with nothing to roll back to.
+#
+#  The POSITIVE control is section F4 and it is what makes F1-F3 mean anything:
+#  "no up -d" passes trivially against a function that never deploys at all.
+# ===========================================================================
+
+# $1 = extra stubs appended last, so a section can override anything above it.
+vol_upgrade() {
+  (
+    export DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state" CALLS="$TMP/f.log"
+    export CFG_FILE="$TMP/domum-media.conf"
+    export VOLUME_UPGRADE_ENABLED=1
+    # 0 means "look once, do not sleep". The default is 60s in 5s steps, and
+    # without this every section that reaches phase 4 costs a real minute --
+    # which is exactly what it cost before this line was added. CLAUDE.md says
+    # the fixture sets it to 0; this one did not.
+    export UPGRADE_READY_LOG_WAIT=0
+    : > "$CALLS"
+    # shellcheck disable=SC1090
+    source "$CLI" >/dev/null 2>&1
+    need_root() { :; }
+    export_env_for_compose() { :; }
+    die() { echo "DIE: $*"; exit 1; }
+    warn() { echo "WARN: $*"; }
+    service_state_model() { printf 'docker-volume domum-media_uptime-kuma-data\n'; }
+    is_managed_service() { return 0; }
+    service_compose_services() { printf 'uptime-kuma\n'; }
+    service_running_images() { printf 'uptime-kuma sha256:aaa\n'; }
+    # service_upgrade reads the staged image from service_staged_image_changes
+    # and takes field 4 of the first `STAGED ` line. Stubbing staged_image_for
+    # instead did nothing -- the function is not on this path -- so every
+    # section below fell into the graceful "nothing to upgrade" branch and F1
+    # failed with a message that named the real cause. A stub of a function
+    # nobody calls is not a stub.
+    service_staged_image_changes() { printf 'STAGED uptime-kuma sha256:aaa sha256:bbb\n'; }
+    other_container_identities() { printf '' ; }
+    domum_acquire_lock() { echo "LOCK" >> "$CALLS"; return 0; }
+    verify_backup_freshness() { return 0; }
+    service_is_healthy() { return 0; }
+    service_ready_probe() { return 1; }
+    service_logged_ready_since() { return 1; }
+    compose_cmd() { echo "COMPOSE $*" >> "$CALLS"; return 0; }
+    # All three gates PASS by default; each section below breaks exactly one.
+    #
+    # The completeness check reads three GLOBALS that the real
+    # create_upgrade_rollback_point sets -- PRE_UPGRADE_POINT, _META and
+    # _ARCHIVE -- so the stub must set them. Without that, `set -u` killed the
+    # function at the completeness line and F2 "passed" on an unbound-variable
+    # abort rather than on the check it names. STUB_* use `-` and not `:-`, so
+    # a section can set one to EMPTY and break completeness the way production
+    # can.
+    create_upgrade_rollback_point() {
+      echo "POINT" >> "$CALLS"
+      PRE_UPGRADE_POINT="${STUB_POINT-pt}"
+      PRE_UPGRADE_META="${STUB_META-pt.recovery}"
+      PRE_UPGRADE_ARCHIVE="${STUB_ARCHIVE-pt.tar}"
+      printf '%s\n' "$PRE_UPGRADE_POINT"
+      return 0
+    }
+    verify_upgrade_rollback_point() { echo "VERIFY" >> "$CALLS"; return 0; }
+    eval "${1:-}"
+    set +e
+    service_upgrade uptime-kuma 2>&1
+    echo "RC=$?"
+    echo "--- calls ---"; cat "$CALLS"
+  ) 2>&1
+}
+
+sect "F1. the pre-upgrade point FAILS -- no up -d, and it says so"
+out="$(vol_upgrade 'create_upgrade_rollback_point() { echo "POINT-TRIED" >> "$CALLS"; return 1; }')"
+grep -q '^RC=0$' <<< "$out" && fail "F1: a failed pre-upgrade point still returned success: $out"
+grep -q 'COMPOSE up -d' <<< "$out" \
+  && fail "F1: it DEPLOYED after the pre-upgrade point failed -- the state is now
+under a new application with nothing to roll back to: $out"
+grep -qi 'NOT deployed' <<< "$out" \
+  || fail "F1: the refusal does not state that the staged image was not deployed: $out"
+echo "  refused, nothing deployed, and the message says which"
+
+sect "F2. the point is created but INCOMPLETE -- no up -d"
+# A point without its metadata and archive is half a recovery point: the data
+# could be restored and the application that wrote it could not be identified.
+# Broken the way production can break: the point is created and one of its
+# three artefacts is missing. The first version of this section stubbed an
+# INVENTED `upgrade_rollback_point_complete`, which does not exist -- so the
+# stub did nothing and the section passed on an unbound-variable abort instead
+# of on the completeness check. Stubbing a function nobody defines is not a
+# stub, and here it hid a vacuous pass.
+out="$(STUB_ARCHIVE='' vol_upgrade '')"
+grep -q '^RC=0$' <<< "$out" && fail "F2: an incomplete point still returned success: $out"
+grep -q 'COMPOSE up -d' <<< "$out" \
+  && fail "F2: it deployed on an incomplete recovery point: $out"
+echo "  refused, nothing deployed"
+
+sect "F3. VERIFICATION of the point fails -- no up -d"
+out="$(vol_upgrade 'verify_upgrade_rollback_point() { echo "VERIFY-TRIED" >> "$CALLS"; return 1; }')"
+grep -q '^RC=0$' <<< "$out" && fail "F3: a point that did not verify still returned success: $out"
+grep -q 'COMPOSE up -d' <<< "$out" \
+  && fail "F3: it deployed on a point that did not verify: $out"
+grep -qi 'did not verify\|NOT deployed' <<< "$out" \
+  || fail "F3: the refusal does not name the cause: $out"
+echo "  refused, nothing deployed"
+
+sect "F4. POSITIVE CONTROL: with all three gates passing, up -d IS reached"
+# Without this, F1-F3 would pass against a service_upgrade that never deploys
+# under any circumstances, and the three sections above would be measuring
+# nothing.
+out="$(vol_upgrade '')"
+grep -q 'COMPOSE up -d' <<< "$out" \
+  || fail "F4: the deploy is never reached even when every gate passes, so F1-F3
+prove nothing: $out"
+# And the order is the safety property, not an incidental: the point and its
+# verification must both precede the deploy.
+calls="$(sed -n '/--- calls ---/,$p' <<< "$out")"
+p_line="$(grep -n '^POINT$'  <<< "$calls" | head -1 | cut -d: -f1)"
+v_line="$(grep -n '^VERIFY$' <<< "$calls" | head -1 | cut -d: -f1)"
+d_line="$(grep -n '^COMPOSE up -d' <<< "$calls" | head -1 | cut -d: -f1)"
+[[ -n "$p_line" && -n "$v_line" && -n "$d_line" ]] \
+  || fail "F4: expected POINT, VERIFY and the deploy to all be recorded: $calls"
+(( p_line < d_line )) || fail "F4: the deploy happened before the point was created"
+(( v_line < d_line )) || fail "F4: the deploy happened before the point was verified"
+echo "  deploy reached, and it follows both the point and its verification"
+
+sect "F5. the two gates are DEFENCE IN DEPTH, not one check written twice"
+# Worth asserting because it is what the first version of this section got
+# wrong. Tolerating gate 1 (the point-creation failure) is NOT sufficient to
+# deploy: gate 2 reads PRE_UPGRADE_POINT/_META/_ARCHIVE, and a creation that
+# failed before setting them is caught there. Mutating gate 1 away therefore
+# still refuses -- for a different reason -- which is a property of the code,
+# not a defect in the test.
+cp "$CLI" "$TMP/cli.orig.g1"
+cat > "$TMP/mutate-g1.py" <<'PYG1'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+# Tolerate gate 1: keep the CALL (so the globals are set exactly as production
+# would set them) and turn its fatal refusal into a warning. `if false` would
+# skip the call entirely and prove nothing -- that is what the first version
+# did, and gate 2 then stopped the mutant on unset globals.
+old = '    die "Pre-upgrade protection failed. The staged image was NOT deployed and'
+new = '    warn "TOLERATED gate 1"; : "Pre-upgrade protection failed and'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYG1
+( python3 -I "$TMP/mutate-g1.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.g1" "$CLI"; fail "F5: the gate-1 mutation did not apply"; }
+# The stub FAILS but still leaves the three artefacts, which a creation that
+# failed late would do. Gate 2 therefore passes and gate 1 is the only thing
+# between this and a deploy.
+mout="$(vol_upgrade 'create_upgrade_rollback_point() {
+  echo "POINT" >> "$CALLS"
+  PRE_UPGRADE_POINT=pt; PRE_UPGRADE_META=pt.recovery; PRE_UPGRADE_ARCHIVE=pt.tar
+  printf "pt\\n"; return 1
+}')"
+cp "$TMP/cli.orig.g1" "$CLI"
+grep -q 'COMPOSE up -d' <<< "$mout" \
+  || fail "F5: the mutation changed no ANSWER -- with gate 1 tolerated and the
+artefacts present, the deploy must happen: $mout"
+echo "  killed: gate 1 tolerated with artefacts present -> it deploys"
+
+sect "F5b. and with the artefacts ABSENT, gate 2 catches it anyway"
+# The other half of defence in depth, and the reason F5 had to be made
+# faithful: tolerate gate 1 AND leave the artefacts unset, and the refusal
+# still happens -- at gate 2.
+( python3 -I "$TMP/mutate-g1.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.g1" "$CLI"; fail "F5b: the mutation did not apply"; }
+mout="$(vol_upgrade 'create_upgrade_rollback_point() {
+  echo "POINT" >> "$CALLS"; printf "pt\\n"; return 1
+}')"
+cp "$TMP/cli.orig.g1" "$CLI"
+grep -q 'COMPOSE up -d' <<< "$mout" \
+  && fail "F5b: with gate 1 tolerated AND no artefacts it still deployed -- gate 2
+is not catching the case it exists for: $mout"
+echo "  gate 2 refuses independently of gate 1"
+
+sect "F6. the CLI is restored"
+grep -q 'if ! create_upgrade_rollback_point "\$service"; then' "$CLI" \
+  || fail "F6: the point-creation gate is missing from the CLI"
+echo "  gate is back"
