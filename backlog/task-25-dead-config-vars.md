@@ -59,3 +59,37 @@ Low. Small. ~6k tokens.
 
 ## Suggested order
 Phase 2, after task 24.
+
+## Result (partial) — 2026-11-10
+
+**Step 1 DONE and enforced.** `IMMICH_UPDATE_CHANNEL` is removed from the
+example, and so is `IMMICH_UPDATE_MODE`, which this task did not list but is the
+same defect: measured, **zero references anywhere in the repository**, sitting in
+a documented "Update policy — Class C" section beside keys that are read. The
+section now states that bundle-only is STRUCTURAL — there is no non-bundle
+Immich update path and `immich` is absent from `managed_image_specs` — so nobody
+re-adds a mode switch expecting it to do something.
+
+`tests/config-example-dead-keys-audit.py` stops this class coming back. It scans
+the example against the CONSUMERS only (`bin/`, `install.sh`, `compose/`,
+`systemd/`, `operator/`) — `tests/` is excluded because a test naming a key
+would make it read as live, which would make the audit unable to fail. The
+`BACKUP_TARGET_*` family is recognised by DERIVING the prefix from the code's own
+`BACKUP_TARGET_$(uppercase_token "$target")_${field}`, so it covers 30 keys
+without an edit and reports no false positives. Negative-controlled in three
+directions: both removed keys coming back, an invented key, and both vacuity
+guards.
+
+**Step 3 NOT done, deliberately, and the reason is a safety one.** This task is
+right that `IMMICH_BUNDLE_ROLLBACK_ENABLED` is inert — verified, it is only
+exported (`bin/domum-media:1516`) and prompted for (3202-3203), and
+`AUTO_ROLLBACK_ENABLED` is what gates rollback (3494, 3503). `configure` asks for
+both on adjacent lines, one real and one inert. But wiring it means a rollback
+gate starts honouring a value that has never been honoured, and the production
+config is `0600 root` — unreadable from this account — so wiring it could
+silently turn bundle rollback OFF on this host. That is an operator-reviewed
+change, not a cleanup. The example now says so where an operator will read it.
+
+Steps 2 (`IMMICH_HOST`) and 4 (`PLEX_ENABLE_HW_TRANSCODE`) are untouched. Both
+are the same "exported but inert" class, which the audit cannot see — a key that
+IS referenced but whose value changes nothing needs a different check.

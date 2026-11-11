@@ -6644,6 +6644,60 @@ the same correction as every other stale-claim entry here, with the novelty
 that re-measuring the files would not have caught it. **Re-measure what a plan
 is ABOUT, not only the figures in it.**
 
+---
+
+**A CONFIG KEY THE OPERATOR CAN SET THAT DOES NOTHING IS A SURFACE IMPLYING
+CONTROL IT DOES NOT HAVE, and there are TWO classes of it.** Found 2026-11-10 by
+asking whether `config/domum-media.conf.example` still agrees with what the code
+reads.
+
+**Class one -- never referenced at all.** `IMMICH_UPDATE_MODE` and
+`IMMICH_UPDATE_CHANNEL` sat in a documented "Update policy -- Class C" section
+beside three keys, with **zero references anywhere in the repository**. So
+`IMMICH_UPDATE_MODE=direct` read as switching the update policy for the service
+this server exists for, and did nothing. Bundle-only is STRUCTURAL -- there is no
+non-bundle Immich update path and `immich` is absent from `managed_image_specs`
+-- so the keys are removed and the section says why, rather than leaving the next
+reader to re-add a switch.
+
+`tests/config-example-dead-keys-audit.py` enforces it, and two design choices are
+the whole of why it works. **The corpus is CONSUMERS only** -- `bin/`,
+`install.sh`, `compose/`, `systemd/`, `operator/` -- because including `tests/`
+would let a test, or the audit's own docstring, make a key read as live: the
+comment-as-code trap, which would make the check unable to fail. **And the
+dynamic family is DERIVED, not hardcoded**: the code builds
+`BACKUP_TARGET_$(uppercase_token "$target")_${field}`, so the audit extracts that
+prefix from the source and recognises 30 keys with no edit and no false
+positives. Measured before shipping: 145 keys, 30 unreferenced, 30 recognised,
+**0** dead. Negative-controlled three ways -- the removed keys returning, an
+invented key, and both vacuity guards.
+
+**Class two -- referenced but inert, which the audit cannot see.**
+`IMMICH_BUNDLE_ROLLBACK_ENABLED` is exported and `configure` PROMPTS for it, yet
+no code reads its value; bundle rollback follows `AUTO_ROLLBACK_ENABLED`, which
+`configure` asks for on the line immediately before. A prompt is worse than a
+silent key, because being asked asserts the answer matters. `IMMICH_HOST` and
+`PLEX_ENABLE_HW_TRANSCODE` are the same shape. An audit for this class needs to
+know whether a value influences behaviour, which "is it referenced" cannot
+answer.
+
+**IT IS NOT WIRED, AND THAT IS A SAFETY DECISION RATHER THAN LAZINESS.**
+`backlog/task-25` step 3 calls for honouring it as
+`AUTO_ROLLBACK_ENABLED && IMMICH_BUNDLE_ROLLBACK_ENABLED`. Wiring it makes a
+ROLLBACK gate start obeying a value that has never been obeyed, and the
+production config is `0600 root` -- unreadable from this account -- so it could
+silently turn bundle rollback OFF on this host. Reported where an operator reads
+it instead.
+
+**AND I PUT A FALSE CLAIM IN THE FIX ITSELF, MINUTES AFTER WRITING THE RULE.**
+My first version of the replacement comment said *"The three keys below ARE
+read"*. Two are -- `IMMICH_BUNDLE_AUTO_UPDATE` gates the apply and
+`IMMICH_BUNDLE_DELAY_DAYS` is read when ageing a candidate -- and the third is
+the inert one. It was caught only because `backlog/task-25` already named it and
+I checked the task before committing, which is the argument for reading the
+existing backlog entry rather than treating a measurement as complete because it
+was mine.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
