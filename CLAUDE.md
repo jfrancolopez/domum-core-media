@@ -7401,6 +7401,46 @@ a blocked one.
 
 ---
 
+**UNDER A SQUASH-MERGE WORKFLOW, EVERY CHEAP GIT CHECK REPORTS MERGED BRANCHES
+AS UNMERGED -- and §8 says never to discard another agent's work, so getting
+this wrong goes one of two bad ways.** Measured 2026-11-11 against 52 local
+branches, immediately after squash-merging one of them:
+
+| check | said | truth |
+|---|---|---|
+| `git rev-list --count main..<b>` | 48 branches have commits not in main | a squash makes ONE commit; the originals are never in main |
+| `git diff --stat main..<b>` | tens of thousands of "deletions" | that is main's NEWER content missing from an old branch |
+| `git cherry main <b>` | the branch just merged has 8 unmerged patches | a squash's patch-id matches none of the originals |
+
+All three are correct about what they measure and none of them answers "is this
+branch's content in main". The third is the sharpest, because `git cherry`
+compares by patch-id and is the tool one would reach for precisely here.
+
+**The authority is the PR state**: `gh pr list --state all --json
+number,state,headRefName`. Measured that way, **45 of the 52 had MERGED PRs**,
+5 had CLOSED PRs (superseded `-v2` branches, and the stacked-PR closure this
+file already records), and **2 had no PR at all** -- which is the only set worth
+examining. One of those turned out to have zero commits ahead of main; the
+other's three commits were verified landed by looking for what they DELIVERED
+in main (calibre-web's declared readiness pattern and sqlite binary,
+`service_state_models`, and its three suites present and CI-wired) rather than
+by trusting a branch name or this file's prose.
+
+So nothing is at risk on any local branch, and **they were deliberately NOT
+deleted**: that is 52 refs, the content question needed four different checks to
+answer, and a sweeping delete is not a decision to take on a metric that has
+already been wrong three times in one sitting.
+
+This is the third verifier in one session whose verdict was decided by what it
+could not see -- after the escape-unaware `awk -F` and the paren-blind sweep
+regex. The pattern is now explicit enough to state as a rule: **when a check
+returns a surprising count, ask what the check cannot see before acting on it.**
+Each of those three would have caused real damage if believed: corrupted
+backlog rows, a false "no more instances", and either deleted work or a
+fabricated alarm about 48 branches.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
