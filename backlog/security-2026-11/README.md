@@ -61,7 +61,7 @@ Status lives in each task file; this table is a summary.
 | [SEC-07](tasks/SEC-07-disable-rpcbind.md) | Close the unused RPC port | BLOCKED (owner, root) | P2 | — |
 | [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) | Traefik behind a Docker socket proxy | DONE (repo half merged `b094616`; deployment owner-gated) | P2 | — |
 | [SEC-09](tasks/SEC-09-no-new-privileges.md) | `no-new-privileges` on every container | DONE (repo merged `6328bc1`; deployment owner-gated) | P3 | SEC-08 |
-| [SEC-10](tasks/SEC-10-docker-group-boundary.md) | Docker group: state the real boundary | IN_PROGRESS (docs; deployment owner-gated) | P2 | D-3 resolved |
+| [SEC-10](tasks/SEC-10-docker-group-boundary.md) | Docker group: state the real boundary | PR_OPEN (#202; CI pending, deployment owner-gated) | P2 | D-3 resolved |
 | [SEC-11](tasks/SEC-11-plex-remote-access-check.md) | Plex relay and remote access check | BLOCKED (owner, Plex UI) | P2 | D-4 may supersede |
 | [SEC-12](tasks/SEC-12-beszel-socket-proxy.md) | Move Beszel container stats off Docker group | QUEUED (host endpoint design; deployment owner-gated) | P2 | SEC-08 deployment, SEC-10 |
 | [APP-01](tasks/APP-01-measure-usage-for-consolidation.md) | Measure real use of the overlapping apps | READY | P2 | — |
