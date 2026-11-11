@@ -166,3 +166,62 @@ section above. It needs one of:
 Written as a gated subcommand it would still follow `immich-phase-a`'s pattern:
 unique disposable names refused if taken, images pinned by ID, no production
 path or volume mounted, teardown asserted.
+
+---
+
+## The two resolution steps are now PROVEN against real Docker objects
+
+Added 2026-11-11: `operator/rehearsals/volume-resolver-real-objects.sh`.
+
+The volume recovery-point chain has three steps, and they do not have the same
+blocker:
+
+| step | what it does | privilege |
+|---|---|---|
+| 1 | `service_named_volumes` -- `docker inspect` of the container | none |
+| 2 | `docker_volume_mountpoint` -- `docker volume inspect` | none |
+| 3 | `dump_volume_to_file` -- `tar -C <mountpoint>` | **root** |
+
+`tests/volume-recovery-point-smoke.sh` drives 1-3 with real tar, checksums,
+xattrs, ACLs and modes -- against a **directory**, with
+`docker_volume_mountpoint` as its one stubbed seam. **That stub is now removed
+from the chain**: steps 1 and 2 are exercised against a real disposable
+container and a real named volume, and the rehearsal additionally asserts that a
+**read-only** mount is excluded (a recovery point cannot be built from a volume
+the service cannot write) and that an **absent** volume resolves to nothing
+rather than to a plausible path, which would otherwise make a dump tar the wrong
+directory.
+
+It also makes the **production** measurement read-only, which no fixture can:
+both declared `docker-volume` services resolve to exactly one named rw volume
+each, and to the ones this design names --
+`domum-media_traefik-letsencrypt` at `/letsencrypt` (the ACME account key) and
+`domum-media_uptime-kuma-data` at `/app/data` (`kuma.db`).
+
+### Why step 3 needs root, measured rather than asserted
+
+The reason is narrower than "`/var/lib/docker` needs root":
+
+```
+/var/lib/docker        drwx--x--- root:root
+```
+
+**The group is `root`, not `docker`.** Membership of the `docker` group -- which
+this account has -- gives nothing here, so `other` (`---`) applies and `statx`
+is denied at `/var/lib/docker/volumes` itself, two components above the
+mountpoint. A **bind-type** volume does not help: docker reports the
+`/var/lib/docker` Mountpoint whatever the device is, and
+`docker_volume_mountpoint` returns the Mountpoint.
+
+The rehearsal **derives** that stopping point at run time rather than hardcoding
+it, and if `tar -C` ever succeeds it **fails** with a message saying this
+document's claim must be re-measured. A blocker that cannot notice its own
+retirement is the stale-claim defect.
+
+### What is still not proven
+
+The tar read, the dump, the restore, and any upgrade or rollback against a real
+volume. Those need the one privileged run described above. The container-name
+half of the blocker is unchanged and is not retired by privilege: both
+`docker-volume` services are running and hold the names a disposable project
+would need.
