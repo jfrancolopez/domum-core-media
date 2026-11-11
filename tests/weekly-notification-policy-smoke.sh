@@ -70,7 +70,25 @@ grep -q 'SENT' <<< "$out" || fail "1: the message was never handed to the transp
 grep -q 'weekly report emailed' <<< "$out" || fail "1: it did not report sending: $out"
 [[ -f "$(ev)" ]] || fail "1: the send was not recorded"
 grep -q "^RESULT=success$" "$(ev)" || fail "1: success was not recorded: $(cat "$(ev)")"
-grep -q "^SENT_DATE=$(date -I)$" "$(ev)" || fail "1: today's date was not recorded: $(cat "$(ev)")"
+# THE RECORDED DATE IS IN THE CLI's TIMEZONE, NOT THIS TEST's. bin/domum-media
+# exports TZ="${TZ:-UTC}" for the containers and it leaks into its own process --
+# CLAUDE.md records that leak and records it as load-bearing for the journal
+# --since window -- so `date -I` inside the CLI is UTC while the same call here is
+# local. Measured 2026-11-10 21:47 EST: local 2026-11-10, UTC 2026-11-11. So a
+# locally computed expectation failed on this host every evening between 19:00
+# and midnight and passed in CI, which runs UTC: the "passes in CI, fails
+# locally" inversion, with the host's TIMEZONE as the dependence.
+#
+# Derived the way the code derives it, so the test follows if that ever changes,
+# and the TS/SENT_DATE agreement is asserted too -- that one holds whatever the
+# clock says, so it cannot rot back into a time-of-day dependence.
+want_date="$(TZ="${TZ:-UTC}" date -I)"
+grep -q "^SENT_DATE=$want_date$" "$(ev)" \
+  || fail "1: the CLI's own date was not recorded (expected $want_date): $(cat "$(ev)")"
+rec_ts="$(sed -n 's/^TS=//p' "$(ev)")"
+[[ -n "$rec_ts" ]] || fail "1: no TS was recorded: $(cat "$(ev)")"
+[[ "$(TZ="${TZ:-UTC}" date -I -d "@$rec_ts")" == "$want_date" ]] \
+  || fail "1: TS and SENT_DATE disagree: $(cat "$(ev)")"
 echo "   sent on a healthy host, and recorded"
 
 sect "2. the same day twice: the SECOND scheduled send is refused"
