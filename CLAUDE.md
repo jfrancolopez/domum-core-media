@@ -7758,6 +7758,61 @@ off-site protection**, and this file has corrected that conflation before.
 
 ---
 
+**THE VOLUME UPGRADE'S THREE PRE-DEPLOY GATES WERE NEVER DRIVEN WITH ONE
+FAILING, and the four runs it took to get the test right found three vacuous
+passes.** `service_upgrade` must not reach `compose up -d` unless the
+pre-upgrade point was created, is complete, and verified -- three separate
+`die`s. The dispatch suite tested the VERIFIERS in isolation; nothing drove the
+function with a gate failing and asked whether the deploy happened anyway. That
+is the question that matters: a volume service whose recovery point failed and
+which got upgraded regardless has its state under a new application with
+nothing to roll back to.
+
+**F4, the positive control, is the load-bearing section.** F1-F3 all assert
+"no `up -d`", and that passes trivially against a `service_upgrade` that
+short-circuits, aborts, or never deploys under any condition. Only requiring
+the deploy to be REACHED when every gate passes distinguishes "the gates work"
+from "this function never deploys". Each of the three fixture defects below
+produced a GREEN section measuring nothing, and F4 is what would have caught
+all three.
+
+The three, in the order they appeared:
+
+- **I stubbed `staged_image_for`, which this path does not call.**
+  `service_upgrade` reads `service_staged_image_changes` and takes field 4 of
+  the first `STAGED ` line, so every section fell into the graceful "nothing to
+  upgrade" branch. A stub of a function nobody calls is not a stub -- second
+  occurrence this session.
+- **I invented `upgrade_rollback_point_complete` and stubbed that.** No such
+  function exists: the completeness check reads three GLOBALS that
+  `create_upgrade_rollback_point` sets. My stub printed a point name and set
+  none of them, so `set -u` killed the function at the completeness line and F2
+  "passed" on an unbound-variable abort rather than on the check it is named
+  after. The `domum_release_lock` family, in a test rather than in the CLI --
+  where `tests/function-definition-audit.py` cannot see it.
+- **The mutation was stopped by the wrong gate.** Replacing
+  `if ! create_upgrade_rollback_point` with `if false` skips the CALL, so the
+  globals stay unset and gate 2 refuses. The mutant was blocked for a reason
+  that has nothing to do with gate 1, which is "name the observable the
+  mutation actually changes" again.
+
+**THAT LAST ONE EXPOSED A PROPERTY WORTH ASSERTING: the gates are defence in
+depth, not one check written twice.** Tolerating gate 1 is NOT sufficient to
+deploy -- gate 2 catches a creation that failed before setting the artefacts. So
+the faithful mutation keeps the CALL, turns only the fatal refusal into a
+warning, and uses a stub that fails yet still leaves the three artefacts, which
+is what a creation failing LATE would do. Then gate 1 is the only thing between
+that and a deploy, and the mutation changes the answer. **F5b pins the other
+half**: same mutation, artefacts absent, and the refusal must still happen.
+Without both, "defence in depth" would be an assumption.
+
+**`UPGRADE_READY_LOG_WAIT=0` belongs in every fixture that reaches phase 4.**
+The default is 60 s in 5 s steps; omitting it cost a real minute per section and
+made the suite look hung. This file already says the fixture sets it to 0, and
+the new helper did not.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
