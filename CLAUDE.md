@@ -7578,6 +7578,59 @@ Verified before relying on it rather than after.
 
 ---
 
+**I HAD THE RIGHT BLOCKER FOR THE WRONG REASON, AND THE WRONG REASON WOULD
+HAVE RETIRED IT FALSELY.** P3.4 was recorded as root-blocked because
+`/var/lib/docker` needs privilege. Re-measured 2026-11-11, component by
+component:
+
+```
+/var/lib/docker              drwx--x--- root:root
+/var/lib/docker/volumes      statx: Permission denied
+```
+
+**The group is `root`, not `docker`.** This account IS in the `docker` group --
+`id -nG` lists it -- so the obvious reading is that group `--x` grants traverse.
+It does not: the group that owns the directory is root. `other` is `---`, and
+statx is denied at `/var/lib/docker/volumes`, **two components above** the
+mountpoint. Had I reasoned from "I am in the docker group, so `--x` applies to
+me", I would have concluded the path was traversable and that the blocker was
+something else entirely. Read the OWNER and GROUP of a mode, not just the bits.
+
+**The blocker is per STEP, not per feature, and only one step has it.** The
+volume recovery-point chain is `service_named_volumes` (docker inspect) ->
+`docker_volume_mountpoint` (docker volume inspect) -> `dump_volume_to_file`
+(`tar -C`). The first two need **no privilege at all**; only the tar read does.
+The smoke suite drives all three against a DIRECTORY with
+`docker_volume_mountpoint` as its one stubbed seam, and
+`operator/rehearsals/volume-resolver-real-objects.sh` removes that stub: steps
+1 and 2 against a real disposable container and a real named volume. "The
+feature needs root" was true of the feature and false of two thirds of it --
+the fourth instance this project has recorded of measuring the blocker for a
+neighbouring question.
+
+Three things the rehearsal asserts that a fixture cannot:
+
+- a **read-only** mount is EXCLUDED. A recovery point cannot be built from a
+  volume the service cannot write, and including it would dump bytes the
+  service does not own. The filter is
+  `{{if and (eq .Type "volume") .RW}}` and this is what proves it;
+- an **absent** volume resolves to EMPTY, not to a plausible path. A path for a
+  volume that does not exist would make a dump tar the wrong directory or
+  create one;
+- **production, read-only**: both declared `docker-volume` services resolve to
+  exactly one named rw volume each, and to the two the design names --
+  `/letsencrypt` holding the ACME account key and `/app/data` holding
+  `kuma.db`. No fixture can establish that the real services resolve to the
+  real volumes.
+
+**A BLOCKER MUST BE ABLE TO NOTICE ITS OWN RETIREMENT.** The rehearsal DERIVES
+the first unreadable path component at run time instead of hardcoding it, and
+if `tar -C` ever succeeds it FAILS with a message saying the documented claim
+must be re-measured. A blocker recorded as prose goes stale silently; this
+project has a dedicated rule about stale claims and a blocker is one.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
