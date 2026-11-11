@@ -7059,6 +7059,296 @@ Writing the proof next to that sentence is the point: the easiest thing to
 overstate here is off-site protection, and the row most likely to be misread as
 closing it is the one that was just opened.
 
+**THE `command -v` PATH TRAP WAS IN THE PRODUCTION CODE, not just in my
+probes.** This file records it twice as a mistake of mine -- `smartctl`, then
+`mkfs.btrfs` -- both times concluding a tool was missing from a run as the wrong
+user. Measured 2026-11-11, `checkup_disk_health` made it too:
+
+```
+dpkg -l smartmontools        ii  smartmontools  7.4-3
+/usr/sbin/smartctl           -rwxr-xr-x root root  1,077,216
+command -v smartctl          (as jfranco) NOT FOUND
+/usr/sbin on jfranco's PATH  no
+-> WARN: Disk SMART health is UNKNOWN: smartmontools is not installed.
+```
+
+`cmd_exists smartctl` is `command -v`, so the guard answered yes under sudo and
+no otherwise. **Production is correct -- `checkup` runs as root -- and the
+message was still wrong twice over**: it named an absent package as the cause,
+and it offered `apt-get install -y smartmontools` for a package that is
+installed. An unactionable remedy trains the operator to ignore the check, and
+this one is the only thing watching two SSDs.
+
+It also blinded the method that has found the last several defects here:
+**driving the real checks unprivileged against the real host**. That is how
+`mreport_smart_interpretable`'s empty-table conflation was found, and the same
+run reported "not installed" rather than reaching the code under test.
+
+`smartctl_bin` is the one resolver -- `command -v` first, then
+`/usr/sbin`, `/sbin`, `/usr/local/sbin` -- so the check answers the same way
+whichever account runs it, and the "appears genuinely absent" branch is reached
+only when there really is no smartctl. **A shell-function stub still works,
+because `command -v` resolves a function to its own name**, which is what keeps
+every existing fixture in the suite live; that is asserted rather than assumed,
+since a resolver that bypassed the stubs would silently invoke the HOST's
+smartctl from six sections.
+
+**AND THE FIX INTRODUCED A WORSE DEFECT, which the declaration guard caught
+before it was committed.** `checkup_disk_wear` read `$smartctl_path` without
+declaring it. Bash's dynamic scoping leaks the caller's local, so it worked from
+`checkup_disk_health` -- the only production call site -- and was unbound for
+the six test sections that drive it directly. The failure is not a crash: the
+read sits inside a command substitution ending in `|| true`, so `set -u` kills
+the subshell, the status is **swallowed**, and `wear` comes back empty.
+Measured:
+
+```
+a drive with 5% of rated write life left, called standalone
+  before:  ADVICE  "/dev/sdb reports no wear attribute ... UNMEASURED"
+  after:   CRITICAL "/dev/sdb reports only 5% of rated write life remaining."
+```
+
+Advice does not pass the notifier's silence gate, so a dying disk would have
+been silent. HEALTHY-must-not-mean-UNMEASURED, manufactured by the fix for a
+wrong-cause message. Resolving at the use site is the rule already recorded for
+`DISK_WEAR_WARN_PERCENT`, and it is the same reason.
+
+**The guard is the reusable part**: every `$smartctl_path` read must sit inside
+a function that declares it. A use that reads the caller's local is invisible to
+any test that drives only the caller, so the defect cannot be found by
+exercising the production path -- which is exactly what every existing section
+did. It has a count check so it cannot scan nothing, and a mutation that
+restores the inherited form must bring the UNMEASURED advice back.
+
+**`str.count` COUNTS SUBSTRINGS, so a 2-space anchor matched a 4-space line.**
+Three times in one sitting: `  if ! cmd_exists smartctl; then` is contained in
+the 4-space copy inside `mreport_render_text`, and `  wear="$(...` in the
+10-space copy. The assertion reported `matched 2 times` and wrote nothing, which
+is why it cost minutes rather than a wrong edit. Anchor on the PRECEDING
+NEWLINE: `\n  if ! ...` forces the match to column 0 and makes the indentation
+exact. This is the same family as the line-at-a-time grep, in the edit tooling
+rather than in an audit.
+
+**An existing section's SEAM went stale while its property stayed right.**
+`absent smartmontools is UNKNOWN with a remedy` simulated absence with
+`cmd_exists() { [[ "$1" != smartctl ]]; }`, which the resolver no longer
+consults -- so it would have left the sbin fallbacks live and asserted nothing.
+Before adapting a test to a change, ask which of the two is wrong: here the
+property is still exactly right and only the seam moved, so the seam became
+`smartctl_bin() { return 1; }` and the assertions are untouched.
+
+**AND A SIBLING SECTION BECAME HOST-DEPENDENT IN A NEW DIMENSION: whether the
+MACHINE HAS SMARTCTL AT ALL.** `SMART: jq absent is UNKNOWN with a remedy`
+hides jq through `cmd_exists` and asserts the jq branch. Because
+`smartctl_bin` deliberately looks past PATH into `/usr/sbin`, hiding jq is no
+longer sufficient: on a runner with no smartctl anywhere the RESOLVER fails
+first and the smartctl-absent branch wins before the jq check is reached. It
+passed here, where `/usr/sbin/smartctl` exists, and **failed in CI** -- caught
+by CI rather than by me, which is the fifth dimension of host dependence this
+file has now recorded after PATH, SPEED, the host's awk, and the host's
+timezone.
+
+The fix is the rule already recorded for the `systemctl` stub: **a sandbox may
+PROVIDE an external dependency; it may not weaken the check.** The fixture
+defines `smartctl() { printf '%s' '{}'; }`, and because `command -v` resolves a
+FUNCTION before searching PATH, the sbin fallback is then never consulted --
+machine-independent by construction rather than by luck. Verified both ways.
+
+Swept for siblings: every other section driving a disk check already stubs
+`smartctl()` as a function, and the placeholder section returns at the
+`interp == 1` branch before the resolver is reached. That one section was the
+only one, and it was checked rather than assumed.
+
+**`DOMUM_SBIN_ROOT` now pins the "no smartctl ANYWHERE" branch, because it was
+UNDRIVABLE on this machine -- which is how the CI failure got through in the
+first place.** The section asserting absence had been written to branch on
+whether the host happened to carry an sbin smartctl and to PRINT which branch
+ran: honest, and it left the absence path unexercised here, so nothing local
+could have caught a neighbouring section depending on the runner. The seam
+defaults to empty (the absolute production paths) and a fixture points it at an
+empty directory. That is the same decision, for the same reason, as
+`DOMUM_SYSBLOCK_ROOT`: without an overridable root the branch "could never be
+driven and the test would default to ... pass for the wrong reason".
+
+**`probe` ends in `true`, so `probe ... ; echo "RC=$?"` can NEVER fail.** Two of
+my new assertions read that status and were therefore vacuous -- one of them the
+assertion that the resolver finds nothing. `smartctl_bin` prints the resolved
+path on success and nothing on failure, so the OUTPUT is the observable and the
+emptiness of it is the assertion. A harness that normalises its own exit status
+makes every status-based assertion through it meaningless; check what the
+harness returns before asserting on it.
+
+**The mutation says when it is NOT KILLABLE rather than reporting a kill that
+did not happen.** Neutralising the override can only change the answer on a
+machine that HAS an sbin smartctl; on a runner without one the override and its
+absence agree. So the section tests for that and prints it, with the
+deterministic assertions carrying the section either way -- a kill claimed on a
+machine where the mutant cannot differ is worse than no mutation at all.
+
+**A branch that depends on the machine is PRINTED, never skipped silently.**
+The fallback section asserts the sbin path is found where one exists and asserts
+the absence wording where none does, and says which branch ran. A silent skip
+would make it indistinguishable from a section that asserts nothing -- the
+fixture-skips-the-iteration mistake.
+
+`tests/health-checks-smoke.sh`, 6 new sections; 2 mutants, both killed.
+
+---
+
+**AN ESCAPE-UNAWARE VERIFIER REPORTED THREE CORRECT ROWS AS BROKEN, AND I
+ACTED ON IT AND CORRUPTED THEM.** Found 2026-11-11 while adding a backlog row:
+`awk -F'|'` over `backlog/QUEUE.md` reported four rows with the wrong cell
+count. One was genuinely broken -- P1.25 held a raw `ITEM=sqlite|navidrome.db|`
+inside a code span, and a raw `|` splits a markdown cell even there, so its
+status rendered as two phantom columns. **The other three were already
+correctly escaped** (`44\|600`, `docker save \| wc -c`, `docker logs \| grep`),
+and awk counts `\|` as a delimiter because it knows nothing of markdown
+escaping.
+
+My repair rebuilt each row by joining the awk fields with `\|`, which turned the
+three correct `\|` into `\\|` -- a literal backslash, not an escaped pipe. The
+round-trip check caught it: unescaping both files and comparing byte for byte
+showed three lines still differing, and a `\\|` assertion named the cause. The
+pre-repair `cp` is what made recovery one command, which is the rule this file
+already states for mutation testing and the reason it says `cp` rather than
+`git checkout`.
+
+**An audit that cannot see escaping tells you to break correct rows**, which is
+worse than not having it: a false positive in a verifier is acted on with the
+same confidence as a true one. The same mistake in the opposite direction is
+already recorded here -- the pipefail audit must not read `||` as a pipe, "or
+the audit flags the very fix it prescribes".
+
+`tests/queue-table-structure-audit.py` is escape-aware and rejects four shapes:
+a cell count other than three, a row with **no** status cell (the recorded P1.7
+defect, which survived four commits), a status cell that is **blank** -- which
+reads as "no status" rather than as "blocked" -- and a `\\|`. It defaults to the
+real queue so a forgotten argument checks production rather than nothing, and
+reports problems BEFORE the vacuity guard, because a stale row pattern yields
+zero matches AND a finding and the finding is the actionable half.
+
+**The ACCEPTANCE cases are the ones that matter here**, and that is the whole
+lesson: `tests/queue-table-structure-smoke.sh` requires a correctly escaped
+pipe to be ACCEPTED, alongside the four rejections, because a single-direction
+assertion cannot tell this audit from the escape-unaware version that started
+the damage. Its fixtures carry 45 filler rows so a rejection case can never
+pass by tripping the vacuity floor instead. 9 sections.
+
+---
+
+**`x="$(cmd | jq ... || echo fallback)"` BUILDS A VALUE OUT OF *BOTH*
+FALLBACKS, and it does so exactly when something is wrong.** Found 2026-11-11
+by rendering the weekly report unprivileged. Under `pipefail` the pipeline
+reports the LEFT side's status, so when `cmd` fails while still printing
+parseable output, jq succeeds and prints its own default **and** the non-zero
+pipeline fires `|| echo fallback` on top of it. Measured against the real host:
+
+```
+smartctl -j -i /dev/sda   exits 2 (permission denied) and still emits JSON
+model = $'unknown\nunknown'
+  rendered:   SMART /dev/sda         unknown
+            unknown: UNKNOWN no verdict
+```
+
+**The report's line grammar is load-bearing** -- this file already records that
+the HTML renderer wraps the text line by line keyed on PREFIX -- so a line that
+breaks in half mis-renders BOTH MIME parts. And it breaks precisely when a
+drive cannot be read, i.e. when the operator most needs the line.
+
+Three sites, all fixed by **capturing first** -- the same remedy this file
+prescribes for `cmd | grep -q`, for the same reason:
+
+- `model` and `passed` in the weekly report's DRIVE HEALTH block. Capturing
+  also HALVED the invocations: `smartctl -j -i` was being run twice per device,
+  once for the model and once for the power-on hours;
+- `mreport_smart_interpretable`'s attribute count. This one reached the right
+  verdict by accident -- the `^[0-9]+$` regex rejects a two-line value and
+  returns 2 -- which is the worst kind of safe, because nothing would ever have
+  surfaced it;
+- **the backup CLI's coverage evidence.** `cov_loc` became two JSON documents,
+  which `--argjson` rejects with `invalid JSON text`, so the whole evidence
+  write failed and the line reported `coverage : NOT RECORDED -- could not
+  write <file>`. The DIRECTION is safe (absent coverage evidence makes
+  `dr-status` report a WEAKER tier, never a stronger one) and the ATTRIBUTION
+  was wrong: nothing was unwritable.
+
+`|| true` as the fallback is safe and is deliberately NOT flagged -- it adds no
+output, so the value is jq's alone. The banned shape is specifically a fallback
+that PRINTS.
+
+**`A || B | C` IS NOT THE SHAPE**, and the distinction is what keeps the sweep
+usable. `||` binds looser than `|`, so that parses as `A || (B | C)`: the
+branches are exclusive and only one can produce a value -- verified by running
+it both ways rather than by reasoning about precedence. The defect needs the
+pipe and the printing fallback in the SAME branch.
+
+**SWEPT AND NEGATIVE-CONTROLLED: 1,785 command substitutions across both CLIs,
+`bin/domum-media-report` and `install.sh`; the four real sites were the only
+ones.** That claim is worth something only because the scanner was first
+required to FIND them: run against the pre-fix files it reports all four, and
+the two `A || B | C` sites are the whole of its over-reporting.
+
+**MY FIRST SCANNER SAID "none" AND WAS STRUCTURALLY BLIND TO A WHOLE CLASS OF
+SITES.** It matched `\$\([^()]*\|[^()]*\|\|\s*echo[^()]*\)` -- a character
+class that cannot cross a parenthesis -- so it could not see
+`jq -Rn '...{(.[1]): ...}...'` and missed the backup CLI's `cov_loc` site
+entirely while reporting the file clean. Parentheses are matched by BALANCE
+now, and a `|` inside a quoted jq filter or awk program is excluded by
+stripping quoted spans first, which took the noise from 62 hits to 6.
+
+That is the **second** verifier in one sitting whose verdict was decided by
+what it could not see -- the first being the escape-unaware `awk -F` that
+flagged three correct backlog rows. Both directions are dangerous and the
+false-clean one is worse, because nothing contradicts it. **A sweep's "none" is
+a claim about the scanner until the scanner has been shown finding the thing.**
+
+**THE SHIPPED `pipefail-grep-audit.py` DOES NOT SHARE THAT BLIND SPOT -- checked
+rather than assumed**, because a future reader of the paragraph above would
+reasonably wonder. Driven against a fixture root (its `argv[1]` is a ROOT, not a
+file list -- passing bare files scans nothing) it rejects all four hostile
+shapes: the plain `cmd | grep -q`, one inside a `$( )` whose body carries nested
+parens, one split across continuations with an awk program containing a quoted
+`|`, and an awk program containing a paren. It accepts both correct forms, the
+capture-first fix and a bare `|| true`. So the family with thirteen recorded
+instances is genuinely covered, and the blind spot was mine alone. "We looked
+and decided no" is worth as much as an audit.
+
+**AND THE REPORT BLAMED VENDOR PLACEHOLDERS FOR A TABLE IT COULD NOT READ.**
+`mreport_smart_interpretable` returns three states -- `0` interpretable, `1`
+placeholders, `2` could not be read -- and the report tested it with
+`if ! f`, which cannot tell 1 from 2. So an unreadable table rendered as
+`NOT INTERPRETABLE -- vendor attributes`: a confident wrong CAUSE in the
+document the operator reads. This file already records fixing exactly that in
+`checkup_disk_wear`, and notes approvingly that "both non-zero values stay
+falsy, so every existing `if ! f` caller is unaffected" -- **"unaffected" was
+the defect**. Fixing one end of a report and leaving the other is a family this
+file records twice; this is the third.
+
+**A SECOND COPY OF A LINE BREAKS A MUTATION ANCHOR IN A DIFFERENT FUNCTION.**
+Adding the three-state guard to the report created an 8-space copy of
+`mreport_smart_interpretable "$dev"; interp=$?`, and `health-checks-smoke`'s
+wear mutation anchors on `checkup_disk_wear`'s 2-space copy as a SUBSTRING --
+so it matched twice and the suite failed against correct code. Newline-anchored,
+the indentation is exact. That is the third occurrence of the substring-anchor
+trap in two sittings, and the `matched %d times` assertion caught all three.
+
+**A RESTORE MUST NOT BE CHAINED BEHIND COMMANDS WHOSE STATUS YOU HAVE NOT
+REASONED ABOUT.** My first attempt at this fix over-escaped the shell quoting
+(`'"'"'` is a trick for use INSIDE a single-quoted shell string and is
+meaningless when python writes the file directly), so the jq FILTER leaked into
+the rendered value. The repair was `cp <backup> <file> && ... && python3 fix.py`
+in one `&&` chain -- and the chain broke before the restore took effect, so the
+"fixed" run operated on the already-broken file and reported six edits applied.
+Re-running the identical steps SEPARATELY worked. This is the recorded mutation
+rule -- "take the backup before the mutation, unconditionally... not chained
+after the command being tested" -- in its mirror image: the RESTORE needs the
+same unconditional treatment, and a multi-step repair gets one step per command.
+
+`tests/health-checks-smoke.sh`; the three render cases (unreadable,
+placeholders, a real wear figure) were each driven against the real renderer.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

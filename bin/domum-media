@@ -25,6 +25,36 @@ need_root() {
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# The usable smartctl, or empty. `cmd_exists smartctl` is NOT enough: smartctl
+# lives in /usr/sbin, which is on root's PATH and not on an unprivileged
+# account's -- so `checkup` under sudo found it while the same code run as the
+# development account reported "smartmontools is not installed" about a host
+# carrying 7.4-3. That is a wrong CAUSE and an apt-get remedy for a package that
+# is present. This file records the identical PATH trap twice, for smartctl
+# itself and for mkfs.btrfs, as a mistake of mine; the code made it too.
+#
+# The sbin fallbacks make the check answer the same way whichever account runs
+# it, which also means the real checks can be driven unprivileged -- the method
+# that found two defects here. When the tool is genuinely absent this still
+# returns non-zero and the "appears genuinely absent" branch is then true.
+smartctl_bin() {
+  local c
+  c="$(command -v smartctl 2>/dev/null || true)"
+  if [[ -n "$c" ]]; then printf '%s' "$c"; return 0; fi
+  # DOMUM_SBIN_ROOT exists so the "no smartctl ANYWHERE" branch can be TESTED.
+  # It defaults to empty, i.e. the absolute production paths. Without it that
+  # branch is undrivable on any machine that HAS smartctl -- and a section
+  # asserting a neighbouring branch silently depended on the RUNNER lacking it,
+  # which passed here and failed in CI. Same reasoning, and the same shape, as
+  # DOMUM_SYSBLOCK_ROOT: a fixture points it at an empty directory, and the
+  # production path is what an unset value gives.
+  local root="${DOMUM_SBIN_ROOT:-}"
+  for c in "$root/usr/sbin/smartctl" "$root/sbin/smartctl" "$root/usr/local/sbin/smartctl"; do
+    [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
 uppercase_token() {
   printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_' | tr -c 'A-Z0-9_' '_'
 }
@@ -6105,8 +6135,9 @@ checkup_btrfs_health() {
 # words. Nothing is installed automatically: that is a host change and belongs
 # to the operator.
 checkup_disk_health() {
-  if ! cmd_exists smartctl; then
-    checkup_add warning "Disk SMART health is UNKNOWN: smartmontools is not installed."
+  local smartctl_path
+  if ! smartctl_path="$(smartctl_bin)"; then
+    checkup_add warning "Disk SMART health is UNKNOWN: no smartctl was found on PATH or in the usual sbin locations, so smartmontools appears genuinely absent."
     checkup_add action "apt-get install -y smartmontools   # then checkup reports real disk health"
     return 0
   fi
@@ -6131,7 +6162,7 @@ checkup_disk_health() {
   local dev out passed
   while IFS= read -r dev; do
     [[ -n "$dev" ]] || continue
-    out="$(smartctl -j -H "/dev/$dev" 2>/dev/null || true)"
+    out="$("$smartctl_path" -j -H "/dev/$dev" 2>/dev/null || true)"
     # NOT `// empty`. jq's `//` is FALSE-coalescing, not null-coalescing:
     # `false // empty` produces NOTHING, so a drive that genuinely FAILED its
     # self-assessment would be indistinguishable from one that could not be
@@ -6182,7 +6213,18 @@ checkup_disk_health() {
 # `healthy`: unavailable wear information is not evidence of health, and saying
 # so is the whole point. Advice is printed and escalates nothing.
 checkup_disk_wear() {  # $1 = device name
-  local dev="$1" wear interp
+  # smartctl_path is resolved HERE and never inherited. Bash's dynamic scoping
+  # leaks the caller's local, so a use that reads the caller's variable works
+  # from checkup_disk_health and is UNBOUND for every other caller -- including
+  # the six test sections that drive this function directly. Worse, the use
+  # below is inside a command substitution ending in `|| true`, so `set -u`
+  # kills the subshell, the status is swallowed, and `wear` comes back EMPTY:
+  # a drive reporting 5% of its write life left is then reported as
+  # "no wear attribute, UNMEASURED", which is advice and does NOT mail. A
+  # silently wrong answer in the check that exists to notice a dying disk.
+  # Resolving at the use site is the rule this file records for
+  # DISK_WEAR_WARN_PERCENT, and for the same reason.
+  local dev="$1" wear interp smartctl_path
   mreport_smart_interpretable "$dev"; interp=$?
   if (( interp == 2 )); then
     # Not the same finding as placeholders, and it must not borrow its words.
@@ -6193,7 +6235,8 @@ checkup_disk_wear() {  # $1 = device name
     checkup_add advice "wear for /dev/$dev is NOT INTERPRETABLE -- every attribute reads alike, so the table holds vendor placeholders. That is not evidence of health, and no remaining-life figure can be derived from it."
     return 0
   fi
-  wear="$(smartctl -j -A "/dev/$dev" 2>/dev/null \
+  smartctl_path="$(smartctl_bin)" || return 0
+  wear="$("$smartctl_path" -j -A "/dev/$dev" 2>/dev/null \
           | jq -r '[.ata_smart_attributes.table[]? | select(.name|test("Wear_Leveling|Percent_Lifetime|Media_Wearout"))][0].value | if . == null then "" else tostring end' 2>/dev/null || true)"
   if [[ ! "$wear" =~ ^[0-9]+$ ]]; then
     checkup_add advice "/dev/$dev reports no wear attribute, so remaining life is UNMEASURED. The self-assessment above is the drive's own opinion and not a wear figure."
@@ -6714,10 +6757,12 @@ mreport_scrub_age_days() {
 # Highest drive temperature across physical disks, or empty when unreadable.
 mreport_disk_temp_c() {
   local dev t best=""
-  cmd_exists smartctl && cmd_exists jq || return 0
+  local smartctl_path
+  smartctl_path="$(smartctl_bin)" || return 0
+  cmd_exists jq || return 0
   while IFS= read -r dev; do
     [[ -n "$dev" ]] || continue
-    t="$(smartctl -j -A "/dev/$dev" 2>/dev/null \
+    t="$("$smartctl_path" -j -A "/dev/$dev" 2>/dev/null \
          | jq -r '.temperature.current | if . == null then "" else tostring end' 2>/dev/null || true)"
     [[ "$t" =~ ^[0-9]+$ ]] || continue
     [[ -z "$best" ]] && best="$t"
@@ -6748,8 +6793,16 @@ mreport_disk_temp_c() {
 mreport_smart_interpretable() {  # $1 = device name
   local n
   cmd_exists jq || return 2
-  n="$(smartctl -j -A "/dev/$1" 2>/dev/null \
-       | jq -r '[.ata_smart_attributes.table[]?.value] | unique | length' 2>/dev/null || echo 0)"
+  local sb; sb="$(smartctl_bin)" || return 2
+  # Capture first: smartctl can fail while still emitting JSON, and then the
+  # pipeline's status fires `|| echo 0` on top of jq's own output, giving two
+  # lines. It happened to reach the right verdict here (the regex below rejects
+  # a two-line value and returns 2), which is the worst kind of safe.
+  local attrs
+  attrs="$("$sb" -j -A "/dev/$1" 2>/dev/null || true)"
+  [[ -n "$attrs" ]] || return 2
+  n="$(jq -r '[.ata_smart_attributes.table[]?.value] | unique | length' <<< "$attrs" 2>/dev/null || true)"
+  [[ -n "$n" ]] || n=0
   [[ "$n" =~ ^[0-9]+$ ]] || return 2
   (( n == 0 )) && return 2
   (( n > 1 ))
@@ -6953,34 +7006,62 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
 
     # --- DRIVE HEALTH --------------------------------------------------------
     mreport_hdr "DRIVE HEALTH"
-    if ! cmd_exists smartctl; then
+    local smartctl_path
+    if ! smartctl_path="$(smartctl_bin)"; then
       printf '  %-22s UNKNOWN \xe2\x96\xb2 smartmontools absent\n' "SMART"
     else
-      local dev model passed poh wear
+      local dev model passed poh wear info health interp
       while IFS= read -r dev; do
         [[ -n "$dev" ]] || continue
-        model="$(smartctl -j -i "/dev/$dev" 2>/dev/null | jq -r '.model_name // "unknown"' 2>/dev/null || echo unknown)"
-        passed="$(smartctl -j -H "/dev/$dev" 2>/dev/null | jq -r '.smart_status.passed | tostring' 2>/dev/null || echo null)"
+        # CAPTURE FIRST. `x="$(cmd | jq ... || echo fallback)"` is wrong under
+        # pipefail: when cmd fails but jq still prints its own default, the
+        # pipeline reports cmd's status and the fallback fires TOO, so x becomes
+        # TWO lines. Measured unprivileged -- smartctl exits 2 while still
+        # emitting JSON -- and the rendered line broke in half:
+        #     SMART /dev/sda         unknown
+        #   unknown: UNKNOWN no verdict
+        # The report's line grammar is load-bearing (the HTML renderer wraps it
+        # line by line keyed on PREFIX), so a broken line mis-renders both MIME
+        # parts, and it breaks precisely when a drive cannot be read. Capturing
+        # also halves the invocations: `-j -i` was being run twice per device.
+        info="$("$smartctl_path" -j -i "/dev/$dev" 2>/dev/null || true)"
+        health="$("$smartctl_path" -j -H "/dev/$dev" 2>/dev/null || true)"
+        [[ -n "$info" ]] || info='{}'
+        [[ -n "$health" ]] || health='{}'
+        model="$(jq -r '.model_name // "unknown"' <<< "$info" 2>/dev/null || true)"
+        [[ -n "$model" ]] || model="unknown"
+        passed="$(jq -r '.smart_status.passed | tostring' <<< "$health" 2>/dev/null || true)"
+        [[ -n "$passed" ]] || passed="null"
         case "$passed" in
           true)  printf '  %-22s %s: passed\n' "SMART /dev/$dev" "$model" ;;
           false) printf '  %-22s %s: DID NOT PASS \xe2\x9c\x97\n' "SMART /dev/$dev" "$model" ;;
           *)     printf '  %-22s %s: UNKNOWN \xe2\x96\xb2 no verdict\n' "SMART /dev/$dev" "$model" ;;
         esac
-        poh="$(smartctl -j -i "/dev/$dev" 2>/dev/null | jq -r '.power_on_time.hours | if . == null then "" else tostring end' 2>/dev/null || true)"
+        poh="$(jq -r '.power_on_time.hours | if . == null then "" else tostring end' <<< "$info" 2>/dev/null || true)"
         [[ -n "$poh" ]] && printf '  %-22s %s h\n' "  power on" "$poh"
         # Wear is reported ONLY when the attribute table is interpretable. A
         # drive reporting every attribute identically is reporting placeholders,
         # and "0% wear" derived from that would be invented.
-        if mreport_smart_interpretable "$dev"; then
-          wear="$(smartctl -j -A "/dev/$dev" 2>/dev/null \
+        # THREE states, not two. `if ! f` cannot tell status 1 (the table holds
+        # vendor placeholders) from status 2 (it could not be READ), so an
+        # unreadable table was blamed on vendor attributes -- a confident wrong
+        # CAUSE in the document the operator reads. This file already records
+        # fixing exactly that in `checkup_disk_wear`; the report kept the
+        # defect, which is the "one end of a report fixed and not the other"
+        # family.
+        mreport_smart_interpretable "$dev"; interp=$?
+        if (( interp == 0 )); then
+          wear="$("$smartctl_path" -j -A "/dev/$dev" 2>/dev/null \
                   | jq -r '[.ata_smart_attributes.table[]? | select(.name|test("Wear_Leveling|Percent_Lifetime|Media_Wearout"))][0].value | if . == null then "" else tostring end' 2>/dev/null || true)"
           if [[ "$wear" =~ ^[0-9]+$ ]]; then
             printf '  %-22s %s%% of rated life remaining%s\n' "  wear" "$wear" "$(mreport_flag "$(( 100 - wear ))" 50 80 90)"
           else
             printf '  %-22s no wear attribute reported\n' "  wear"
           fi
-        else
+        elif (( interp == 1 )); then
           printf '  %-22s NOT INTERPRETABLE -- vendor attributes\n' "  wear"
+        else
+          printf '  %-22s UNKNOWN \xe2\x96\xb2 could not be read\n' "  wear"
         fi
       done < <(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
     fi

@@ -423,6 +423,17 @@ jobs:
       - name: No conflict markers smoke test
         run: tests/no-conflict-markers-smoke.sh
 
+      # P1.7 -- the row gating the whole selective-backup priority -- carried a
+      # two-cell row in a three-cell table for four commits, because an edit
+      # rebuilt the line from the prefix it searched with. An empty status
+      # column reads as "no status", not as "blocked", in the one file whose
+      # purpose is to survive context compaction.
+      - name: Backlog table structure
+        run: python3 tests/queue-table-structure-audit.py
+
+      - name: Backlog table structure smoke test
+        run: tests/queue-table-structure-smoke.sh
+
       # Prevent private/tailnet addresses and backup account IDs from returning
       # to tracked text. The audit redacts matched values in its CI output.
       - name: Infrastructure identifier audit

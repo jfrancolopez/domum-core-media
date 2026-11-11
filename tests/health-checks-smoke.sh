@@ -437,7 +437,11 @@ echo "  says it could not read, and claims nothing"
 
 # ---------------------------------------------------------------------------
 sect "absent smartmontools is UNKNOWN with a remedy, not a clean bill"
-out="$(probe 'cmd_exists() { [[ "$1" != smartctl ]]; }' checkup_disk_health)"
+# The absence seam is smartctl_bin, NOT cmd_exists: the resolver deliberately
+# looks past PATH into /usr/sbin, because `command -v` depends on PATH and
+# smartctl is not on an unprivileged account's. Stubbing cmd_exists would leave
+# the sbin fallbacks live and this section would assert nothing.
+out="$(probe 'smartctl_bin() { return 1; }' checkup_disk_health)"
 grep -q 'WARN|Disk SMART health is UNKNOWN' <<< "$out" \
   || fail "a missing tool must report UNKNOWN: $out"
 grep -q 'ACT|apt-get install -y smartmontools' <<< "$out" || fail "no remedy: $out"
@@ -598,8 +602,16 @@ grep -q 'WARN|SMART health for /dev/sda is UNKNOWN' <<< "$out" \
 echo "  prose containing OK is still UNKNOWN"
 
 sect "SMART: jq absent is UNKNOWN with a remedy, not silence"
+# smartctl must be PROVIDED, not left to the machine. `smartctl_bin` no longer
+# consults cmd_exists -- it looks past PATH into /usr/sbin, deliberately -- so
+# hiding jq through cmd_exists is not enough: on a runner with no smartctl
+# anywhere the resolver fails FIRST and the smartctl-absent branch wins before
+# the jq check is reached. That is exactly what happened; this section passed
+# here, where /usr/sbin/smartctl exists, and failed in CI. The sandbox supplies
+# the dependency rather than the check being weakened.
 out="$(probe "
 lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{}'; }
 cmd_exists() { [[ \"\$1\" != jq ]]; }
 " checkup_disk_health)"
 grep -qi 'jq is not installed' <<< "$out" || fail "a missing jq is not reported: $out"
@@ -869,6 +881,166 @@ grep -q 'placeholder' <<< "$out" \
 grep -q 'CRITICAL' <<< "$out" && fail "an unreadable table reported CRITICAL: $out"
 echo "  2 unreadable / 1 placeholders / 0 interpretable, and the advice matches"
 
+sect "smartctl is resolved by PATH *and* the usual sbin locations"
+# `command -v smartctl` depends on PATH, and smartctl lives in /usr/sbin --
+# which is on root's PATH and not on an unprivileged account's. So the same code
+# found it under sudo and reported "smartmontools is not installed" about a host
+# carrying 7.4-3: a wrong CAUSE and an apt-get remedy for a package that is
+# present. This file records the identical PATH trap twice as a human mistake;
+# the code made it too.
+printf '#!/bin/sh\nprintf "%%s" "{}"\n' > "$TMP/bin/smartctl"
+chmod +x "$TMP/bin/smartctl"
+out="$(probe '' smartctl_bin)"
+grep -qF "$TMP/bin/smartctl" <<< "$out" \
+  || fail "a smartctl ON PATH was not resolved: $out"
+# A shell FUNCTION must still be honoured, or every stub in this suite is
+# bypassed and the sections below silently invoke the HOST's smartctl.
+out="$(probe "smartctl() { :; }" smartctl_bin)"
+grep -qx 'smartctl' <<< "$out" \
+  || fail "a function stub was not resolved to itself: $out"
+echo "  resolved from PATH, and a function stub resolves to itself"
+
+sect "with smartctl present, the check does NOT claim it is uninstalled"
+# The wrong-cause half. The verdict may legitimately be UNKNOWN (the stub
+# returns {}), but it must not name an absent package as the reason.
+out="$(probe '' checkup_disk_health)"
+grep -q 'smartmontools is not installed' <<< "$out" \
+  && fail "it claimed smartmontools is absent while a smartctl was on PATH: $out"
+grep -q 'apt-get install' <<< "$out" \
+  && fail "it offered an install remedy for a package that is present: $out"
+echo "  no absent-package claim and no install remedy while smartctl is present"
+
+sect "a genuinely absent smartctl still reports absent"
+# DETERMINISTIC on any machine. This section used to branch on whether the host
+# happened to have an sbin smartctl and print which branch ran -- honest, but it
+# meant the "none anywhere" path was undrivable here, and that is precisely how
+# a sibling section came to depend on the RUNNER lacking smartctl and failed in
+# CI. DOMUM_SBIN_ROOT pins it, exactly as DOMUM_SYSBLOCK_ROOT pins the
+# rotational branch.
+mkdir -p "$TMP/nosbin"
+NOSMART='export PATH=/nonexistent; export DOMUM_SBIN_ROOT="'"$TMP/nosbin"'"'
+# The OBSERVABLE is the output, not the status: `probe` ends in `true`, so its
+# own exit code is always 0 and an `RC=$?` assertion can never fail. smartctl_bin
+# prints the resolved path on success and nothing on failure.
+out="$(probe "$NOSMART" smartctl_bin)"
+[[ -z "${out//[[:space:]]/}" ]] \
+  || fail "the resolver found a smartctl with none anywhere: $out"
+out="$(probe "$NOSMART
+lsblk() { printf 'sda disk\n'; }" checkup_disk_health)"
+grep -q 'appears genuinely absent' <<< "$out" \
+  || fail "with no smartctl anywhere it did not report absence: $out"
+grep -q 'ACT|apt-get install -y smartmontools' <<< "$out" \
+  || fail "no install remedy when the package really is absent: $out"
+grep -q 'OK|SMART' <<< "$out" && fail "it claimed health with no tool: $out"
+echo "  absence is reported as absence, with the install remedy, on any machine"
+
+sect "with smartctl present the absent-package wording must NOT appear"
+# The other direction, and what makes the section above falsifiable: the same
+# fixture with a smartctl available must stop claiming the package is missing.
+out="$(probe "$NOSMART
+lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{}'; }" checkup_disk_health)"
+grep -q 'appears genuinely absent' <<< "$out" \
+  && fail "it claimed the package was absent while a smartctl was available: $out"
+echo "  the absence claim is gone the moment a smartctl can be resolved"
+
+sect "MUTATION: ignoring DOMUM_SBIN_ROOT"
+# Without the override the sbin paths are absolute, so on a machine that HAS
+# smartctl the absence branch becomes undrivable and the section above passes
+# for the wrong reason -- or fails, depending on the machine. Either way the
+# suite stops being a test of the code.
+cp "$CLI" "$TMP/cli.orig.sbin"
+cat > "$TMP/mutate-sbin.py" <<'PYSBIN'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  local root="${DOMUM_SBIN_ROOT:-}"\n'
+new = '  local root=""\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYSBIN
+( python3 -I "$TMP/mutate-sbin.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.sbin" "$CLI"; fail "the sbin mutation did not apply"; }
+mout="$(probe "$NOSMART" smartctl_bin)"
+cp "$TMP/cli.orig.sbin" "$CLI"
+if [[ -x /usr/sbin/smartctl || -x /sbin/smartctl || -x /usr/local/sbin/smartctl ]]; then
+  [[ -z "${mout//[[:space:]]/}" ]] \
+    && fail "the mutation changed no ANSWER -- ignoring DOMUM_SBIN_ROOT must make
+the resolver find this machine's real sbin smartctl despite the override: $mout"
+  echo "  killed: without the override the real sbin smartctl is found anyway"
+else
+  # Nothing to find, so the mutation cannot change the answer. Say so rather
+  # than reporting a kill that did not happen.
+  echo "  NOT KILLABLE HERE: this machine has no sbin smartctl, so the override
+    and its absence agree. The assertion above is what carries the section."
+fi
+
+sect "checkup_disk_wear resolves its own smartctl and still escalates"
+# The regression that matters, and it was introduced BY the PATH fix: the wear
+# read sat inside a command substitution ending in `|| true`, so when
+# smartctl_path was inherited rather than declared, `set -u` killed the
+# subshell, the status was swallowed, and `wear` came back EMPTY. A drive with
+# 5% of its write life left was then reported as "no wear attribute,
+# UNMEASURED" -- advice, which does NOT mail. Driven STANDALONE on purpose,
+# because calling it through checkup_disk_health leaks the caller's local and
+# hides the defect entirely.
+DYING="
+  mreport_smart_interpretable() { return 0; }
+  smartctl() { printf '%s' '{\"ata_smart_attributes\":{\"table\":[{\"name\":\"Wear_Leveling_Count\",\"value\":5}]}}'; }
+"
+out="$(probe "$DYING
+  w() { checkup_disk_wear sdb; }" w)"
+grep -q 'CRIT|/dev/sdb reports only 5%' <<< "$out" \
+  || fail "a drive with 5% of its write life left did not escalate: $out"
+grep -q 'no wear attribute' <<< "$out" \
+  && fail "the wear figure was lost and reported as UNMEASURED: $out"
+echo "  5% remaining escalates to CRITICAL when driven standalone"
+
+sect "every \$smartctl_path use is inside a function that declares it"
+# This guard is what caught the above. Bash's dynamic scoping means a use that
+# reads the caller's local WORKS from one call site and is unbound from every
+# other, so the defect is invisible to any test that drives only the caller.
+bad="$(awk '
+  /^[a-z_]+\(\) \{/ { fn=$1 }
+  /local .*smartctl_path/ { decl[fn]=1 }
+  /\$smartctl_path/ && !/local .*smartctl_path/ && !decl[fn] { print NR": "fn }
+' "$CLI")"
+[[ -z "$bad" ]] || fail "\$smartctl_path is read where it is not declared:
+$bad"
+nuses="$(grep -c '\$smartctl_path' "$CLI")"
+(( nuses >= 4 )) || fail "only $nuses uses found -- the guard is scanning nothing"
+echo "  $nuses uses, every one inside its declaring function"
+
+sect "MUTATION: checkup_disk_wear inheriting the caller's smartctl_path"
+# The dangerous direction: it keeps working from checkup_disk_health and
+# silently loses the wear figure everywhere else.
+cp "$CLI" "$TMP/cli.orig.inherit"
+cat > "$TMP/mutate-inherit.py" <<'PYINH'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  local dev="$1" wear interp smartctl_path\n'
+new = '  local dev="$1" wear interp\n'
+assert s.count(old) == 1, "decl anchor matched %d times" % s.count(old)
+s = s.replace(old, new, 1)
+old2 = '  smartctl_path="$(smartctl_bin)" || return 0\n  wear="$("$smartctl_path"'
+new2 = '  wear="$("$smartctl_path"'
+assert s.count(old2) == 1, "resolve anchor matched %d times" % s.count(old2)
+io.open(p, "w", encoding="utf-8").write(s.replace(old2, new2, 1))
+PYINH
+( python3 -I "$TMP/mutate-inherit.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.inherit" "$CLI"; fail "the inherit mutation did not apply"; }
+mout="$(probe "$DYING
+  w() { checkup_disk_wear sdb; }" w)"
+cp "$TMP/cli.orig.inherit" "$CLI"
+grep -q 'CRIT|/dev/sdb reports only 5%' <<< "$mout" \
+  && fail "the mutation changed no ANSWER -- inheriting the caller's local must
+lose the wear figure when the function is driven standalone: $mout"
+grep -q 'no wear attribute' <<< "$mout" \
+  || fail "the mutant lost the figure in some other way than the UNMEASURED
+advice, so this section is not observing the defect it describes: $mout"
+echo "  killed: inheriting the local turns a dying drive into 'UNMEASURED'"
+
 sect "MUTATION: treating uninterpretable attributes as a wear figure"
 # The dangerous direction and the reason this file records NOT thresholding raw
 # attributes: a drive reporting placeholders would read as a confident healthy.
@@ -880,8 +1052,11 @@ s = io.open(p, encoding="utf-8").read()
 # The guard is now two branches on a THREE-state status (0 interpretable,
 # 1 placeholders, 2 unreadable), so neutralising it means forcing the status to
 # 0 rather than deleting one `if`.
-old = '  mreport_smart_interpretable "$dev"; interp=$?'
-new = '  mreport_smart_interpretable "$dev"; interp=0'
+# NEWLINE-anchored, so the 2-space indent is exact. The weekly report gained an
+# 8-space copy of this same line when its own three-state guard was fixed, and a
+# substring anchor matches both -- the defect this suite itself ran into.
+old = '\n  mreport_smart_interpretable "$dev"; interp=$?\n'
+new = '\n  mreport_smart_interpretable "$dev"; interp=0\n'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT

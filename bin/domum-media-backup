@@ -1613,8 +1613,19 @@ missed the 58 originals under encoded-video/."
   # was measured against. A denominator with no stated provenance is how the
   # filesystem-walk figure passed for an original count for as long as it did.
   local cov_loc
-  cov_loc="$(inventory_by_location "$inv" "$lib" \
-    | jq -Rn '[inputs | split(" ") | {(.[1]): (.[0]|tonumber)}] | add // {}' 2>/dev/null || echo '{}')"
+  # Capture first. `x="$(producer | jq ... || echo fallback)"` is wrong under
+  # pipefail: when the producer fails but jq still prints, the fallback fires
+  # TOO and x becomes two JSON documents -- measured, an object followed by {}.
+  # That is then rejected by --argjson ("invalid JSON text"), so the whole
+  # evidence write fails and the coverage line reports "could not write
+  # $cov_file", naming a cause that is not the one. The DIRECTION is safe --
+  # dr-status reports a WEAKER tier when the evidence is absent -- and the
+  # attribution was wrong.
+  local cov_rows
+  cov_rows="$(inventory_by_location "$inv" "$lib" || true)"
+  cov_loc="$(jq -Rn '[inputs | split(" ") | {(.[1]): (.[0]|tonumber)}] | add // {}' \
+    <<< "$cov_rows" 2>/dev/null || true)"
+  [[ -n "$cov_loc" ]] || cov_loc='{}'
   if jq -cn --arg t "$target" --arg o "$lib" --arg ts "$(date -Iseconds)" \
        --arg src "immich-asset-table" \
        --argjson tf "${c_tf:-0}" --argjson tb "${c_tb:-0}" \
