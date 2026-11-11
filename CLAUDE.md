@@ -7137,6 +7137,28 @@ Before adapting a test to a change, ask which of the two is wrong: here the
 property is still exactly right and only the seam moved, so the seam became
 `smartctl_bin() { return 1; }` and the assertions are untouched.
 
+**AND A SIBLING SECTION BECAME HOST-DEPENDENT IN A NEW DIMENSION: whether the
+MACHINE HAS SMARTCTL AT ALL.** `SMART: jq absent is UNKNOWN with a remedy`
+hides jq through `cmd_exists` and asserts the jq branch. Because
+`smartctl_bin` deliberately looks past PATH into `/usr/sbin`, hiding jq is no
+longer sufficient: on a runner with no smartctl anywhere the RESOLVER fails
+first and the smartctl-absent branch wins before the jq check is reached. It
+passed here, where `/usr/sbin/smartctl` exists, and **failed in CI** -- caught
+by CI rather than by me, which is the fifth dimension of host dependence this
+file has now recorded after PATH, SPEED, the host's awk, and the host's
+timezone.
+
+The fix is the rule already recorded for the `systemctl` stub: **a sandbox may
+PROVIDE an external dependency; it may not weaken the check.** The fixture
+defines `smartctl() { printf '%s' '{}'; }`, and because `command -v` resolves a
+FUNCTION before searching PATH, the sbin fallback is then never consulted --
+machine-independent by construction rather than by luck. Verified both ways.
+
+Swept for siblings: every other section driving a disk check already stubs
+`smartctl()` as a function, and the placeholder section returns at the
+`interp == 1` branch before the resolver is reached. That one section was the
+only one, and it was checked rather than assumed.
+
 **A branch that depends on the machine is PRINTED, never skipped silently.**
 The fallback section asserts the sbin path is found where one exists and asserts
 the absence wording where none does, and says which branch ran. A silent skip

@@ -602,8 +602,16 @@ grep -q 'WARN|SMART health for /dev/sda is UNKNOWN' <<< "$out" \
 echo "  prose containing OK is still UNKNOWN"
 
 sect "SMART: jq absent is UNKNOWN with a remedy, not silence"
+# smartctl must be PROVIDED, not left to the machine. `smartctl_bin` no longer
+# consults cmd_exists -- it looks past PATH into /usr/sbin, deliberately -- so
+# hiding jq through cmd_exists is not enough: on a runner with no smartctl
+# anywhere the resolver fails FIRST and the smartctl-absent branch wins before
+# the jq check is reached. That is exactly what happened; this section passed
+# here, where /usr/sbin/smartctl exists, and failed in CI. The sandbox supplies
+# the dependency rather than the check being weakened.
 out="$(probe "
 lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{}'; }
 cmd_exists() { [[ \"\$1\" != jq ]]; }
 " checkup_disk_health)"
 grep -qi 'jq is not installed' <<< "$out" || fail "a missing jq is not reported: $out"
