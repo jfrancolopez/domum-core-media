@@ -7720,6 +7720,44 @@ nothing about the inputs it would not have needed.
 
 ---
 
+**THE SCHEDULED PATH HAD NEVER BEEN THROUGH A REPOSITORY, AND "the pack chain
+is proven" was a claim about the per-service commands.** The unit runs
+`capture-all-state --pack` then `prune-state-packs --confirm`; neither existed
+when the repository round trip was written, so the proof covered one service
+through commands the unit does not call. Different path, different claim.
+
+`tests/pack-repository-roundtrip-smoke.sh` §11-18 drives it for every declared
+service: 5 captured and packed with a sidecar each, backed up, **every local
+pack, sidecar and capture destroyed**, restored (5 byte-identical, 5 sidecars
+intact and still parseable), verified, unpacked, restored to state, and then put
+through retention -- 5 retained, 0 superseded, none unknown.
+
+**THE SIDECAR IS THE LOAD-BEARING PART, and nothing had checked it survives a
+transfer.** Retention reads `<pack>.meta` for the service name, because the
+manifest is inside the ENCRYPTED pack and this host holds only the public key.
+Had the sidecar not survived, every restored pack would read as `unknown` after
+a real disaster -- kept, correctly, but retention could do nothing with them,
+and **nothing would have said so until the day it mattered**. The mutation
+removes the sidecar write and requires exactly that outcome: 0 retained, every
+pack unknown. Without that mutation §16's clean verdict would not have been
+earned by the sidecar at all.
+
+**§16 proves "never delete the only one" in the configuration most likely to
+break it.** After a disaster each service has exactly one pack, and
+`STATE_PACK_KEEP=1` is the setting that would delete something if the rule were
+wrong. Nothing is superseded.
+
+**What is still operator-gated is unchanged, and saying so is the point.** No
+pack has left this host -- the repository is a scratch directory under the
+test's own temp dir, asserted before anything is written -- and the operator's
+real age key has opened none; the identity is generated for the test. So the
+transfer medium is proven not to corrupt the artefacts and the whole scheduled
+chain works end to end, while the two claims needing a real target and a real
+key sit exactly where they were. **A disposable proof of the mechanism is not
+off-site protection**, and this file has corrected that conflation before.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

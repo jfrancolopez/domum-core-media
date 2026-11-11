@@ -10,10 +10,25 @@
 # kind of thing where a silent truncation would survive every check until the
 # day it was needed.
 #
-# WHAT THIS PROVES: capture -> pack -> restic backup -> the local pack DESTROYED
-# -> restic restore -> verify-pack -> unpack -> restore-state -> digests and
-# modes re-checked. The restored pack must be byte-identical to the one backed
-# up, and the state must come back out of it.
+# WHAT THIS PROVES, in two passes. First for ONE service through the
+# per-service commands: capture -> pack -> restic backup -> the local pack
+# DESTROYED -> restic restore -> verify-pack -> unpack -> restore-state ->
+# digests and modes re-checked.
+#
+# Then (11-18) for the SCHEDULED path, which is a different claim: the unit runs
+# `capture-all-state --pack` and `prune-state-packs --confirm`, and neither had
+# ever been through a repository. All five declared services are captured,
+# packed, backed up, DESTROYED locally, restored, verified, unpacked, restored
+# to state, and then put through retention -- which must retain every one of
+# them, because each is the only pack of its service.
+#
+# The sharpest part is the SIDECAR. Retention reads `<pack>.meta` for the
+# service name, because the manifest is inside the encrypted pack and this host
+# holds only the public key. If the sidecar did not survive a round trip, then
+# after a real disaster every restored pack would read as `unknown` -- kept,
+# correctly, but retention could do nothing with them, and nothing would have
+# said so until the day it mattered. A mutation removes the sidecar write and
+# requires exactly that outcome.
 #
 # WHAT IT DOES NOT PROVE, stated here because this is the easiest claim in the
 # project to overstate:
@@ -211,9 +226,178 @@ grep -qiE 'mismatch|does not match' <<< "$out" \
   || fail "10: the refusal does not name a checksum mismatch: $out"
 echo "   killed: damage in transit is caught before anything is decrypted"
 
+# ===========================================================================
+# 11-16: the SCHEDULED path, which is a different thing from the per-service
+# one proved above. The unit runs `capture-all-state --pack` and then
+# `prune-state-packs --confirm`, and neither had ever been through a
+# repository. The sharpest part is 14: retention reads the `.meta` SIDECAR, so
+# if that does not survive a round trip then after a real disaster every
+# restored pack reads as `unknown` and retention can do nothing with them.
+# ===========================================================================
+sect "11. capture-all-state --pack over EVERY declared service"
+# State synthesised from each service's OWN declaration, so this follows a
+# declaration change instead of needing an edit beside one.
+build_all_state() {
+  local svc kind rel
+  rm -rf -- "$TMP/data/state-all"
+  while IFS= read -r svc; do
+    [[ -n "$svc" ]] || continue
+    rm -rf -- "$TMP/data/$svc"
+    while IFS='|' read -r kind rel; do
+      [[ -n "$rel" ]] || continue
+      case "$kind" in
+        dir) mkdir -p "$TMP/data/$svc/$rel" ; printf 'x\n' > "$TMP/data/$svc/$rel/.keep" ;;
+        sqlite)
+          mkdir -p "$(dirname -- "$TMP/data/$svc/$rel")"
+          python3 - "$TMP/data/$svc/$rel" <<'MKDB2'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table t(id integer primary key, v text)")
+con.execute("insert into t values (1,'row')")
+con.commit(); con.close()
+MKDB2
+          ;;
+        *)  mkdir -p "$(dirname -- "$TMP/data/$svc/$rel")"
+            printf 'content for %s/%s\n' "$svc" "$rel" > "$TMP/data/$svc/$rel"
+            case "$rel" in *.key|*Preferences.xml) chmod 0600 "$TMP/data/$svc/$rel" ;; esac ;;
+      esac
+    done < <(probe '' "service_essential_state '$svc'")
+  done < <(probe '' "state_capture_services")
+}
+build_all_state
+SVCS="$(probe '' 'state_capture_services' | tr -d '\r')"
+n_svcs="$(grep -c . <<< "$SVCS")"
+(( n_svcs >= 5 )) || fail "11: only $n_svcs services derived; expected at least 5"
+out="$(probe '' "storage_capture_all_state --pack")"
+grep -q 'result      : done' <<< "$out" \
+  || fail "11: capture-all-state did not complete: $out"
+grep -q "packed      : $n_svcs" <<< "$out" \
+  || fail "11: not every service was packed: $out"
+PACKDIR="$(probe '' 'state_pack_dir')"
+n_packs="$(find "$PACKDIR" -maxdepth 1 -name '*.tar.age' 2>/dev/null | wc -l)"
+[[ "$n_packs" == "$n_svcs" ]] || fail "11: $n_packs packs for $n_svcs services"
+n_meta="$(find "$PACKDIR" -maxdepth 1 -name '*.tar.age.meta' 2>/dev/null | wc -l)"
+[[ "$n_meta" == "$n_svcs" ]] || fail "11: $n_meta sidecars for $n_svcs services"
+echo "   $n_svcs services captured and packed, each with a sidecar"
+
+sect "12. the whole pack directory goes into the repository"
+restic backup "$PACKDIR" >/dev/null 2>&1 \
+  || fail "12: the pack directory could not be backed up"
+echo "   backed up"
+
+sect "13. every LOCAL pack, sidecar and capture is destroyed"
+# Without this the restore could read the originals and prove nothing.
+before_sha="$(find "$PACKDIR" -maxdepth 1 -name '*.tar.age' -print0 | sort -z \
+              | xargs -0 sha256sum | awk '{print $1}' | sort | tr '\n' ' ')"
+rm -rf -- "$PACKDIR" "$TMP/data/backups/state"
+[[ ! -d "$PACKDIR" ]] || fail "13: the pack directory survived"
+echo "   gone; only the repository holds them now"
+
+sect "14. restored from the repository WITH the sidecars intact"
+# The sidecar is what retention reads. If it did not survive, every restored
+# pack would read as `unknown` after a real disaster -- kept, but unusable for
+# retention, and nothing would have said so.
+rst="$TMP/restore-all"
+restic restore latest --target "$rst" >/dev/null 2>&1 \
+  || fail "14: restore failed"
+RPACKDIR="$(find "$rst" -type d -name "$(basename -- "$PACKDIR")" | head -1)"
+[[ -n "$RPACKDIR" ]] || fail "14: the restored pack directory was not found under $rst"
+r_packs="$(find "$RPACKDIR" -maxdepth 1 -name '*.tar.age' | wc -l)"
+r_meta="$(find "$RPACKDIR" -maxdepth 1 -name '*.tar.age.meta' | wc -l)"
+[[ "$r_packs" == "$n_svcs" ]] || fail "14: $r_packs of $n_svcs packs restored"
+[[ "$r_meta"  == "$n_svcs" ]] || fail "14: $r_meta of $n_svcs SIDECARS restored --
+retention reads these, so without them every pack reads as unknown"
+after_sha="$(find "$RPACKDIR" -maxdepth 1 -name '*.tar.age' -print0 | sort -z \
+             | xargs -0 sha256sum | awk '{print $1}' | sort | tr '\n' ' ')"
+[[ "$before_sha" == "$after_sha" ]] \
+  || fail "14: the restored packs are not byte-identical
+   before: $before_sha
+   after : $after_sha"
+# Each sidecar must still name a service and a capture time.
+while IFS= read -r m; do
+  grep -qE '^SERVICE=[a-z]' "$m"      || fail "14: $m lost its SERVICE"
+  grep -qE '^CAPTURED_AT=[0-9]{4}' "$m" || fail "14: $m lost its CAPTURED_AT"
+done < <(find "$RPACKDIR" -maxdepth 1 -name '*.tar.age.meta')
+echo "   $r_packs packs byte-identical, $r_meta sidecars intact and still parseable"
+
+sect "15. every restored pack verifies, unpacks and restores its state"
+ok_v=0; ok_u=0
+while IFS= read -r pk; do
+  out="$(probe '' "service_state_pack_verify '$pk'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "15: $(basename -- "$pk") did not verify: $out"
+  ok_v=$(( ok_v + 1 ))
+  d="$TMP/unpack-$(basename -- "$pk" .tar.age)"
+  out="$(probe '' "service_state_unpack '$pk' '$TMP/keys/ident' '$d'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "15: $(basename -- "$pk") did not unpack: $out"
+  [[ -s "$d/MANIFEST" ]] || fail "15: no manifest in $d"
+  r="$TMP/rs-$(basename -- "$pk" .tar.age)"
+  out="$(probe '' "service_state_restore '$d' '$r'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "15: state did not restore from $(basename -- "$pk"): $out"
+  ok_u=$(( ok_u + 1 ))
+done < <(find "$RPACKDIR" -maxdepth 1 -name '*.tar.age' | sort)
+[[ "$ok_v" == "$n_svcs" && "$ok_u" == "$n_svcs" ]] \
+  || fail "15: verified $ok_v, restored $ok_u, of $n_svcs"
+echo "   $ok_v verified, $ok_u unpacked and restored"
+
+sect "16. retention works on the RESTORED set, and keeps the newest of each"
+# The second half of what the unit runs. Every restored pack is the only one of
+# its service, so NOTHING may be superseded -- "never delete the only one".
+out="$(probe "STATE_PACK_KEEP=1" "storage_prune_state_packs --confirm '$RPACKDIR'")"
+grep -q 'superseded  : 0' <<< "$out" \
+  || fail "16: retention proposed deleting a service's only pack: $out"
+grep -q "retained    : $n_svcs" <<< "$out" \
+  || fail "16: not every restored pack was retained: $out"
+grep -qi 'unknown' <<< "$out" \
+  && fail "16: a restored pack read as UNKNOWN -- its sidecar did not survive: $out"
+still="$(find "$RPACKDIR" -maxdepth 1 -name '*.tar.age' | wc -l)"
+[[ "$still" == "$n_svcs" ]] || fail "16: retention removed $(( n_svcs - still )) pack(s)"
+echo "   $n_svcs retained, 0 superseded, none unknown, nothing removed"
+
+sect "17. MUTATION: without the sidecar, retention cannot act after a disaster"
+# The sidecar is the whole reason retention works on a restored set: the service
+# name lives inside the ENCRYPTED pack otherwise, and this host holds only the
+# public key. Remove the sidecar write and the restored packs must all read as
+# `unknown` -- kept, correctly, but retention can do nothing with them and
+# nothing would have said so until the day it mattered.
+cp "$CLI" "$TMP/cli.orig.sidecar"
+cat > "$TMP/mutate-sidecar.py" <<'PYSC'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  } > "$dest.meta"\n'
+new = '  } > /dev/null\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYSC
+( python3 -I "$TMP/mutate-sidecar.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.sidecar" "$CLI"; fail "17: the sidecar mutation did not apply"; }
+rm -rf -- "$TMP/data/backups/state-packs" "$TMP/mut"
+build_all_state
+mout="$(probe '' "storage_capture_all_state --pack")"
+mdir="$(probe '' 'state_pack_dir')"
+m_meta="$(find "$mdir" -maxdepth 1 -name '*.tar.age.meta' 2>/dev/null | wc -l)"
+mret="$(probe "STATE_PACK_KEEP=1" "storage_prune_state_packs '$mdir'")"
+cp "$TMP/cli.orig.sidecar" "$CLI"
+[[ "$m_meta" == "0" ]] \
+  || fail "17: the mutation changed nothing -- $m_meta sidecars were still written"
+grep -qE 'unknown     : [1-9]' <<< "$mret" \
+  || fail "17: without sidecars the restored packs did not read as unknown, so
+section 16's clean verdict was not actually earned by the sidecar: $mret"
+grep -q 'retained    : 0' <<< "$mret" \
+  || fail "17: without sidecars something was still retained by service: $mret"
+echo "   killed: no sidecar -> every pack unknown, nothing retainable by service"
+
+sect "18. the CLI is restored after the mutations"
+grep -q '} > "$dest.meta"' "$CLI" || fail "18: the sidecar write is missing from the CLI"
+echo "   sidecar write is back"
+
 echo
 echo "PROVEN: capture -> pack -> repository -> restore -> unpack -> state, with the"
 echo "        local copies destroyed in between and the credential's mode and bytes"
-echo "        intact. NOT proven, and still operator-gated: that any pack has left"
-echo "        this host, and that the real age key opens one."
+echo "        intact -- for one service through the per-service commands, AND for"
+echo "        all five through the SCHEDULED path the unit runs, with retention"
+echo "        working on the restored set and the sidecars intact."
+echo "NOT proven, and still operator-gated: that any pack has left this host, and"
+echo "        that the real age key opens one. The repository here is a scratch"
+echo "        directory under the test's own temp dir."
 echo "ALL PACK-REPOSITORY CHECKS PASSED"
