@@ -6878,6 +6878,41 @@ tests" and "the behaviours are covered" can both be true and neither has to be
 guessed at. Listing which sections cover what is the difference between a
 coverage claim and coverage evidence.
 
+---
+
+**`command -v` FOUND NOTHING AND I REPORTED THE TOOL AS ABSENT -- for the third
+time, against the rule this file already states.** Asked whether a disposable
+btrfs filesystem could be built to exercise `storage scrub` end to end, I ran
+`command -v mkfs.btrfs` as the development account, got nothing, and wrote that
+it was not installed. It is: `/usr/sbin/mkfs.btrfs`, btrfs-progs 6.14-1, and it
+**works unprivileged on a plain file** (`rc=0`). `/usr/sbin` is simply not on
+that account's PATH. The recorded instance was `smartctl`; this is the same
+error in the same shape, and the fix is the same -- probe with the full path, or
+with the PATH the code will run under.
+
+**The real blocker is one group membership, which is a much narrower statement
+than "needs root".** Measured 2026-11-11:
+
+```
+mkfs.btrfs on a file          rc=0, works unprivileged
+mount -o loop                 failed to setup loop device
+/dev/loop-control             crw-rw---- root disk   -- not in `disk`
+btrfs scrub start -B <file>   ERROR: not a directory
+btrfs filesystem show/check   work against the unmounted image
+```
+
+`btrfs scrub` takes a MOUNT POINT, so the image must be mounted, and that needs
+a loop device. Several other btrfs commands run fine against the unmounted
+image, which is why the distinction matters: the tooling is present and the
+filesystem is real; only the mount is out of reach.
+
+**And the honest statement of what is missing is narrow too.** The scrub path
+has 26 driven sections and a mutation, plus something no fixture can give -- a
+REAL scrub on this host, 215.87 GiB in 7m14s with zero errors. What the
+disposable run would add is injecting a checksum error and watching **exit 3
+propagate for real**, which is precisely what a clean production run cannot
+demonstrate. That is the gap; it is not "the scrub is untested".
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
