@@ -1912,4 +1912,228 @@ grep -qE 'age could not encrypt the state pack$' <<< "$mout" \
 failure must carry no cause at all: $mout"
 echo "  killed: the mutant reports the fact with no cause"
 
+# ===========================================================================
+#  THE WHOLE CHAIN, FOR ALL FIVE SERVICES, IN CI.
+#
+#  operator/rehearsals/five-service-fresh-environment-recovery.sh proved this
+#  against the REAL images: five captures, five packs, every source destroyed
+#  and asserted gone, five restores with digests and modes re-checked. CI cannot
+#  run it -- it needs the production images and a Docker daemon -- so that proof
+#  has no regression net: a change to one service's declaration that broke the
+#  round trip would be caught by nothing automated.
+#
+#  This drives the chain hermetically instead: capture -> verify -> pack ->
+#  verify-pack -> unpack -> restore -> re-verify, once per service.
+#
+#  THE STATE IS SYNTHESISED FROM THE DECLARATION ITSELF, not from a hardcoded
+#  list, so the test FOLLOWS a declaration change rather than needing an edit
+#  beside it. That matters here specifically: three services gained a declared
+#  credential or identity in the last week, and a hardcoded fixture would have
+#  silently stopped covering them.
+#
+#  What it cannot show, stated rather than implied: CAPTURE_MODE=consistent,
+#  which needs an sqlite3 inside the service's own image. These captures are
+#  `unproven` by construction and the real-image rehearsal owns that claim.
+# ===========================================================================
+# ===========================================================================
+sect "CAPTURE_MODE is what HAPPENED, not what the declaration made POSSIBLE"
+# `mode` is decided up front from service_state_capture_mode -- does this service
+# ship an sqlite3 -- and was recorded as CAPTURE_MODE directly. So a capture
+# whose every database fell back to `cp` still claimed `consistent`, and the
+# restore reports that value to the operator as the strong claim. Measured
+# before the fix: CAPTURE_MODE=consistent beside ITEM=...|file-copy-unproven.
+#
+# The weakest result governs, as `storage scrub` already does across filesystems.
+build_navidrome_min() {
+  rm -rf "$TMP/data/navidrome"; mkdir -p "$TMP/data/navidrome"
+  python3 - "$TMP/data/navidrome/navidrome.db" <<'MKND'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table marker(i integer primary key)")
+con.commit(); con.close()
+MKND
+}
+build_navidrome_min
+rm -rf "$TMP/out/cap-mode"
+# docker is stubbed to fail and tracked_service_container_id_any returns 1, so
+# neither the in-image sqlite3 nor a helper is reachable: every sqlite item must
+# fall back, while navidrome's DECLARATION still says consistent is possible.
+out="$(probe '' "service_state_capture navidrome '$TMP/out/cap-mode'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "mode: the capture failed: $out"
+grep -q 'file-copy-unproven' "$TMP/out/cap-mode/MANIFEST" \
+  || fail "mode: the fixture did not actually force a fallback, so this proves nothing:
+$(cat "$TMP/out/cap-mode/MANIFEST")"
+grep -qx 'CAPTURE_MODE=unproven' "$TMP/out/cap-mode/MANIFEST" \
+  || fail "mode: a capture whose database fell back recorded
+$(grep '^CAPTURE_MODE' "$TMP/out/cap-mode/MANIFEST") -- the declared mode, not the achieved one"
+# And the case that used to be SILENT: declared possible, did not happen.
+grep -q 'DECLARED capable of a consistent capture' <<< "$out" \
+  || fail "mode: it did not warn that a consistent capture was possible and did not happen: $out"
+echo "  achieved mode recorded, and the previously-silent case warns"
+
+sect "and a capture that DID achieve a consistent copy still says consistent"
+# Otherwise the fix would simply make everything unproven, which is a check that
+# always fires -- indistinguishable from one that never looks.
+build_navidrome_min
+rm -rf "$TMP/out/cap-mode2"
+out="$(probe 'service_sqlite_backup() { cp -p -- "$2" "$3"; }' \
+  "service_state_capture navidrome '$TMP/out/cap-mode2'; echo RC=\$?")"
+grep -q 'RC=0' <<< "$out" || fail "mode2: the capture failed: $out"
+grep -q 'sqlite-backup' "$TMP/out/cap-mode2/MANIFEST" \
+  || fail "mode2: the stub did not take the .backup path: $(cat "$TMP/out/cap-mode2/MANIFEST")"
+grep -qx 'CAPTURE_MODE=consistent' "$TMP/out/cap-mode2/MANIFEST" \
+  || fail "mode2: a genuinely consistent capture was downgraded:
+$(grep '^CAPTURE_MODE' "$TMP/out/cap-mode2/MANIFEST")"
+grep -q 'DECLARED capable' <<< "$out" \
+  && fail "mode2: it warned about a capture that actually achieved consistency: $out"
+echo "  consistent still means consistent -- both directions asserted"
+
+sect "MUTATION: recording the DECLARED mode brings the overclaim back"
+cat > "$TMP/m-mode.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if (( sq_fellback > 0 )); then recorded_mode="unproven"; fi\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PY
+cp "$CLI" "$TMP/cli.mode.orig"
+python3 -I "$TMP/m-mode.py" "$CLI" || { cp "$TMP/cli.mode.orig" "$CLI"; fail "the mode mutation did not apply"; }
+build_navidrome_min
+rm -rf "$TMP/out/cap-mode3"
+mout="$(probe '' "service_state_capture navidrome '$TMP/out/cap-mode3'; echo RC=\$?")"
+mman="$(cat "$TMP/out/cap-mode3/MANIFEST" 2>/dev/null || true)"
+cp "$TMP/cli.mode.orig" "$CLI"
+grep -qx 'CAPTURE_MODE=consistent' <<< "$mman" \
+  || fail "mode3: the mutant did not record the declared mode -- the mutation changed no ANSWER:
+$mman"
+grep -q 'file-copy-unproven' <<< "$mman" \
+  || fail "mode3: the mutant's fixture did not fall back, so the overclaim is not demonstrated"
+grep -q 'DECLARED capable' <<< "$mout" \
+  && fail "mode3: the mutant still warned, so the warning does not depend on the achieved mode"
+echo "  killed: consistent claimed over a plain copy, and silently"
+
+sect "every declared item of all FIVE services survives capture -> pack -> restore"
+
+synthesise() {  # $1 = service -- build state at exactly its DECLARED paths
+  local svc="$1" root="$TMP/data/$svc" decl kind rel abs
+  rm -rf -- "$root"; mkdir -p "$root"
+  decl="$(probe '' "service_essential_state $svc")"
+  [[ -n "$decl" ]] || fail "five: $svc declares nothing"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    kind="${line%%|*}"; rel="${line#*|}"
+    abs="$root/$rel"
+    mkdir -p -- "$(dirname -- "$abs")"
+    case "$kind" in
+      sqlite)
+        # A REAL database: a digest over a file that cannot be opened would
+        # prove the bytes arrived and nothing about it being usable.
+        python3 - "$abs" <<'MKDB'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table marker(id integer primary key, note text)")
+con.execute("insert into marker values (1,'five-service-chain')")
+con.commit(); con.close()
+MKDB
+        ;;
+      file)
+        printf 'content-of-%s\n' "$(basename -- "$rel")" > "$abs"
+        # One declared file per service is given a RESTRICTED mode, because a
+        # restore that widened a credential's permissions would be a disclosure
+        # and a digest over contents alone would verify clean.
+        chmod 0600 -- "$abs"
+        ;;
+      dir)
+        mkdir -p -- "$abs"
+        printf 'key-material\n' > "$abs/key.xml"
+        chmod 0600 -- "$abs/key.xml"
+        ;;
+      *) fail "five: $svc declares an unrecognised kind '$kind' in: $line" ;;
+    esac
+  done <<< "$decl"
+}
+
+five_ok=0
+for svc in plex navidrome jellyfin kavita calibre-web; do
+  synthesise "$svc"
+  n_items="$(probe '' "service_essential_state $svc" | grep -c .)"
+
+  capdir="$TMP/out/five-$svc"
+  rm -rf -- "$capdir"
+  out="$(probe "$PACKENV" "service_state_capture $svc '$capdir'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "five/$svc: capture failed: $out"
+  grep -qE "RESULT=COMPLETE" "$capdir/MANIFEST" \
+    || fail "five/$svc: the manifest is not COMPLETE: $(cat "$capdir/MANIFEST")"
+  got_items="$(grep -c '^ITEM=' "$capdir/MANIFEST")"
+  # The writer's own count must agree with the lines it wrote -- the truncation
+  # check, applied in the test as well as in the verifier.
+  grep -qx "ITEMS=$n_items" "$capdir/MANIFEST" \
+    || fail "five/$svc: ITEMS= disagrees with the $n_items declared item(s)"
+  [[ "$got_items" == "$n_items" ]] \
+    || fail "five/$svc: declared $n_items item(s) but captured $got_items"
+
+  out="$(probe "$PACKENV" "service_state_verify '$capdir'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "five/$svc: verify failed: $out"
+
+  pack="$TMP/out/five-packs/$svc.tar.age"
+  rm -rf -- "$(dirname -- "$pack")"
+  out="$(probe "$PACKENV" "service_state_pack '$capdir' '$pack'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "five/$svc: pack failed: $out"
+  [[ -s "$pack" ]] || fail "five/$svc: no pack artefact"
+  # Encrypted, not merely archived: a known plaintext from the fixture must not
+  # appear in the artefact's bytes.
+  grep -qa 'five-service-chain' "$pack" \
+    && fail "five/$svc: fixture plaintext is readable inside the pack"
+
+  out="$(probe "$PACKENV" "service_state_pack_verify '$pack'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "five/$svc: verify-pack failed: $out"
+
+  # INDEPENDENCE: the capture directory is destroyed, so the restore below can
+  # only be reading the pack. A restore that could still see the original would
+  # prove nothing.
+  rm -rf -- "$capdir"
+  [[ ! -e "$capdir" ]] || fail "five/$svc: the source capture survived"
+
+  unp="$TMP/out/five-unpack/$svc"
+  rm -rf -- "$unp"; mkdir -p -- "$unp"
+  out="$(probe "$PACKENV" "service_state_unpack '$pack' '$TMP/keys/ident' '$unp'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "five/$svc: unpack failed: $out"
+
+  scratch="$TMP/out/five-restore/$svc"
+  rm -rf -- "$scratch"; mkdir -p -- "$scratch"
+  out="$(probe "$PACKENV" "service_state_restore '$unp' '$scratch'; echo RC=\$?")"
+  grep -q 'RC=0' <<< "$out" || fail "five/$svc: restore failed: $out"
+
+  # Every declared item is back, and a 0600 item is still 0600 -- the restore
+  # re-checks this itself, and asserting it here is what makes that observable.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    rel="${line#*|}"
+    [[ -e "$scratch/$rel" ]] || fail "five/$svc: $rel was not restored"
+  done <<< "$(probe '' "service_essential_state $svc")"
+  # The 0600 assertion applies only where the DECLARATION has a file or dir item
+  # to carry one. navidrome declares a single sqlite item and nothing else, so
+  # demanding a restricted mode there would be asserting a fixture artefact --
+  # and my first version failed on navidrome for exactly that reason, which is
+  # the vacuity guard doing its job rather than a defect.
+  if grep -qE '^(file|dir)\|' <<< "$(probe '' "service_essential_state $svc")"; then
+    mode_checked=0
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      [[ "$(stat -c %a "$f")" == "600" ]] || fail "five/$svc: $f came back $(stat -c %a "$f"), not 600"
+      mode_checked=$(( mode_checked + 1 ))
+    done <<< "$(find "$scratch" -type f -perm 0600 2>/dev/null || true)"
+    (( mode_checked > 0 )) \
+      || fail "five/$svc: it declares a file or dir item but no 0600 item was
+restored, so the mode claim would be vacuous"
+  fi
+
+  printf '   %-12s %s item(s), packed %s bytes, restored and re-verified\n' \
+    "$svc" "$n_items" "$(stat -c %s "$pack")"
+  five_ok=$(( five_ok + 1 ))
+done
+[[ "$five_ok" == "5" ]] || fail "five: only $five_ok service(s) completed the chain"
+echo "   all five: capture, verify, pack, verify-pack, unpack, restore"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"

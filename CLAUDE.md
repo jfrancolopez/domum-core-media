@@ -6958,6 +6958,70 @@ the ARTEFACTS can only ever answer questions about artefacts that exist**, and
 every question worth asking here -- is this protected, is this covered, is this
 the point I would roll back to -- is a question about the RECORDS. Walk the
 records and join to the artefacts, never the reverse.
+**`CAPTURE_MODE` RECORDED WHAT THE DECLARATION MADE POSSIBLE, NOT WHAT
+HAPPENED -- so a manifest claimed `consistent` over databases copied while the
+service could be writing.** Found 2026-11-11 while building a hermetic
+five-service chain test, from a manifest that contradicted itself in four lines:
+
+```
+CAPTURE_MODE=consistent
+ITEM=sqlite|navidrome.db|file-copy-unproven|8192|644|c2afdd09…
+```
+
+`mode` is decided UP FRONT by `service_state_capture_mode` -- does this service
+ship an sqlite3 -- and was written straight into the manifest. Each sqlite item
+then tries the application's own `.backup`, then the helper, and falls back to
+`cp` recorded as `file-copy-unproven`. Nothing reconciled the two, so with
+neither sqlite reachable every database fell back and the capture still asserted
+the strong claim. **And the restore reports `CAPTURE_MODE` to the operator as
+exactly that claim** -- this file already requires a restore to state the mode
+because "a digest is not a consistency claim".
+
+**The silent half was worse than the wrong word.** The `unproven` warning was
+gated on the DECLARED mode, so the one state most needing a flag -- a consistent
+capture was possible and did not happen -- produced no message at all. Neither
+existing branch covered it: one is "ships no sqlite3 anywhere", the other is "a
+helper was available and unused". Declared-capable-but-fell-back fell between
+them.
+
+Fixed by deriving the recorded mode from what the items ACHIEVED, with the
+weakest governing -- the rule `storage scrub` already follows across
+filesystems. `CAPTURE_MODE` moved to be written beside `RESULT` and `ITEMS`,
+which are also loop-derived; every reader uses a position-independent
+`sed -nE 's/^CAPTURE_MODE=(.*)$/\1/p'`, checked rather than assumed.
+
+**Both directions are asserted, because a fix that made everything `unproven`
+would be a check that always fires.** A capture that genuinely reaches
+`sqlite-backup` must still record `consistent` and must NOT warn. The mutation
+removes the single derivation line and must bring back both halves: `consistent`
+over a plain copy, AND the silence.
+
+**The defect was invisible to every existing test because they all drove one
+service at a time.** It surfaced only when a loop over all five printed a
+manifest for a service whose declaration says `consistent` while the fixture
+made both sqlite routes unreachable. A per-service test and a per-service
+fixture agree with each other by construction; the inconsistency lived between
+the declaration and the outcome.
+
+**And `tests/state-capture-smoke.sh` now drives the WHOLE chain for all five
+services hermetically** -- capture, verify, pack, verify-pack, unpack, restore,
+re-verify -- synthesising state from each service's OWN declaration rather than
+a hardcoded list, so it follows a declaration change instead of needing an edit
+beside one. That matters here: three services gained a declared credential or
+identity in the last week and a hardcoded fixture would have quietly stopped
+covering them. The five-service proof previously existed only as
+`operator/rehearsals/five-service-fresh-environment-recovery.sh`, which CI
+cannot run because it needs the production images -- so the strongest evidence
+had no regression net.
+
+Three of my own errors in building it, each caught by a guard: I invented
+`service_state_verify_pack` (it is `service_state_pack_verify`) -- the
+`domum_release_lock` family; I grepped `^ITEM ` where the manifest writes
+`ITEM=`; and my 0600 assertion failed on navidrome, which declares a single
+sqlite item and nothing else, so requiring a restricted mode there would have
+been asserting a fixture artefact. The vacuity guard caught the last one, which
+is what it is for. Identical pack sizes across 1, 3, 4 and 7 items looked wrong
+and are not: GNU tar pads to its 10240-byte blocking factor, verified directly.
 
 ## 15. Known open safety defects
 
