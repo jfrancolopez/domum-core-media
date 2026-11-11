@@ -43,7 +43,7 @@ gaps are at the edges rather than in the applications:
 |---|---|---|---|---|
 | [SEC-04](tasks/SEC-04-ssh-hardening.md) SSH key-only | owner (root) | 10 min | P1 | The LAN is trusted by decision D-2, so SSH is the control that matters |
 | [SEC-06](tasks/SEC-06-reboot-patched-kernel.md) reboot into the patched kernel | owner (root) | 15 min | P1 | The fix is already installed and not running |
-| [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) Traefik Docker socket proxy (repo half landed) | worker | 90 min | P2 | Removes broad Docker API access from the public-facing proxy |
+| [SEC-08](tasks/SEC-08-traefik-socket-proxy.md) deploy the Traefik socket proxy | owner (deploy) | — | P2 | Removes broad Docker API access from the public-facing proxy. The repository half is merged (`b094616`) and the task file says *"repository work complete"*, so **no worker effort remains** — this row billed it as `worker / 90 min`, which sends a fresh session to re-derive landed work. Deploying recreates Traefik, so pin its running image ID first or `up -d` also deploys the newer one staged under the same tag: `docs/DEPLOYMENT-PLAN.md` §10 |
 
 ## All tasks
 
