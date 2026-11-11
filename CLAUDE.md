@@ -7254,6 +7254,17 @@ flagged three correct backlog rows. Both directions are dangerous and the
 false-clean one is worse, because nothing contradicts it. **A sweep's "none" is
 a claim about the scanner until the scanner has been shown finding the thing.**
 
+**THE SHIPPED `pipefail-grep-audit.py` DOES NOT SHARE THAT BLIND SPOT -- checked
+rather than assumed**, because a future reader of the paragraph above would
+reasonably wonder. Driven against a fixture root (its `argv[1]` is a ROOT, not a
+file list -- passing bare files scans nothing) it rejects all four hostile
+shapes: the plain `cmd | grep -q`, one inside a `$( )` whose body carries nested
+parens, one split across continuations with an awk program containing a quoted
+`|`, and an awk program containing a paren. It accepts both correct forms, the
+capture-first fix and a bare `|| true`. So the family with thirteen recorded
+instances is genuinely covered, and the blind spot was mine alone. "We looked
+and decided no" is worth as much as an audit.
+
 **AND THE REPORT BLAMED VENDOR PLACEHOLDERS FOR A TABLE IT COULD NOT READ.**
 `mreport_smart_interpretable` returns three states -- `0` interpretable, `1`
 placeholders, `2` could not be read -- and the report tested it with
