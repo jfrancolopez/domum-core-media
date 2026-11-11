@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | PR_OPEN (#202; CI green on evidence head; owner review pending); deployment BLOCKED on the owner |
+| Status | DONE (repository change merged as `5e56ea1`, PR #202; CI green); deployment BLOCKED on the owner |
 | Priority and reason | P2 — the documented boundary (sudo) is not the real one |
 | Effort and change risk | 30 min for the documentation option; low |
 | Target and baseline | `domum-core-media`, branch off `origin/main` = `758833d`; security audit baseline `e0754a8` (2026-11-10) |
@@ -53,9 +53,9 @@ unchanged; SEC-12 tracks moving Beszel to a constrained proxy path.
 
 ## Verification handoff
 
-- **Result** PR_OPEN — D-3 resolved; repository documentation and SEC-12 follow-up task submitted; both GitHub CI runs PASS; owner review pending; no host changes.
-- **References** base `758833d`; implementation `0230d51`; evidence head `192b94c`; branch `task/sec-10-docker-group-boundary`; PR [#202](https://github.com/jfrancolopez/domum-core-media/pull/202).
+- **Result** DONE (repository scope) — merged in PR #202 by the owner on 2026-11-11; deployment remains owner-gated; no host changes.
+- **References** base `758833d`; implementation `0230d51`; final PR head `b06bce0`; merge commit `5e56ea1`; PR [#202](https://github.com/jfrancolopez/domum-core-media/pull/202).
 - **Evidence** read-only `getent group docker` listed two members (operator account and `beszel`). Owner selected D-3 option 1 and confirmed Beszel needs per-container statistics. `tests/no-conflict-markers-audit.py`, `tests/no-conflict-markers-smoke.sh`, `tests/ci-coverage-audit.sh` (92 files), and documented-command audit (106 commands) PASS; redacted Gitleaks scan PASS (0 findings); `git diff --check` PASS. The CLAUDE diff states Docker access is root-equivalent, preserves §5/§11 approval rules, and adds no escalation command. No group membership or service was changed.
-- **CI evidence** push and pull-request `compose-validate` runs on evidence head `192b94c` PASS (`42934747001`, `42934754048`).
-- **Next model** obtain owner review of PR #202; keep deployment owner-gated.
-- **Open items** owner review pending. SEC-12 must design a host-reachable read-only path through the SEC-08 proxy before Beszel can safely leave the Docker group; owner approval is required for any host-side deployment.
+- **CI evidence** push and pull-request `compose-validate` runs on final PR head `b06bce0` PASS (`42937056831`, `42937062564`); prior checks on `192b94c` also passed (`42934747001`, `42934754048`).
+- **Next model** SEC-12 remains queued pending SEC-08 deployment and its host-only endpoint design; any host-side deployment requires owner approval.
+- **Open items** No SEC-10 repository items remain. SEC-12 must design a host-reachable read-only path through the SEC-08 proxy before Beszel can safely leave the Docker group. No group membership, Beszel service, or production service was changed by SEC-10.
