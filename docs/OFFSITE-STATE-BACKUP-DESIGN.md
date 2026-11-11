@@ -13,9 +13,21 @@ overstated:**
 | a capture restores | **proven**, digests and modes re-verified on restore |
 | an application starts against a restored capture | **proven** for navidrome, calibre-web, plex |
 | a capture can be encrypted and decrypted | **proven — with a DISPOSABLE key** |
+| a pack survives a backup REPOSITORY round trip | **proven** — `tests/pack-repository-roundtrip-smoke.sh`, a real restic 0.18.0 scratch repository: pack → `restic backup` → the local pack and capture DESTROYED → `restic restore` → byte-identical sha256 → `verify-pack` → unpack → state restored with the Fernet key still 0600 and its bytes intact, and the database opening with `integrity_check ok`. A corrupted stored pack is refused before anything is decrypted |
 | a pack can be decrypted with the REAL production age key | **NOT proven** |
 | packs exist anywhere other than this SSD | **NO** |
 | the five applications have off-site protection | **NO** |
+
+**What the repository round trip does and does not add.** It removes one
+genuine unknown: a repository stores, deduplicates and re-assembles bytes, and
+an encrypted, content-addressed artefact is exactly the kind of thing where a
+silent truncation would pass every local check until the day it was needed. That
+is now tested end to end, with the local copies destroyed in between so the
+restore can only be reading the repository. It adds **nothing** to the three
+rows below it: the repository is a scratch directory under the test's own temp
+directory, no production target or credential is read, and the identity is
+generated for the test. A mechanism proven against a disposable repository is
+still a mechanism.
 
 The last three are the gap. Everything above them is mechanism; off-site
 protection is a property of where the bytes are, and today they are on the one

@@ -7023,6 +7023,42 @@ been asserting a fixture artefact. The vacuity guard caught the last one, which
 is what it is for. Identical pack sizes across 1, 3, 4 and 7 items looked wrong
 and are not: GNU tar pads to its 10240-byte blocking factor, verified directly.
 
+---
+
+**A PACK HAD NEVER BEEN THROUGH A BACKUP REPOSITORY AND BACK OUT, and that is a
+different claim from "pack-state works".** `docs/OFFSITE-STATE-BACKUP-DESIGN.md`
+opens by listing what is not proven, and this row was missing from it entirely --
+not marked unproven, simply absent, which is the weaker position of the two
+because nothing invites anyone to look. The pack/unpack mechanism was proven on
+this SSD; a repository STORES, DEDUPLICATES and RE-ASSEMBLES the bytes, and an
+encrypted content-addressed artefact is precisely where a silent truncation
+survives every local check until the day it is needed.
+
+Proven 2026-11-11 by `tests/pack-repository-roundtrip-smoke.sh` against a real
+restic 0.18.0 repository: capture -> pack -> `restic backup` -> **the local pack
+AND the source capture destroyed and asserted gone** -> `restic restore` ->
+byte-identical sha256 -> `verify-pack` -> unpack -> `restore-state`, with
+calibre-web's Fernet key still **0600**, its sentinel bytes intact, and the
+restored database opening with `integrity_check ok`. A corrupted stored pack is
+refused before anything is decrypted, which is the mutation.
+
+**THE SCRATCH REPOSITORY IS ASSERTED BEFORE ANYTHING IS WRITTEN, not after.**
+The path must be under the test's own `$TMP`, must not already exist, and the
+snapshot's own file listing is checked for `/srv/data`, `/opt/domum-core-media`
+and `/etc/domum-core-media` afterwards. A test that COULD reach the production
+repository is not a test, and this project already records a suite that silently
+queried the live Immich database because redirecting roots is not enough when
+the code path leaves the filesystem.
+
+**It adds NOTHING to the three rows it sits above, and the doc says so.** The
+repository is disposable, no production target or credential is read, and the
+identity is generated for the test. **A mechanism proven against a disposable
+repository is still a mechanism** -- whether a pack has left this SSD, and
+whether the operator's real age key opens one, are unchanged and operator-gated.
+Writing the proof next to that sentence is the point: the easiest thing to
+overstate here is off-site protection, and the row most likely to be misread as
+closing it is the one that was just opened.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

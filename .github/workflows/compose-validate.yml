@@ -179,6 +179,15 @@ jobs:
       - name: SQLite unsupported classification smoke test
         run: tests/sqlite-unsupported-smoke.sh
 
+      # A pack had never been through a backup repository and back out. That is
+      # a different claim from "pack-state works": a repository stores,
+      # deduplicates and re-assembles the bytes, and an encrypted artefact is
+      # exactly where a silent truncation would survive every check until the
+      # day it was needed. Uses a scratch repository under the test's own temp
+      # directory; it reads no production target, credential or configuration.
+      - name: Pack repository round-trip smoke test
+        run: tests/pack-repository-roundtrip-smoke.sh
+
       # The selective state capture takes 8.90 MiB of the five migrated
       # services' 352.28 MiB, so it must fail closed: a capture missing a
       # declared item is not a backup.
