@@ -2136,4 +2136,108 @@ done
 [[ "$five_ok" == "5" ]] || fail "five: only $five_ok service(s) completed the chain"
 echo "   all five: capture, verify, pack, verify-pack, unpack, restore"
 
+# ---------------------------------------------------------------------------
+#  service_container_path: the host-path -> container-path mapping that decides
+#  which file `.backup` operates on. Instrumentation found it executed by NO
+#  test, while being the one thing between a `consistent` capture and a silent
+#  fall back to `file-copy-unproven`.
+#
+#  Verified read-only against all five real containers first -- every mapping
+#  correct -- so these sections pin the logic, including the case production
+#  does NOT have: two bind mounts where one is a prefix of the other.
+# ---------------------------------------------------------------------------
+
+# $1 = mount rows as `src|dest` lines, $2 = service, $3 = host path
+cpath() {
+  printf '%s' "$1" > "$TMP/mountrows"
+  # The stub variable must NOT be named `cid`: service_container_path declares
+  # `local ... cid ...` BEFORE calling the id helper, so a stub reading $cid
+  # reads the caller's own empty local under bash's dynamic scoping. That
+  # produced a wrong "every mapping FAILED" reading until it was traced.
+  probe "
+    cmd_exists() { return 0; }
+    tracked_service_container_id_any() { printf 'deadbeef\n'; }
+    docker() { cat '$TMP/mountrows'; }
+  " "v=\$(service_container_path '$2' '$3'); rc=\$?; printf 'PATH=%s\\nRC=%s\\n' \"\$v\" \"\$rc\""
+}
+
+sect "the mapping: an exact mount source, and a path beneath one"
+out="$(cpath '/srv/data/navidrome|/data' navidrome /srv/data/navidrome/navidrome.db)"
+grep -qx 'PATH=/data/navidrome.db' <<< "$out" \
+  || fail "a path beneath a mount did not map: $out"
+out="$(cpath '/srv/data/navidrome|/data' navidrome /srv/data/navidrome)"
+grep -qx 'PATH=/data' <<< "$out" || fail "an exact mount source did not map: $out"
+echo "   beneath -> prefix+remainder, exact -> the destination"
+
+sect "the LONGEST matching mount wins, which production does not exercise"
+# No service here has overlapping bind mounts, so this is the case most likely
+# to be wrong and least likely to be noticed. First-match-wins would map the
+# path through /config and `.backup` would address a path that is not there.
+ROWS='/srv/data/plex/config|/config
+/srv/data/plex/config/Library/Databases|/dbs'
+out="$(cpath "$ROWS" plex /srv/data/plex/config/Library/Databases/library.db)"
+grep -qx 'PATH=/dbs/library.db' <<< "$out" \
+  || fail "the longest mount did not win: $out"
+ROWS_REV='/srv/data/plex/config/Library/Databases|/dbs
+/srv/data/plex/config|/config'
+out="$(cpath "$ROWS_REV" plex /srv/data/plex/config/Library/Databases/library.db)"
+grep -qx 'PATH=/dbs/library.db' <<< "$out" \
+  || fail "the answer depends on the ORDER docker lists mounts in: $out"
+echo "   longest wins, in both listing orders"
+
+sect "a path with SPACES maps, because plex's real paths have them"
+out="$(cpath '/srv/data/plex/config|/config' plex '/srv/data/plex/config/Application Support/Plex Media Server/x.db')"
+grep -qx 'PATH=/config/Application Support/Plex Media Server/x.db' <<< "$out" \
+  || fail "a path containing spaces did not map: $out"
+echo "   spaces preserved"
+
+sect "a path under NO mount is refused, not guessed"
+out="$(cpath '/srv/data/navidrome|/data' navidrome /srv/data/elsewhere/x.db)"
+grep -q '^RC=1$' <<< "$out" || fail "a path outside every mount did not refuse: $out"
+grep -qx 'PATH=' <<< "$out" || fail "it printed a path it could not map: $out"
+echo "   refused with no path printed"
+
+sect "a near-miss PREFIX is not treated as a match"
+# /srv/data/navidrome-old is NOT inside /srv/data/navidrome, and a plain string
+# prefix test would say it is.
+out="$(cpath '/srv/data/navidrome|/data' navidrome /srv/data/navidrome-old/x.db)"
+grep -q '^RC=1$' <<< "$out" \
+  || fail "a sibling sharing a name prefix was mapped as if inside the mount: $out"
+echo "   navidrome-old is not inside navidrome"
+
+sect "no container, and no bind mounts, each refuse"
+out="$(probe '
+  cmd_exists() { return 0; }
+  tracked_service_container_id_any() { return 1; }
+' "service_container_path navidrome /srv/data/navidrome/navidrome.db; echo \"RC=\$?\"")"
+grep -q '^RC=1$' <<< "$out" || fail "no container did not refuse: $out"
+out="$(cpath '' navidrome /srv/data/navidrome/navidrome.db)"
+grep -q '^RC=1$' <<< "$out" || fail "no bind mounts did not refuse: $out"
+echo "   both refuse"
+
+sect "MUTATION: first match instead of longest"
+cp "$CLI" "$TMP/cli.orig.cpath"
+cat > "$TMP/mutate-cpath.py" <<'PYCP'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    (( ${#src} > ${#best_src} )) && { best_src="$src"; best_dest="$dest"; }\n'
+new = '    [[ -z "$best_src" ]] && { best_src="$src"; best_dest="$dest"; }\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYCP
+( python3 -I "$TMP/mutate-cpath.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.cpath" "$CLI"; fail "the cpath mutation did not apply"; }
+mout="$(cpath '/srv/data/plex/config|/config
+/srv/data/plex/config/Library/Databases|/dbs' plex /srv/data/plex/config/Library/Databases/library.db)"
+cp "$TMP/cli.orig.cpath" "$CLI"
+grep -qx 'PATH=/config/Library/Databases/library.db' <<< "$mout" \
+  || fail "the mutation changed no ANSWER -- first-match-wins must map through
+/config instead of /dbs: $mout"
+echo "   killed: first match maps through the wrong mount"
+
+sect "the CLI is restored"
+grep -q '(( ${#src} > ${#best_src} ))' "$CLI" || fail "the longest-match comparison is missing"
+echo "   longest-match comparison is back"
+
 echo "ALL STATE-CAPTURE CHECKS PASSED"
