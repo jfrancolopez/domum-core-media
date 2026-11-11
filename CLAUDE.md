@@ -7940,6 +7940,66 @@ above is the version that does not.
 
 ---
 
+**ONE OF THE 43 FUNCTIONS ADDED SINCE THE PRODUCTION BASELINE WAS EXECUTED BY
+NO TEST, and it is the one that decides whether a capture is `consistent`.**
+Swept 2026-11-11: 11 of the 43 are not referenced by name in any suite. That
+metric is the weak one this file already records being wrong -- it cannot see a
+function reached indirectly -- so the 11 were INSTRUMENTED, each with a marker
+appended to a FILE rather than stdout, because several are captured functions
+whose stdout IS their return value. 2,926 marker writes later:
+
+```
+observed executing   9   backup_cli_path, read_weekly_report,
+                         record_weekly_report, recovery_pack_offhost_delivery,
+                         state_item_digest, state_item_mode,
+                         state_item_stored_name, state_pack_recipient,
+                         weekly_report_evidence_file
+never executed       1   service_container_path
+not instrumentable   1   state_capture_schema
+```
+
+So the name-grep over-reported by nine, exactly as the earlier pass did
+(11 -> 3). **Report the instrumented figure, never the grep.**
+
+**`service_container_path` maps a host path to the container path for
+`.backup`**, and is called from one place: `service_sqlite_backup`. A wrong
+answer there means `.backup` addresses a path that is not in the container, the
+sqlite route fails, and the capture silently falls back to
+`file-copy-unproven`. It had no test at all.
+
+Verified read-only against all five real containers first -- every mapping
+correct, `/srv/data/navidrome/navidrome.db -> /data/navidrome.db` and so on --
+then pinned with 8 sections. The one that matters most is the case **production
+does not have**: two bind mounts where one is a prefix of the other. No service
+here has overlapping mounts, so first-match-wins would be invisible; the
+mutation replaces the longest-match comparison with "first one chosen" and must
+map through `/config` instead of `/dbs`. A near-miss prefix is covered too --
+`/srv/data/navidrome-old` is NOT inside `/srv/data/navidrome`, and a plain
+string-prefix test would say it is.
+
+**TWO MEASUREMENT MISTAKES OF MINE ON THE WAY, both already rules here.**
+
+- **My stub was named `cid`, and the function declares `local ... cid ...`
+  BEFORE calling the id helper.** Under bash's dynamic scoping the stub read
+  the caller's own empty local and returned nothing, so every real mapping read
+  as FAILED -- a confident wrong "this function is broken against production".
+  `set -x` showed `cid=` in one line. Third dynamic-scoping incident this
+  session, after `smartctl_path` and the `$model` guard.
+- **The instrumenter could not match a SINGLE-LINE function definition.**
+  `state_capture_schema() { printf '2'; }` has its body on the definition line,
+  so `name() {\n` and the trailing-comment variants all missed it, and it was
+  reported as "not found". It exists, this file names it correctly, and it is
+  called from the writer and the verifier -- both heavily tested. The earlier
+  recorded limitation was a trailing comment; a same-line body is the same
+  family.
+
+**The function prints with `printf '%s'` and no trailing newline**, which is
+correct -- every caller uses `$( )`, which strips it -- but a test that echoes
+a status after it gets `PATHRC=0` on one line. The helper emits labelled
+`PATH=` and `RC=` lines instead of asserting on a bare path.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
