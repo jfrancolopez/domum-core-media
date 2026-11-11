@@ -177,8 +177,26 @@ KAVITA_CONFIG_DIR="/srv/data/kavita/config"
 # Never update Postgres or Redis/Valkey independently outside the bundle.
 # ============================================================
 
-IMMICH_UPDATE_MODE=bundle
-IMMICH_UPDATE_CHANNEL=stable
+# There is deliberately NO mode or channel switch here. Bundle-only is
+# STRUCTURAL, not configured: there is no non-bundle Immich update path in the
+# CLI, and `immich` is absent from `managed_image_specs`, so the per-service
+# upgrade path cannot target it either. IMMICH_UPDATE_MODE and
+# IMMICH_UPDATE_CHANNEL used to sit here and were read by nothing -- measured,
+# zero references anywhere in the repository -- so setting
+# IMMICH_UPDATE_MODE=direct read as switching the policy for the service this
+# server exists for, and did nothing.
+#
+# Of the three below, AUTO_UPDATE gates the bundle apply and DELAY_DAYS is read
+# when deciding whether a candidate is old enough. IMMICH_BUNDLE_ROLLBACK_ENABLED
+# is a THIRD case and is NOT yet honoured: it is exported and `configure` prompts
+# for it, but no code reads its value -- bundle rollback follows
+# AUTO_ROLLBACK_ENABLED, which `configure` asks for on the line immediately
+# before. Setting it to 0 does not disable anything today. It is left in place
+# rather than removed because backlog/task-25-dead-config-vars.md step 3 calls
+# for WIRING it (`AUTO_ROLLBACK_ENABLED && IMMICH_BUNDLE_ROLLBACK_ENABLED`), and
+# wiring a rollback gate whose production value cannot be read from an
+# unprivileged account could silently turn bundle rollback OFF -- so that is an
+# operator-reviewed change, not a cleanup.
 IMMICH_BUNDLE_AUTO_UPDATE=1
 IMMICH_BUNDLE_DELAY_DAYS=21
 IMMICH_BUNDLE_ROLLBACK_ENABLED=1

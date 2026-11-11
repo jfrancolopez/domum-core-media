@@ -185,6 +185,12 @@ jobs:
       - name: Selective state capture smoke test
         run: tests/state-capture-smoke.sh
 
+      # A key in the config example that nothing reads is a surface implying
+      # control it does not have: IMMICH_UPDATE_MODE=direct read as switching
+      # the Immich update policy and did nothing.
+      - name: Config example dead-key audit
+        run: python3 tests/config-example-dead-keys-audit.py
+
       # `smtp_send_message` is the ONE place mail leaves this host and no test
       # had ever executed it -- five suites stub it whole. It drives the real
       # function and compares the credential curl parses back, byte for byte,
