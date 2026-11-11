@@ -352,3 +352,49 @@ sudo domum-media storage scrub start      # blocks; 0 clean, 1 failed, 3 errors 
 The CLI form is what the timer uses, and it is the one implementation of the
 per-filesystem dedup — `checkup` reads the same `btrfs_unique_roots`, so the
 two cannot disagree about how many filesystems there are.
+
+## Why there is no disposable scrub run, measured 2026-11-11
+
+The obvious way to exercise `storage scrub` end to end is a throwaway btrfs
+filesystem in a file. Measured, that fails at exactly one step, and it is not
+the step I first guessed:
+
+```
+/usr/sbin/mkfs.btrfs -q 200M.img        rc=0   -- works UNPRIVILEGED
+mount -o loop 200M.img /mnt             failed to setup loop device
+/dev/loop-control                       crw-rw---- root disk   (not in `disk`)
+btrfs scrub start -B 200M.img           ERROR: not a directory
+btrfs filesystem show 200M.img          works
+btrfs inspect-internal dump-super       works
+btrfs check --readonly 200M.img         works
+```
+
+So: a real btrfs filesystem CAN be created here without privilege, and several
+btrfs commands run against the unmounted image. **`btrfs scrub` is not one of
+them** -- it takes a mount point, and mounting needs a loop device this account
+cannot open because it is not in the `disk` group. That is the whole blocker,
+and it is a group membership rather than a missing tool.
+
+**I first reported `mkfs.btrfs` as not installed, and that was wrong.**
+`command -v mkfs.btrfs` as the development account finds nothing because
+`/usr/sbin` is not on that account's PATH, while the binary is there and
+btrfs-progs 6.14-1 is installed. This file already records the identical mistake
+about `smartctl`; it is the third occurrence. Probe with the full path, or with
+the PATH the code will actually run under.
+
+### What the scrub path does have
+
+26 driven sections in `tests/btrfs-scrub-smoke.sh` plus a mutation, covering the
+exit-status contract (`0` clean, `1` could not scrub, `3` uncorrectable), `-B`
+always passed, `--limit` passed when given and absent when not, the worst result
+across filesystems governing, never-scrubbed reported with
+`no errors found` explicitly NOT read as clean, an unreadable status as UNKNOWN,
+no btrfs filesystem at all refused, and an already-running scrub SKIPPED rather
+than failing the unit.
+
+And one thing no fixture provides: **a real scrub has run on this host** --
+2026-10-21, `/srv/data`, 215.87 GiB, 7m14s, 509.34 MiB/s, zero errors, exit 0.
+That is production evidence for the operation itself; what the disposable run
+would add is the ability to inject a checksum error and watch exit 3 propagate
+for real, which is the one thing both the fixtures and the clean production run
+cannot show.
