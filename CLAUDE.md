@@ -6835,6 +6835,49 @@ function.** `tests/capabilities-contract-audit.py` refused
 is a promise that the SUBCOMMAND works. Pointing it at the inner helper
 advertised a path the dispatcher does not take.
 
+---
+
+**"BLOCKED ON ROOT" WAS HALF THE REASON, AND THE OTHER HALF CANNOT BE UNBLOCKED
+BY PRIVILEGE AT ALL.** P3.4 -- the volume upgrade/rollback rehearsal against
+real containers -- has been recorded as root-blocked since 2026-11-02, measured
+twice. Re-measured 2026-11-11, there is a SECOND independent blocker, and it is
+structural:
+
+```
+docker create --name uptime-kuma busybox:latest true
+  -> Conflict. The container name "/uptime-kuma" is already in use by 823c31d71946…
+  -> rc=1, nothing created, production still 11 containers, Up 41 hours (healthy)
+```
+
+The only two `docker-volume` services are traefik and uptime-kuma, **both
+running in production**, and both set `container_name` equal to their service
+key. Container names are unique per daemon, so a disposable compose project
+cannot host either. And renaming the container in a fixture would defeat
+`stop_compose_services_verified`, which compares COMPOSE SERVICE names against
+`docker ps --format '{{.Names}}'` and is correct only because that invariant
+holds -- a renamed container would read as STOPPED while running, which is the
+dangerous direction and the exact failure that check exists to prevent. The
+three managed names that are free (`docker-socket-proxy`, `tailscale`,
+`restic-rest-server`) are all declared `stateless`, so none reaches the volume
+path.
+
+**This matters because a blocker recorded as the wrong KIND sends the next
+reader down the wrong path** -- the same rule this file already records for
+P1.16, where "needs root" was really "not permitted". Here the first half is
+retired by one privileged run and the second is not retired by privilege at all:
+it needs a volume service whose container name is free (none exists), or
+production downtime (an approval boundary), or a second stub that would make the
+exercise prove less than the fixtures already do.
+
+**And the honest answer to "is the item covered" is an ENUMERATION, not a
+verdict.** All six aspects the goal names -- ACME key at 0600, SQLite/WAL, exact
+images, readiness, failure injection, rollback -- have driven sections against
+real files, with `docker_volume_mountpoint` the single stubbed seam.
+`docs/VOLUME-UPGRADE-REHEARSAL.md` carries that table, so "only fixture-based
+tests" and "the behaviours are covered" can both be true and neither has to be
+guessed at. Listing which sections cover what is the difference between a
+coverage claim and coverage evidence.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

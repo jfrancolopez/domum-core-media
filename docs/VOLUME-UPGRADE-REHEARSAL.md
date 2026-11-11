@@ -1,6 +1,8 @@
-# Volume upgrade rehearsal — what it would prove, and why it needs root
+# Volume upgrade rehearsal — what it would prove, and the two things blocking it
 
-**Status: NOT WRITTEN. Blocked on root, measured rather than assumed.**
+**Status: NOT WRITTEN. Blocked on TWO independent things, both measured:
+root for the dump/restore half, and container-name uniqueness for the
+real-container half — and no privilege retires the second.**
 
 `traefik` and `uptime-kuma` are the two `docker-volume` services. Their upgrade
 and rollback path is implemented and covered against fixtures —
@@ -74,10 +76,93 @@ and ACLs behave differently inside a container's user namespace, and
 `acme.json`'s mode is exactly what must not change. A restore path is the worst
 place to trade correctness for testability.
 
+## A SECOND, INDEPENDENT BLOCKER — and it is structural, not a privilege
+
+Measured 2026-11-11. Root is not the only thing in the way, and the second
+reason is the stronger one because no privilege retires it.
+
+**The only two `docker-volume` services are traefik and uptime-kuma, and both
+are running in production under container names that are unique per daemon.**
+
+```
+docker create --name uptime-kuma busybox:latest true
+  -> Error response from daemon: Conflict. The container name "/uptime-kuma"
+     is already in use by container "823c31d71946…"
+  -> rc=1, nothing created, production still 11 containers, uptime-kuma
+     Up 41 hours (healthy)
+```
+
+So a disposable compose project cannot host either service, because
+`compose/monitoring/uptime-kuma.yml` and `compose/proxy/traefik.yml` both set
+`container_name` equal to the service key — which is itself a load-bearing
+invariant, not an accident.
+
+**And renaming the container in the fixture would defeat the very check the
+rehearsal exists to drive.** `stop_compose_services_verified` compares COMPOSE
+SERVICE names against `docker ps --format '{{.Names}}'`, and those are the same
+only because every service sets `container_name` to its key — measured across
+every fragment, and guarded by `tests/operation-lock-smoke.sh` with a negative
+control. A fixture that renamed the container would make a running container
+read as stopped, which is the dangerous direction and is exactly the failure
+the stop verification prevents.
+
+**No managed service offers a way round it.** The three whose names are free —
+`docker-socket-proxy`, `tailscale`, `restic-rest-server` — are all declared
+`stateless` in `service_state_models`, so none of them reaches the
+docker-volume path at all. Taking one and stubbing its state model would add a
+second seam on top of `docker_volume_mountpoint`, at which point the "real
+container" claim is doing very little work.
+
+## What IS covered, enumerated rather than claimed
+
+The goal's six aspects each have a driven section against real artefacts. The
+gap is specifically "against a real disposable CONTAINER", not the behaviours.
+
+| aspect | where | what is real |
+|---|---|---|
+| ACME key / modes | `volume-recovery-point-smoke` §3, §10 | a real `acme.json` at mode 0600, real `tar --numeric-owner --xattrs --acls`, modes re-checked after restore |
+| SQLite / WAL | §5, §6 | a real non-empty `-wal` refuses; a real open handle refuses |
+| exact images | §4, §14, §17 | the image id is recorded, loaded FROM the archive, and the loaded id compared to the record; no recorded identity refuses |
+| readiness | `volume-upgrade-dispatch-smoke` | the real `service_upgrade` phase 4, including the all-absent UNPROVEN wording |
+| failure injection | §5–§8, §11, §15–§17, §20–§23 | bad checksum, missing dump, no identity, wrong model, unreadable volume, failed unpack — each refusing, and the pre-stop verification mutation-tested |
+| rollback | §13, §14, §18, §19 | both halves restored, image loaded from the archive, the two rollbacks refusing each other's points |
+
+`docker_volume_mountpoint` is the ONE stubbed seam, and that is the half root
+blocks. Everything above runs against real files.
+
+## So the honest status
+
+Not "blocked on root". Blocked on **root for the dump/restore half**, and on
+**container-name uniqueness for the real-container half** — and the second
+cannot be unblocked by privilege, only by stopping a production service, which
+is forbidden, or by accepting a second stub, which would make the exercise
+prove less than the fixtures already do.
+
+A future session should not re-derive this. The probe is one command and it is
+quoted above.
+
 ## To unblock
 
-Write the rehearsal as a gated subcommand following `immich-phase-a`'s pattern
-(unique disposable names refused if taken, images pinned by ID, no production
-path or volume mounted, teardown asserted) with a stub-based smoke test in
-`tests/` that CI can run, and have the operator run the real-container pass
-once as root.
+Two things, and they are not the same step.
+
+**For the dump/restore half** (`tar -C <mountpoint>`), one privileged run is
+enough: the fixtures already drive both primitives with real tar, real
+checksums, real xattrs and ACLs and real modes, and `docker_volume_mountpoint`
+is the one stubbed seam. An operator running that half as root closes it.
+
+**For the real-container half there is no privileged step that helps**, because
+the blocker is container-name uniqueness rather than permission — see the
+section above. It needs one of:
+
+- a service whose container name is free AND whose declared state model is
+  `docker-volume`. None exists today: the two volume services are both running,
+  and the three free names are all `stateless`;
+- or the operator stopping traefik or uptime-kuma for the duration, which is
+  application downtime and an approval boundary of its own;
+- or accepting a second stub (the state model) on top of
+  `docker_volume_mountpoint`, which would make the exercise prove less than the
+  fixtures already do — so it is not recommended.
+
+Written as a gated subcommand it would still follow `immich-phase-a`'s pattern:
+unique disposable names refused if taken, images pinned by ID, no production
+path or volume mounted, teardown asserted.
