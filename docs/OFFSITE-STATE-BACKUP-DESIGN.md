@@ -82,8 +82,48 @@ Reasoning, each point learned from something already recorded here:
   writes encrypted credentials is an operator decision. The timer would be
   installed and left disabled, exactly as the scrub timer was.
 
-**Not written.** No unit file exists for this yet; writing one is the next
-implementation step and installing it is the operator's.
+**WRITTEN 2026-11-11, not installed and not enabled.**
+`systemd/domum-media-state-capture.{service,timer}` exist, and
+`systemd/auto-enable.timers` deliberately does not list the timer -- which
+`tests/timer-auto-enable-safety-smoke.sh` now asserts for it by name, and the
+assertion was proved to bite by adding the timer to that file and watching the
+suite fail. `systemd-analyze` accepts both, and the schedule resolves to
+`Sun 2026-11-15 04:00:00 EST`.
+
+The unit has **two** `ExecStart` lines and **the order is §3's fourth retention
+rule**, not a detail:
+
+```
+ExecStart=/usr/local/bin/domum-media storage capture-all-state --pack
+ExecStart=/usr/local/bin/domum-media storage prune-state-packs --confirm
+```
+
+Neither carries a `-` prefix, so a failed capture or pack fails the unit and
+systemd never reaches the prune -- which is exactly "delete nothing on a run
+that failed to produce a new pack". A `-` on the first would break it silently,
+so the test asserts both the ordering and the absence of the prefix, and both
+assertions were proved to bite. `--confirm` is supplied **here** rather than
+being the command's default, so the only thing that ever deletes a pack is a
+unit that says so in its own text.
+
+`storage capture-all-state [--pack]` is the entry point this needed and did not
+have. Its service set is **derived** -- `protected-tier` in
+`service_state_models` *and* a non-empty `service_essential_state` -- which is
+why immich is absent: it is protected-tier and declares nothing, because its
+library is the restic backup's job rather than a 9 MiB state capture. Deriving
+it means a declaration change is followed automatically; three of these five
+gained a declared credential or identity in a single week, and a hardcoded list
+would have had to be edited each time or quietly fallen behind.
+
+It **continues past a failing service and fails at the end**, so one service's
+problem does not cost the other four their capture -- the shape of the retention
+failure that once aborted before `heartbeat` and made a successful backup report
+as stale. A failed pack leaves its capture intact and says so. An empty service
+set is refused rather than reported as a clean run.
+
+**Installing and enabling remain the operator's**, and enabling it means
+encrypted packs holding a Fernet key, a JWT signing key and a server token will
+be written unattended on a schedule.
 
 ## 3. Retention — newest N per service, and never the only one
 

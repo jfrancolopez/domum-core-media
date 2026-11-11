@@ -29,7 +29,13 @@ DEPLOYMENT_TIMERS=(domum-media-image-refresh.timer)
 # scrub REPAIRS DUP metadata by writing. Never auto-enabled, because enabling
 # it means a scrub WILL start unattended and starting one is an operator
 # decision. Listed separately so the reason stays attached to it.
-OPERATOR_ONLY_TIMERS=(domum-media-btrfs-scrub.timer)
+#
+# The weekly state capture is the same shape: enabling it means encrypted packs
+# WILL be written unattended, and the unit's second ExecStart deletes superseded
+# ones. Both are operator decisions. It is also the only job here that writes an
+# artefact holding credentials -- a Fernet key, a JWT signing key and a server
+# token -- so it is never auto-enabled.
+OPERATOR_ONLY_TIMERS=(domum-media-btrfs-scrub.timer domum-media-state-capture.timer)
 
 # ---------------------------------------------------------------------------
 # 1. The canonical list exists and excludes every deployment timer.

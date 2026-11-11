@@ -11293,6 +11293,79 @@ service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
   return 0
 }
 
+# The services a scheduled capture covers, DERIVED from the two declarations
+# rather than listed here. A service qualifies when it is `protected-tier` in
+# service_state_models AND declares at least one essential item -- which is why
+# immich is absent: it is protected-tier and declares nothing, because its
+# library is the restic backup's job and not a 9 MiB state capture.
+#
+# Deriving it means a declaration change is followed automatically. A hardcoded
+# list is the thing that silently stops covering a service: three of these five
+# gained a declared credential or identity in one week, and a list beside the
+# declaration would have had to be edited each time or quietly fallen behind.
+state_capture_services() {
+  local svc model
+  while IFS='|' read -r svc model _; do
+    [[ "$model" == "protected-tier" ]] || continue
+    [[ -n "$(service_essential_state "$svc" 2>/dev/null)" ]] || continue
+    printf '%s\n' "$svc"
+  done < <(service_state_models)
+}
+
+# Capture every declared service, and optionally pack each capture. This is what
+# a scheduled job invokes; there was no entry point for one before, so the
+# schedule in docs/OFFSITE-STATE-BACKUP-DESIGN.md §2 had nothing to point at.
+#
+# It CONTINUES past a failing service and fails at the END. One service's
+# problem must not skip the other four: that is the recorded shape of the
+# retention failure which aborted before `heartbeat` and made a successful
+# backup report as stale. Every service that CAN be captured is captured, and
+# the command still reports failure.
+storage_capture_all_state() {  # $@ = [--pack]
+  local pack=0 a
+  for a in "$@"; do
+    case "$a" in
+      --pack) pack=1 ;;
+      *) die "Unknown argument for storage capture-all-state: $a" ;;
+    esac
+  done
+
+  local svcs; svcs="$(state_capture_services)"
+  [[ -n "$svcs" ]] || die "no service declares essential state -- refusing to report success for an empty set"
+
+  echo "[domum-media] capture-all-state"
+  echo "  services    : $(tr '\n' ' ' <<< "$svcs" | sed 's/ *$//')"
+  echo "  packing     : $( (( pack )) && echo yes || echo "no (capture only)" )"
+
+  local svc dir rc=0 n_cap=0 n_pack=0 n_fail=0
+  while IFS= read -r svc; do
+    [[ -n "$svc" ]] || continue
+    echo "  --- $svc ---"
+    dir="$(state_capture_dir)/$svc/$(date -u +%Y%m%d-%H%M%S)"
+    if ! service_state_capture "$svc" "$dir" plain; then
+      warn "capture FAILED for $svc -- continuing with the remaining services"
+      n_fail=$(( n_fail + 1 )); continue
+    fi
+    n_cap=$(( n_cap + 1 ))
+    (( pack )) || continue
+    if ! service_state_pack "$dir" ""; then
+      warn "pack FAILED for $svc -- the capture is intact at $dir"
+      n_fail=$(( n_fail + 1 )); continue
+    fi
+    n_pack=$(( n_pack + 1 ))
+  done <<< "$svcs"
+
+  echo "  captured    : $n_cap"
+  (( pack )) && echo "  packed      : $n_pack"
+  if (( n_fail > 0 )); then
+    echo "  result      : INCOMPLETE -- $n_fail service(s) failed. The ones that"
+    echo "                succeeded are intact; this is not a partial success."
+    return 1
+  fi
+  echo "  result      : done. Nothing was transmitted and no backup target was touched."
+  return 0
+}
+
 # The operator surface over state_pack_retention_decisions. A DRY RUN by
 # default: `--confirm` is required before anything is removed, exactly as
 # `cleanup images` requires it, and this command is on no timer of its own.
@@ -13472,6 +13545,7 @@ state-pack|storage pack-state|service_state_pack
 state-unpack|storage unpack-state|service_state_unpack
 verify-state-pack|storage verify-pack|service_state_pack_verify
 state-pack-retention|storage prune-state-packs|storage_prune_state_packs
+state-capture-all|storage capture-all-state|storage_capture_all_state
 EOF
 }
 
@@ -13772,6 +13846,8 @@ storage_cmd() {
       # operator decision.
       load_cfg
       service_state_pack "${1:-}" "${2:-}" ;;
+    capture-all-state)
+      shift; need_root; load_cfg; storage_capture_all_state "$@" ;;
     prune-state-packs)
       shift; need_root; load_cfg; storage_prune_state_packs "$@" ;;
     verify-pack)
@@ -13839,7 +13915,7 @@ storage_cmd() {
         # and on-disk retention are different, and conflating them is how a
         # local rollback artefact gets deleted to save cloud bytes.
         storage_archive_retention "$@" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|archive-retention [--json]|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>|prune-state-packs [--confirm] [dir]}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|archive-retention [--json]|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>|prune-state-packs [--confirm] [dir]|capture-all-state [--pack]}" ;;
   esac
 }
 

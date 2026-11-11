@@ -1,0 +1,21 @@
+[Unit]
+Description=domum-media: schedule the weekly encrypted state capture
+
+[Timer]
+# Sunday 04:00, which is deliberately between the jobs either side of it:
+# after the 02:30 backup (+15m) and the 03:30 restic check (+20m), and before
+# the 04:30 snapshot prune. It contends with none of them.
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=15m
+# A missed run fires at the next boot, and that is safe here in a way it is not
+# for `snapshot prune`: a catch-up run produces one extra capture, and the only
+# deletion is the retention step, which never removes the newest pack for a
+# service and keeps any pack it cannot verify.
+#
+# No OnBootSec=/OnStartupSec=: those would make a REBOOT a capture trigger in
+# its own right, which is a different thing from catching up a missed week.
+Persistent=true
+Unit=domum-media-state-capture.service
+
+[Install]
+WantedBy=timers.target
