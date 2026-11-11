@@ -274,3 +274,50 @@ pack. Until step 2 has been done, and until packs actually exist somewhere
 other than this SSD, **the five applications do not have off-site
 protection** — they have a tested way of producing artefacts that would
 provide it.
+
+---
+
+## The SCHEDULED path has now been through a repository, 2026-11-11
+
+The per-service chain had been proven through a scratch restic repository. The
+path the **unit** runs had not, and it is a different claim: it invokes
+`capture-all-state --pack` and then `prune-state-packs --confirm`, neither of
+which existed when that proof was written.
+
+`tests/pack-repository-roundtrip-smoke.sh` sections 11-18 now drive it for
+**every declared service**:
+
+```
+11  capture-all-state --pack      5 services captured and packed, each with a sidecar
+12  restic backup                 the whole pack directory
+13  destroy                       every local pack, sidecar and capture removed
+14  restic restore                5 packs byte-identical, 5 sidecars intact
+15  verify / unpack / restore     5 verified, 5 unpacked, 5 restored to state
+16  prune-state-packs --confirm   5 retained, 0 superseded, none unknown
+```
+
+**Section 14 is the sharp one.** Retention reads `<pack>.meta` for the service
+name, because the manifest is inside the encrypted pack and this host holds
+only the public key. Had the sidecar not survived a round trip, every restored
+pack would read as `unknown` after a real disaster -- kept, correctly, but
+retention could do nothing with them, and nothing would have said so until the
+day it mattered. The mutation in section 17 removes the sidecar write and
+requires exactly that: 0 retained, every pack unknown.
+
+**Section 16 proves the "never delete the only one" rule where it counts.**
+After a disaster each service has exactly one pack, and `STATE_PACK_KEEP=1` is
+the configuration most likely to delete something. Nothing is superseded.
+
+### What this still does not prove
+
+Unchanged, and both operator-gated:
+
+- **that any pack has left this host.** The repository is a scratch directory
+  under the test's own temp dir, asserted before anything is written, and no
+  production target, repository, credential or configuration is read.
+- **that the operator's age key opens a pack.** The identity is generated for
+  the test; the real key is deliberately not on this host.
+
+So the transfer medium is proven not to corrupt the artefacts and the whole
+scheduled chain is proven to work end to end. The two claims that need a real
+target and a real key are exactly where they were.
