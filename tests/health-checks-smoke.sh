@@ -911,24 +911,68 @@ grep -q 'apt-get install' <<< "$out" \
 echo "  no absent-package claim and no install remedy while smartctl is present"
 
 sect "a genuinely absent smartctl still reports absent"
-# PATH emptied, so only the sbin fallbacks remain. Both branches are correct
-# behaviour and which one runs depends on the machine, so the branch taken is
-# PRINTED -- a silent skip would make this section indistinguishable from one
-# that asserts nothing.
-sb_found=""
-for c in /usr/sbin/smartctl /sbin/smartctl /usr/local/sbin/smartctl; do
-  [[ -x "$c" ]] && { sb_found="$c"; break; }
-done
-out="$(probe 'export PATH=/nonexistent' smartctl_bin; echo "RC=$?")"
-if [[ -n "$sb_found" ]]; then
-  grep -qF "$sb_found" <<< "$out" \
-    || fail "an sbin smartctl ($sb_found) was not found with PATH emptied: $out"
-  echo "  this machine has $sb_found and the fallback found it"
+# DETERMINISTIC on any machine. This section used to branch on whether the host
+# happened to have an sbin smartctl and print which branch ran -- honest, but it
+# meant the "none anywhere" path was undrivable here, and that is precisely how
+# a sibling section came to depend on the RUNNER lacking smartctl and failed in
+# CI. DOMUM_SBIN_ROOT pins it, exactly as DOMUM_SYSBLOCK_ROOT pins the
+# rotational branch.
+mkdir -p "$TMP/nosbin"
+NOSMART='export PATH=/nonexistent; export DOMUM_SBIN_ROOT="'"$TMP/nosbin"'"'
+# The OBSERVABLE is the output, not the status: `probe` ends in `true`, so its
+# own exit code is always 0 and an `RC=$?` assertion can never fail. smartctl_bin
+# prints the resolved path on success and nothing on failure.
+out="$(probe "$NOSMART" smartctl_bin)"
+[[ -z "${out//[[:space:]]/}" ]] \
+  || fail "the resolver found a smartctl with none anywhere: $out"
+out="$(probe "$NOSMART
+lsblk() { printf 'sda disk\n'; }" checkup_disk_health)"
+grep -q 'appears genuinely absent' <<< "$out" \
+  || fail "with no smartctl anywhere it did not report absence: $out"
+grep -q 'ACT|apt-get install -y smartmontools' <<< "$out" \
+  || fail "no install remedy when the package really is absent: $out"
+grep -q 'OK|SMART' <<< "$out" && fail "it claimed health with no tool: $out"
+echo "  absence is reported as absence, with the install remedy, on any machine"
+
+sect "with smartctl present the absent-package wording must NOT appear"
+# The other direction, and what makes the section above falsifiable: the same
+# fixture with a smartctl available must stop claiming the package is missing.
+out="$(probe "$NOSMART
+lsblk() { printf 'sda disk\n'; }
+smartctl() { printf '%s' '{}'; }" checkup_disk_health)"
+grep -q 'appears genuinely absent' <<< "$out" \
+  && fail "it claimed the package was absent while a smartctl was available: $out"
+echo "  the absence claim is gone the moment a smartctl can be resolved"
+
+sect "MUTATION: ignoring DOMUM_SBIN_ROOT"
+# Without the override the sbin paths are absolute, so on a machine that HAS
+# smartctl the absence branch becomes undrivable and the section above passes
+# for the wrong reason -- or fails, depending on the machine. Either way the
+# suite stops being a test of the code.
+cp "$CLI" "$TMP/cli.orig.sbin"
+cat > "$TMP/mutate-sbin.py" <<'PYSBIN'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  local root="${DOMUM_SBIN_ROOT:-}"\n'
+new = '  local root=""\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYSBIN
+( python3 -I "$TMP/mutate-sbin.py" "$CLI" ) \
+  || { cp "$TMP/cli.orig.sbin" "$CLI"; fail "the sbin mutation did not apply"; }
+mout="$(probe "$NOSMART" smartctl_bin)"
+cp "$TMP/cli.orig.sbin" "$CLI"
+if [[ -x /usr/sbin/smartctl || -x /sbin/smartctl || -x /usr/local/sbin/smartctl ]]; then
+  [[ -z "${mout//[[:space:]]/}" ]] \
+    && fail "the mutation changed no ANSWER -- ignoring DOMUM_SBIN_ROOT must make
+the resolver find this machine's real sbin smartctl despite the override: $mout"
+  echo "  killed: without the override the real sbin smartctl is found anyway"
 else
-  out2="$(probe 'export PATH=/nonexistent' checkup_disk_health)"
-  grep -q 'appears genuinely absent' <<< "$out2" \
-    || fail "with no smartctl anywhere it did not report absence: $out2"
-  echo "  no smartctl anywhere on this machine, and absence is reported as absence"
+  # Nothing to find, so the mutation cannot change the answer. Say so rather
+  # than reporting a kill that did not happen.
+  echo "  NOT KILLABLE HERE: this machine has no sbin smartctl, so the override
+    and its absence agree. The assertion above is what carries the section."
 fi
 
 sect "checkup_disk_wear resolves its own smartctl and still escalates"

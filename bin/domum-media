@@ -41,7 +41,15 @@ smartctl_bin() {
   local c
   c="$(command -v smartctl 2>/dev/null || true)"
   if [[ -n "$c" ]]; then printf '%s' "$c"; return 0; fi
-  for c in /usr/sbin/smartctl /sbin/smartctl /usr/local/sbin/smartctl; do
+  # DOMUM_SBIN_ROOT exists so the "no smartctl ANYWHERE" branch can be TESTED.
+  # It defaults to empty, i.e. the absolute production paths. Without it that
+  # branch is undrivable on any machine that HAS smartctl -- and a section
+  # asserting a neighbouring branch silently depended on the RUNNER lacking it,
+  # which passed here and failed in CI. Same reasoning, and the same shape, as
+  # DOMUM_SYSBLOCK_ROOT: a fixture points it at an empty directory, and the
+  # production path is what an unset value gives.
+  local root="${DOMUM_SBIN_ROOT:-}"
+  for c in "$root/usr/sbin/smartctl" "$root/sbin/smartctl" "$root/usr/local/sbin/smartctl"; do
     [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
   done
   return 1

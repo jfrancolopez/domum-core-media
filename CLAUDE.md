@@ -7159,6 +7159,32 @@ Swept for siblings: every other section driving a disk check already stubs
 `interp == 1` branch before the resolver is reached. That one section was the
 only one, and it was checked rather than assumed.
 
+**`DOMUM_SBIN_ROOT` now pins the "no smartctl ANYWHERE" branch, because it was
+UNDRIVABLE on this machine -- which is how the CI failure got through in the
+first place.** The section asserting absence had been written to branch on
+whether the host happened to carry an sbin smartctl and to PRINT which branch
+ran: honest, and it left the absence path unexercised here, so nothing local
+could have caught a neighbouring section depending on the runner. The seam
+defaults to empty (the absolute production paths) and a fixture points it at an
+empty directory. That is the same decision, for the same reason, as
+`DOMUM_SYSBLOCK_ROOT`: without an overridable root the branch "could never be
+driven and the test would default to ... pass for the wrong reason".
+
+**`probe` ends in `true`, so `probe ... ; echo "RC=$?"` can NEVER fail.** Two of
+my new assertions read that status and were therefore vacuous -- one of them the
+assertion that the resolver finds nothing. `smartctl_bin` prints the resolved
+path on success and nothing on failure, so the OUTPUT is the observable and the
+emptiness of it is the assertion. A harness that normalises its own exit status
+makes every status-based assertion through it meaningless; check what the
+harness returns before asserting on it.
+
+**The mutation says when it is NOT KILLABLE rather than reporting a kill that
+did not happen.** Neutralising the override can only change the answer on a
+machine that HAS an sbin smartctl; on a runner without one the override and its
+absence agree. So the section tests for that and prints it, with the
+deterministic assertions carrying the section either way -- a kill claimed on a
+machine where the mutant cannot differ is worse than no mutation at all.
+
 **A branch that depends on the machine is PRINTED, never skipped silently.**
 The fallback section asserts the sbin path is found where one exists and asserts
 the absence wording where none does, and says which branch ran. A silent skip
