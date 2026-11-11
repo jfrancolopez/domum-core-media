@@ -7813,6 +7813,47 @@ the new helper did not.
 
 ---
 
+**"RUN THE CAPTURE AGAINST A LIVE TARGET" IS PROHIBITED BY THE
+CREDENTIAL-COPY INSTRUCTION, NOT MERELY BY ROOT -- and I attempted it before
+recognising that.** The remaining gap on the selective-backup work is that no
+capture has run against real production state: every proof uses fixtures or
+disposable containers of the production images. The obvious next step is to
+capture the five services' real state read-only into a scratch directory, and I
+started doing exactly that.
+
+It was refused, correctly. **The capture's declared purpose is to copy
+credentials** -- calibre-web's Fernet key, kavita's JWT `TokenKey`, jellyfin's
+`DataProtection-Keys`, plex's `Preferences.xml` server token. Copying
+production state to a scratch directory therefore materialises production
+credentials somewhere new, which the operator's standing instruction forbids
+outright: *do not make or transmit credential copies automatically*. That is a
+stronger and more accurate blocker than "the subcommand calls `need_root`",
+and it does not go away with privilege.
+
+What the attempt did establish, read-only and without reading any content
+(`stat` only): **every declared item of all five services is present and
+readable by this account**, including jellyfin's `DataProtection-Keys`
+directory, which is `drwxr-xr-x` in production where the rehearsal's fixture
+had it at 0600. So nothing about the production layout would block a capture --
+the prohibition is the whole of what stands in the way.
+
+**The sqlite path was checked before anything ran, and is also not read-only.**
+`service_sqlite_backup` writes `/tmp/.domum-state-capture.$$.db` INSIDE the
+service container, `docker cp`s it out and removes it. That never touches the
+service's bind-mounted tree, so it is far safer than it first looks -- but it
+is still execution inside a production container, so the capture was attempted
+in `plain` mode instead. Checking that before running is the point: the
+difference between "reads the database" and "executes in the production
+container" is not visible from the function's name.
+
+**So this item is blocked by INSTRUCTION, like P1.16's `chmod`, and not by
+privilege.** Recording which kind matters: a privilege blocker is retired by
+one `sudo`; an instruction blocker is retired only by the operator deciding to
+allow it, and the next session should not waste a measurement rediscovering
+that.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
