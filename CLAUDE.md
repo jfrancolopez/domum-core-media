@@ -7059,6 +7059,135 @@ Writing the proof next to that sentence is the point: the easiest thing to
 overstate here is off-site protection, and the row most likely to be misread as
 closing it is the one that was just opened.
 
+**THE `command -v` PATH TRAP WAS IN THE PRODUCTION CODE, not just in my
+probes.** This file records it twice as a mistake of mine -- `smartctl`, then
+`mkfs.btrfs` -- both times concluding a tool was missing from a run as the wrong
+user. Measured 2026-11-11, `checkup_disk_health` made it too:
+
+```
+dpkg -l smartmontools        ii  smartmontools  7.4-3
+/usr/sbin/smartctl           -rwxr-xr-x root root  1,077,216
+command -v smartctl          (as jfranco) NOT FOUND
+/usr/sbin on jfranco's PATH  no
+-> WARN: Disk SMART health is UNKNOWN: smartmontools is not installed.
+```
+
+`cmd_exists smartctl` is `command -v`, so the guard answered yes under sudo and
+no otherwise. **Production is correct -- `checkup` runs as root -- and the
+message was still wrong twice over**: it named an absent package as the cause,
+and it offered `apt-get install -y smartmontools` for a package that is
+installed. An unactionable remedy trains the operator to ignore the check, and
+this one is the only thing watching two SSDs.
+
+It also blinded the method that has found the last several defects here:
+**driving the real checks unprivileged against the real host**. That is how
+`mreport_smart_interpretable`'s empty-table conflation was found, and the same
+run reported "not installed" rather than reaching the code under test.
+
+`smartctl_bin` is the one resolver -- `command -v` first, then
+`/usr/sbin`, `/sbin`, `/usr/local/sbin` -- so the check answers the same way
+whichever account runs it, and the "appears genuinely absent" branch is reached
+only when there really is no smartctl. **A shell-function stub still works,
+because `command -v` resolves a function to its own name**, which is what keeps
+every existing fixture in the suite live; that is asserted rather than assumed,
+since a resolver that bypassed the stubs would silently invoke the HOST's
+smartctl from six sections.
+
+**AND THE FIX INTRODUCED A WORSE DEFECT, which the declaration guard caught
+before it was committed.** `checkup_disk_wear` read `$smartctl_path` without
+declaring it. Bash's dynamic scoping leaks the caller's local, so it worked from
+`checkup_disk_health` -- the only production call site -- and was unbound for
+the six test sections that drive it directly. The failure is not a crash: the
+read sits inside a command substitution ending in `|| true`, so `set -u` kills
+the subshell, the status is **swallowed**, and `wear` comes back empty.
+Measured:
+
+```
+a drive with 5% of rated write life left, called standalone
+  before:  ADVICE  "/dev/sdb reports no wear attribute ... UNMEASURED"
+  after:   CRITICAL "/dev/sdb reports only 5% of rated write life remaining."
+```
+
+Advice does not pass the notifier's silence gate, so a dying disk would have
+been silent. HEALTHY-must-not-mean-UNMEASURED, manufactured by the fix for a
+wrong-cause message. Resolving at the use site is the rule already recorded for
+`DISK_WEAR_WARN_PERCENT`, and it is the same reason.
+
+**The guard is the reusable part**: every `$smartctl_path` read must sit inside
+a function that declares it. A use that reads the caller's local is invisible to
+any test that drives only the caller, so the defect cannot be found by
+exercising the production path -- which is exactly what every existing section
+did. It has a count check so it cannot scan nothing, and a mutation that
+restores the inherited form must bring the UNMEASURED advice back.
+
+**`str.count` COUNTS SUBSTRINGS, so a 2-space anchor matched a 4-space line.**
+Three times in one sitting: `  if ! cmd_exists smartctl; then` is contained in
+the 4-space copy inside `mreport_render_text`, and `  wear="$(...` in the
+10-space copy. The assertion reported `matched 2 times` and wrote nothing, which
+is why it cost minutes rather than a wrong edit. Anchor on the PRECEDING
+NEWLINE: `\n  if ! ...` forces the match to column 0 and makes the indentation
+exact. This is the same family as the line-at-a-time grep, in the edit tooling
+rather than in an audit.
+
+**An existing section's SEAM went stale while its property stayed right.**
+`absent smartmontools is UNKNOWN with a remedy` simulated absence with
+`cmd_exists() { [[ "$1" != smartctl ]]; }`, which the resolver no longer
+consults -- so it would have left the sbin fallbacks live and asserted nothing.
+Before adapting a test to a change, ask which of the two is wrong: here the
+property is still exactly right and only the seam moved, so the seam became
+`smartctl_bin() { return 1; }` and the assertions are untouched.
+
+**A branch that depends on the machine is PRINTED, never skipped silently.**
+The fallback section asserts the sbin path is found where one exists and asserts
+the absence wording where none does, and says which branch ran. A silent skip
+would make it indistinguishable from a section that asserts nothing -- the
+fixture-skips-the-iteration mistake.
+
+`tests/health-checks-smoke.sh`, 6 new sections; 2 mutants, both killed.
+
+---
+
+**AN ESCAPE-UNAWARE VERIFIER REPORTED THREE CORRECT ROWS AS BROKEN, AND I
+ACTED ON IT AND CORRUPTED THEM.** Found 2026-11-11 while adding a backlog row:
+`awk -F'|'` over `backlog/QUEUE.md` reported four rows with the wrong cell
+count. One was genuinely broken -- P1.25 held a raw `ITEM=sqlite|navidrome.db|`
+inside a code span, and a raw `|` splits a markdown cell even there, so its
+status rendered as two phantom columns. **The other three were already
+correctly escaped** (`44\|600`, `docker save \| wc -c`, `docker logs \| grep`),
+and awk counts `\|` as a delimiter because it knows nothing of markdown
+escaping.
+
+My repair rebuilt each row by joining the awk fields with `\|`, which turned the
+three correct `\|` into `\\|` -- a literal backslash, not an escaped pipe. The
+round-trip check caught it: unescaping both files and comparing byte for byte
+showed three lines still differing, and a `\\|` assertion named the cause. The
+pre-repair `cp` is what made recovery one command, which is the rule this file
+already states for mutation testing and the reason it says `cp` rather than
+`git checkout`.
+
+**An audit that cannot see escaping tells you to break correct rows**, which is
+worse than not having it: a false positive in a verifier is acted on with the
+same confidence as a true one. The same mistake in the opposite direction is
+already recorded here -- the pipefail audit must not read `||` as a pipe, "or
+the audit flags the very fix it prescribes".
+
+`tests/queue-table-structure-audit.py` is escape-aware and rejects four shapes:
+a cell count other than three, a row with **no** status cell (the recorded P1.7
+defect, which survived four commits), a status cell that is **blank** -- which
+reads as "no status" rather than as "blocked" -- and a `\\|`. It defaults to the
+real queue so a forgotten argument checks production rather than nothing, and
+reports problems BEFORE the vacuity guard, because a stale row pattern yields
+zero matches AND a finding and the finding is the actionable half.
+
+**The ACCEPTANCE cases are the ones that matter here**, and that is the whole
+lesson: `tests/queue-table-structure-smoke.sh` requires a correctly escaped
+pipe to be ACCEPTED, alongside the four rejections, because a single-direction
+assertion cannot tell this audit from the escape-unaware version that started
+the damage. Its fixtures carry 45 filler rows so a rejection case can never
+pass by tripping the vacuity floor instead. 9 sections.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
