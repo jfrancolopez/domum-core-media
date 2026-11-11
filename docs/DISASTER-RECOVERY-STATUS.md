@@ -561,3 +561,42 @@ so until a whole tier is restored and Immich itself confirms the result.
 | The Immich dump is restorable from Hetzner | **UNKNOWN** (root-only evidence) |
 | Image archives are inside the snapshot | **UNKNOWN** (root-only directory) |
 | Any tier is fully recoverable | **NOT VERIFIED** — no such run has been performed |
+
+---
+
+## The LOCAL tier, re-observed 2026-11-11 (read-only, no root)
+
+The four claims about an original are `LOCAL` < `IN SNAPSHOT` <
+`RESTORE TESTED` < `APP USABLE`, and none implies another. **`LOCAL` is now
+re-observed in full**, which had previously been reported as unobtainable from
+an unprivileged account:
+
+```
+originals in the asset table   23267
+  under upload/                23209
+  under encoded-video/            58
+duplicates / nulls / elsewhere   0 / 0 / 0
+present on disk                23267
+MISSING on disk                    0
+total size                     131.6 GiB
+```
+
+`verify-snapshot-coverage` does refuse without root, and that was read as the
+whole measurement being blocked. It is not: `immich_db_original_paths` needs
+only `docker exec` into `immich_postgres` and `psql`, which is read-only
+inspection of the application's own data. **A blocker is a property of a STEP,
+not of a command** -- a command that refuses for one of its inputs says nothing
+about the inputs it would not have needed.
+
+What remains root-gated is the rung above: reconciling each of those 23,267
+paths against a restic snapshot's own file list needs the repository
+credentials under `/etc/domum-core-media/secrets`, which are `0600 root`. That
+is `IN SNAPSHOT`, and it is a different claim from `LOCAL`.
+
+**The 58 under `encoded-video/` are unchanged, and that is the figure to
+watch.** They are irreplaceable originals -- motion-photo parts -- in a subtree
+that otherwise looks purely derivative, which is why the derivative-exclusion
+pattern is written as a character class that cannot match them. A change in
+that count means the pattern must be re-derived. The library grew by 234
+originals and 1.2 GiB since the last recorded measurement and those 58 did not
+move.
