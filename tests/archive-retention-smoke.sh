@@ -256,5 +256,77 @@ echo "   killed: an archive that may not hold its image becomes coverage"
 
 cmp -s "$CLI" "$TMP/cli.orig" || fail "the CLI was left mutated"
 
+# ===========================================================================
+sect "10. A POINT WHOSE ARCHIVE HAS VANISHED IS A VERDICT, NOT A SILENCE"
+# Pass one walks the archives on DISK, so a recovery point naming an archive
+# that is gone produced NO record at all -- the `0 named by a recovery point`
+# defect: a candidate list cannot distinguish PROTECTED from NEVER CONSIDERED.
+G="$TMP/gone"; rm -rf -- "$G"; mkdir -p "$G/data/backups/images" "$G/state/snapshots"
+printf 'good\n' > "$G/data/backups/images/plex-good.tar"
+mkpoint "$G" plex-20261110-120000-pre plex 2026-11-10T12:00:00-05:00 plex-good real
+# A point naming an archive that does not exist. mkpoint needs the file for its
+# checksum, so it is created and then removed -- the POINT keeps naming it.
+printf 'temp\n' > "$G/data/backups/images/plex-gone.tar"
+mkpoint "$G" plex-20261112-120000-pre plex 2026-11-12T12:00:00-05:00 plex-gone real
+rm -f "$G/data/backups/images/plex-gone.tar"
+
+gout="$(drive "$G" archive_retention_decisions)"
+grep -qF "archive-missing plex plex-gone.tar plex-20261112-120000-pre" <<< "$gout" \
+  || fail "10: a point whose archive is gone produced no record: $gout"
+echo "   the vanished archive is named, with its point"
+
+# ===========================================================================
+sect "11. and the retained OLDER archive must not read as coverage"
+ghuman="$(drive "$G" 'storage_archive_retention')"
+grep -qF "THE NEWEST RECOVERY POINT HAS NO ARCHIVE for: plex" <<< "$ghuman" \
+  || fail "11: the report did not escalate: $ghuman"
+grep -qiE 'not a statement that this service is covered' <<< "$ghuman" \
+  || fail "11: it does not say 'retain' is about an older point: $ghuman"
+echo "   escalated, and 'retain' is explicitly not a coverage claim"
+
+# ===========================================================================
+sect "12. the escalation does NOT fire when the missing point is OLDER"
+# A check that fires either way is noise. Here the gone archive belongs to an
+# OLDER point, so the retained archive IS the newest and nothing is wrong.
+O="$TMP/older"; rm -rf -- "$O"; mkdir -p "$O/data/backups/images" "$O/state/snapshots"
+printf 'good\n' > "$O/data/backups/images/plex-good.tar"
+mkpoint "$O" plex-20261112-120000-pre plex 2026-11-12T12:00:00-05:00 plex-good real
+printf 'temp\n' > "$O/data/backups/images/plex-gone.tar"
+mkpoint "$O" plex-20261101-120000-pre plex 2026-11-01T12:00:00-05:00 plex-gone real
+rm -f "$O/data/backups/images/plex-gone.tar"
+
+ohuman="$(drive "$O" 'storage_archive_retention')"
+grep -qF "THE NEWEST RECOVERY POINT HAS NO ARCHIVE" <<< "$ohuman" \
+  && fail "12: it escalated for an OLDER point's missing archive, which is noise: $ohuman"
+# It must still be REPORTED, just not escalated.
+odec="$(drive "$O" archive_retention_decisions)"
+grep -qF "archive-missing plex plex-gone.tar" <<< "$odec" \
+  || fail "12: an older point's missing archive was not reported at all: $odec"
+echo "   reported but not escalated -- both directions asserted"
+
+# ===========================================================================
+sect "13. MUTATION: without the points pass the vanished archive is invisible"
+cat > "$TMP/m3.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+start = s.index('  local pm pbody parch psvc pcap')
+end = s.index('  done <<< "$point_metas"', start) + len('  done <<< "$point_metas"\n')
+io.open(p, "w", encoding="utf-8").write(s[:start] + s[end:])
+PY
+mutate "$TMP/m3.py"
+mout3="$(drive "$G" archive_retention_decisions)"
+mhuman3="$(drive "$G" 'storage_archive_retention')"
+unmutate
+grep -qF "plex-gone.tar" <<< "$mout3" \
+  && fail "13: the mutant still reported the vanished archive -- the mutation changed nothing: $mout3"
+grep -qF "THE NEWEST RECOVERY POINT HAS NO ARCHIVE" <<< "$mhuman3" \
+  && fail "13: the mutant still escalated, so the escalation does not depend on the points pass"
+grep -qF "retain plex plex-good.tar" <<< "$mout3" \
+  || fail "13: the mutant did not still retain the older archive, so the fixture proves nothing"
+echo "   killed: the older archive reads as coverage and the gap is silent"
+
+cmp -s "$CLI" "$TMP/cli.orig" || fail "the CLI was left mutated"
+
 echo
-echo "PASS: archive-retention-smoke (9 sections, 2 mutants)"
+echo "PASS: archive-retention-smoke (13 sections, 3 mutants)"

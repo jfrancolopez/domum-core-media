@@ -12563,6 +12563,28 @@ archive_retention_decisions() {
     rows+=("valid ${svc:-unknown} $base $point $bytes $cap")
   done <<< "$archives"
 
+  # Pass 1b: THE RECORD SET MUST BE WIDER THAN THE CANDIDATE SET. Pass one walks
+  # the archives on DISK, so a recovery point whose named archive has VANISHED
+  # produced no record at all -- and if it was the service's newest point, an
+  # older archive was reported `retain` and read as "this service's newest point
+  # is covered". That is the `0 named by a recovery point` defect this project
+  # already records: a candidate list cannot distinguish PROTECTED from NEVER
+  # CONSIDERED. So the points are walked too, and a point naming an absent
+  # archive is a verdict rather than a silence.
+  local pm pbody parch psvc pcap
+  local point_metas
+  point_metas="$(compgen -G "$meta_dir/*.recovery" || true)"
+  while IFS= read -r pm; do
+    [[ -e "$pm" ]] || continue
+    pbody="$(cat "$pm" 2>/dev/null || true)"
+    parch="$(sed -nE "s/^IMAGE_ARCHIVE='(.*)'\$/\1/p" <<< "$pbody" | head -1)"
+    [[ -n "$parch" ]] || continue
+    [[ -e "$parch" ]] && continue
+    psvc="$(sed -nE "s/^SERVICE='(.*)'\$/\1/p" <<< "$pbody" | head -1)"
+    pcap="$(sed -nE "s/^CAPTURED_AT='(.*)'\$/\1/p" <<< "$pbody" | head -1)"
+    rows+=("archive-missing ${psvc:-unknown} $(basename "$parch") $(basename "$pm" .recovery) 0 named-by-this-point-but-absent-from-disk|${pcap:-}")
+  done <<< "$point_metas"
+
   # Pass two: among the VALID ones, the newest CAPTURED_AT per service is what
   # goes off-site. Ties cannot be split by metadata, so the first is kept and
   # the other is reported superseded rather than silently dropped.
@@ -12643,6 +12665,7 @@ storage_archive_retention() {
     v="$(awk '{print $1}' <<< "$a")"; s="$(awk '{print $2}' <<< "$a")"
     arch="$(awk '{print $3}' <<< "$a")"; pt="$(awk '{print $4}' <<< "$a")"
     by="$(awk '{print $5}' <<< "$a")"; de="$(awk '{print $6}' <<< "$a")"
+    de="${de%%|*}"
     printf '  %-20s %-14s %s\n' "$v" "$s" "$arch"
     [[ "$pt" != "-" ]] && printf '  %-20s %-14s point %s\n' "" "" "$pt"
     printf '  %-20s %-14s %s bytes, %s\n' "" "" "$by" "$de"
@@ -12653,9 +12676,36 @@ storage_archive_retention() {
     fi
   done <<< "$decisions"
 
+  # Per service: is the NEWEST point's archive the one being retained? If a
+  # later point's archive is absent, the retained archive is not the rollback
+  # target an operator would reach for, and saying only "retain" would be the
+  # weaker claim in the stronger claim's words.
+  local svc_list svc newest_missing retained_cap
+  svc_list="$(awk '{print $2}' <<< "$decisions" | sort -u)"
+  local stale_newest=""
+  while IFS= read -r svc; do
+    [[ -n "$svc" && "$svc" != "unknown" ]] || continue
+    newest_missing="$(awk -v s="$svc" '$1=="archive-missing" && $2==s {split($6,p,"|"); print p[2]}' \
+      <<< "$decisions" | sort -r | head -1)"
+    [[ -n "$newest_missing" ]] || continue
+    retained_cap="$(awk -v s="$svc" '$1=="retain" && $2==s {print $6}' <<< "$decisions" | head -1)"
+    if [[ -z "$retained_cap" || "$newest_missing" > "$retained_cap" ]]; then
+      stale_newest="${stale_newest}${stale_newest:+ }$svc"
+    fi
+  done <<< "$svc_list"
+
   echo
   echo "  off-site set: $retain_n archive(s), $retain_b bytes"
   echo "  not off-site: $other_n archive(s)"
+  if [[ -n "$stale_newest" ]]; then
+    echo
+    echo "  ** THE NEWEST RECOVERY POINT HAS NO ARCHIVE for: $stale_newest"
+    echo "     A point names an image archive that is NOT on disk, and it is newer"
+    echo "     than anything retained above. So the retained archive is not the"
+    echo "     rollback target you would reach for, and this service's newest"
+    echo "     point has no application half at all. 'retain' above is about an"
+    echo "     OLDER point -- it is not a statement that this service is covered."
+  fi
   echo
   echo "  NOTHING WAS DELETED and nothing here is a disk decision. Off-site"
   echo "  retention and on-disk retention are separate: a superseded archive is"

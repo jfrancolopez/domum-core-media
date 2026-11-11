@@ -6913,6 +6913,52 @@ disposable run would add is injecting a checksum error and watching **exit 3
 propagate for real**, which is precisely what a clean production run cannot
 demonstrate. That is the gap; it is not "the scrub is untested".
 
+---
+
+**I SHIPPED THE NARROW-CANDIDATE-SET DEFECT INTO THE RETENTION SELECTOR, ONE DAY
+AFTER CITING THE RULE THAT FORBIDS IT.** `archive_retention_decisions` walked the
+archives on DISK. Measured 2026-11-11 with two recovery points and one archive:
+
+```
+points on disk 2   archives on disk 1   decisions emitted 1
+  retain plex plex-good.tar plex-20261110-120000-pre
+  (the 11-12 point, whose archive is GONE, produced NOTHING)
+```
+
+So a recovery point naming an archive that has vanished was **invisible**, and
+because the vanished one was the NEWER point, `retain` on the older archive read
+as *"this service's newest point is covered"* when its newest point had no
+application half at all. That is the `0 named by a recovery point` defect
+verbatim -- *"a candidate list cannot distinguish PROTECTED from NEVER
+CONSIDERED"* -- and `cleanup images` already solves it by making the record set
+**wider** than the candidate set. I quoted that very rule in the commit that
+introduced this function and then built the narrow version.
+
+Two halves to the fix, because reporting the gap is not enough:
+
+- **the POINTS are walked too**, so a point naming an absent archive is a
+  verdict (`archive-missing`) rather than a silence;
+- **and the per-service claim is corrected.** Emitting the record while still
+  printing `retain` for an older archive would leave the reassuring reading
+  intact. The report now names any service whose NEWEST point's archive is
+  absent and says in its own words that `retain` above is about an OLDER point
+  and *"is not a statement that this service is covered"* -- the weaker claim
+  kept out of the stronger claim's words.
+
+**Both directions are asserted, because a check that fires either way is
+noise.** A missing archive belonging to an OLDER point is REPORTED and
+deliberately NOT escalated: the retained archive really is the newest, and
+nothing is wrong. The mutation removes the points pass and must make the
+vanished archive invisible AND the escalation disappear AND the older archive
+still read as `retain` -- the last clause is what stops the fixture proving
+nothing.
+
+**The lesson is not "add a wider pass". It is that an inventory built by walking
+the ARTEFACTS can only ever answer questions about artefacts that exist**, and
+every question worth asking here -- is this protected, is this covered, is this
+the point I would roll back to -- is a question about the RECORDS. Walk the
+records and join to the artefacts, never the reverse.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
