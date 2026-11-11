@@ -530,3 +530,93 @@ state. The credential itself was never at risk there, because a command-line
 
 Failure propagation is unchanged and asserted: curl still returns non-zero once
 retries are exhausted, and every caller that died on a failed send still dies.
+
+---
+
+## 10. THERE ARE NOW TWO DEPLOYMENTS, AND ONLY ONE OF THEM IS THIS PLAN
+
+Re-measured 2026-11-10 against `origin/main` = `df2e849`. The delta has grown
+47 -> **57 commits**, and the growth is not more of the same: a security
+workstream (#196-#203) added **13 compose files**, two config files and two of
+the three binaries. That changes the *kind* of deployment the repository
+contains, not just its size.
+
+| | A -- the narrow deployment | B -- the security compose change set |
+|---|---|---|
+| files | 3 binaries + 2 weekly-report units | 13 `compose/*`, `config/ci.env`, `config/domum-media.conf.example` |
+| carried by `operator/domum-media-deploy-reporting-fixes.sh` | **yes** | **no** -- `TARGETS`/`UNIT_TARGETS` name neither compose nor config |
+| containers touched | **none** | **every one whose config changed** |
+| mechanism | `install` + `daemon-reload` | `docker compose up -d` |
+| approval | narrow, reviewed here | **§11 stop condition** (broad container recreation) |
+
+**§5's "no container is created, recreated, restarted or stopped" is true of A
+and must not be read as a claim about deploying `main`.** It was written when
+the delta was binaries and units only. It still describes what the script does;
+it no longer describes everything the repository now contains, and that
+difference is in the dangerous direction for an operator sizing the work.
+
+### 10.1 What B would actually do
+
+Measured from the diff: **14** services gain
+`security_opt: [no-new-privileges:true]`, one gains `read_only`, and a **new
+service** appears -- `docker-socket-proxy`, with a new `traefik-docker` network,
+so Traefik reaches the Docker API through a read-only proxy instead of the
+socket. Applying any of it means `compose up -d`, which recreates a container
+whose configuration changed. There are 11 running containers.
+
+### 10.2 AND `up -d` WOULD DEPLOY TWO STAGED IMAGES AS A SIDE EFFECT
+
+This is the part that is easy to miss, because it has nothing to do with the
+security change itself. Measured 2026-11-10, read-only:
+
+```
+traefik      running sha256:9c3b91d5fb77   traefik:latest        -> sha256:9c2a54d87f76
+uptime-kuma  running sha256:a8610b3b4c38   louislam/uptime-kuma:2 -> sha256:3e24e96c89ef
+plex jellyfin kavita navidrome calibre-web  tag resolves to the running image
+```
+
+`up -d` *reconciles*, so recreating traefik and uptime-kuma to pick up
+`no-new-privileges` resolves their tags and lands them on the newer images --
+an unreviewed application upgrade smuggled inside a security change. These are
+also the two services this project records as running **dangling** images
+(`RepoTags: []` and `RepoDigests: []`), so the image they are on now survives
+only because a container references it.
+
+**The pin is available and is the same mechanism `rollback_upgrade` uses.**
+`compose/proxy/traefik.yml` and `compose/monitoring/uptime-kuma.yml` both read
+`image: ${TRAEFIK_IMAGE}` / `${UPTIME_KUMA_IMAGE}`, and
+`export_env_for_compose` resolves them as `${VAR:-default}` -- so a value
+exported first is preserved. Demonstrated:
+
+```
+export TRAEFIK_IMAGE="sha256:PINNED"; export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:latest}"
+  -> sha256:PINNED
+unset TRAEFIK_IMAGE;                  export TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:latest}"
+  -> traefik:latest
+```
+
+So B can be applied **without** deploying those two, by exporting each running
+image id before `up -d`. Whether to take the image upgrades is a separate
+decision from whether to take the security hardening, and they must not be
+made by accident.
+
+### 10.3 Hashes, re-measured, with the command that re-derives them
+
+| file | installed at `a63ad19` | new at `df2e849` |
+|---|---|---|
+| `bin/domum-media` | `5e65f06c8a7a4bf4` | `64dc04d70abd703b` |
+| `bin/domum-media-backup` | `08a81ba2065850c4` | `31677cdb7e2665c0` |
+| `bin/domum-media-report` | `d813ae0e4181a7d5` | `14a5f7334adf68e0` |
+
+Production is still `a63ad19` with **no drift** on any of the three installed
+files, so A starts from a clean base. Re-derive with the loop in §9.3 rather
+than trusting this table -- it has gone stale twice in a week, which is why the
+command is given beside it.
+
+### 10.4 Recommendation
+
+Deploy **A** on its own, as this plan already describes: it fixes the weekly
+report, the notification policy and the SMTP transport, touches no container,
+and retires the 2026-11-15 and 2026-12-06 dated items. Review **B** separately
+and on its own merits, with the image question decided explicitly rather than
+inherited from a tag.
