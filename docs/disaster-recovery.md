@@ -142,7 +142,61 @@ five services' state exists on exactly one device** — the SSD that also holds
 every snapshot and every `.premigration` copy — so losing that device loses it.
 `domum-media storage capture-state` exists to capture the 8.90 MiB that
 matters, and **no backup target includes those captures yet**; activating one
-is an operator decision.
+is an operator decision. The route that would use one is below, with its
+preconditions stated, because an operator who has a pack should not have to
+discover the commands during a recovery.
+
+### 4b. Restoring the five media services from a state pack
+
+**Read the three preconditions first. If any fails, this section does not
+apply and the table above stands: the five services come up as fresh
+installs.**
+
+| precondition | how to check | state as of 2026-11-11 |
+|---|---|---|
+| the commands exist in the INSTALLED binary | `domum-media capabilities --has state-unpack` → exit 0 | **NO** — production predates them; exit 2 (token unknown) |
+| a pack exists somewhere off this host | look wherever you put it | **NO** — none has ever been transferred |
+| you hold the age private key | `age-keygen -y <identity>` prints a public key | operator-held, deliberately not on the host |
+
+`capabilities --has` is the check to use rather than running the subcommand and
+reading its error: it exits **0** supported, **1** implementation absent, **2**
+token unknown — and an older binary answers 2, which must not be read as a no
+about the feature.
+
+When all three hold, for each service:
+
+```
+# 1. the file is intact and is a pack -- no decryption, no mutation
+domum-media storage verify-pack <pack>.tar.age
+
+# 2. open it with YOUR key into a scratch directory
+domum-media storage unpack-state <pack>.tar.age <identity> /var/tmp/unpacked-<svc>
+
+# 3. restore the state into a scratch target, NEVER over live state
+domum-media storage restore-state /var/tmp/unpacked-<svc> /var/tmp/restored-<svc>
+```
+
+Then stop the service, move the restored tree into place, and start it with
+`domum-media compose start <svc>` — **not** `up -d`, which reconciles and would
+deploy whatever the image tag now resolves to.
+
+Three things this route does **not** give you, stated here so they are not
+discovered later:
+
+- **it is state, not the application.** A recovery point is service + state +
+  the application that wrote it. The manifest records `IMAGE_ID`; whether that
+  image can still be obtained is a separate question, and for every service on
+  this host the `docker save` archive is the only proven copy — and those
+  archives are themselves not in the cloud target.
+- **`restore-state` proves the capture restores, not that the service runs
+  against it.** It says so in its own output. Three of the five have been shown
+  to start against a restored capture in rehearsals; none has been shown to
+  serve its library.
+- **a capture is not everything under the service directory.** It is the
+  declared essential items — databases, configuration, credentials and
+  identities. Regenerable material (Plex's `Drivers/`, navidrome's `cache/`,
+  kavita's own `backups/`) is deliberately excluded, so expect the service to
+  rebuild those.
 
 Read `docs/HIDDEN-RECOVERY-DEPENDENCIES.md` before step 4. It lists the twelve
 things a recovery needs that no backup list mentions — among them the six
