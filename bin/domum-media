@@ -1491,7 +1491,6 @@ export_env_for_compose() {
   export DOMUM_DOMAIN="${DOMUM_DOMAIN:-example.test}"
   export DOMUM_EMAIL="${DOMUM_EMAIL:-admin@${DOMUM_DOMAIN}}"
   export DOMUM_LAN_IP="${DOMUM_LAN_IP:-}"
-  export DOMUM_TS_IP="${DOMUM_TS_IP:-}"
   export DOMUM_STATE_ROOT
   export DOMUM_MEDIA_ROOT="${DOMUM_MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
   export DOMUM_CACHE_ROOT="${DOMUM_CACHE_ROOT:-$DOMUM_MEDIA_ROOT/.cache}"
@@ -3145,7 +3144,6 @@ configure_cmd() {
   configure_text_value DOMUM_DOMAIN "Base domain"
   configure_text_value DOMUM_EMAIL "ACME email for Let's Encrypt"
   configure_text_value DOMUM_LAN_IP "LAN IP for split-DNS notes"
-  configure_text_value DOMUM_TS_IP "Tailscale IP for split-DNS notes"
 
   echo
   configure_service_toggle ENABLE_TRAEFIK "Enable Traefik reverse proxy?"

@@ -16,9 +16,13 @@ DOMUM_DOMAIN=example.test
 # ACME notification email (Let's Encrypt)
 DOMUM_EMAIL=
 
-# Optional — used by docs and dynamic routes for split-DNS notes
+# Optional — DOMUM_LAN_IP is passed to Traefik (compose/proxy/traefik.yml) and
+# cited by two setup documents. DOMUM_TS_IP used to sit here under the same
+# comment and was read by NOTHING: measured, no dynamic route references it and
+# no document mentions it, so both halves of that comment were false of it. It
+# was exported and `configure` prompted for it, which asserts the answer
+# matters. Removed, along with the prompt.
 DOMUM_LAN_IP=192.0.2.10
-DOMUM_TS_IP=''
 
 # ============================================================
 # SECTION: Paths — durable vs disposable
@@ -72,7 +76,7 @@ ENABLE_RESTIC_REST_SERVER=0
 # ============================================================
 
 TRAEFIK_DASHBOARD_HOST=traefik-media.example.test
-IMMICH_HOST=photos.example.test
+IMMICH_HOST=photos.example.test  # inert-audit: the Immich route hardcodes Host(`photos.${DOMUM_DOMAIN}`), so setting this changes nothing; task-25 step 2 wires it, which is a compose change
 JELLYFIN_HOST=media.example.test
 PLEX_HOST=plex.example.test
 NAVIDROME_HOST=music.example.test
@@ -199,7 +203,7 @@ KAVITA_CONFIG_DIR="/srv/data/kavita/config"
 # operator-reviewed change, not a cleanup.
 IMMICH_BUNDLE_AUTO_UPDATE=1
 IMMICH_BUNDLE_DELAY_DAYS=21
-IMMICH_BUNDLE_ROLLBACK_ENABLED=1
+IMMICH_BUNDLE_ROLLBACK_ENABLED=1  # inert-audit: nothing reads it; rollback follows AUTO_ROLLBACK_ENABLED. task-25 step 3 wires it, but that makes a rollback gate obey a never-obeyed value and the production config is 0600 root, so it needs operator review
 
 # These image refs are managed automatically by the bundle manager after each
 # successful bundle apply. Do not edit them manually.

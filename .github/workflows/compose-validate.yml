@@ -191,6 +191,12 @@ jobs:
       - name: Config example dead-key audit
         run: python3 tests/config-example-dead-keys-audit.py
 
+      # The harder half: a key that IS referenced but whose value nothing reads.
+      # `configure` prompted for three of these, and being asked asserts the
+      # answer matters.
+      - name: Config example inert-key audit
+        run: python3 tests/config-example-inert-keys-audit.py
+
       # `smtp_send_message` is the ONE place mail leaves this host and no test
       # had ever executed it -- five suites stub it whole. It drives the real
       # function and compares the credential curl parses back, byte for byte,

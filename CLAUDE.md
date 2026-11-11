@@ -6698,6 +6698,80 @@ I checked the task before committing, which is the argument for reading the
 existing backlog entry rather than treating a measurement as complete because it
 was mine.
 
+---
+
+**A KEY THAT IS REFERENCED BUT WHOSE VALUE NOTHING READS IS STILL INERT, AND
+`configure` PROMPTED FOR THREE OF THEM.** This is the second class recorded in
+the dead-key entry, and the dead-key audit cannot see it by construction: the
+key appears in the code, so "is it referenced" answers yes. What makes it inert
+is that EVERY occurrence is plumbing -- its own export, its `load_cfg` default,
+or a `configure`/`config_set` line that WRITES it -- with nothing reading the
+value to decide anything. It is the worse half of the family, because **being
+asked a question asserts that the answer matters.**
+
+Measured 2026-11-10, all three verified individually:
+
+| key | evidence |
+|---|---|
+| `DOMUM_TS_IP` | exported + prompted. Its own comment claimed it was *"used by docs and dynamic routes"*; **both halves are false** -- nothing in `compose/proxy/` references it and no document mentions it. Its NEIGHBOUR `DOMUM_LAN_IP`, under the same comment, genuinely is used (`compose/proxy/traefik.yml:19` plus two setup docs), which is the contrast that makes it a finding rather than a guess. REMOVED, with the prompt and the export |
+| `IMMICH_HOST` | exported + prompted, while `compose/photos/immich.yml:29` hardcodes ``Host(`photos.${DOMUM_DOMAIN}`)`` |
+| `IMMICH_BUNDLE_ROLLBACK_ENABLED` | exported + prompted; rollback follows `AUTO_ROLLBACK_ENABLED`, prompted for on the line IMMEDIATELY BEFORE |
+
+**CONTINUATIONS MUST BE JOINED, and that is the whole reason the audit works.**
+A `config_set` whose prompt default sits on the next physical line puts
+`${KEY:-...}` on a line with no `config_set` on it, so a line-at-a-time scan
+reads it as a genuine read. Measured: **0** inert keys before joining, **3**
+after. That is the blind spot `tests/pipefail-grep-audit.py` already records,
+arriving in a third place.
+
+**The two deferred keys are EXEMPTED, not ignored, and the exemption is the
+audit's own negative control.** `# inert-audit: <reason>` on the key's own line
+-- not the line before, which drifts from what it vouches for -- and every
+exemption is PRINTED with whether it is still inert. A marker on a key that has
+since become live FAILS, so it cannot outlive the defect it describes. That
+check is what catches the continuation join being removed: both exemptions
+immediately read `NOT inert any more`, so the join cannot be dropped silently.
+
+**NEITHER DEFERRED KEY IS WIRED, and both reasons are substantive.** `IMMICH_HOST`
+needs the Traefik rule changed, which is a compose change and therefore
+deployment-affecting. `IMMICH_BUNDLE_ROLLBACK_ENABLED` is a ROLLBACK gate: wiring
+it makes it start obeying a value that has never been obeyed, and the production
+config is `0600 root` -- unreadable from this account -- so it could silently
+turn bundle rollback OFF on this host. Reported where an operator reads it.
+
+**A SETTER MISSING FROM THE HELPER LIST FAILS SAFE.** The audit knows seven
+`configure_*`/`config_set` writers. A new one it has not been taught makes a key
+look READ, i.e. a false negative, never a false alarm -- so the list going stale
+is the harmless direction, which is why it is a list rather than a derivation.
+
+**And a backtick plus `${...}` went into a comment in a file `load_cfg`
+SOURCES.** Comments are not expanded, so it is safe -- but this file records
+three instances of a backtick executing where it was assumed inert, so it was
+verified rather than argued: sourcing the example returns 0, nothing executes,
+no trailing comment leaks into a value, and `bash -n` passes.
+
+**AND MY OWN TEST DEPENDED ON THE HOST'S TIMEZONE -- the fourth dimension of
+host dependence this file has recorded, after PATH, SPEED and the host's awk.**
+`weekly-notification-policy-smoke` asserted `SENT_DATE=$(date -I)` computed in
+the TEST's shell, while `record_weekly_report` computes it inside the CLI --
+which exports `TZ="${TZ:-UTC}"` for the containers, and that leaks into its own
+process. Measured 2026-11-10 21:47 EST: `date -I` is `2026-11-10` locally and
+`2026-11-11` under UTC. So the assertion failed on this host every evening
+between 19:00 and midnight and passed in CI, which runs UTC -- the
+"passes in CI, fails locally" inversion. The production guard is unaffected:
+the writer and the same-day reader both run inside the CLI, so both are UTC and
+agree. The fix derives the date the way the code does, and additionally requires
+the recorded `TS` and `SENT_DATE` to agree -- which holds whatever the clock
+says, so it cannot rot back into a time-of-day dependence. Both halves are
+negative-controlled.
+
+**And I read a mutation's indentation off `sed`-prefixed output AGAIN, hours
+after recording that exact mistake.** `cat -A` shows four spaces; the
+`sed 's/^/  /'` display shows six. Both anchors matched 0. Then the second
+anchor matched **2**, because `TS "$(date +%s)"` appears in three recorders --
+so it had to be scoped inside `record_weekly_report`. The `matched %d` assertion
+caught both, which is the entire reason it exists.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

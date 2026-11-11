@@ -93,3 +93,29 @@ change, not a cleanup. The example now says so where an operator will read it.
 Steps 2 (`IMMICH_HOST`) and 4 (`PLEX_ENABLE_HW_TRANSCODE`) are untouched. Both
 are the same "exported but inert" class, which the audit cannot see — a key that
 IS referenced but whose value changes nothing needs a different check.
+
+## Result (continued) — 2026-11-10, the inert class
+
+**Step 2 and step 3 are now DOCUMENTED AND ENFORCED rather than done**, and a
+third inert key this task did not list was found and removed.
+
+`tests/config-example-inert-keys-audit.py` covers the class this task actually
+describes — a key that IS referenced but whose value nothing reads. It joins line
+continuations, which is not optional: a `config_set` whose prompt default sits on
+the next physical line puts `${KEY:-...}` on a line with no `config_set` on it,
+so a line-at-a-time scan found **0** inert keys where joining finds **3**.
+
+| key | outcome |
+|---|---|
+| `DOMUM_TS_IP` | **REMOVED** — not listed by this task. Its comment claimed "used by docs and dynamic routes"; both halves measured false, while its neighbour `DOMUM_LAN_IP` under the same comment genuinely is used. Prompt and export removed with it; the CI compose render was measured identical with and without it |
+| `IMMICH_HOST` | exempt with a printed reason — step 2's wiring is a compose change |
+| `IMMICH_BUNDLE_ROLLBACK_ENABLED` | exempt with a printed reason — step 3 wires a ROLLBACK gate to a never-obeyed value, and the production config is `0600 root` |
+
+Both exemptions carry `# inert-audit: <reason>` on the key's own line and the
+audit FAILS if the key stops being inert, so a marker cannot outlive its defect.
+
+**Step 4 was stale in this task**: `PLEX_ENABLE_HW_TRANSCODE` is no longer in the
+example at all (it is only exported in `bin/domum-media:1534`), so it is outside
+both audits' scope by construction. The underlying observation still holds —
+`compose/media/plex.yml:11` passes `/dev/dri` unconditionally — and task 39
+owns it.
