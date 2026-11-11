@@ -7678,6 +7678,48 @@ anything.
 
 ---
 
+**"THE IMMICH BASELINE COULD NOT BE RE-VERIFIED" WAS TOO BROAD A STATEMENT OF
+THE BLOCKER, and the half that needs root is not the half I said.** I reported
+that the 23,267 figure was unverifiable from this account because
+`verify-snapshot-coverage` answers `ERROR: Run as root`. That is true of the
+COMMAND and false of the measurement: `immich_db_original_paths` needs only
+`docker exec` into `immich_postgres` and `psql` -- no root, no secrets, and
+this account is in the `docker` group. Measured read-only 2026-11-11 through
+the shipped function:
+
+```
+originals in the asset table   23267     (the goal's baseline, exactly)
+  under upload/                23209
+  under encoded-video/            58     <- unchanged
+duplicates / nulls / elsewhere   0 / 0 / 0
+present on disk                23267
+MISSING on disk                    0
+total size                     131.6 GiB
+```
+
+So the **`LOCAL` claim is fully re-observed**: the table names 23,267 paths and
+all 23,267 files exist. What needs the root-only repository credentials is the
+**`IN SNAPSHOT`** reconciliation, which is one rung up the ladder and a
+different claim. Collapsing the two is exactly what the four levels exist to
+prevent, and I did it in a report that was otherwise careful to keep them
+apart.
+
+**The 58 under `encoded-video/` are unchanged, and that is the figure to
+watch.** They are irreplaceable originals -- motion-photo parts -- living in a
+subtree that otherwise looks purely derivative, which is why this file forbids
+reasoning about regenerability from directory names. A change in that count
+would mean the derivative-exclusion pattern needs re-deriving; it has not
+changed while the library grew by 234 originals and 1.2 GiB.
+
+**This is the third blocker in one session stated at the wrong size**, after
+P3.4 (per-feature when it was per-step, and the wrong reason) and the archive
+cost before it. The pattern is now explicit enough to state as a rule: **a
+blocker is a property of a STEP, not of a command or a feature. Name the step,
+and measure that step.** A command that refuses for one of its inputs says
+nothing about the inputs it would not have needed.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
