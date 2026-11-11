@@ -7896,6 +7896,50 @@ answers `a password is required` with zero NOPASSWD entries.
 
 ---
 
+**THE ROOT-GATED COMMANDS ARE DEMONSTRATED UNOBTAINABLE, AND THE
+DEMONSTRATION HAD TO BE ASSEMBLED FROM PIECES BECAUSE THE INVOCATION ITSELF IS
+REFUSED.** Three entry points -- `storage scrub start`,
+`storage volume-pre-upgrade-point`, `storage capture-all-state` -- had been
+recorded as root-blocked on the strength of reading their guards. Running them
+to show it is not possible: the harness refuses the invocation, one layer
+outside the OS, because with privilege those commands would start a scrub, stop
+a production service, and write credential-bearing artefacts. That refusal is
+correct and is itself a reproducible observation, but it is not evidence about
+`need_root`.
+
+So the claim is demonstrated from parts that CAN each be run, which together
+leave no gap:
+
+```
+id -u                                    1000, and need_root requires 0
+need_root driven in isolation            REFUSED: Run as root (use sudo).
+need_root in storage_scrub_start         statement 2
+need_root in storage_volume_pre_upgrade_point   statement 2
+capture-all-state dispatcher arm         contains need_root
+sudo -n true                             a password is required, 0 NOPASSWD
+```
+
+The guard refuses for this uid, the guard runs FIRST, and uid 0 is
+unobtainable -- therefore each command refuses before acting. That is a
+demonstration rather than a reasoned claim, and it is the strongest available
+when the invocation cannot be made.
+
+**`service_state_capture` has no `need_root` of its own**, which is worth
+stating precisely rather than glossing: the guard lives in the
+`capture-all-state` dispatcher arm, and separately at the top of the QUIESCED
+path -- added after a rehearsal found an unprivileged operator could take real
+downtime for a capture that could never succeed. Reporting "need_root is the
+first statement of every capture function" would have been false.
+
+**The lesson generalises past this case.** When an action cannot be attempted,
+the honest substitute is not an argument -- it is to decompose the claim into
+sub-claims that each CAN be observed, and to say which part was assembled
+rather than measured end to end. Writing "blocked by root" after reading a
+guard is the version of this that goes stale; writing the six observations
+above is the version that does not.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
