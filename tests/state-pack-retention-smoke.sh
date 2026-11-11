@@ -271,4 +271,127 @@ grep -q 'if (( confirm == 0 )); then' "$CLI" || fail "the --confirm gate is miss
 grep -q "printf 'unverifiable %s %s %s" "$CLI" || fail "the unverifiable branch is missing from the CLI"
 echo "  all three mutation targets are back"
 
+# ---------------------------------------------------------------------------
+#  capture-all-state: the entry point a scheduled job invokes. There was none
+#  before, so the schedule in the design had nothing to point at.
+# ---------------------------------------------------------------------------
+sect "the service set is DERIVED from the two declarations, not listed"
+out="$(probe '' state_capture_services)"
+for svc in jellyfin plex navidrome calibre-web kavita; do
+  grep -qx "$svc" <<< "$out" || fail "$svc is missing from the derived set: $out"
+done
+grep -qx immich <<< "$out" \
+  && fail "immich is in the capture set -- it is protected-tier but declares no
+essential state, because its library is the restic backup's job: $out"
+[[ "$(grep -c . <<< "$out")" == 5 ]] || fail "expected exactly 5 services: $out"
+echo "  five services, derived; immich correctly absent"
+
+sect "a service that stops declaring essential state leaves the set"
+# This is why the set is derived. A hardcoded list would keep capturing a
+# service whose declaration had gone, or miss one that gained it.
+out="$(probe 'service_essential_state() { [[ "$1" == navidrome ]] || return 0; printf "sqlite|navidrome.db\n"; }' \
+  state_capture_services)"
+[[ "$(grep -c . <<< "$out")" == 1 ]] || fail "the set did not follow the declaration: $out"
+grep -qx navidrome <<< "$out" || fail "the one declaring service is not in the set: $out"
+echo "  the set follows the declaration"
+
+sect "capture-all CONTINUES past a failing service and fails at the END"
+# One service's problem must not cost the other four their capture. That is the
+# shape of the retention failure which aborted before `heartbeat` and made a
+# successful backup report as stale.
+STUBS='
+  service_state_capture() { echo "CAPTURE|$1"; [[ "$1" != plex ]]; }
+  service_state_pack()    { echo "PACK|$1"; return 0; }
+  state_capture_dir()     { printf "%s" "'"$TMP"'/caps"; }
+'
+out="$(probe "$STUBS" storage_capture_all_state)"
+for svc in jellyfin plex navidrome calibre-web kavita; do
+  grep -q "^CAPTURE|.*$svc" <<< "$out" \
+    || fail "$svc was never attempted -- a failure stopped the loop: $out"
+done
+grep -q 'INCOMPLETE' <<< "$out" || fail "a failed service did not make the run INCOMPLETE: $out"
+grep -q 'captured    : 4' <<< "$out" || fail "the four that succeeded were not counted: $out"
+echo "  all five attempted, 4 captured, verdict INCOMPLETE"
+
+sect "a clean run reports done and says nothing was transmitted"
+out="$(probe '
+  service_state_capture() { return 0; }
+  service_state_pack()    { return 0; }
+  state_capture_dir()     { printf "%s" "'"$TMP"'/caps"; }' storage_capture_all_state)"
+grep -q 'result      : done' <<< "$out" || fail "a clean run did not report done: $out"
+grep -q 'Nothing was transmitted' <<< "$out" \
+  || fail "it did not state that nothing left the host: $out"
+grep -q 'INCOMPLETE' <<< "$out" && fail "a clean run reported INCOMPLETE: $out"
+echo "  done, and it says nothing left the host"
+
+sect "--pack is OPT-IN, and without it no pack is produced"
+out="$(probe "$STUBS
+  service_state_capture() { return 0; }" storage_capture_all_state)"
+grep -q '^PACK|' <<< "$out" && fail "packing happened without --pack: $out"
+grep -q 'packing     : no' <<< "$out" || fail "it did not say packing was off: $out"
+out="$(probe "$STUBS
+  service_state_capture() { return 0; }" storage_capture_all_state --pack)"
+[[ "$(grep -c '^PACK|' <<< "$out")" == 5 ]] || fail "--pack did not pack all five: $out"
+grep -q 'packed      : 5' <<< "$out" || fail "the packed count is wrong: $out"
+echo "  off by default, five packs with --pack"
+
+sect "a pack failure is reported WITHOUT discarding the capture"
+out="$(probe '
+  service_state_capture() { return 0; }
+  service_state_pack()    { [[ "$1" != *navidrome* ]]; }
+  state_capture_dir()     { printf "%s" "'"$TMP"'/caps"; }' storage_capture_all_state --pack)"
+grep -q 'pack FAILED' <<< "$out" || fail "a failed pack was not reported: $out"
+grep -q 'the capture is intact' <<< "$out" \
+  || fail "it did not say the capture survives a failed pack: $out"
+grep -q 'INCOMPLETE' <<< "$out" || fail "a failed pack did not make the run INCOMPLETE: $out"
+echo "  the capture is kept and the run still fails"
+
+sect "an empty service set is REFUSED, never reported as success"
+out="$(probe 'service_state_models() { :; }' storage_capture_all_state)"
+grep -q '^DIE|' <<< "$out" || fail "an empty set did not refuse: $out"
+grep -q 'empty set' <<< "$out" || fail "the refusal did not say why: $out"
+echo "  refused -- zero services is not a clean run"
+
+sect "an unknown argument is refused rather than ignored"
+out="$(probe '' storage_capture_all_state --prune-everything)"
+grep -q '^DIE|' <<< "$out" || fail "an unknown argument was accepted: $out"
+echo "  refused"
+
+# ---------------------------------------------------------------------------
+#  The unit. Its ExecStart ORDER is §3's fourth retention rule.
+# ---------------------------------------------------------------------------
+sect "the unit packs BEFORE it prunes, and neither step is '-' prefixed"
+U="$REPO_ROOT/systemd/domum-media-state-capture.service"
+[[ -r "$U" ]] || fail "the unit file does not exist: $U"
+cap_line="$(grep -n '^ExecStart=.*capture-all-state' "$U" | cut -d: -f1)"
+pru_line="$(grep -n '^ExecStart=.*prune-state-packs' "$U" | cut -d: -f1)"
+[[ -n "$cap_line" && -n "$pru_line" ]] || fail "the unit does not run both steps"
+(( cap_line < pru_line )) \
+  || fail "the prune runs BEFORE the pack, so a failed pack would still delete --
+that ordering IS the rule 'delete nothing on a run that failed to produce a new
+pack' (line $cap_line vs $pru_line)"
+# A `-` prefix on either would break the rule: systemd keeps going after a
+# tolerated failure, so a failed pack would reach the prune.
+grep -qE '^ExecStart=-' "$U" \
+  && fail "an ExecStart is '-' prefixed, so a failed step no longer stops the unit"
+grep -q 'prune-state-packs --confirm' "$U" \
+  || fail "the prune step does not pass --confirm, so it would never delete"
+echo "  pack at line $cap_line, prune at $pru_line, neither tolerated"
+
+sect "the timer is Sunday 04:00, between the backup and the snapshot prune"
+T="$REPO_ROOT/systemd/domum-media-state-capture.timer"
+[[ -r "$T" ]] || fail "the timer file does not exist: $T"
+grep -qx 'OnCalendar=Sun \*-\*-\* 04:00:00' "$T" || fail "the schedule is not Sunday 04:00: $(grep OnCalendar "$T")"
+grep -qx 'Persistent=true' "$T" || fail "Persistent=true is missing"
+grep -qE '^(OnBootSec|OnStartupSec)=' "$T" \
+  && fail "a boot trigger would make a REBOOT a capture trigger in its own right"
+echo "  Sun 04:00, Persistent, no boot trigger"
+
+sect "the unit requires /srv/data and nothing it does not use"
+grep -qx 'RequiresMountsFor=/srv/data' "$U" || fail "the protected tier is not required"
+grep -qE 'RequiresMountsFor=.*(srv/media|srv/snapshots)' "$U" \
+  && fail "it requires a filesystem it does not use, so that filesystem's failure
+would stop a job which could have run"
+echo "  /srv/data only"
+
 echo "PASS: state pack retention smoke test"

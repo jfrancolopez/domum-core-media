@@ -1,0 +1,33 @@
+[Unit]
+Description=domum-media: weekly encrypted state capture for the five declared services
+Documentation=file:///opt/domum-core-media/docs/OFFSITE-STATE-BACKUP-DESIGN.md
+ConditionPathExists=/usr/local/bin/domum-media
+# The captures read /srv/data/<service> and write under /srv/data/backups, so
+# the protected tier must be mounted. Nothing here touches /srv/media, and no
+# container binds /srv/snapshots, so neither is required -- requiring a
+# filesystem this job does not use would let its failure stop a job that could
+# have run. Same scoping as docker.service and the scrub unit.
+RequiresMountsFor=/srv/data
+
+[Service]
+Type=oneshot
+# TWO steps, and the ORDER is the whole of the "delete nothing on a run that
+# failed to produce a new pack" rule in §3 of the design: the pack step runs
+# first and carries NO `-` prefix, so a failed capture or pack fails the unit
+# and systemd never reaches the prune. Enforcing that inside the prune command
+# would be the command guessing what a scheduled run did.
+#
+# capture-all-state continues past a failing service and fails at the END, so
+# one service's problem does not cost the other four their capture -- the shape
+# of the retention failure that once aborted before `heartbeat` and made a
+# successful backup report as stale.
+ExecStart=/usr/local/bin/domum-media storage capture-all-state --pack
+# --confirm is required by the command and is supplied HERE rather than being
+# the default, so the only thing that ever deletes a pack is a unit that says
+# so in its own text. Retention bounds the COUNT: 4 packs x 5 services x ~1 MiB
+# is single-digit MiB, so there is nothing here worth reclaiming.
+ExecStart=/usr/local/bin/domum-media storage prune-state-packs --confirm
+# Five captures, five `age` invocations and a `docker exec` sqlite3 backup each.
+# Measured end to end in the fresh-environment rehearsal at well under a minute;
+# the ceiling is generous for a host under load, not an expectation.
+TimeoutStartSec=30m

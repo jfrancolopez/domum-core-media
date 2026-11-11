@@ -7518,6 +7518,66 @@ are the next implementation step; installing and enabling remain the operator's.
 
 ---
 
+**THE SCHEDULED CAPTURE NOW HAS SOMETHING TO INVOKE, AND THE UNIT'S ExecStart
+ORDER IS A SAFETY RULE RATHER THAN A DETAIL.** The design specified a weekly
+schedule and there was no entry point for it: six per-service subcommands
+existed and nothing captured the set. `storage capture-all-state [--pack]` is
+that entry point, and
+`systemd/domum-media-state-capture.{service,timer}` are written, **not
+installed and not enabled**.
+
+The unit has two `ExecStart` lines, pack then prune, and **neither carries a
+`-` prefix** -- which IS the design's rule "delete nothing on a run that failed
+to produce a new pack". systemd stops a oneshot at the first unprefixed failure,
+so a failed capture or pack never reaches the prune; a `-` on the first would
+break that silently. Enforcing it inside the prune command would be the command
+guessing what a scheduled run did. Both the ordering and the absence of the
+prefix are asserted, and **both assertions were proved to bite** by swapping the
+lines and by adding a `-`.
+
+`--confirm` is supplied in the UNIT rather than being the command's default, so
+the only thing that ever deletes a pack is a unit that says so in its own text.
+
+**THE SERVICE SET IS DERIVED FROM TWO DECLARATIONS, NEVER LISTED.**
+`protected-tier` in `service_state_models` **and** a non-empty
+`service_essential_state`. That is why immich is absent: it is protected-tier
+and declares nothing, because its library is the restic backup's job rather
+than a 9 MiB state capture. A hardcoded list is the thing that silently stops
+covering a service -- three of these five gained a declared credential or
+identity in ONE week -- and the test drives a stub where only one service
+declares anything and requires the set to follow.
+
+**IT CONTINUES PAST A FAILING SERVICE AND FAILS AT THE END.** One service's
+problem must not cost the other four their capture: that is the shape of the
+retention failure which aborted before `heartbeat` and made a fully successful
+backup report as STALE. The test asserts all five were attempted when the middle
+one fails, that four were captured, and that the verdict is still INCOMPLETE. A
+failed pack leaves its capture intact and says so, and an empty service set is
+refused rather than reported as a clean run.
+
+**I OVER-ESCAPED SHELL QUOTING IN A PYTHON GENERATOR FOR THE SECOND TIME.**
+`'"'"'` is a trick for use INSIDE a single-quoted shell string and is literal
+when python writes the file directly, so `printf '"'"'%s\n'"'"'` reached the
+file verbatim and the derived service list came out as
+`"'jellyfin '""'plex '"...`. The first instance, hours earlier, put a jq FILTER
+into a rendered report. The tell is the same both times: output containing
+quote characters that no format string explains. When a generator writes bash,
+the only quoting that applies is python's.
+
+**And I read an indent off `sed`-prefixed output for the FIFTH time this
+session**, using six spaces where the file has four. `cat -A` on the target
+line before writing the anchor is the habit; reading it off a display that adds
+two is the one to break. Every instance was caught by a `matched %d times`
+assertion, which is the whole argument for having one.
+
+**`(( x )) && echo ...` as a standalone statement does NOT abort under
+`set -e`** -- measured, because a report that stops half way is this project's
+recurring defect and the construct looks exactly like one that would. The
+status of the list is 1 when `x` is 0 and execution continues to the next line.
+Verified before relying on it rather than after.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
