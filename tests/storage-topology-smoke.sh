@@ -254,9 +254,26 @@ storage_block="$(awk '/^storage_cmd\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media")
 [[ -n "$storage_block" ]] || fail "storage_cmd not found"
 grep -q 'topology)' <<< "$storage_block" || fail "storage topology is not dispatched"
 grep -q -- '--verify' <<< "$storage_block" || fail "storage topology --verify is not dispatched"
-# Isolate just the topology arm, so migrate-subvolume's need_root is not read as
-# topology's.
-topo_block="$(awk '/^    topology\)/,/^    \*\)/' <<< "$storage_block")"
+# Isolate just the topology arm. The range form `/topology)/,/\*)/` ran to the
+# DEFAULT arm and therefore swallowed every arm in between -- 11 of them -- so
+# any later arm's need_root was read as topology's. It passed for as long as it
+# did only because no arm in that range happened to need root; the first one
+# that legitimately did (`prune-state-packs`, which deletes under a root-owned
+# 0700 directory) failed this assertion against correct code. Stop at the NEXT
+# arm instead, which is the same over-wide-window mistake this project already
+# records for `grep -A3`.
+topo_block="$(awk '
+  /^    topology\)/ { on=1; print; next }
+  on && /^    [a-z][a-z-]*\)/ { exit }
+  on && /^    \*\)/ { exit }
+  on { print }
+' <<< "$storage_block")"
+[[ -n "$topo_block" ]] || fail "the topology arm could not be isolated"
+grep -q 'storage_topology' <<< "$topo_block" \
+  || fail "the isolated block is not the topology arm: $topo_block"
+grep -q 'prune-state-packs' <<< "$topo_block" \
+  && fail "the window still reaches a later arm, so a need_root there would be
+read as topology's: $topo_block"
 grep -q 'need_root' <<< "$topo_block" \
   && fail "storage topology must not require root; a pre-capture could then differ from the post-capture"
 

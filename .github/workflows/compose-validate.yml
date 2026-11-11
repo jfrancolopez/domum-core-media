@@ -194,6 +194,12 @@ jobs:
       - name: Selective state capture smoke test
         run: tests/state-capture-smoke.sh
 
+      # Retention DELETES, so its two load-bearing rules are negative-controlled:
+      # ranking follows the sidecar's CAPTURED_AT against deliberately inverted
+      # mtimes, and an unverifiable pack is kept as evidence rather than removed.
+      - name: State pack retention smoke test
+        run: tests/state-pack-retention-smoke.sh
+
       # A key in the config example that nothing reads is a surface implying
       # control it does not have: IMMICH_UPDATE_MODE=direct read as switching
       # the Immich update policy and did nothing.

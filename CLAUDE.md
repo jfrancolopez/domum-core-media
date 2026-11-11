@@ -7460,6 +7460,64 @@ computed once"* -- and the degenerate case is a number computed ZERO times.
 
 ---
 
+**A DOCUMENTED RETENTION RULE WAS UNIMPLEMENTABLE, AND THE ONE THING IT
+FORBADE WAS THE ONLY THING AVAILABLE.** `docs/OFFSITE-STATE-BACKUP-DESIGN.md`
+§3 said state-pack retention selects *"by service name read from the manifest,
+never by the filename"*. Measured 2026-11-11 while implementing it: the
+manifest is **inside the encrypted pack**, and this host holds only the public
+key -- `pack-state` prints that in its own output. The only unencrypted things
+beside a pack were the artefact and its `.sha256`, so the service name was
+obtainable **only** from the filename, which is exactly what the rule exists to
+forbid. A rule that cannot be followed is worse than none: the next
+implementer either breaks it or quietly reads the filename and says nothing.
+
+The remedy is this project's own -- *if something needs a fact, give it a way
+to state the fact*. `pack-state` now writes `<pack>.meta` at 0600 with
+`SERVICE`, `CAPTURED_AT`, `CAPTURE_MODE`, `MANIFEST_SHA` and `PACK_SHA`. **It
+holds nothing secret**, and that is asserted rather than argued: the service
+name and timestamp are already visible in the filename, the mode is a property
+of the capture rather than data from it, the rest are digests, and a test drives
+a real `age` pack and requires the sidecar to contain no item PATH and no digest
+from the manifest BODY.
+
+**`storage prune-state-packs [--confirm] [dir]` is the retention surface**, one
+decision function with the report as a thin filter over it, so they cannot
+disagree. Four verdicts and only `superseded` deletes; `unverifiable` (checksum
+absent or mismatching) and `unknown` (no readable sidecar) are both **KEPT**,
+because an unverifiable pack is evidence and "I could not tell" is not "delete
+it". DRY RUN by default, `--confirm` required, on no timer, and an absent or
+empty directory is reported as explicitly **not a finding** -- that is what an
+unscheduled host looks like.
+
+**The mtime fixture is inverted on purpose, and that is what makes the ranking
+claim mean anything.** The newest capture is given the OLDEST mtime, so a
+selector reading `stat -c %Y` returns the opposite answer; the mutation that
+ranks by mtime must supersede the NEWEST pack. Without the inversion that
+mutation would pass. This project has reasoned from mtime wrongly three times,
+and the pack FILENAME carries a timestamp too, which is the same mistake in a
+new hat.
+
+**The fourth rule is deliberately NOT in the command.** "Delete nothing on a run
+that failed to produce a new pack" belongs to the unit ordering -- the pack step
+precedes the prune step with no `-` prefix, so a failed pack never reaches it.
+Enforcing it inside the command would mean the command guessing at what a
+scheduled run did.
+
+**shellcheck caught a missing restore destination in my own mutation test**:
+`cp "$TMP/cli.orig.unver"` with no second argument, on the path taken when the
+mutation fails to apply. So a failed mutation would have left the mutant in the
+tree -- the exact hazard recorded two entries above, written into the test
+added in the same session as the rule. `--severity=error` on `tests/` is why it
+was caught in seconds rather than by a later confusing failure.
+
+**Still NOT written: the systemd unit.** §2 specifies it
+(`OnCalendar=Sun *-*-* 04:00:00`, `RandomizedDelaySec=15m`, `Persistent=true`,
+deliberately absent from `auto-enable.timers`) and nothing invokes the capture
+across all five services yet, so there is no `ExecStart` to point at. Those two
+are the next implementation step; installing and enabling remain the operator's.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
