@@ -11262,7 +11262,28 @@ service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
   sha="$(sha256_of_file "$dest")"
   size="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
   printf '%s\n' "$sha" > "$dest.sha256"
-  chmod 0600 "$dest" "$dest.sha256" 2>/dev/null || true
+
+  # An UNENCRYPTED sidecar, because retention cannot read the manifest. The
+  # design's retention rule said to select "by service name read from the
+  # manifest, never by the filename" -- and the manifest is INSIDE the pack,
+  # which this host cannot decrypt: it holds only the public key. So that rule
+  # was unimplementable as written, and parsing the filename is the thing it
+  # exists to forbid. The fact is recorded beside the artefact instead, which is
+  # this project's own remedy: if something needs a fact, give it a way to state
+  # the fact.
+  #
+  # It holds NOTHING secret. SERVICE and the timestamp are already visible in
+  # the filename, CAPTURE_MODE is a property of the capture rather than data
+  # from it, and MANIFEST_SHA is a digest. No path from inside the capture and
+  # no byte of its contents appears here.
+  {
+    printf 'SERVICE=%s\n' "$service"
+    printf 'CAPTURED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'CAPTURE_MODE=%s\n' "$(sed -nE "s/^CAPTURE_MODE=(.*)$/\\1/p" "$cap/MANIFEST" | sed -n '1p')"
+    printf 'MANIFEST_SHA=%s\n' "$(sha256_of_file "$cap/MANIFEST")"
+    printf 'PACK_SHA=%s\n' "$sha"
+  } > "$dest.meta"
+  chmod 0600 "$dest" "$dest.sha256" "$dest.meta" 2>/dev/null || true
   echo "[domum-media] state pack: $dest"
   echo "[domum-media] $size bytes, sha256 ${sha:0:16}..., encrypted to $(basename -- "${STATE_PACK_AGE_PUBKEY_FILE:-${RECOVERY_PACK_AGE_PUBKEY_FILE:-recovery_pack_pubkey}}")"
   echo "[domum-media] This host holds only the PUBLIC key, so it cannot decrypt"
@@ -11270,6 +11291,142 @@ service_state_pack() {  # $1 = capture dir, $2 = destination .tar.age
   echo "              pack is only as recoverable as the operator's private key."
   echo "[domum-media] Nothing was transmitted. No backup target was touched."
   return 0
+}
+
+# The operator surface over state_pack_retention_decisions. A DRY RUN by
+# default: `--confirm` is required before anything is removed, exactly as
+# `cleanup images` requires it, and this command is on no timer of its own.
+#
+# It bounds the COUNT, not the bytes: 4 packs x 5 services x ~1 MiB is
+# single-digit MiB, so there is nothing here worth reclaiming and no reason to
+# take a risk for it.
+storage_prune_state_packs() {  # $@ = [--confirm] [dir]
+  local confirm=0 dir="" a
+  for a in "$@"; do
+    case "$a" in
+      --confirm) confirm=1 ;;
+      -*) die "Unknown flag for storage prune-state-packs: $a" ;;
+      *)  [[ -z "$dir" ]] || die "storage prune-state-packs takes at most one directory"
+          dir="$a" ;;
+    esac
+  done
+  [[ -n "$dir" ]] || dir="$(state_pack_dir)"
+  local keep="${STATE_PACK_KEEP:-4}"
+
+  echo "[domum-media] state pack retention"
+  echo "  directory   : $dir"
+  echo "  policy      : keep the newest $keep per service, by the sidecar's"
+  echo "                CAPTURED_AT -- never by filename and never by mtime"
+  if [[ ! -d "$dir" ]]; then
+    echo "  result      : the directory does not exist, so there is nothing to"
+    echo "                prune. That is what an unscheduled host looks like and"
+    echo "                is NOT a finding."
+    return 0
+  fi
+
+  local out n_retain=0 n_sup=0 n_unver=0 n_unknown=0 v svc at p
+  out="$(state_pack_retention_decisions "$dir")"
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    echo "  result      : no packs found. Not a finding -- see above."
+    return 0
+  fi
+
+  while read -r v svc at p; do
+    [[ -n "$v" ]] || continue
+    case "$v" in
+      retain)       n_retain=$(( n_retain + 1 ));  printf '  RETAIN       %-14s %s  %s\n' "$svc" "$at" "$(basename -- "$p")" ;;
+      superseded)   n_sup=$(( n_sup + 1 ));        printf '  SUPERSEDED   %-14s %s  %s\n' "$svc" "$at" "$(basename -- "$p")" ;;
+      unverifiable) n_unver=$(( n_unver + 1 ));    printf '  KEPT         %-14s %s  %s  -- its recorded sha256 is missing or does not match\n' "$svc" "$at" "$(basename -- "$p")" ;;
+      unknown)      n_unknown=$(( n_unknown + 1 )); printf '  KEPT         %-14s %s  %s  -- no readable sidecar, so its service is unknown\n' "$svc" "$at" "$(basename -- "$p")" ;;
+    esac
+  done <<< "$out"
+
+  echo "  retained    : $n_retain"
+  echo "  superseded  : $n_sup"
+  (( n_unver > 0 ))   && echo "  unverifiable: $n_unver -- KEPT. An unverifiable pack is EVIDENCE, not garbage."
+  (( n_unknown > 0 )) && echo "  unknown     : $n_unknown -- KEPT. \"I could not tell\" is not \"delete it\"."
+
+  if (( n_sup == 0 )); then
+    echo "  result      : nothing to remove."
+    return 0
+  fi
+  if (( confirm == 0 )); then
+    echo "  result      : DRY RUN -- nothing was removed. Re-run with --confirm."
+    return 0
+  fi
+
+  domum_acquire_lock
+  local removed=0 failed=0
+  while read -r v svc at p; do
+    [[ "$v" == "superseded" ]] || continue
+    if rm -f -- "$p" "$p.sha256" "$p.meta"; then
+      removed=$(( removed + 1 )); echo "  removed     : $(basename -- "$p")"
+    else
+      failed=$(( failed + 1 )); warn "could not remove $p"
+    fi
+  done <<< "$out"
+  echo "  removed     : $removed"
+  (( failed > 0 )) && { echo "  result      : INCOMPLETE -- $failed could not be removed."; return 1; }
+  echo "  result      : done. Nothing was transmitted and no backup target was touched."
+  return 0
+}
+
+# One decision per pack, on stdout, as `<verdict> <service> <captured_at> <path>`.
+# Every reader is a thin filter over THIS function, so the human report and any
+# caller cannot disagree -- the cleanup_image_decisions pattern.
+#
+# Four verdicts and only one of them deletes:
+#   retain        among the newest STATE_PACK_KEEP for its service
+#   superseded    older than that, and safe to remove
+#   unverifiable  .sha256 missing or not matching -- an unverifiable pack is
+#                 EVIDENCE, not garbage, so it is KEPT and reported
+#   unknown       no readable sidecar, so its service cannot be established;
+#                 kept, because "I could not tell" is not "delete it"
+#
+# Ordering is by the sidecar's CAPTURED_AT, never by mtime and never by the
+# filename. This project has reasoned from mtime wrongly three times, and the
+# filename carries a timestamp too, which is the same mistake in a new hat.
+state_pack_retention_decisions() {  # $1 = pack dir (default: state_pack_dir)
+  local dir="${1:-$(state_pack_dir)}" keep="${STATE_PACK_KEEP:-4}"
+  [[ -d "$dir" ]] || return 0
+  local p svc at want got rows=""
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    svc=""; at=""
+    if [[ -s "$p.meta" ]]; then
+      svc="$(sed -nE "s/^SERVICE=(.*)$/\\1/p" "$p.meta" | sed -n '1p')"
+      at="$(sed -nE "s/^CAPTURED_AT=(.*)$/\\1/p" "$p.meta" | sed -n '1p')"
+    fi
+    if [[ -z "$svc" || -z "$at" ]]; then
+      printf 'unknown - - %s\n' "$p"
+      continue
+    fi
+    if [[ ! -s "$p.sha256" ]]; then
+      printf 'unverifiable %s %s %s\n' "$svc" "$at" "$p"
+      continue
+    fi
+    want="$(sed -n '1p' "$p.sha256")"
+    got="$(sha256_of_file "$p")"
+    if [[ "$want" != "$got" ]]; then
+      printf 'unverifiable %s %s %s\n' "$svc" "$at" "$p"
+      continue
+    fi
+    rows+="$svc	$at	$p"$'\n'
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.tar.age' -print 2>/dev/null | sort || true)
+
+  [[ -n "$rows" ]] || return 0
+  # Per service, newest CAPTURED_AT first; the first `keep` are retained.
+  local s
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    local i=0 line
+    while IFS=$'\t' read -r _ at p; do
+      [[ -n "$p" ]] || continue
+      i=$(( i + 1 ))
+      if (( i <= keep )); then line=retain; else line=superseded; fi
+      printf '%s %s %s %s\n' "$line" "$s" "$at" "$p"
+    done < <(awk -F'\t' -v S="$s" '$1==S' <<< "$rows" | sort -t$'\t' -k2,2r)
+  done < <(cut -f1 <<< "$rows" | sort -u)
 }
 
 # Is a pack intact, and does it even look like a pack?
@@ -13314,6 +13471,7 @@ state-restore|storage restore-state|service_state_restore
 state-pack|storage pack-state|service_state_pack
 state-unpack|storage unpack-state|service_state_unpack
 verify-state-pack|storage verify-pack|service_state_pack_verify
+state-pack-retention|storage prune-state-packs|storage_prune_state_packs
 EOF
 }
 
@@ -13614,6 +13772,8 @@ storage_cmd() {
       # operator decision.
       load_cfg
       service_state_pack "${1:-}" "${2:-}" ;;
+    prune-state-packs)
+      shift; need_root; load_cfg; storage_prune_state_packs "$@" ;;
     verify-pack)
       shift
       # Read-only, and the only claim this host can make about a production
@@ -13679,7 +13839,7 @@ storage_cmd() {
         # and on-disk retention are different, and conflating them is how a
         # local rollback artefact gets deleted to save cloud bytes.
         storage_archive_retention "$@" ;;
-    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|archive-retention [--json]|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>}" ;;
+    *) die "Usage: domum-media storage {migrate-subvolume <service>|topology [--verify <file>]|protection [service]|verify-recovery <service> <point> [--deep]|pre-upgrade-point <service> [--archive-image]|volume-pre-upgrade-point <service> [--archive-image]|verify-volume-dumps <point>|verify-archive <point>|archives|archive-retention [--json]|capture-state <service> [dir] [--quiesce]|verify-state <dir>|restore-state <capture-dir> <scratch-dir>|pack-state <capture-dir> [dest.tar.age]|verify-pack <pack>|unpack-state <pack> <identity> <dir>|prune-state-packs [--confirm] [dir]}" ;;
   esac
 }
 

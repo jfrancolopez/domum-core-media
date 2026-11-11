@@ -96,10 +96,49 @@ delete nothing on a run that failed to produce a new pack
 ```
 
 The last two are the important ones. This project has already corrected a
-retention rule that deleted on the basis of filename and mtime; selection here
-is by recorded checksum and by service name read from the manifest, never by
-the filename, and a pack that cannot be verified is kept and reported rather
-than removed.
+retention rule that deleted on the basis of filename and mtime, and a pack that
+cannot be verified is kept and reported rather than removed.
+
+**IMPLEMENTED 2026-11-11 as `storage prune-state-packs [--confirm] [dir]`, and
+one sentence of this section had to be corrected first: it said selection is
+"by service name read from the manifest, never by the filename".** That is
+unimplementable here. The manifest is INSIDE the encrypted pack, and this host
+holds only the public key -- `pack-state` says so in its own output -- so
+nothing on this machine can read it. The only unencrypted things beside a pack
+were the artefact and its `.sha256`, which left the filename as the sole source
+of the service name: exactly what the rule exists to forbid.
+
+So `pack-state` now writes an **unencrypted sidecar**, `<pack>.meta` at 0600,
+recording `SERVICE`, `CAPTURED_AT`, `CAPTURE_MODE`, `MANIFEST_SHA` and
+`PACK_SHA`. That is this project's own remedy -- *if something needs a fact,
+give it a way to state the fact* -- and it holds nothing secret: the service
+name and timestamp are already visible in the filename, the mode is a property
+of the capture rather than data from it, and the other two are digests. A test
+drives a real `age` pack and asserts the sidecar contains no item path and no
+digest from the manifest body.
+
+Retention then reads the sidecar, so ranking is by recorded `CAPTURED_AT` and
+never by mtime or the filename. **The test inverts mtime order against
+`CAPTURED_AT`** -- the newest capture is given the oldest mtime -- so a selector
+that read mtime would return the opposite answer, and the mutation that ranks by
+`stat -c %Y` must supersede the newest pack.
+
+Four verdicts, and only one of them deletes:
+
+| verdict | meaning |
+|---|---|
+| `retain` | among the newest `STATE_PACK_KEEP` (default 4) for its service |
+| `superseded` | older than that -- the only deletable class |
+| `unverifiable` | `.sha256` absent or not matching. **KEPT**: an unverifiable pack is evidence |
+| `unknown` | no readable sidecar, so its service cannot be established. **KEPT** |
+
+It is a **DRY RUN by default**; `--confirm` is required before anything is
+removed, as `cleanup images` requires it, and the command is on no timer of its
+own. An absent or empty directory is reported as explicitly **not a finding** --
+that is what an unscheduled host looks like. The fourth rule above ("delete
+nothing on a run that failed to produce a new pack") is not enforced inside the
+command: it belongs to the unit ordering, where the pack step precedes the prune
+step without a `-` prefix, so a failed pack never reaches it.
 
 At 4 packs × 5 services × ~1 MiB the whole set is single-digit MiB. **Retention
 exists to bound the count, not to reclaim space.**
