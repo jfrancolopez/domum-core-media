@@ -19,8 +19,6 @@ the row's **Selected** line; a worker never fills one in on the owner's behalf.
 - **Consequence:** no host firewall task. The absence of one (finding F-04) is an accepted risk for the LAN. What remains is to make the services that listen worth trusting: SEC-04 (SSH keys only) and SEC-07 (close the unused RPC port).
 - **Residual risk, stated:** any device on the home network, including guests and smart devices, can reach the login pages of every app and the SSH port. A guest or IoT VLAN on the router is the fix if that ever matters; it is outside this repository (see `../task-40-future-network-segmentation.md`).
 
-## Open
-
 ### D-3 — Docker group membership
 
 - **Question:** the operator account is in the `docker` group, which gives root without the sudo password. Keep it?
@@ -29,8 +27,10 @@ the row's **Selected** line; a worker never fills one in on the owner's behalf.
   2. **Remove it.** Docker then needs `sudo`. Restores the boundary and stops agents running containers at all, which breaks most of the test and rehearsal workflow.
   3. **Rootless Docker for development, rootful for production.** The strongest answer and a real project: two daemons, two image stores.
 - **Also decide:** whether the `beszel` monitoring account needs the group. It does only for per-container statistics.
-- **Blocks:** SEC-10.
-- **Selected:** _open_
+- **Selected (2026-11-10):** option 1 — keep and document the operator account's membership. Keep `beszel` in the group for per-container statistics for now; SEC-12 tracks a least-privilege path through the SEC-08 proxy before its membership is reconsidered.
+- **Consequence:** the sudo prompt is not a security boundary for the operator account; Docker access is root-equivalent. The §5/§11 approval and stop rules still bind. The effective access boundary is who can log into the account. Beszel's current group access is retained pending SEC-12.
+
+## Open
 
 ### D-4 — Which overlapping apps stay
 

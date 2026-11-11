@@ -1719,6 +1719,14 @@ resume autonomously once the result is provided.
 
 Never resolve sudo friction by configuring broad passwordless sudo.
 
+**Docker access is root-equivalent.** This account is in the `docker` group, so
+the sudo prompt is a speed bump here, not a security boundary: Docker access can
+act with host-level authority. The production approval rules in §5 and stop
+conditions in §11 bind regardless. Never use a container to read a root-only
+file or change a host path this session could not change directly. The real
+access boundary is who can log into this account (including the owner-controlled
+access measures in SEC-04 and SEC-05).
+
 ---
 
 ## 11. Stop conditions — explicit approval required
