@@ -13,13 +13,16 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-09** against `origin/main` = `896cac5`. The delta has
-grown 16 -> 30 -> 38 -> 44 -> **47 commits**, and the installable surface grew
-from FIVE paths to **SIX**: all three binaries, the two comment-only `systemd/`
-files, and now `systemd/domum-media-weekly-report.service`, whose **directives**
-changed. That sixth path is the only one of the three unit files the narrow
-script carries, and it already did -- see §9. Re-measure rather than trust this
-paragraph: the surface has changed shape twice in a week.
+Reconciled **2026-11-10** against `origin/main` = `bddab55`, **61 commits**
+ahead of production. The count is recorded once, here, and is re-derived with
+`git rev-list --count a63ad19..origin/main` -- a running tally in prose rots the
+same way a baked hash does, and this paragraph had grown one.
+
+What matters is not the count but the SHAPE, which has changed twice in a week:
+the installable surface went from five paths to **six** when
+`systemd/domum-media-weekly-report.service` gained a directive change, and then
+grew a whole second KIND of change when the security workstream added compose
+files -- see §10, which is the part to read before sizing any of this.
 
 An earlier reconciliation recorded `bin/domum-media-report` as *unchanged since
 2026-10-11*, which by then was false: it carries the recovery-pack contents
@@ -59,9 +62,12 @@ and it holds right now — so a run of it starts from a clean base.
 
 ## 2. What would change
 
-47 commits, of which the **installable** surface is still small and
-UNCHANGED IN SHAPE since the 38-commit reconciliation. Re-measured 2026-11-06
-with `git diff --name-only a63ad19..main -- bin systemd install.sh`:
+The delta (count in the header) has an **installable** surface that is still
+small, but it has NOT kept its shape: it went from five paths to six when the
+weekly-report unit gained a directive change, and then gained a second KIND of
+change -- compose -- which §10 covers and this table does not. The table below
+is the NARROW surface, i.e. what the deploy script carries. Re-measure with
+`git diff --name-only a63ad19..origin/main -- bin systemd compose config`:
 
 | repository path | installed as | changes? | note |
 |---|---|---|---|
@@ -366,9 +372,17 @@ would not have delivered it.
 
 ### 9.3 Exact hashes — measured, and how to re-derive them
 
-Measured at `896cac5`. **A hash baked into a document goes stale exactly like a
-baked-in revision**, so the command that re-derives it is given with it and is
-what should be trusted at deploy time:
+**A hash baked into a document goes stale exactly like a baked-in revision** --
+this section said so while baking one anyway, and the baked column then went
+stale FOUR times in two days (`a5c3578`, `896cac5`, `df2e849`, and again at
+`bddab55`), twice in two different tables carrying two different revision
+labels. The target column is therefore gone. What is listed below is the
+INSTALLED side, which is stable because production has not moved, plus the one
+fact that matters: all three files differ, so all three are deployed.
+
+The target is whatever `origin/main` is when the script runs; the operator pins
+it with `--expect-revision=<sha>`, and the script asserts for itself that each
+installed file's sha256 equals that file in the checkout. Re-derive with:
 
 ```sh
 for p in bin/domum-media:/usr/local/bin/domum-media \
@@ -380,11 +394,14 @@ for p in bin/domum-media:/usr/local/bin/domum-media \
 done
 ```
 
-| file | installed at `a63ad19` | new at `896cac5` |
+| file | installed at `a63ad19` | differs from `origin/main`? |
 |---|---|---|
-| `bin/domum-media` → `/usr/local/bin/domum-media` | `5e65f06c8a7a4bf4` | `a4d90a43382c8ffe` |
-| `bin/domum-media-backup` → `/usr/local/bin/domum-media-backup` | `08a81ba2065850c4` | `d5aa2fb56cb11ae3` |
-| `bin/domum-media-report` → `/usr/local/lib/domum-media/domum-media-report` | `d813ae0e4181a7d5` | `14a5f7334adf68e0` |
+| `bin/domum-media` → `/usr/local/bin/domum-media` | `5e65f06c8a7a4bf4` | yes |
+| `bin/domum-media-backup` → `/usr/local/bin/domum-media-backup` | `08a81ba2065850c4` | yes |
+| `bin/domum-media-report` → `/usr/local/lib/domum-media/domum-media-report` | `d813ae0e4181a7d5` | yes |
+
+Re-verified 2026-11-10 at the revision named in the header: production is
+`a63ad19` with no drift on any of the three installed files.
 
 Unit files, compared with comments and blank lines stripped:
 
@@ -535,11 +552,12 @@ retries are exhausted, and every caller that died on a failed send still dies.
 
 ## 10. THERE ARE NOW TWO DEPLOYMENTS, AND ONLY ONE OF THEM IS THIS PLAN
 
-Re-measured 2026-11-10 against `origin/main` = `df2e849`. The delta has grown
-47 -> **57 commits**, and the growth is not more of the same: a security
-workstream (#196-#203) added **13 compose files**, two config files and two of
-the three binaries. That changes the *kind* of deployment the repository
-contains, not just its size.
+The revision and commit count are stated once, in the header, and not repeated
+here -- two copies of one number is how this document came to carry two
+different revision labels for the same question. What this section is about does
+not depend on the count: a security workstream (#196-#203) added **13 compose
+files**, two config files and two of the three binaries, which changes the *kind*
+of deployment the repository contains rather than its size.
 
 | | A -- the narrow deployment | B -- the security compose change set |
 |---|---|---|
@@ -600,13 +618,12 @@ image id before `up -d`. Whether to take the image upgrades is a separate
 decision from whether to take the security hardening, and they must not be
 made by accident.
 
-### 10.3 Hashes, re-measured, with the command that re-derives them
+### 10.3 Hashes
 
-| file | installed at `a63ad19` | new at `df2e849` |
-|---|---|---|
-| `bin/domum-media` | `5e65f06c8a7a4bf4` | `64dc04d70abd703b` |
-| `bin/domum-media-backup` | `08a81ba2065850c4` | `31677cdb7e2665c0` |
-| `bin/domum-media-report` | `d813ae0e4181a7d5` | `14a5f7334adf68e0` |
+Deliberately NOT repeated here. A second copy of the same table is a second
+thing to go stale, and that is exactly what happened: this section carried
+`df2e849` while §9.3 carried `896cac5`, two labels for one question. §9.3 is the
+single statement, and the operator re-derives at run time.
 
 Production is still `a63ad19` with **no drift** on any of the three installed
 files, so A starts from a clean base. Re-derive with the loop in §9.3 rather
