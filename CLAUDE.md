@@ -6603,6 +6603,47 @@ anchor was six spaces where the file has four and `matched 0 times` fired. `cat 
 settles it in one look. That is the same family as every other anchor failure here:
 the anchor must come from the file, not from a rendering of it.
 
+---
+
+**A CONFIG-ONLY COMPOSE CHANGE DEPLOYS EVERY STAGED IMAGE UNLESS EACH ONE IS
+PINNED, and that is how a security hardening smuggles in an application
+upgrade.** Found 2026-11-10 after a security workstream (#196-#203) landed
+13 compose files on `main`: `security_opt: [no-new-privileges:true]` on **14**
+services, one `read_only`, and a NEW `docker-socket-proxy` service with its own
+network so Traefik reaches the Docker API through a read-only proxy.
+
+Nothing in that change set mentions an image. But applying it means
+`compose up -d`, which this file already records as *reconciling* -- and
+measured the same day, **traefik and uptime-kuma still have newer images staged
+under the same tag** (`9c3b91d5fb77` -> `9c2a54d87f76`,
+`a8610b3b4c38` -> `3e24e96c89ef`), while the other five resolve to the image
+they are running. So recreating those two to pick up a security flag lands them
+on different applications. They are also the two running **dangling** images, so
+the version they are on now survives only because a container references it.
+
+**The pin is available and is the mechanism `rollback_upgrade` already uses.**
+Both compose files read `image: ${TRAEFIK_IMAGE}` / `${UPTIME_KUMA_IMAGE}`, and
+`export_env_for_compose` resolves every one as `${VAR:-default}`, so a value
+exported first is preserved -- demonstrated, `sha256:PINNED` survives and an
+unset variable falls back to the tag. Export each running image id before
+`up -d` and the recreate is configuration-only. **Whether to take an image
+upgrade is a separate decision from whether to take the hardening, and it must
+not be inherited from a tag.**
+
+**AND A SCOPE CLAIM WRITTEN FOR ONE DEPLOYMENT BECOMES FALSE WHEN THE
+REPOSITORY GROWS A DIFFERENT KIND OF CHANGE.** `docs/DEPLOYMENT-PLAN.md` §5
+says *"no container is created, recreated, restarted or stopped"*. That was
+measured and true when the delta was three binaries and two unit files, and it
+is still true of the narrow deploy script -- whose `TARGETS`/`UNIT_TARGETS`
+name neither compose nor config, so it cannot carry the security change at all.
+What changed is that the sentence now sits in a document about deploying
+`main`, and `main` contains a change set that recreates every container. The
+claim did not rot; its SUBJECT grew around it. The plan now states the two
+deployments separately rather than letting one scope sentence cover both --
+the same correction as every other stale-claim entry here, with the novelty
+that re-measuring the files would not have caught it. **Re-measure what a plan
+is ABOUT, not only the figures in it.**
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
