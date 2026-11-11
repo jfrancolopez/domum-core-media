@@ -7349,6 +7349,58 @@ placeholders, a real wear figure) were each driven against the real renderer.
 
 ---
 
+**STOPPING A MUTATION-TESTING SUITE MID-RUN LEAVES THE MUTANT IN THE WORKING
+TREE, and I came one `git add -A` away from pushing a neutralised safety guard
+to `main`.** Found 2026-11-11: a `git checkout main` refused with *"Your local
+changes to the following files would be overwritten"*, and the change was
+
+```
+-  if [[ "$model" == "protected-tier" ]]; then
++  if [[ "$model" == "$model" ]]; then
+```
+
+-- phase 4's model-awareness guard, neutralised. It came from
+`volume-upgrade-dispatch-smoke`, which I had stopped part-way while diagnosing
+something else. The suites `cp` the CLI before mutating and restore afterwards;
+**a killed process never reaches the restore.**
+
+This file already records the `&&`-chain variant -- "a short-circuited `&&`
+chain leaves the mutation applied and no way back". The killed-process variant
+is worse in one specific way: the `&&` case fails loudly at the next step,
+whereas a stopped background task leaves a tree that looks ordinary. Nothing
+reported it. `git status` was the only witness, and the only reason it was
+consulted at all is that an unrelated `checkout` happened to collide.
+
+Two rules follow, and the second is the one that actually protects:
+
+- **after stopping a test task, read `git status`.** A suite that mutates a
+  tracked file is a suite that can leave the file mutated.
+- **`git add -A` is unsafe in a session that has run mutation tests**, which is
+  every session here. It is what I had been using, repeatedly, and the near-miss
+  was decided by timing rather than by care. Stage named paths, or read
+  `git diff` before staging. Verified afterwards that none of the eight commits
+  carried the mutant -- `git show <c>:bin/domum-media` across the range, which
+  is how to answer that question rather than assuming.
+
+**`git checkout -- <file>` WAS the right restore here, and that is not a
+contradiction of the rule against it.** The earlier entry says a mutation test
+must be undone with `cp` because `git checkout` restores the INDEX state, which
+for uncommitted work is a different thing -- there it destroyed an unfinished
+feature. Here the file's wanted state was already committed and the only delta
+was the mutant, so the index state IS the wanted state. The distinction is
+whether the file carries uncommitted work, not which command is in favour.
+
+**And `2>/dev/null` on that `git checkout` turned a failure into a false
+report.** The merge step ran `git checkout -q main 2>/dev/null && git pull`,
+the checkout refused because of the mutant, the suppressed error hid it, and
+`git rev-parse HEAD` then reported the FEATURE BRANCH's tip as `main`'s new
+revision. A wrong revision in a merge report is the stale-claim defect in the
+one place a reader most needs the truth. This file already records the same
+mechanism for `du`: checking stderr is what distinguishes a complete walk from
+a blocked one.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
