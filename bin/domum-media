@@ -1261,7 +1261,21 @@ service_ready_log_pattern() {  # $1 = service
     # claim than Plex's TCP-listener probe. uptime-kuma also has a container
     # healthcheck (CMD-SHELL extra/healthcheck, 180s start period), so its
     # readiness is the best-evidenced of the eleven.
-    uptime-kuma) printf 'Listening on:' ;;
+    #
+    # No trailing colon, because the line is VERSION-SPECIFIC and a ROLLBACK
+    # crosses versions by definition -- rollback_upgrade restores the OLD
+    # image. Measured 2026-11-12 by starting both majors on --network none:
+    #
+    #   uptime-kuma:2   [SETUP-DATABASE] INFO: Listening on:
+    #   uptime-kuma:1   [SERVER]         INFO: Listening on 3001
+    #
+    # The old declaration carried the colon, so it matched v2 and NOT v1: after
+    # a rollback to a v1 image, phase 4 would have reported readiness as
+    # unproven for a service that was perfectly ready. The direction was safe
+    # -- absence is reported and never sets rc -- but it is still a claim about
+    # the wrong thing. `Listening on` matches both, and it is the only line
+    # containing those words in either image.
+    uptime-kuma) printf 'Listening on' ;;
     # traefik is DELIBERATELY absent. Measured: it has no container healthcheck
     # and logs no definitive readiness line -- its providers start
     # asynchronously and the last lines of a clean start are

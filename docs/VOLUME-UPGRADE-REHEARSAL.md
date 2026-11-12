@@ -1,8 +1,59 @@
-# Volume upgrade rehearsal — what it would prove, and the two things blocking it
+# Volume upgrade rehearsal — written, passing, and what it still does not cover
 
-**Status: NOT WRITTEN. Blocked on TWO independent things, both measured:
-root for the dump/restore half, and container-name uniqueness for the
-real-container half — and no privilege retires the second.**
+**Status: WRITTEN AND PASSING — `operator/rehearsals/volume-upgrade-rollback-real-containers.sh`,
+8 sections, rc=0, 2026-11-12.** It drives the real `service_upgrade` against
+REAL containers and two REAL uptime-kuma image ids, with exactly one stubbed
+call. Production was 11 containers before and after, with unchanged ids.
+
+**The second blocker was retired STRUCTURALLY, not by privilege — and the way
+it was retired is the point.** This document previously recorded it as
+something *"no privilege retires"*, which was true of the question as asked:
+the two `docker-volume` services both run in production under container names
+that are unique per daemon, so a disposable project cannot use either name, and
+renaming one in a fixture would defeat `stop_compose_services_verified` — it
+compares compose SERVICE names against `docker ps` NAMES and is correct only
+because every service sets `container_name` equal to its key. A renamed
+container would read as STOPPED while running, the dangerous direction.
+
+What was never required was *hosting the rehearsal on traefik or uptime-kuma*.
+The rehearsal **declares its own `docker-volume` service** whose container name
+equals its service key: the invariant stays intact, nothing collides, and the
+production code under test is unchanged. The blocker was a property of one
+phrasing of the question, not of the feature — the fourth time in this project
+that a blocker turned out to belong to a neighbouring question.
+
+**The root blocker is real and is now checked LIVE rather than quoted.**
+Section 3 resolves the volume unprivileged and then asserts that `tar -C` on
+the mountpoint docker reports is still denied, deriving the first unreadable
+path component at run time. If that ever succeeds the rehearsal FAILS, so the
+blocker can notice its own retirement instead of going stale as prose.
+
+**It found a defect no fixture could.** `service_ready_log_pattern uptime-kuma`
+declared `Listening on:` — with the colon — which is version-specific:
+
+```
+uptime-kuma:2   [SETUP-DATABASE] INFO: Listening on:
+uptime-kuma:1   [SERVER]         INFO: Listening on 3001
+```
+
+A rollback restores the OLD image, so it crosses versions by definition. After
+one, phase 4 would have reported readiness UNPROVEN for a service that was
+perfectly ready — safe in direction, and still a claim about the wrong thing.
+The declaration drops the colon; `Listening on` is the only line containing
+those words in either image.
+
+**A measurement worth keeping:** a cross-major uptime-kuma upgrade takes about
+**two minutes** to reach its readiness line, because v2 migrates a v1 database
+on startup, against a default `UPGRADE_READY_LOG_WAIT` of 60 s. That is the
+designed behaviour — absence is reported and never sets `rc` — but an operator
+who sees `NOT logged within 60s` after upgrading uptime-kuma should know it is
+expected. The rehearsal asserts the CONTRACT (reported either way, upgrade
+still exits 0) rather than requiring the line, because requiring it would be
+stricter than the code and flaky by design.
+
+**Still NOT covered, and no amount of work here changes it:** an upgrade of the
+actual production traefik or uptime-kuma. That is `VOLUME_UPGRADE_ENABLED=1`
+plus an application upgrade, both operator-gated. The gate is untouched.
 
 `traefik` and `uptime-kuma` are the two `docker-volume` services. Their upgrade
 and rollback path is implemented and covered against fixtures —
@@ -19,7 +70,7 @@ fixture can establish is that the real Docker volume dump and restore work.
 | WAL handling | that `kuma.db` plus a **non-empty `-wal`** survives a dump and restore as a database the application opens, not merely as bytes |
 | `restore_volume_from_file` | that it sets the failed state aside as `.failed-<stamp>` before writing, and that restoring is idempotent |
 | exact images | that `rollback_volume_upgrade` pins the recorded image **id** and recreates on it, rather than resolving a tag |
-| readiness | that uptime-kuma logs `Connected to the database` then `Listening on:` across a real restart, which is what makes its declared pattern stronger than a TCP-listener probe |
+| readiness | that uptime-kuma logs `Connected to the database` then a listening line across a real restart, which is what makes its declared pattern stronger than a TCP-listener probe. The DECLARED pattern is `Listening on` with **no colon**, because the line is version-specific -- v2 logs `Listening on:` and v1 logs `Listening on 3001`, and a rollback crosses versions by definition |
 | failure injection | that a dump which fails mid-write leaves no `.tar` under its final name, and that a corrupted dump is refused rather than restored |
 
 ## Why it needs root — measured 2026-11-02
@@ -76,10 +127,14 @@ and ACLs behave differently inside a container's user namespace, and
 `acme.json`'s mode is exactly what must not change. A restore path is the worst
 place to trade correctness for testability.
 
-## A SECOND, INDEPENDENT BLOCKER — and it is structural, not a privilege
+## A SECOND BLOCKER — structural, and RETIRED 2026-11-12 without privilege
 
-Measured 2026-11-11. Root is not the only thing in the way, and the second
-reason is the stronger one because no privilege retires it.
+Measured 2026-11-11, and every measurement below is still true. What was wrong
+was the conclusion drawn from them: that the rehearsal therefore could not be
+written. **It was retired by declaring a NEW `docker-volume` service whose
+container name equals its service key, rather than by borrowing a production
+one** — see the header. The measurements are kept because they are what forbids
+the obvious shortcut of renaming a production container in a fixture.
 
 **The only two `docker-volume` services are traefik and uptime-kuma, and both
 are running in production under container names that are unique per daemon.**
@@ -132,14 +187,25 @@ blocks. Everything above runs against real files.
 
 ## So the honest status
 
-Not "blocked on root". Blocked on **root for the dump/restore half**, and on
-**container-name uniqueness for the real-container half** — and the second
-cannot be unblocked by privilege, only by stopping a production service, which
-is forbidden, or by accepting a second stub, which would make the exercise
-prove less than the fixtures already do.
+**Written and passing.** One call is stubbed — `docker_volume_mountpoint`,
+which returns a path under `/var/lib/docker` that needs root to read.
+Everything it feeds (quiesce, tar, checksum, verify, restore) runs for real
+against a real directory, here and in `tests/volume-recovery-point-smoke.sh`
+with real xattrs, ACLs and modes.
 
-A future session should not re-derive this. The probe is one command and it is
-quoted above.
+What a privileged run would add is narrow and worth naming precisely: that
+`tar -C` on the path **docker itself reports** behaves as it does on the
+equivalent directory. Not the dump logic, not the restore logic, not the
+upgrade or the rollback — those are driven here against real containers and
+real image ids.
+
+What NO amount of work here retires is upgrading the actual production traefik
+or uptime-kuma. That is `VOLUME_UPGRADE_ENABLED=1` plus an application upgrade,
+both operator-gated, and the gate is untouched.
+
+A future session should not re-derive the blockers. Both probes are one command
+each and both are quoted above; the rehearsal re-checks the root one at run
+time and fails if it ever stops being true.
 
 ## To unblock
 

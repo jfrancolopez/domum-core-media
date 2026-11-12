@@ -525,7 +525,9 @@ operator decision. What is worth knowing first, measured 2026-10-21:
   in the image, so the dump gets a real integrity check instead of
   `unsupported: not checked`.
 - **Readiness is asymmetric.** uptime-kuma logs `Connected to the database` and
-  then `Listening on:`, and has a container healthcheck — the best-evidenced
+  then a listening line (`Listening on:` in v2, `Listening on 3001` in v1 — the
+  declared pattern drops the colon so a rollback to v1 still matches), and has a
+  container healthcheck — the best-evidenced
   readiness of the eleven. traefik has **no** healthcheck and logs **no**
   readiness line, so `service_ready_log_pattern` deliberately leaves it
   undeclared and its readiness is reported as unproven. Declaring one of its
