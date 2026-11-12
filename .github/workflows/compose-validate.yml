@@ -442,6 +442,9 @@ jobs:
       - name: Recovery pack email smoke test
         run: tests/recovery-pack-email-smoke.sh
 
+      - name: Rollback entry status smoke test
+        run: tests/rollback-entry-status-smoke.sh
+
       - name: No conflict markers smoke test
         run: tests/no-conflict-markers-smoke.sh
 
