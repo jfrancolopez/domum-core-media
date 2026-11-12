@@ -74,10 +74,35 @@
 # uses %q, so they carry none of the quoting defects found elsewhere;
 # report_tmp_cleanup guards each path before removing it.
 #
-# What remains is the doctor_* family (read and found clean -- it prints
-# basenames and set/empty, never contents), the configure_* prompts, and
-# reporting helpers. None of them gates, deletes or writes anything a recovery
-# depends on.
+#   render_traefik_dynamic    read and found SOUND: it REFUSES to write when a
+#                             placeholder is unresolved, and uses the
+#                             capture-first grep form. Its `shopt -u nullglob`
+#                             assumes the option was unset on entry -- swept,
+#                             six paired sites across the CLIs, none of them
+#                             enterable while another has it on, so measured
+#                             and left alone rather than churned.
+#
+# WHERE THIS THREAD STANDS, as a MEASUREMENT and not a classification -- the
+# distinction matters, because the earlier "no consequential names remain" was
+# the latter and was wrong. Of the 59 remaining, what each function actually
+# does, with comments stripped:
+#
+#   52  touch nothing: pure computation or printing
+#    6  make a NETWORK call, all diagnostics -- configure_cmd, doctor_backups,
+#       doctor_secrets, doctor_traefik, service_probe_ready,
+#       service_probe_version
+#    1  writes a file: render_traefik_dynamic, above
+#
+# NONE of them deletes, recreates a container, writes a credential, or gates a
+# recovery operation. Everything that does is now driven by a test. That is the
+# claim, and the command that produced it is worth re-running rather than
+# trusting this comment:
+#
+#   for fn in $(grep '^[a-z_]' docs/never-executed-functions.txt); do ... done
+#
+# -- matching each function body against rm -rf / btrfs subvolume delete /
+# docker rm / restic forget / compose_cmd up|stop|rm|start / a redirect to a
+# variable path / write_env_kv / install -m / chmod / curl / smtp_send.
 #   immich_reset_db           would stop and REMOVE all four Immich containers
 #                             and then refuse, because the snapshot gate fires
 #                             after the stop and /srv/data/immich is not a
@@ -122,7 +147,6 @@ prompt_secret_value
 prompt_with_default
 prompt_yes_no
 recovery_pack_cmd
-render_traefik_dynamic
 report_render_text
 report_update_candidate
 rollback_list_cmd

@@ -8999,6 +8999,32 @@ And **`git branch --show-current` before committing**, which costs nothing and
 is the one check that would have caught this immediately rather than at the
 push.
 
+**WHERE THE NEVER-EXECUTED THREAD STANDS, STATED AS A MEASUREMENT BECAUSE THE
+LAST TIME I STATED IT AS A CLASSIFICATION IT WAS WRONG.** 81 at the sweep, 58
+now. Of what remains, matched against what each body actually does with
+comments stripped:
+
+```
+52  touch nothing -- pure computation or printing
+ 6  make a NETWORK call, all diagnostics (doctor_*, the readiness probes,
+    configure_cmd)
+ 1  writes a file: render_traefik_dynamic, read and found sound
+```
+
+**None of them deletes, recreates a container, writes a credential, or gates a
+recovery operation.** Everything that does is now driven by a test. The command
+that produced that split is recorded beside the list, so the next session
+re-runs it rather than trusting the sentence.
+
+**`shopt -u nullglob` is the umask leak's cousin, and was measured rather than
+churned.** Six paired `shopt -s`/`-u nullglob` sites across the CLIs each
+assume the option was unset on entry and restore it to unset -- which is wrong
+if any of them can be entered while another has it on. Checked: none can, and
+`report_generate_json`'s two pairs are sequential with its calls to the other
+two functions falling outside both. So: no defect, left alone, recorded. The
+umask sweep found a real second site; this one did not, and saying so is the
+point -- a sweep that only ever reports findings is one nobody believes.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
