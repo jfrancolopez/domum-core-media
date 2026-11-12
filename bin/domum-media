@@ -751,9 +751,26 @@ write_secret_file() {
   local path="$1"
   local value="$2"
   ensure_secret_dir
-  umask 077
-  printf '%s' "$value" > "$path"
-  chmod 600 "$path"
+  # The umask is set in a SUBSHELL. `umask` is not scoped to a function, so the
+  # bare form leaked 077 to the rest of the process -- measured, a caller at
+  # umask 022 that created an ordinary file after writing a secret got 600
+  # instead of 644. A function must not change its caller's umask.
+  #
+  # The write is ATOMIC: `> "$path"` truncates before it writes, so an
+  # interruption left a ZERO-BYTE secret -- and an empty credential file is
+  # exactly the condition `checkup` exists to report, which the write path
+  # should not be able to create. Staged in the same directory and renamed, so
+  # the live file is either the old secret or the new one.
+  local tmp
+  tmp="$(
+    umask 077
+    t="$(mktemp "$(dirname -- "$path")/.$(basename -- "$path").XXXXXX")" || exit 1
+    printf '%s' "$value" > "$t" || { rm -f -- "$t"; exit 1; }
+    chmod 600 -- "$t" || { rm -f -- "$t"; exit 1; }
+    printf '%s' "$t"
+  )" || die "Could not stage the secret beside $path."
+  [[ -n "$tmp" ]] || die "Could not stage the secret beside $path."
+  mv -f -- "$tmp" "$path" || { rm -f -- "$tmp"; die "Could not install the secret at $path."; }
 }
 
 generate_secret() {
@@ -5556,39 +5573,83 @@ recovery_pack_secret_files() {
 
 send_recovery_pack_email() {
   local archive="$1"
-  local message
+  local message from to name
   [[ "${RECOVERY_PACK_EMAIL_ENABLED:-0}" == "1" ]] || return 0
+
+  # Every header value goes through mreport_header_safe, which strips CR, LF and
+  # NUL. It already exists in this file and the weekly report's mail path
+  # already used it; this one did not -- two mail paths, one sanitising and one
+  # not. Demonstrated: a newline in RECOVERY_PACK_EMAIL_TO injected a Bcc into
+  # the message that carries the encrypted recovery pack.
+  #
+  # Not a privilege boundary: the config is 0600 root, so anyone who can set
+  # that value already has root. What it is, is an injection hole in the one
+  # path that sends the artefact which makes every other off-site copy openable
+  # -- and this project deliberately did NOT copy exactly this hole from
+  # domum-core. A pasted value with a stray newline is the realistic trigger.
+  from="$(mreport_header_safe "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}")"
+  to="$(mreport_header_safe "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}")"
+  name="$(mreport_header_safe "$(basename "$archive")")"
+
+  # Refuse BEFORE building the message. smtp_send_message dies, and `die` exits
+  # the process, so neither a RETURN trap nor a `||` here can clean up after it
+  # -- measured, the whole base64-encoded pack was left behind. Checking the
+  # transport first means the common failure happens while there is nothing to
+  # leave behind.
+  local problem
+  problem="$(smtp_transport_problem)" \
+    || die "Refusing to build the recovery-pack message: $problem"
+
   message="$(mktemp)"
+  # Removed on the paths that RETURN. The die path is handled by the check
+  # above, which runs before this file exists.
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$message'" RETURN
   {
-    printf 'From: %s\n' "${RECOVERY_PACK_EMAIL_FROM:-$DOMUM_EMAIL}"
-    printf 'To: %s\n' "${RECOVERY_PACK_EMAIL_TO:-$DOMUM_EMAIL}"
-    printf 'Subject: domum-media recovery pack %s\n' "$(basename "$archive")"
+    printf 'From: %s\n' "$from"
+    printf 'To: %s\n' "$to"
+    printf 'Subject: domum-media recovery pack %s\n' "$name"
     printf 'MIME-Version: 1.0\n'
     printf 'Content-Type: multipart/mixed; boundary="domum-boundary"\n\n'
     printf -- '--domum-boundary\n'
     printf 'Content-Type: text/plain; charset="utf-8"\n\n'
-    printf 'Attached: %s\n\n' "$(basename "$archive")"
+    printf 'Attached: %s\n\n' "$name"
     printf -- '--domum-boundary\n'
-    printf 'Content-Type: application/octet-stream; name="%s"\n' "$(basename "$archive")"
+    printf 'Content-Type: application/octet-stream; name="%s"\n' "$name"
     printf 'Content-Transfer-Encoding: base64\n'
-    printf 'Content-Disposition: attachment; filename="%s"\n\n' "$(basename "$archive")"
+    printf 'Content-Disposition: attachment; filename="%s"\n\n' "$name"
     base64 < "$archive"
     printf '\n--domum-boundary--\n'
   } > "$message"
   smtp_send_message "$message"
-  rm -f "$message"
 }
 
 # The one SMTP transport. Both the recovery-pack delivery and the health
 # notification build their own message and hand it here, so there is one place
 # that knows how mail leaves this host and one place to get the credentials
 # right. Credentials are read from their files into locals and never echoed.
+# Can mail leave this host at all? Prints the reason it cannot, and returns
+# non-zero. ONE implementation: smtp_send_message enforces it by dying, and a
+# caller that is about to build an expensive message consults it FIRST.
+#
+# That ordering is the point. smtp_send_message DIES, and `die` exits the
+# process, so no RETURN trap and no `||` in the caller can clean up after it --
+# measured: a failed send left the whole base64-encoded recovery pack in the
+# temp directory, on a path that fails exactly when a credential is missing,
+# which is the condition `checkup` exists to pre-empt. Refusing before the
+# message exists is the only cleanup that works.
+smtp_transport_problem() {
+  [[ -n "${RECOVERY_PACK_SMTP_HOST:-}" ]] \
+    || { printf 'RECOVERY_PACK_SMTP_HOST is required to send mail.'; return 1; }
+  [[ -f "${RECOVERY_PACK_SMTP_USERNAME_FILE:-}" && -f "${RECOVERY_PACK_SMTP_PASSWORD_FILE:-}" ]] \
+    || { printf 'SMTP credential files are missing.'; return 1; }
+  return 0
+}
+
 smtp_send_message() {  # $1 = a complete RFC-822 message file
-  local message="$1" smtp_user smtp_pass
+  local message="$1" smtp_user smtp_pass problem
   [[ -f "$message" ]] || die "smtp_send_message: no message file"
-  [[ -n "${RECOVERY_PACK_SMTP_HOST:-}" ]] || die "RECOVERY_PACK_SMTP_HOST is required to send mail."
-  [[ -f "$RECOVERY_PACK_SMTP_USERNAME_FILE" && -f "$RECOVERY_PACK_SMTP_PASSWORD_FILE" ]] \
-    || die "SMTP credential files are missing."
+  problem="$(smtp_transport_problem)" || die "$problem"
   smtp_user="$(read_secret_file_value "$RECOVERY_PACK_SMTP_USERNAME_FILE")"
   smtp_pass="$(read_secret_file_value "$RECOVERY_PACK_SMTP_PASSWORD_FILE")"
   # ONE attempt was all this ever made, and the CALLER's cadence sets the cost of

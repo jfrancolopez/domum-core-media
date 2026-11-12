@@ -24,9 +24,36 @@
 #                             NAME without ever confirming the repository was
 #                             the pinned one, and recorded no check evidence
 #
-# No consequential names remain on the list: every function that gates, deletes,
-# verifies or records is now driven. What is left is reporting, configuration
-# and doctor helpers -- worth covering, none of it a safety control.
+#   write_secret_file         the writer for EVERY file under the secrets dir.
+#                             Its `umask 077` leaked to the whole process, and
+#                             `> "$path"` truncated before writing, so an
+#                             interruption left a ZERO-BYTE credential.
+#
+# CORRECTION. An earlier version of this header claimed "no consequential names
+# remain". That was a classification, not a measurement, and it was wrong.
+# Re-assessed 2026-11-12 by what each remaining function TOUCHES (comments
+# stripped), 20 of the 68 reach deletion, a gate, or a write:
+#
+#   DELETES    clear_update_candidate_state, report_tmp_cleanup, doctor_immich,
+#              send_recovery_pack_email, validate_backup_env_content
+#   GATE       configure_cmd, configure_non_interactive, doctor_cmd,
+#              doctor_navidrome, doctor_traefik, init_host, logs_cmd,
+#              recovery_pack_cmd, render_traefik_dynamic, show_update_inventory
+#   WRITES     record_update_history, update_rollback_entry_status,
+#              write_immich_db_password_fingerprint, write_update_state
+#
+#   send_recovery_pack_email  the encrypted pack's ONLY off-host route. No
+#                             header sanitisation, while mreport_header_safe is
+#                             in the same file and the sibling mail path used
+#                             it; and the base64 pack was left in the temp dir
+#                             when the send failed, because `die` exits and no
+#                             trap can run.
+#
+# Next, by consequence: `validate_backup_env_content` writes backup-env CONTENT
+# (credentials) to a temp file with no trap, so a failure under `set -e` leaks
+# it; then the update-state writers (write_update_state,
+# update_rollback_entry_status, record_update_history,
+# clear_update_candidate_state), which are the rollback pointer's bookkeeping.
 #   immich_reset_db           would stop and REMOVE all four Immich containers
 #                             and then refuse, because the snapshot gate fires
 #                             after the stop and /srv/data/immich is not a
@@ -81,7 +108,6 @@ rollback_list_cmd
 rollback_show_cmd
 sample_unsamplable_count
 sanitize_immich_secret_files
-send_recovery_pack_email
 service_configured_version
 service_probe_ready
 service_probe_version
@@ -100,5 +126,4 @@ validate_backup_env_file_or_die
 validate_immich_db_password_state
 within_reboot_window
 write_immich_db_password_fingerprint
-write_secret_file
 write_update_state
