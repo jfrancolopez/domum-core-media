@@ -335,6 +335,126 @@ restic_forget_for() { return 0; }')"
 [ -f "$d/log/last-success" ] || fail "G: the heartbeat is missing on a fully successful run"
 echo "  G: a successful retention leaves the run clean"
 
+# ---------------------------------------------------------------------------
+# W. do_weekly_retention, which an instrumented sweep found is executed by NO
+#    test. Section G above drives the DAILY loop; the weekly one is a separate
+#    function with its own copy of the attempt-every-target shape, and on this
+#    host it is the ONLY retention that runs -- `cloud` defaults to weekly and
+#    is the only enabled target, so `retention_targets daily` is empty. The
+#    path that actually executes `restic forget --prune` here had never run in
+#    a test.
+#
+#    It is reached from the check unit's SECOND ExecStart, so it only runs when
+#    `--check` succeeded. That is why a stale lock in 2026-10-25 cost a whole
+#    week of retention.
+# ---------------------------------------------------------------------------
+run_weekly() {
+  local name="$1" stubs="$2"
+  local dir="$TMP_DIR/$name"
+  mkdir -p "$dir/state/backups" "$dir/log"
+  cat > "$dir/harness.sh" <<HARNESS
+DOMUM_DIR="$REPO_ROOT"
+CFG_FILE="$dir/absent.conf"
+source "$REPO_ROOT/bin/domum-media-backup"
+DOMUM_LOG_DIR="$dir/log"
+DOMUM_STATE_ROOT="$dir/state"
+REPO_META_DIR="$dir/state/backups"
+ensure_dirs
+# log is NOT silenced here: the no-targets case is observable only through it.
+log() { printf 'LOG %s\n' "\$*"; }
+$stubs
+do_weekly_retention
+HARNESS
+  bash "$dir/harness.sh" >"$dir/out.txt" 2>&1
+  printf '%s' "$?" > "$dir/rc"
+  printf '%s' "$dir"
+}
+
+sect_w() { echo "== $* =="; }
+
+sect_w "W1. the FIRST weekly target failing must not skip the second"
+: > "$TMP_DIR/wforgets"
+d="$(run_weekly weekly-partial '
+retention_targets() { [ "$1" = weekly ] && printf "%s\n" cloud nas; }
+restic_forget_for() { printf "FORGET %s\n" "$1" >> "'"$TMP_DIR"'/wforgets"; [ "$1" = cloud ] && return 1; return 0; }')"
+grep -q 'FORGET cloud' "$TMP_DIR/wforgets" || fail "W1: the first target was never attempted"
+grep -q 'FORGET nas' "$TMP_DIR/wforgets" \
+  || fail "W1: cloud's failure skipped nas -- this is the defect the guard exists for"
+[ "$(cat "$d/rc")" != "0" ] || fail "W1: a failed weekly retention must fail the unit"
+grep -q 'cloud' "$d/out.txt" || fail "W1: the failure does not name the target that failed: $(cat "$d/out.txt")"
+grep -q 'nas' "$d/out.txt" \
+  && fail "W1: it named a target that SUCCEEDED as failed: $(cat "$d/out.txt")"
+echo "   both attempted, only the failed one named"
+
+sect_w "W2. the message says snapshots are RETAINED, which is the safe direction"
+grep -qi 'retained rather than deleted' "$d/out.txt" \
+  || fail "W2: the failure does not state that snapshots are retained, so an
+operator cannot tell a retention failure from data loss: $(cat "$d/out.txt")"
+grep -qi 'EXCLUSIVE repository lock' "$d/out.txt" \
+  || fail "W2: it does not name the likely cause -- forget --prune needs an
+exclusive lock, which is what a stale lock blocks: $(cat "$d/out.txt")"
+echo "   retained, and the exclusive lock named as the cause"
+
+sect_w "W3. every target succeeding exits 0"
+d="$(run_weekly weekly-ok '
+retention_targets() { [ "$1" = weekly ] && printf "%s\n" cloud nas; }
+restic_forget_for() { return 0; }')"
+[ "$(cat "$d/rc")" = "0" ] || fail "W3: a successful weekly retention failed: $(cat "$d/out.txt")"
+echo "   clean"
+
+sect_w "W4. NO weekly targets is logged and is NOT a failure"
+# An empty target list is the normal state of a host whose only target is
+# daily. Failing there would mail a false alarm every week.
+d="$(run_weekly weekly-none '
+retention_targets() { :; }
+restic_forget_for() { fail_marker=1; return 0; }')"
+[ "$(cat "$d/rc")" = "0" ] \
+  || fail "W4: an empty weekly target list must not fail: $(cat "$d/out.txt")"
+grep -qi 'No weekly-retention targets configured' "$d/out.txt" \
+  || fail "W4: it did not say the list was empty, so silence is ambiguous: $(cat "$d/out.txt")"
+echo "   logged, exit 0"
+
+sect_w "W5. MUTATION: the unguarded call skips every later target"
+# The exact historical shape: `restic_forget_for "$target"` with no `|| failed=`
+# aborts the loop under set -e at the FIRST failure. The observable is whether
+# the SECOND target was attempted -- the command fails either way, so asserting
+# the exit status would pass against the defect.
+WMUT="$TMP_DIR/mutant-weekly"
+cp "$REPO_ROOT/bin/domum-media-backup" "$WMUT"
+cat > "$TMP_DIR/mutate-weekly.py" <<'PYWK'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    restic_forget_for "$target" || failed="${failed:+$failed }$target"\n'
+new = '    restic_forget_for "$target"\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYWK
+python3 -I "$TMP_DIR/mutate-weekly.py" "$WMUT" || fail "W5: the mutation did not apply"
+: > "$TMP_DIR/wforgets2"
+mdir="$TMP_DIR/weekly-mutant"; mkdir -p "$mdir/state/backups" "$mdir/log"
+cat > "$mdir/harness.sh" <<HARNESS
+DOMUM_DIR="$REPO_ROOT"
+CFG_FILE="$mdir/absent.conf"
+source "$WMUT"
+DOMUM_LOG_DIR="$mdir/log"
+DOMUM_STATE_ROOT="$mdir/state"
+REPO_META_DIR="$mdir/state/backups"
+ensure_dirs
+log() { printf 'LOG %s\n' "\$*"; }
+retention_targets() { [ "\$1" = weekly ] && printf "%s\n" cloud nas; }
+restic_forget_for() { printf "FORGET %s\n" "\$1" >> "$TMP_DIR/wforgets2"; [ "\$1" = cloud ] && return 1; return 0; }
+do_weekly_retention
+HARNESS
+bash "$mdir/harness.sh" >"$mdir/out.txt" 2>&1 || true
+grep -q 'FORGET nas' "$TMP_DIR/wforgets2" \
+  && fail "W5: the mutation changed no ANSWER -- unguarded, cloud's failure must
+abort the loop before nas is attempted: $(cat "$TMP_DIR/wforgets2")"
+grep -q 'FORGET cloud' "$TMP_DIR/wforgets2" \
+  || fail "W5: the mutant did not attempt the first target either, so the
+section is not observing the loop it is about"
+echo "   killed: unguarded, nas is never attempted"
+
 # The mutation: restore the unguarded call. The observable is the HEARTBEAT --
 # the run fails either way, so asserting the exit status would pass against the
 # defect. Name the observable the mutation actually changes.
