@@ -22,9 +22,22 @@ sect() { echo "== $* =="; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_CLI="$REPO_ROOT/bin/domum-media-backup"
+# What the writer drivers LOAD. Defaults to the tracked CLI; the mutation below
+# repoints it at a mutated COPY, so bin/domum-media-backup is never written and
+# an interrupted run leaves nothing behind.
+MUT_BACKUP="$BACKUP_CLI"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the drivers LOAD. Defaults to the tracked CLI; a mutation repoints it at
+# a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer reset
+# rather than a file restore, so an interrupted run leaves nothing behind and a
+# concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 # ---------------------------------------------------------------------------
 #  The writer, driven through the real functions in bin/domum-media-backup.
@@ -54,7 +67,7 @@ DRIVER
 
 drive_writer() {  # $1 = shell to run with the writer functions loaded
   (
-    export META="$TMP/meta" TMPDIR_T="$TMP" CLI_BACKUP="$BACKUP_CLI" DRIVE="$1"
+    export META="$TMP/meta" TMPDIR_T="$TMP" CLI_BACKUP="$MUT_BACKUP" DRIVE="$1"
     bash "$TMP/drive-writer.sh"
   )
 }
@@ -120,7 +133,7 @@ read_probe() {  # $1 = fixture, $2 = expression to evaluate
   (
     export REPO_META_DIR="$TMP/rmeta"
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     eval "$1"
     eval "$2"
@@ -202,7 +215,7 @@ sect "what the backup CLI writes, the main CLI reads"
 E2E="$TMP/e2e"
 mkdir -p "$E2E"
 (
-  export META="$E2E" TMPDIR_T="$TMP" CLI_BACKUP="$BACKUP_CLI" \
+  export META="$E2E" TMPDIR_T="$TMP" CLI_BACKUP="$MUT_BACKUP" \
          DRIVE='restic_check_for cloud; restic_forget_for cloud' RESTIC_RC=0
   bash "$TMP/drive-writer.sh"
 ) || fail "the writer failed while producing end-to-end evidence"
@@ -211,7 +224,7 @@ e2e_read() {  # $1 = expression, evaluated against the writer's own directory
   (
     export REPO_META_DIR="$E2E"
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     enabled_backup_targets() { printf 'cloud\n'; }
     # The failed run is dated well before the evidence the writer just made.
@@ -239,7 +252,7 @@ sect "a FAILED check written end to end does not supersede"
 # The direction that matters: the writer records a failure, and the reader must
 # not read it as a verification.
 (
-  export META="$E2E" TMPDIR_T="$TMP" CLI_BACKUP="$BACKUP_CLI" \
+  export META="$E2E" TMPDIR_T="$TMP" CLI_BACKUP="$MUT_BACKUP" \
          DRIVE='restic_check_for cloud' RESTIC_RC=11
   bash "$TMP/drive-writer.sh"
 ) && fail "a failing check returned zero through the writer"
@@ -281,35 +294,38 @@ PYEOF
 sect "MUTATION: 'any target verified' instead of 'every target'"
 # Take the backup BEFORE the mutation, unconditionally and on its own line -- a
 # short-circuited && chain leaves the mutation applied with no way back.
-cp "$CLI" "$TMP/cli.orig"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 mutate 'old = "  if (( ${#outstanding[@]} == 0 )); then"
 new = "  if (( ${#later[@]} > 0 )); then"
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
-s = s.replace(old, new)' "$CLI" || { cp "$TMP/cli.orig" "$CLI"; fail "the mutation did not apply"; }
+s = s.replace(old, new)' "$MUTCLI" || fail "the mutation did not apply"
 write_ev nas   check success 2026-10-28T10:51:00-0400
 write_ev cloud check success 2026-10-20T03:40:00-0400
 out="$(read_probe "$TWO_TARGETS" "restic_checks_since $SINCE")"
-cp "$TMP/cli.orig" "$CLI"
+MUTCLI="$CLI"
 [[ "$out" == superseded* ]] \
   || fail "the mutation changed no ANSWER -- it must make one verified target supersede the fleet: $out"
 echo "  caught: one target's clean check would have excused an unverified one"
 
 sect "MUTATION: a failure record read as a success"
-cp "$CLI" "$TMP/cli.orig"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 mutate 'old = """    [[ "${RESULT:-}" == "success" ]] || exit 1
     [[ -n "${FINISHED_TS:-}" ]] || exit 1"""
 new = """    [[ -n "${FINISHED_TS:-}" ]] || exit 1"""
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
-s = s.replace(old, new)' "$CLI" || { cp "$TMP/cli.orig" "$CLI"; fail "the mutation did not apply"; }
+s = s.replace(old, new)' "$MUTCLI" || fail "the mutation did not apply"
 write_ev cloud check failure 2026-10-28T10:00:00-0400
 out="$(read_probe "$TWO_TARGETS" 'restic_op_last_success cloud check && echo READ_AS_SUCCESS')"
-cp "$TMP/cli.orig" "$CLI"
+MUTCLI="$CLI"
 grep -q READ_AS_SUCCESS <<< "$out" \
   || fail "the mutation changed no ANSWER -- a recorded failure must read as a success: $out"
 echo "  caught: a FAILED check would have superseded the failure it caused"
 
 sect "MUTATION: the check's exit status swallowed"
-cp "$BACKUP_CLI" "$TMP/backup.orig"
+MUT_BACKUP="$TMP/backup-cli-mutant"
+cp "$BACKUP_CLI" "$MUT_BACKUP"
 mutate 'old = """  # Preserved so a locked repository still fails the unit. restic exit 11 is
   # what makes `checkup` able to say the check never ran.
   return "$rc"
@@ -317,10 +333,10 @@ mutate 'old = """  # Preserved so a locked repository still fails the unit. rest
 new = """  return 0
 }"""
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
-s = s.replace(old, new)' "$BACKUP_CLI" || { cp "$TMP/backup.orig" "$BACKUP_CLI"; fail "the mutation did not apply"; }
+s = s.replace(old, new)' "$MUT_BACKUP" || fail "the mutation did not apply"
 rc=0
 RESTIC_RC=11 drive_writer 'restic_check_for cloud' || rc=$?
-cp "$TMP/backup.orig" "$BACKUP_CLI"
+MUT_BACKUP="$BACKUP_CLI"
 (( rc == 0 )) \
   || fail "the mutation changed no ANSWER -- a locked repository must stop failing: got $rc"
 echo "  caught: a locked repository would have left the unit green"
@@ -386,5 +402,13 @@ grep -q 'no enabled backup targets' <<< "$mgot" \
   || fail "the mutation changed no ANSWER -- without the status check a FAILURE to
 read the target list must report 'no enabled backup targets': $mgot"
 echo "  killed: the mutant reports a failure as 'none enabled'"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "ALL RESTIC-OP-EVIDENCE CHECKS PASSED"

@@ -19,6 +19,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the drivers LOAD. Defaults to the tracked CLI; a mutation repoints it at
+# a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer reset
+# rather than a file restore, so an interrupted run leaves nothing behind and a
+# concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 mkdir -p "$TMP"/{state/restore-verification,state/report,state/updates,state/backups,data,snapshots,media,secrets,log,bin}
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq unavailable"; exit 0; }
 
@@ -384,7 +393,8 @@ grep -qi 'DATA corruption' <<< "$out" \
 echo "  scoped to the scrub"
 
 sect "MUTATION: widening the branch to ANY unit at exit 3"
-cp "$CLI" "$TMP/cli.orig.scrub3"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-scrub3.py" <<'PYS3'
 import io, sys
 p = sys.argv[1]
@@ -394,10 +404,10 @@ new = '"$status" == "3"'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYS3
-( python3 -I "$TMP/mutate-scrub3.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.scrub3" "$CLI"; fail "the scrub3 mutation did not apply"; }
-mout="$(probe_systemd "$CLI" "$OTHER3")"
-cp "$TMP/cli.orig.scrub3" "$CLI"
+python3 -I "$TMP/mutate-scrub3.py" "$MUTCLI" \
+  || fail "the scrub3 mutation did not apply"
+mout="$(probe_systemd "$MUTCLI" "$OTHER3")"
+MUTCLI="$CLI"
 grep -qi 'DATA corruption' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- without the unit test, a backup
 exiting 3 must start claiming corruption of the photo tier: $mout"
@@ -604,7 +614,8 @@ sect "MUTATION: the staleness gate always open downgrades a LIVE failure"
 # alarm.
 #
 # The backup is taken BEFORE the mutation, unconditionally and on its own line.
-cp "$CLI" "$TMP/cli.orig.staleness"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 # `[[ x == * ]]` always matches, so the gate is open for every verdict. Written
 # as its own file with a quoted heredoc: expressing a mutation through nested
 # quoting is how one came to apply textually and change nothing.
@@ -616,11 +627,11 @@ old = '[[ "$verdict" == superseded* ]]'
 assert s.count(old) == 2, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, '[[ "$verdict" == * ]]'))
 PYMUT
-( python3 -I "$TMP/mutate-staleness.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.staleness" "$CLI"; fail "the staleness mutation did not apply"; }
+python3 -I "$TMP/mutate-staleness.py" "$MUTCLI" \
+  || fail "the staleness mutation did not apply"
 rm -f "$EVDIR"/*-check.env
-out="$(probe_systemd_ev "$CLI" "$LOCKED_WITH_TS")"
-cp "$TMP/cli.orig.staleness" "$CLI"
+out="$(probe_systemd_ev "$MUTCLI" "$LOCKED_WITH_TS")"
+MUTCLI="$CLI"
 grep -qi 'STALE' <<< "$out" \
   || fail "the mutation changed no ANSWER -- with the gate open a live failure must read as stale: $out"
 grep -q 'CRIT|' <<< "$out" \
@@ -670,7 +681,7 @@ sect "an exact duplicate finding is suppressed"
 # status. Printing the identical text twice makes the host look twice as bad.
 dup="$(
   # shellcheck disable=SC1090
-  source "$CLI" >/dev/null 2>&1
+  source "$MUTCLI" >/dev/null 2>&1
   CHECKUP_ACTIONS=()
   checkup_add action "sudo domum-media compose logs --tail 50 immich_server immich_redis"
   checkup_add action "sudo domum-media compose logs --tail 50 immich_server immich_redis"
@@ -755,7 +766,7 @@ sect "the UNHEALTHY finding NAMES the container, not just the logical service"
 # systemd finding that does not name its unit.
 members="$(
   # shellcheck disable=SC1090
-  source "$CLI" >/dev/null 2>&1
+  source "$MUTCLI" >/dev/null 2>&1
   service_compose_services() { printf 'immich_server\nimmich_machine_learning\nimmich_postgres\nimmich_redis\n'; }
   tracked_service_container_id() { printf 'cid-%s' "$1"; }
   docker() {
@@ -780,7 +791,7 @@ echo "  names immich_machine_learning:unhealthy, and the state word is unchanged
 sect "healthy members are NOT listed, so the finding stays short"
 allok="$(
   # shellcheck disable=SC1090
-  source "$CLI" >/dev/null 2>&1
+  source "$MUTCLI" >/dev/null 2>&1
   service_compose_services() { printf 'a\nb\nc\n'; }
   tracked_service_container_id() { printf 'cid-%s' "$1"; }
   docker() { case "$*" in *'{{.State.Status}}'*) printf 'running\n' ;; *Health*) printf 'healthy\n' ;; esac; }
@@ -840,5 +851,13 @@ default, and forcing it could interrupt a live backup."
 grep -rqE 'unlock' "$REPO_ROOT/systemd/" 2>/dev/null \
   && fail "a systemd unit references unlock. It must stay operator-initiated."
 echo "  unknown target refused, no force flag, on no timer"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "PASS: monitoring completeness smoke test"

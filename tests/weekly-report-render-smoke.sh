@@ -14,6 +14,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+PRISTINE_WR="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE_WR"
 mkdir -p "$TMP"/{state/restore-verification,state/report,data,snapshots,media,secrets,log}
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq unavailable"; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 unavailable"; exit 0; }
@@ -665,7 +667,11 @@ echo "  unknown is its own answer"
 sect "MUTATION: dropping the comparison restores the present-tense claim"
 cov fb948da5
 runev 78e40ef8 '2026-11-01T02:36:57-05:00'
-cp "$CLI" "$TMP/cli.orig.stale"
+# A COPY, and driven with the CLI= prefix this suite already uses above: a
+# suite that mutates the tracked file can be stopped mid-run and leave it
+# mutated, and makes any concurrent run unsound.
+MUTS="$TMP/cli-mutant-stale"
+cp "$CLI" "$MUTS"
 cat > "$TMP/mutate-stale.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -675,10 +681,9 @@ new = 'if [[ -n "$c_snap" && -n "$run_snap" && "$c_snap" != "$c_snap" ]]; then'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate-stale.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.stale" "$CLI"; fail "the staleness mutation did not apply"; }
-mout="$(drive "" --stdout)"
-cp "$TMP/cli.orig.stale" "$CLI"
+python3 -I "$TMP/mutate-stale.py" "$MUTS" \
+  || fail "the staleness mutation did not apply"
+mout="$( CLI="$MUTS" drive "" --stdout )"
 grep -q 'STALE' <<< "$mout" \
   && fail "the mutation changed no ANSWER -- without the comparison a proof four
 backups old must read as current: $mout"
@@ -686,5 +691,12 @@ grep -qi 'proof is current' <<< "$mout" \
   || fail "the mutant did not take the 'current' branch: $mout"
 echo "  killed: without the comparison a four-run-old proof reads as current"
 rm -f "$TMP/state/restore-verification/cloud-snapshot-coverage.json" "$TMP/meta/cloud-run.env"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutates in place.
+cmp -s "$CLI" "$PRISTINE_WR" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first
+section -- something mutated it IN PLACE, so stopping this suite part-way would
+leave the change behind and any concurrent run would read it"
 
 echo "PASS: weekly report render smoke test"

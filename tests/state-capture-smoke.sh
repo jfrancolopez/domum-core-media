@@ -18,6 +18,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What probe() LOADS. Defaults to the tracked CLI; a mutation repoints it at a
+# mutated COPY, so bin/domum-media is never written. The eight sections that
+# already swapped CLI for a copied tree now swap MUTCLI instead, so there is one
+# indirection rather than two.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 mkdir -p "$TMP/bin" "$TMP/data" "$TMP/out"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/docker"; chmod +x "$TMP/bin/docker"
@@ -109,7 +118,7 @@ probe() {  # $1 = extra stubs, $2 = expression
     export PATH="$TMP/bin:$PATH"
     export DOMUM_DATA_ROOT="$TMP/data"
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     warn() { echo "WARN: $*"; }
     # Hide ONLY docker. A stub that claimed every tool exists would send
@@ -464,7 +473,8 @@ echo "  capture, verify and restore all complete under set -euo pipefail"
 sect "MUTATION: accepting a missing item makes a partial capture look COMPLETE"
 build_jellyfin
 rm -f "$TMP/data/jellyfin/config/encoding.xml"
-cp "$CLI" "$TMP/cli.orig"
+MUTCLI="$TMP/cli-mutant-cliorig"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -476,10 +486,11 @@ new = '''  if (( bad < 0 )); then
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate.py" "$CLI" ) || { cp "$TMP/cli.orig" "$CLI"; fail "the mutation did not apply"; }
+python3 -I "$TMP/mutate.py" "$MUTCLI" \
+  || fail "the mutation did not apply"
 rm -rf "$TMP/out/mut"
 mout="$(probe '' "service_state_capture jellyfin '$TMP/out/mut'; echo RC=\$?")"
-cp "$TMP/cli.orig" "$CLI"
+MUTCLI="$CLI"
 grep -q 'RC=0' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- without the bad-item check a
 capture missing a declared file must report success: $mout"
@@ -490,7 +501,8 @@ echo "  killed: without the check, a capture missing a declared file reads COMPL
 sect "MUTATION: copying a database instead of .backup loses the consistency claim"
 # The claim, not the bytes, is what this protects: a service that ships sqlite3
 # must not silently fall back to a file copy and still be recorded consistent.
-cp "$CLI" "$TMP/cli.orig2"
+MUTCLI="$TMP/cli-mutant-cliorig2"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate2.py" <<'PYMUT2'
 import io, sys
 p = sys.argv[1]
@@ -509,9 +521,10 @@ new = '''  else
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT2
-( python3 -I "$TMP/mutate2.py" "$CLI" ) || { cp "$TMP/cli.orig2" "$CLI"; fail "the second mutation did not apply"; }
+python3 -I "$TMP/mutate2.py" "$MUTCLI" \
+  || fail "the second mutation did not apply"
 m2="$(probe '' 'service_state_capture_mode jellyfin')"
-cp "$TMP/cli.orig2" "$CLI"
+MUTCLI="$CLI"
 [[ "$m2" == "consistent" ]] \
   || fail "the mutation changed no ANSWER -- declaring every service consistent
 must make jellyfin, which has no sqlite3 anywhere, claim consistency: $m2"
@@ -521,7 +534,8 @@ sect "MUTATION: without the overlap guard a restore writes into LIVE state"
 build_jellyfin
 rm -rf "$TMP/out/cap-m3"
 probe '' "service_state_capture jellyfin '$TMP/out/cap-m3'" >/dev/null
-cp "$CLI" "$TMP/cli.orig3"
+MUTCLI="$TMP/cli-mutant-cliorig3"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate3.py" <<'PYMUT3'
 import io, sys
 p = sys.argv[1]
@@ -531,12 +545,13 @@ new = '  if [[ "$rtarget" == "$rtarget/cannot-hold" ]]; then'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT3
-( python3 -I "$TMP/mutate3.py" "$CLI" ) || { cp "$TMP/cli.orig3" "$CLI"; fail "the third mutation did not apply"; }
+python3 -I "$TMP/mutate3.py" "$MUTCLI" \
+  || fail "the third mutation did not apply"
 # An EMPTY path inside the live tree: the non-empty guard cannot catch this
 # one, so the overlap guard is the only thing standing in the way.
 mout="$(probe '' "service_state_restore '$TMP/out/cap-m3' '$TMP/data/jellyfin/config/restored'; echo RC=\$?")"
 wrote=0; [[ -e "$TMP/data/jellyfin/config/restored/config/system.xml" ]] && wrote=1
-cp "$TMP/cli.orig3" "$CLI"
+MUTCLI="$CLI"
 rm -rf "$TMP/data/jellyfin/config/restored"
 [[ "$wrote" == "1" ]] \
   || fail "the mutation changed no ANSWER -- with the overlap comparison
@@ -548,7 +563,8 @@ build_jellyfin
 rm -rf "$TMP/out/cap-m4" "$TMP/out/scratch-m4"
 probe '' "service_state_capture jellyfin '$TMP/out/cap-m4'" >/dev/null
 printf 'rot\n' >> "$TMP/out/cap-m4/files/config_system.xml"
-cp "$CLI" "$TMP/cli.orig4"
+MUTCLI="$TMP/cli-mutant-cliorig4"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate4.py" <<'PYMUT4'
 import io, sys
 p = sys.argv[1]
@@ -558,10 +574,11 @@ new = '  true || {'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT4
-( python3 -I "$TMP/mutate4.py" "$CLI" ) || { cp "$TMP/cli.orig4" "$CLI"; fail "the fourth mutation did not apply"; }
+python3 -I "$TMP/mutate4.py" "$MUTCLI" \
+  || fail "the fourth mutation did not apply"
 mout="$(probe '' "service_state_restore '$TMP/out/cap-m4' '$TMP/out/scratch-m4'; echo RC=\$?")"
 created=0; [[ -d "$TMP/out/scratch-m4" ]] && created=1
-cp "$TMP/cli.orig4" "$CLI"
+MUTCLI="$CLI"
 [[ "$created" == "1" ]] \
   || fail "the mutation changed no ANSWER -- without the gate, a damaged capture
 must get as far as creating its target: $mout"
@@ -813,7 +830,8 @@ echo "  documented"
 sect "MUTATION: without the gate it STOPS a production service"
 build_jellyfin
 rm -rf "$TMP/out/qm"; : > "$TMP/calls"
-cp "$CLI" "$TMP/cli.origq"
+MUTCLI="$TMP/cli-mutant-cliorigq"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutq.py" <<'PYMUTQ'
 import io, sys
 p = sys.argv[1]
@@ -823,10 +841,11 @@ new = '  if (( 1 != 1 )); then'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUTQ
-( python3 -I "$TMP/mutq.py" "$CLI" ) || { cp "$TMP/cli.origq" "$CLI"; fail "the gate mutation did not apply"; }
+python3 -I "$TMP/mutq.py" "$MUTCLI" \
+  || fail "the gate mutation did not apply"
 mout="$(CALLS="$TMP/calls" probe "$QSTUB" "service_state_capture_quiesced jellyfin '$TMP/out/qm'" 2>&1)"
 stopped=0; grep -q '^compose stop' "$TMP/calls" && stopped=1
-cp "$TMP/cli.origq" "$CLI"
+MUTCLI="$CLI"
 [[ "$stopped" == "1" ]] \
   || fail "the mutation changed no ANSWER -- with the gate neutralised and the
 flag unset, the service must actually be stopped: $mout
@@ -916,9 +935,9 @@ PYMV
 grep -q 'if false && via=' "$MUTV/domum-media" \
   || fail "the mutation is not in the file"
 rm -rf "$TMP/out/scratch-via4"
-saved_cli="$CLI"; CLI="$MUTV/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTV/domum-media"
 out="$(probe "$VIA_STUBS" "service_state_restore '$TMP/out/cap-via' '$TMP/out/scratch-via4'; echo RC=\$?")"
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 grep -q 'restored databases: 0 checked sound, 1 not checked' <<< "$out" \
   || fail "the mutation changed no ANSWER -- without the fallback a database the
 host cannot read must read as 'not checked': $out"
@@ -983,9 +1002,9 @@ io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
 PYMK
 build_calibre_web
 rm -rf "$TMP/out/cap-cw-m"
-saved_cli="$CLI"; CLI="$MUTK/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTK/domum-media"
 out="$(probe '' "service_state_capture calibre-web '$TMP/out/cap-cw-m'; echo RC=\$?")"
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 grep -q 'RC=0' <<< "$out" || fail "the mutant capture failed for an unrelated reason: $out"
 grep -q 'config/\.key' "$TMP/out/cap-cw-m/MANIFEST" \
   && fail "the mutation changed no ANSWER -- without the declaration the key
@@ -1057,9 +1076,9 @@ PYMD
   case "$target" in *device.txt) svc=jellyfin; rel='config/data/data/device.txt' ;; esac
   "build_$(tr - _ <<< "$svc")"
   rm -rf "$TMP/out/cap-mutd"
-  saved_cli="$CLI"; CLI="$MUTD/domum-media"
+  saved_cli="$MUTCLI"; MUTCLI="$MUTD/domum-media"
   out="$(probe '' "service_state_capture $svc '$TMP/out/cap-mutd'; echo RC=\$?")"
-  CLI="$saved_cli"
+  MUTCLI="$saved_cli"
   grep -q 'RC=0' <<< "$out" || fail "the mutant capture of $svc failed unexpectedly: $out"
   grep -qF "$rel" "$TMP/out/cap-mutd/MANIFEST" \
     && fail "the mutation changed no ANSWER -- without the declaration $rel must
@@ -1138,9 +1157,9 @@ io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMP
 rm -rf "$TMP/data/backups"
 build_calibre_web
-saved_cli="$CLI"; CLI="$MUTP2/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTP2/domum-media"
 probe '' "service_state_capture calibre-web '$dest_default'" >/dev/null
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 mroot="$(stat -c %a "$(probe '' 'state_capture_dir')" 2>/dev/null || echo MISSING)"
 [[ "$mroot" != "700" ]] \
   || fail "the mutation changed no ANSWER -- without the explicit mode the
@@ -1296,10 +1315,10 @@ new = "  elif false; then"
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMH
-saved_cli="$CLI"; CLI="$MUTH/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTH/domum-media"
 mout="$(probe 'sqlite_helper_image() { printf sha256:helperimage; }' \
   'service_state_capture_mode jellyfin')"
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 [[ "$mout" == "unproven" ]] \
   || fail "the mutation changed no ANSWER -- without the helper arm jellyfin
 must report unproven, got: $mout"
@@ -1428,9 +1447,9 @@ build_calibre_web
 rm -rf "$TMP/out/cap-m5" "$TMP/out/packs5"
 probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-m5'" >/dev/null
 printf 'tampered\n' >> "$TMP/out/cap-m5/files/config_gdrive.db"
-saved_cli="$CLI"; CLI="$MUTP3/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTP3/domum-media"
 out="$(probe "$PACKENV" "service_state_pack '$TMP/out/cap-m5' '$TMP/out/packs5/d.tar.age'; echo RC=\$?")"
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 grep -q 'RC=0' <<< "$out" \
   || fail "the mutation changed no ANSWER -- without the gate a tampered
 capture must be packed: $out"
@@ -1469,9 +1488,9 @@ out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/iden
 grep -q 'RC=0' <<< "$out" && fail "the real code unpacked a pack whose recorded checksum does not match: $out"
 grep -q 'checksum mismatch' <<< "$out" || fail "it does not say the checksum is wrong: $out"
 rm -rf "$TMP/out/unp-m2"
-saved_cli="$CLI"; CLI="$MUTP4/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTP4/domum-media"
 out="$(probe '' "service_state_unpack '$TMP/out/packs/b.tar.age' '$TMP/keys/ident' '$TMP/out/unp-m2'; echo RC=\$?")"
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 grep -q 'RC=0' <<< "$out" \
   || fail "the mutation changed no ANSWER -- without the check a mismatched
 checksum must be ignored: $out"
@@ -1539,9 +1558,9 @@ new = '''    echo "file integrity: VERIFIED"
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMV2
-saved_cli="$CLI"; CLI="$MUTV2/domum-media"
+saved_cli="$MUTCLI"; MUTCLI="$MUTV2/domum-media"
 out="$(probe '' "service_state_pack_verify '$TMP/vp-nosum.age'; echo RC=\$?")"
-CLI="$saved_cli"
+MUTCLI="$saved_cli"
 grep -q 'RC=0' <<< "$out" \
   || fail "the mutation changed no ANSWER -- a pack with no recorded checksum
 must be able to read as VERIFIED once the UNKNOWN branch is removed: $out"
@@ -1753,7 +1772,8 @@ probe '' "service_state_capture jellyfin '$TMP/out/vf-mut'" >/dev/null 2>&1
 awk '/device\.txt/ {next} /^RESULT=|^ITEMS=/ {next} {print}' \
   "$TMP/out/vf-mut/MANIFEST" > "$TMP/vf-mut.m"
 mv "$TMP/vf-mut.m" "$TMP/out/vf-mut/MANIFEST"
-cp "$CLI" "$TMP/cli.origvf"
+MUTCLI="$TMP/cli-mutant-cliorigvf"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-vf.py" <<'PYMUTVF'
 import io, sys
 p = sys.argv[1]
@@ -1775,9 +1795,10 @@ for old, new in pairs:
     s = s.replace(old, new, 1)
 io.open(p, "w", encoding="utf-8").write(s)
 PYMUTVF
-( python3 -I "$TMP/mutate-vf.py" "$CLI" ) || { cp "$TMP/cli.origvf" "$CLI"; fail "the verify mutation did not apply"; }
+python3 -I "$TMP/mutate-vf.py" "$MUTCLI" \
+  || fail "the verify mutation did not apply"
 mout="$(probe '' "service_state_verify '$TMP/out/vf-mut'; echo RC=\$?")"
-cp "$TMP/cli.origvf" "$CLI"
+MUTCLI="$CLI"
 grep -q 'RC=0' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- without the summary checks a
 truncated manifest must verify clean again: $mout"
@@ -1788,7 +1809,8 @@ build_jellyfin
 rm -rf "$TMP/out/vf-mut2" "$TMP/out/vf-mut2-rst"
 probe '' "service_state_capture jellyfin '$TMP/out/vf-mut2'" >/dev/null 2>&1
 sed -i 's|^SQLITE_HELPER=none$|SQLITE_HELPER=sha256:deadbeefdeadbeef|' "$TMP/out/vf-mut2/MANIFEST"
-cp "$CLI" "$TMP/cli.origvf2"
+MUTCLI="$TMP/cli-mutant-cliorigvf2"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-vf2.py" <<'PYMUTVF2'
 import io, sys
 p = sys.argv[1]
@@ -1798,9 +1820,10 @@ new = '        case "no/none" in'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUTVF2
-( python3 -I "$TMP/mutate-vf2.py" "$CLI" ) || { cp "$TMP/cli.origvf2" "$CLI"; fail "the cause mutation did not apply"; }
+python3 -I "$TMP/mutate-vf2.py" "$MUTCLI" \
+  || fail "the cause mutation did not apply"
 mout="$(probe '' "service_state_restore '$TMP/out/vf-mut2' '$TMP/out/vf-mut2-rst'; echo RC=\$?")"
-cp "$TMP/cli.origvf2" "$CLI"
+MUTCLI="$CLI"
 grepF_q 'no helper image was' "$mout" \
   || fail "the mutation changed no ANSWER -- it must assert the no-sqlite cause
 for a capture that recorded a helper: $mout"
@@ -1891,7 +1914,8 @@ sect "MUTATION: discarding the diagnostic makes every pack failure identical"
 build_calibre_web
 rm -rf "$TMP/out/cap-cz2" "$TMP/out/packsz2"
 probe "$PACKENV" "service_state_capture calibre-web '$TMP/out/cap-cz2'" >/dev/null
-cp "$CLI" "$TMP/cli.origcz"
+MUTCLI="$TMP/cli-mutant-cliorigcz"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-cz.py" <<'PYMUTCZ'
 import io, sys
 p = sys.argv[1]
@@ -1903,10 +1927,11 @@ new = '''  if ! age -r "$recipient" -o "$tmp" "$plain" 2>/dev/null; then
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUTCZ
-( python3 -I "$TMP/mutate-cz.py" "$CLI" ) || { cp "$TMP/cli.origcz" "$CLI"; fail "the cause mutation did not apply"; }
+python3 -I "$TMP/mutate-cz.py" "$MUTCLI" \
+  || fail "the cause mutation did not apply"
 mout="$(probe "STATE_PACK_AGE_PUBKEY_FILE='$TMP/keys/bogus'" \
   "service_state_pack '$TMP/out/cap-cz2' '$TMP/out/packsz2/z.tar.age'; echo RC=\$?")"
-cp "$TMP/cli.origcz" "$CLI"
+MUTCLI="$CLI"
 grep -qE 'age could not encrypt the state pack$' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- without the captured stderr the
 failure must carry no cause at all: $mout"
@@ -1997,13 +2022,15 @@ old = '  if (( sq_fellback > 0 )); then recorded_mode="unproven"; fi\n'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
 PY
-cp "$CLI" "$TMP/cli.mode.orig"
-python3 -I "$TMP/m-mode.py" "$CLI" || { cp "$TMP/cli.mode.orig" "$CLI"; fail "the mode mutation did not apply"; }
+MUTCLI="$TMP/cli-mutant-climodeorig"
+cp "$CLI" "$MUTCLI"
+python3 -I "$TMP/m-mode.py" "$MUTCLI" \
+  || fail "the mode mutation did not apply"
 build_navidrome_min
 rm -rf "$TMP/out/cap-mode3"
 mout="$(probe '' "service_state_capture navidrome '$TMP/out/cap-mode3'; echo RC=\$?")"
 mman="$(cat "$TMP/out/cap-mode3/MANIFEST" 2>/dev/null || true)"
-cp "$TMP/cli.mode.orig" "$CLI"
+MUTCLI="$CLI"
 grep -qx 'CAPTURE_MODE=consistent' <<< "$mman" \
   || fail "mode3: the mutant did not record the declared mode -- the mutation changed no ANSWER:
 $mman"
@@ -2216,7 +2243,8 @@ grep -q '^RC=1$' <<< "$out" || fail "no bind mounts did not refuse: $out"
 echo "   both refuse"
 
 sect "MUTATION: first match instead of longest"
-cp "$CLI" "$TMP/cli.orig.cpath"
+MUTCLI="$TMP/cli-mutant-cliorigcpath"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-cpath.py" <<'PYCP'
 import io, sys
 p = sys.argv[1]
@@ -2226,11 +2254,11 @@ new = '    [[ -z "$best_src" ]] && { best_src="$src"; best_dest="$dest"; }\n'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYCP
-( python3 -I "$TMP/mutate-cpath.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.cpath" "$CLI"; fail "the cpath mutation did not apply"; }
+python3 -I "$TMP/mutate-cpath.py" "$MUTCLI" \
+  || fail "the cpath mutation did not apply"
 mout="$(cpath '/srv/data/plex/config|/config
 /srv/data/plex/config/Library/Databases|/dbs' plex /srv/data/plex/config/Library/Databases/library.db)"
-cp "$TMP/cli.orig.cpath" "$CLI"
+MUTCLI="$CLI"
 grep -qx 'PATH=/config/Library/Databases/library.db' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- first-match-wins must map through
 /config instead of /dbs: $mout"
@@ -2239,5 +2267,13 @@ echo "   killed: first match maps through the wrong mount"
 sect "the CLI is restored"
 grep -q '(( ${#src} > ${#best_src} ))' "$CLI" || fail "the longest-match comparison is missing"
 echo "   longest-match comparison is back"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "ALL STATE-CAPTURE CHECKS PASSED"

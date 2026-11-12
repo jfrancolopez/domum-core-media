@@ -31,8 +31,15 @@ sect() { echo "== $* =="; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
+# What the drivers LOAD. Defaults to the tracked CLI and is repointed at a
+# mutated copy by mutate() below, so no mutation ever touches bin/.
+MUTCLI="$CLI"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# Taken BEFORE the first section, so the guard at the end proves the tracked
+# CLI was never mutated rather than that the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 # ---------------------------------------------------------------------------
 #  The fixture: six archives, one per verdict.
@@ -98,7 +105,7 @@ DRV
 drive() {  # drive <root> <command...>
   local r="$1"; shift
   write_driver "$r/drv.sh" "$*"
-  env WORK="$r" CLI="$CLI" bash "$r/drv.sh" 2>&1
+  env WORK="$r" CLI="$MUTCLI" bash "$r/drv.sh" 2>&1
 }
 
 R="$TMP/fix"; build "$R"
@@ -209,11 +216,18 @@ echo "   stated plainly, no alarm"
 # ===========================================================================
 #  Mutations.
 # ===========================================================================
-mutate() {  # mutate <python file>
-  cp "$CLI" "$TMP/cli.orig"          # the backup FIRST, unconditionally
-  python3 -I "$1" "$CLI" || { cp "$TMP/cli.orig" "$CLI"; fail "the mutation did not apply"; }
+# Mutations operate on a COPY, and MUTCLI is what the drivers below load.
+# A suite that mutates the TRACKED file can be stopped mid-run and leave it
+# mutated -- which happened twice -- and makes any concurrent run unsound: a
+# deterministic suite failed because another full-suite loop had that file
+# mutated while it read it. unmutate is therefore a pointer reset, not a file
+# restore, so there is nothing to miss if the run stops early.
+mutate() {  # mutate <python-file>
+  MUTCLI="$TMP/cli-mutant"
+  cp "$CLI" "$MUTCLI"
+  python3 -I "$1" "$MUTCLI" || fail "the mutation did not apply"
 }
-unmutate() { cp "$TMP/cli.orig" "$CLI"; }
+unmutate() { MUTCLI="$CLI"; }
 
 sect "8. MUTATION: ranking by mtime must flip the answer"
 cat > "$TMP/m1.py" <<'PY'
@@ -254,7 +268,10 @@ grep -qF "identity-unverified" <<< "$mout2" \
   && fail "9: the mutant still reported identity-unverified, so the gate was not removed: $mout2"
 echo "   killed: an archive that may not hold its image becomes coverage"
 
-cmp -s "$CLI" "$TMP/cli.orig" || fail "the CLI was left mutated"
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first
+section -- something mutated it IN PLACE, so stopping this suite part-way would
+leave the change behind and any concurrent run would read it"
 
 # ===========================================================================
 sect "10. A POINT WHOSE ARCHIVE HAS VANISHED IS A VERDICT, NOT A SILENCE"
@@ -326,7 +343,10 @@ grep -qF "retain plex plex-good.tar" <<< "$mout3" \
   || fail "13: the mutant did not still retain the older archive, so the fixture proves nothing"
 echo "   killed: the older archive reads as coverage and the gap is silent"
 
-cmp -s "$CLI" "$TMP/cli.orig" || fail "the CLI was left mutated"
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first
+section -- something mutated it IN PLACE, so stopping this suite part-way would
+leave the change behind and any concurrent run would read it"
 
 echo
 echo "PASS: archive-retention-smoke (13 sections, 3 mutants)"

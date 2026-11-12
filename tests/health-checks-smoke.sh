@@ -13,6 +13,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the driver LOADS. Defaults to the tracked CLI; a mutation below repoints
+# it at a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer
+# reset rather than a file restore, so an interrupted run leaves nothing behind
+# and a concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 # BOTH roots must exist, or checkup_btrfs_health skips the second one on
 # `[[ -d ]]` and every per-filesystem assertion below passes for the wrong
 # reason -- the dedup test would "pass" while iterating a single root.
@@ -37,7 +46,7 @@ probe() {
     export DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state"
     export DOMUM_SNAPSHOT_ROOT="$TMP/snapshots" ENABLE_IMMICH=1
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     CHECKUP_CRITICAL=(); CHECKUP_WARNINGS=(); CHECKUP_HEALTHY=(); CHECKUP_ACTIONS=(); CHECKUP_ADVICE=()
     eval "$1"
@@ -729,7 +738,8 @@ echo "  absent timer is not a contradiction"
 sect "MUTATION: treating the flag's absence as enabled hides the whole defect"
 # The dangerous direction: default to "mail works" and a host discarding every
 # alert reports a clean notification path.
-cp "$CLI" "$TMP/cli.orig.notify"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-notify.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -743,15 +753,15 @@ new = """  if [[ "${RECOVERY_PACK_EMAIL_ENABLED:-1}" == "1" ]]; then
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate-notify.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.notify" "$CLI"; fail "the notify mutation did not apply"; }
+python3 -I "$TMP/mutate-notify.py" "$MUTCLI" \
+  || fail "the notify mutation did not apply"
 # A usable transport in every respect EXCEPT that the flag is unset. Unmutated
 # that is the contradiction (timer enabled, delivery off) and must be critical;
 # mutated, the unset flag defaults to 1 and the path reports clean.
 out="$(probe "$MAIL_OK
 unset RECOVERY_PACK_EMAIL_ENABLED
 " checkup_notification_path)"
-cp "$TMP/cli.orig.notify" "$CLI"
+MUTCLI="$CLI"
 grep -q 'OK|Mail delivery is configured' <<< "$out" \
   || fail "the mutation changed no ANSWER -- defaulting to 1 must report the path as healthy: $out"
 grep -q 'CRIT|' <<< "$out" \
@@ -949,7 +959,8 @@ sect "MUTATION: ignoring DOMUM_SBIN_ROOT"
 # smartctl the absence branch becomes undrivable and the section above passes
 # for the wrong reason -- or fails, depending on the machine. Either way the
 # suite stops being a test of the code.
-cp "$CLI" "$TMP/cli.orig.sbin"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-sbin.py" <<'PYSBIN'
 import io, sys
 p = sys.argv[1]
@@ -959,10 +970,10 @@ new = '  local root=""\n'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYSBIN
-( python3 -I "$TMP/mutate-sbin.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.sbin" "$CLI"; fail "the sbin mutation did not apply"; }
+python3 -I "$TMP/mutate-sbin.py" "$MUTCLI" \
+  || fail "the sbin mutation did not apply"
 mout="$(probe "$NOSMART" smartctl_bin)"
-cp "$TMP/cli.orig.sbin" "$CLI"
+MUTCLI="$CLI"
 if [[ -x /usr/sbin/smartctl || -x /sbin/smartctl || -x /usr/local/sbin/smartctl ]]; then
   [[ -z "${mout//[[:space:]]/}" ]] \
     && fail "the mutation changed no ANSWER -- ignoring DOMUM_SBIN_ROOT must make
@@ -1014,7 +1025,8 @@ echo "  $nuses uses, every one inside its declaring function"
 sect "MUTATION: checkup_disk_wear inheriting the caller's smartctl_path"
 # The dangerous direction: it keeps working from checkup_disk_health and
 # silently loses the wear figure everywhere else.
-cp "$CLI" "$TMP/cli.orig.inherit"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-inherit.py" <<'PYINH'
 import io, sys
 p = sys.argv[1]
@@ -1028,11 +1040,11 @@ new2 = '  wear="$("$smartctl_path"'
 assert s.count(old2) == 1, "resolve anchor matched %d times" % s.count(old2)
 io.open(p, "w", encoding="utf-8").write(s.replace(old2, new2, 1))
 PYINH
-( python3 -I "$TMP/mutate-inherit.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.inherit" "$CLI"; fail "the inherit mutation did not apply"; }
+python3 -I "$TMP/mutate-inherit.py" "$MUTCLI" \
+  || fail "the inherit mutation did not apply"
 mout="$(probe "$DYING
   w() { checkup_disk_wear sdb; }" w)"
-cp "$TMP/cli.orig.inherit" "$CLI"
+MUTCLI="$CLI"
 grep -q 'CRIT|/dev/sdb reports only 5%' <<< "$mout" \
   && fail "the mutation changed no ANSWER -- inheriting the caller's local must
 lose the wear figure when the function is driven standalone: $mout"
@@ -1044,7 +1056,8 @@ echo "  killed: inheriting the local turns a dying drive into 'UNMEASURED'"
 sect "MUTATION: treating uninterpretable attributes as a wear figure"
 # The dangerous direction and the reason this file records NOT thresholding raw
 # attributes: a drive reporting placeholders would read as a confident healthy.
-cp "$CLI" "$TMP/cli.orig.wear"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-wear.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -1060,8 +1073,8 @@ new = '\n  mreport_smart_interpretable "$dev"; interp=0\n'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate-wear.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.wear" "$CLI"; fail "the wear mutation did not apply"; }
+python3 -I "$TMP/mutate-wear.py" "$MUTCLI" \
+  || fail "the wear mutation did not apply"
 WEAR_MUT="
   cmd_exists() { return 0; }
   mreport_smart_interpretable() { return 1; }
@@ -1069,10 +1082,18 @@ WEAR_MUT="
 "
 mout="$(probe "$WEAR_MUT
   w() { checkup_disk_wear sdb; }" w)"
-cp "$TMP/cli.orig.wear" "$CLI"
+MUTCLI="$CLI"
 grep -q 'OK|/dev/sdb wear: 100%' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- ignoring the interpretability guard
 must turn a placeholder table into a confident '100% remaining': $mout"
 echo "  killed: without the guard, placeholders report as 100% of life remaining"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "PASS: health-checks smoke test"
