@@ -32,6 +32,12 @@ DOMUM_SNAPSHOT_ROOT="$TMP_DIR/snapshots"
 DOMUM_STATE_ROOT="$TMP_DIR/state"
 is_btrfs_subvol() { return 1; }
 service_data_path() { echo "$TMP_DIR/data/\$1"; }
+# Carried into the probe so a section's own stubs can refer to \$TMP_DIR.
+# Without it they reached the inner shell with TMP_DIR unset, where set -u
+# killed the stub -- and one case then passed for the WRONG reason, because an
+# unset TMP_DIR made the "absent" fixture path /data/absent, which is also
+# absent.
+TMP_DIR="$TMP_DIR"
 EOF
 }
 
@@ -442,5 +448,262 @@ grep -q 'elsewhere/jellyfin-custom$' <<< "$out" \
   || fail "snapshot_subvolumes ignored JELLYFIN_CONFIG_DIR; it would snapshot a path that does not exist: $out"
 grep -q "$TMP_DIR/data/plex" <<< "$out" \
   || fail "snapshot_subvolumes lost a default-located service: $out"
+
+# ---------------------------------------------------------------------------
+# 7. service_snapshot_possible AGREES WITH create_service_snapshot.
+#
+#    It mirrors the creator's three conditions rather than sharing them,
+#    because the creator's refusal messages are detailed, operator-facing and
+#    asserted by nine suites. The agreement is therefore enforced here: the
+#    predicate must succeed exactly when the creator returns a name. If this
+#    fails, the predicate is wrong -- not the test.
+# ---------------------------------------------------------------------------
+agree() {  # $1 = stubs describing the fixture
+  bash -c "$(harness)
+die() { echo \"DIE: \$*\"; exit 9; }
+record_service_snapshot_metadata() { :; }
+record_rollback_entry() { :; }
+btrfs() { mkdir -p \"\${!#}\"; return 0; }
+$1
+poss=0; service_snapshot_possible immich >/dev/null 2>&1 || poss=1
+name=\"\$(create_service_snapshot immich tag 2>/dev/null || true)\"
+made=1; [ -n \"\$name\" ] && made=0
+printf '%s %s\n' \"\$poss\" \"\$made\"
+" 2>/dev/null
+}
+check_agree() {  # $1 = label, $2 = stubs, $3 = expected (0 possible / 1 not)
+  local got; got="$(agree "$2")"
+  local poss="${got%% *}" made="${got##* }"
+  [ "$poss" = "$made" ] \
+    || fail "7: $1 -- the predicate says possible=$poss while the creator made=$made;
+they must agree or a preflight will refuse what would have worked, or permit
+what cannot"
+  [ "$poss" = "$3" ] || fail "7: $1 -- expected possible=$3, got $poss"
+}
+check_agree "an ordinary directory" 'is_btrfs_subvol() { return 1; }' 1
+check_agree "the path does not exist" "service_data_path() { echo '$TMP_DIR/data/absent'; }
+is_btrfs_subvol() { return 0; }
+subvolume_nested_children() { printf ''; }" 1
+check_agree "nested subvolumes" "is_btrfs_subvol() { return 0; }
+subvolume_nested_children() { printf '%s' '$TMP_DIR/data/immich/n'; }" 1
+check_agree "no data path configured" 'service_data_path() { return 1; }
+is_btrfs_subvol() { return 0; }
+subvolume_nested_children() { printf ""; }' 1
+check_agree "a clean subvolume" "is_btrfs_subvol() { return 0; }
+subvolume_nested_children() { printf ''; }" 0
+# The reason has to name the cause, or the refusal below is unactionable.
+why="$(bash -c "$(harness)
+service_snapshot_possible immich || true" 2>/dev/null)"
+grep -qi 'not a Btrfs subvolume' <<< "$why" \
+  || fail "7: the reason does not name the cause: $why"
+echo "  7: the predicate and the creator agree on all five fixtures"
+
+# ---------------------------------------------------------------------------
+# 8. `immich reset-db` MUST NOT STOP ANYTHING IT THEN REFUSES TO RESET.
+#
+#    The snapshot gate fires after `compose stop` AND `compose rm -f`, and that
+#    ordering is deliberate -- the database has to be quiesced before it is
+#    snapshotted. The consequence was not. Measured on this host,
+#    /srv/data/immich is inode 273 on st_dev 45, the same device as its parent,
+#    so it is an ordinary directory and create_service_snapshot returns 1. The
+#    command would therefore stop and REMOVE all four Immich containers and only
+#    then refuse: Immich down, nothing reset -- and because `rm -f` removes the
+#    containers, recovering needs `up -d`, which reconciles, so the remedy for
+#    the downtime is itself an image-deployment vector.
+#
+#    A closed gate that still causes downtime is not a closed gate.
+#
+#    No `rm` is stubbed anywhere below, deliberately: every case here must
+#    refuse long before the deletion, so reaching an `rm` at all would be the
+#    failure.
+# ---------------------------------------------------------------------------
+reset_probe() {  # $1 = extra stubs
+  bash -c "$(harness)
+die() { echo \"DIE: \$*\"; exit 9; }
+warn() { echo \"WARN: \$*\"; }
+need_root() { :; }
+load_cfg() { :; }
+export_env_for_compose() { :; }
+ENABLE_IMMICH=1
+immich_postgres_data_dir() { printf '%s' \"\$TMP_DIR/data/immich/postgres\"; }
+immich_db_password_fingerprint_file() { printf '%s' \"\$TMP_DIR/state/fp\"; }
+immich_library_data_dir() { printf '%s' \"\$TMP_DIR/data/immich/library\"; }
+compose_cmd() { echo \"COMPOSE \$*\"; }
+snapshot_policy() { printf '%s' \"\${SNAPSHOT_POLICY:-STRICT}\"; }
+$1
+immich_reset_db < /dev/null
+" 2>&1
+}
+out="$(reset_probe '')"
+grep -qi 'Cannot snapshot Immich state' <<< "$out" \
+  || fail "8: it did not refuse on a host where no snapshot is possible: $out"
+grep -q 'COMPOSE' <<< "$out" \
+  && fail "8: it stopped or removed containers for an operation it then refused: $out"
+grep -q 'wipe immich' <<< "$out" \
+  && fail "8: it asked the operator to type the confirmation for an operation
+that cannot proceed: $out"
+grep -qi 'not a Btrfs subvolume' <<< "$out" \
+  || fail "8: the refusal does not name why no snapshot is possible: $out"
+
+# SNAPSHOT_POLICY=WARN is the documented override and must still work -- and the
+# warning must come BEFORE the confirmation, so the operator knows there will be
+# no rollback point before they type it.
+out="$(reset_probe 'SNAPSHOT_POLICY=WARN')"
+grep -qi 'NO rollback point' <<< "$out" \
+  || fail "8: WARN did not produce the documented override warning: $out"
+grep -q 'wipe immich' <<< "$out" \
+  || fail "8: under WARN it must go on to ask for the confirmation: $out"
+warn_at="$(grep -n 'NO rollback point' <<< "$out" | head -1 | cut -d: -f1)"
+ask_at="$(grep -n 'wipe immich' <<< "$out" | head -1 | cut -d: -f1)"
+[ "$warn_at" -lt "$ask_at" ] \
+  || fail "8: the operator is asked to confirm before being told there is no
+rollback point (warning at $warn_at, prompt at $ask_at)"
+
+# The recovery half must be reachable BEFORE the destructive half runs: an exec
+# that fails after the rm -rf leaves the database deleted and nothing reapplied.
+printf 'not executable\n' > "$TMP_DIR/noexec"
+out="$(reset_probe "is_btrfs_subvol() { return 0; }
+subvolume_nested_children() { printf ''; }
+DOMUM_SELF_CLI=\"\$TMP_DIR/noexec\"")"
+grep -qi 'could not be reapplied after the wipe' <<< "$out" \
+  || fail "8: it did not refuse an unreachable recovery copy: $out"
+grep -q 'COMPOSE' <<< "$out" \
+  && fail "8: it stopped containers before checking the recovery copy: $out"
+echo "  8: reset-db refuses before the confirmation, the stop, and the wipe"
+
+# ---------------------------------------------------------------------------
+# 9. THE CLI EXECS THE COPY THAT IS RUNNING, not whatever is installed.
+#
+#    repo_update's exec of the installed path is CORRECT and deliberately
+#    unchanged: converge_local_installation runs immediately before it, so it
+#    really is handing off to its freshly installed replacement -- the same
+#    pattern as the deployment script re-executing itself. The other two sites
+#    had no install step, so the halves could be different revisions.
+# ---------------------------------------------------------------------------
+printf '#!/bin/sh\necho "MARKER-BACKUP-CLI $*"\n' > "$TMP_DIR/fake-backup"
+chmod +x "$TMP_DIR/fake-backup"
+# The observable is the process being REPLACED: the line after the exec must not
+# run. A source assertion could not tell that from a function that never execs.
+out="$(bash -c "$(harness)
+need_root() { :; }
+DOMUM_BACKUP_CLI=\"\$TMP_DIR/fake-backup\"
+main backup verify cloud
+echo 'NOT-REPLACED'
+" 2>&1)"
+grep -q 'MARKER-BACKUP-CLI verify cloud' <<< "$out" \
+  || fail "9: the backup arm did not exec the resolved CLI with its arguments: $out"
+grep -q 'NOT-REPLACED' <<< "$out" \
+  && fail "9: exec did not replace the process: $out"
+
+out="$(bash -c "$(harness)
+echo \"override=\$(DOMUM_SELF_CLI=/x/y self_cli_path)\"
+echo \"default=\$(self_cli_path)\"
+" 2>&1)"
+grep -qx 'override=/x/y' <<< "$out" \
+  || fail "9: self_cli_path does not honour the fixture override: $out"
+grep -q "default=.*bin/domum-media\$" <<< "$out" \
+  || fail "9: self_cli_path does not resolve to the running file: $out"
+
+# repo_update is the ONE site that should still name the installed path, and the
+# reason is in its comment. Asserted on the stripped source, because a comment
+# mentioning the path is not a use of it.
+src="$(sed 's/#.*//' "$REPO_ROOT/bin/domum-media")"
+ru="$(awk '/^repo_update\(\) \{/,/^\}/' <<< "$src")"
+grep -q 'exec /usr/local/bin/domum-media apply' <<< "$ru" \
+  || fail "9: repo_update no longer execs its freshly installed replacement,
+which is the one place that is correct"
+grep -q 'converge_local_installation' <<< "$ru" \
+  || fail "9: repo_update execs the installed path without installing first"
+others="$(grep -c 'exec /usr/local/bin/domum-media' <<< "$src" || true)"
+[ "$others" = "1" ] \
+  || fail "9: expected exactly one deliberate exec of an installed path
+(repo_update's), found $others"
+echo "  9: the running copy is exec'd, except where a replacement was just installed"
+
+# ---------------------------------------------------------------------------
+# 10. MUTATIONS, against a COPY so a stopped run leaves nothing behind.
+# ---------------------------------------------------------------------------
+cp "$REPO_ROOT/bin/domum-media" "$TMP_DIR/mut-cli"
+cat > "$TMP_DIR/mut10.py" <<'PY'
+import io, sys
+p, which = sys.argv[1], sys.argv[2]
+s = io.open(p, encoding="utf-8").read()
+if which == "preflight":
+    old = '  local snap_why\n  if ! snap_why="$(service_snapshot_possible immich)"; then'
+    new = '  local snap_why\n  if ! snap_why="$(service_snapshot_possible immich)" && false; then'
+elif which == "predicate":
+    # Drop the predicate's subvolume check. The creator still has its own, so
+    # the two DISAGREE -- which is the only thing making "mirror rather than
+    # share" defensible.
+    old = ('  if ! is_btrfs_subvol "$data_path"; then\n'
+           "    printf '%s is an ordinary directory, not a Btrfs subvolume, so no per-service snapshot can be taken of it' \"$data_path\"\n"
+           '    return 1\n  fi\n')
+    new = ''
+elif which == "selfexec":
+    old = '  exec "$self_cli" apply\n'
+    new = '  exec /usr/local/bin/domum-media apply\n'
+else:
+    raise SystemExit("unknown mutation")
+assert s.count(old) == 1, "anchor %s matched %d times" % (which, s.count(old))
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+print("applied")
+PY
+python3 -I "$TMP_DIR/mut10.py" "$TMP_DIR/mut-cli" preflight >/dev/null \
+  || fail "10: the preflight mutation did not apply"
+out="$(bash -c "set -uo pipefail
+DOMUM_DIR=\"$REPO_ROOT\"
+CFG_FILE=\"$TMP_DIR/absent.conf\"
+source \"$TMP_DIR/mut-cli\"
+DOMUM_DATA_ROOT=\"$TMP_DIR/data\"
+DOMUM_SNAPSHOT_ROOT=\"$TMP_DIR/snapshots\"
+DOMUM_STATE_ROOT=\"$TMP_DIR/state\"
+is_btrfs_subvol() { return 1; }
+service_data_path() { echo \"$TMP_DIR/data/\$1\"; }
+die() { echo \"DIE: \$*\"; exit 9; }
+warn() { echo \"WARN: \$*\"; }
+need_root() { :; }
+load_cfg() { :; }
+export_env_for_compose() { :; }
+ENABLE_IMMICH=1
+immich_postgres_data_dir() { printf '%s' \"$TMP_DIR/data/immich/postgres\"; }
+immich_db_password_fingerprint_file() { printf '%s' \"$TMP_DIR/state/fp\"; }
+immich_library_data_dir() { printf '%s' \"$TMP_DIR/data/immich/library\"; }
+compose_cmd() { echo \"COMPOSE \$*\"; }
+snapshot_policy() { printf '%s' STRICT; }
+immich_reset_db < /dev/null" 2>&1)"
+grep -q 'wipe immich' <<< "$out" \
+  || fail "10: the mutation applied but the preflight still refused, so section 8
+would pass without it: $out"
+echo " 10: without the preflight the operator is asked to confirm an impossible reset"
+
+# The agreement in section 7 must be able to DETECT a disagreement, or
+# "mirror rather than share" is just a comment. Driven against the real suite's
+# own predicate, in the fixture where the two would part company.
+cp "$REPO_ROOT/bin/domum-media" "$TMP_DIR/mut-cli"
+python3 -I "$TMP_DIR/mut10.py" "$TMP_DIR/mut-cli" predicate >/dev/null \
+  || fail "10: the predicate mutation did not apply"
+poss=0
+bash -c "set -uo pipefail
+DOMUM_DIR=\"$REPO_ROOT\"
+CFG_FILE=\"$TMP_DIR/absent.conf\"
+source \"$TMP_DIR/mut-cli\"
+DOMUM_DATA_ROOT=\"$TMP_DIR/data\"
+DOMUM_SNAPSHOT_ROOT=\"$TMP_DIR/snapshots\"
+DOMUM_STATE_ROOT=\"$TMP_DIR/state\"
+is_btrfs_subvol() { return 1; }
+service_data_path() { echo \"$TMP_DIR/data/\$1\"; }
+service_snapshot_possible immich >/dev/null 2>&1" || poss=1
+[ "$poss" = "0" ] \
+  || fail "10: the mutation applied but the predicate still refused an ordinary
+directory, so section 7 would agree for the wrong reason"
+echo " 10: a predicate that stops matching the creator is detected"
+
+cp "$REPO_ROOT/bin/domum-media" "$TMP_DIR/mut-cli"
+python3 -I "$TMP_DIR/mut10.py" "$TMP_DIR/mut-cli" selfexec >/dev/null \
+  || fail "10: the self-exec mutation did not apply"
+src_mut="$(sed 's/#.*//' "$TMP_DIR/mut-cli")"
+[ "$(grep -c 'exec /usr/local/bin/domum-media apply' <<< "$src_mut" || true)" = "2" ] \
+  || fail "10: the mutation did not reintroduce a second installed-path exec"
+echo " 10: reintroducing the hardcoded installed exec is detectable"
 
 echo "PASS: snapshot safety gate smoke test"

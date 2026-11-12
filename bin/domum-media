@@ -2266,6 +2266,62 @@ assert_service_snapshot_covers() {
 # shared block above, so the CLI and the report cannot disagree about it.
 subvolume_nested_children() { domum_subvolume_nested_children "$1"; }
 
+# Can create_service_snapshot succeed for this service? Asked WITHOUT creating
+# anything, so a destructive operation can refuse before it breaks something.
+# Prints a reason on failure; returns 0 when a snapshot is possible.
+#
+# It mirrors create_service_snapshot's three conditions rather than sharing
+# them, and that is a deliberate trade: the creator's refusal messages are
+# detailed, operator-facing and asserted by nine suites, and funnelling them
+# through a one-line reason would lose that. The agreement is enforced by test
+# instead of by a comment -- `service_snapshot_possible` must succeed exactly
+# when `create_service_snapshot` returns a name, driven against the same
+# fixtures. If that assertion ever fails, the predicate is wrong and not the
+# test.
+service_snapshot_possible() {  # $1 = service
+  local service="$1" data_path nested
+  if ! data_path="$(service_data_path "$service")"; then
+    printf 'no data path is configured for %s' "$service"
+    return 1
+  fi
+  if [[ ! -d "$data_path" ]]; then
+    printf '%s does not exist' "$data_path"
+    return 1
+  fi
+  if ! is_btrfs_subvol "$data_path"; then
+    printf '%s is an ordinary directory, not a Btrfs subvolume, so no per-service snapshot can be taken of it' "$data_path"
+    return 1
+  fi
+  nested="$(subvolume_nested_children "$data_path")"
+  if [[ -n "$nested" ]]; then
+    printf '%s contains nested subvolume(s) that a snapshot would leave empty: %s' "$data_path" "$nested"
+    return 1
+  fi
+  return 0
+}
+
+# The binary that is RUNNING, not the one that happens to be installed.
+#
+# immich reset-db deletes the database and then re-applies desired state. If
+# those two halves are different revisions, the recovery runs code the deletion
+# never saw; and if nothing is installed at all, the exec fails AFTER the
+# rm -rf. repo_update's identical exec of the installed path is correct and is
+# deliberately left alone: converge_local_installation runs immediately before
+# it, so there it really is handing off to its freshly installed replacement --
+# the same pattern as the deployment script re-executing itself.
+#
+# DOMUM_SELF_CLI exists so a fixture can redirect it; every root a test uses
+# must be redirected into it.
+self_cli_path() {
+  if [[ -n "${DOMUM_SELF_CLI:-}" ]]; then
+    printf '%s' "$DOMUM_SELF_CLI"
+    return 0
+  fi
+  local self="${BASH_SOURCE[0]}"
+  [[ "$self" == /* ]] || self="$PWD/$self"
+  printf '%s' "$self"
+}
+
 create_service_snapshot() {
   local service="$1"
   local tag="$2"
@@ -4472,7 +4528,12 @@ logs_cmd() {
 backup_cmd() {
   need_root
   shift || true
-  exec /usr/local/bin/domum-media-backup "$@"
+  # backup_cli_path, not a hardcoded installed path: it prefers the CHECKOUT's
+  # copy, which is what `checkup` and `status` already ask, and it is
+  # redirectable by a fixture. Dispatching to the installed binary meant a run
+  # from the development checkout silently executed production's copy -- a
+  # different revision, with no way for a test to redirect it.
+  exec "$(backup_cli_path)" "$@"
 }
 
 snapshot_cmd() {
@@ -8276,6 +8337,37 @@ immich_reset_db() {
     shift
   done
 
+  # PREFLIGHT, before the confirmation and before anything is stopped.
+  #
+  # The snapshot gate below fires AFTER `compose stop` and `compose rm -f`, and
+  # that ordering is deliberate -- the database has to be quiesced before it is
+  # snapshotted. The consequence was not: measured on this host,
+  # /srv/data/immich is inode 273 on st_dev 45, the same device as its parent,
+  # so it is an ordinary directory and create_service_snapshot returns 1. So
+  # this command would stop and REMOVE all four Immich containers and only then
+  # refuse -- leaving Immich down with nothing reset, and `rm -f` means
+  # recovering needs `up -d`, which reconciles, so the remedy for the downtime
+  # is itself an image-deployment vector.
+  #
+  # A closed gate that still causes downtime is not a closed gate. The same
+  # function decides, so SNAPSHOT_POLICY=WARN still overrides exactly as it does
+  # below, and under WARN the operator sees the warning BEFORE being asked to
+  # type the confirmation.
+  local snap_why
+  if ! snap_why="$(service_snapshot_possible immich)"; then
+    snapshot_protection_unavailable \
+      "Cannot snapshot Immich state before resetting the database" \
+      "$snap_why"
+  fi
+
+  # The recovery half must be reachable before the destructive half runs. An
+  # exec that fails after the rm -rf leaves the database deleted and nothing
+  # reapplied.
+  local self_cli
+  self_cli="$(self_cli_path)"
+  [[ -x "$self_cli" ]] \
+    || die "Refusing to reset: cannot find an executable copy of this CLI at $self_cli, so desired state could not be reapplied after the wipe."
+
   cat <<EOF
 [domum-media] This will wipe the Immich Postgres database.
 
@@ -8325,7 +8417,10 @@ EOF
   fi
 
   echo "[domum-media] Reapplying desired state..."
-  exec /usr/local/bin/domum-media apply
+  # The copy that is running, resolved and checked in the preflight above --
+  # never a hardcoded installed path, which would run a different revision from
+  # the one that just deleted the data.
+  exec "$self_cli" apply
 }
 
 container_exists() {
