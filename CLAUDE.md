@@ -8490,6 +8490,293 @@ the mismatch an operator runs it to inspect. **The two halves interact, and
 either one alone makes the other's defect worse.** That is why the row was filed
 scoped and not bundled into the previous PR.
 
+---
+
+**`immich reset-db` WOULD STOP AND REMOVE ALL FOUR IMMICH CONTAINERS AND THEN
+REFUSE, and that is live on this host rather than latent.** Found 2026-11-11 by
+driving the last consequential name on the never-executed list -- the most
+dangerous arm in the CLI, which this file had recorded as *read and found
+clean*. Reading it was not enough.
+
+The ordering is:
+
+```
+8300   compose_cmd stop immich_server immich_machine_learning immich_postgres immich_redis
+8301   compose_cmd rm -f   (the same four)
+8308   assert_service_snapshot_covers immich ... || snapshot_protection_unavailable
+```
+
+The stop-before-snapshot is **deliberate and correct** -- a database has to be
+quiesced before it is snapshotted. The consequence was not. Measured read-only:
+
+```
+/srv/data          inode=256  st_dev=45
+/srv/data/immich   inode=273  st_dev=45   <- same device as its parent
+/srv/data/plex     inode=256  st_dev=56   <- a real subvolume, for contrast
+```
+
+So `/srv/data/immich` is an ordinary directory, `create_service_snapshot`
+returns 1 at its final `return 1`, the gate fails, and
+`snapshot_protection_unavailable` dies -- **after** the containers are gone.
+Immich down, nothing reset. And `rm -f` removed the containers, so recovering
+needs `up -d`, which reconciles: **the remedy for the downtime is itself an
+image-deployment vector.** *A closed gate that still causes downtime is not a
+closed gate* -- the rule this file already records for
+`VOLUME_UPGRADE_ENABLED`, `QUIESCED_CAPTURE_ENABLED` and `capture-state`'s
+missing `need_root`, now in the one command that deletes the photo database.
+
+**The preflight refuses before the CONFIRMATION, not merely before the stop.**
+Asking an operator to type `wipe immich` for an operation that cannot proceed is
+its own defect. `SNAPSHOT_POLICY=WARN` still overrides, because the preflight
+calls `snapshot_protection_unavailable` itself rather than re-deciding -- and
+under WARN the warning therefore arrives BEFORE the prompt, so the operator
+knows there will be no rollback point before they commit. The ordering of those
+two lines is asserted.
+
+**`service_snapshot_possible` MIRRORS the creator's conditions instead of
+sharing them, and the agreement is enforced by test.** That is a deliberate
+exception to the one-implementation rule with its reason stated: the creator's
+refusal messages are detailed, operator-facing, and asserted by **nine** suites,
+and funnelling them through a one-line reason would lose that. So the test drives
+BOTH against the same five fixtures and requires the predicate to succeed
+exactly when the creator returns a name. If that ever fails, the predicate is
+wrong and not the test.
+
+**THE RECOVERY HALF EXEC'D A HARDCODED INSTALLED PATH.** `immich_reset_db`
+ended in `exec /usr/local/bin/domum-media apply` with no install step before
+it, so the destructive half ran the current code and the recovery half ran
+whatever happens to be installed -- a different revision -- and on a host with
+nothing installed the `exec` fails **after** the `rm -rf`, leaving the database
+deleted and nothing reapplied. It execs `self_cli_path` now, and the preflight
+checks that copy is executable before anything is stopped.
+
+**`repo_update`'s identical exec is CORRECT and deliberately unchanged**, which
+is the distinction that makes this a two-site fix rather than a three-site one:
+`converge_local_installation` runs immediately before it, so it really is
+handing off to its freshly installed replacement -- the same pattern as the
+deployment script re-executing itself. A test asserts there is **exactly one**
+such exec left and that the function installing first is the one that has it, so
+a future reader cannot "fix" it by symmetry.
+
+**`backup_cmd` dispatched to the installed backup CLI while `backup_cli_path`
+already existed and prefers the CHECKOUT.** `checkup` and `status` ask the
+checkout's copy, on the recorded grounds that *the two CLIs must be at the same
+revision*; the `backup` dispatcher arm execed `/usr/local/bin/domum-media-backup`,
+so a run from the development checkout silently executed production's binary
+with no way for a fixture to redirect it. One implementation now.
+
+**The observable for an exec is the process being REPLACED.** A source
+assertion cannot tell `exec "$(backup_cli_path)"` from a function that never
+execs at all, so the test points `DOMUM_BACKUP_CLI` at a marker script, drives
+the real dispatcher, and requires both that the marker ran with the right
+arguments AND that the line after the exec did not print.
+
+**My own probe called `backup_cmd verify cloud` and the marker received only
+`cloud`.** For a moment that looked like the fix dropping an argument. It is
+not: `backup_cmd` does `shift || true` to drop its own name, because the
+dispatcher passes `"$@"` *including* `backup`. Read a function's own argument
+handling before driving it -- the same lesson as the `die`-to-stdout probe
+earlier the same day, and the test now uses the dispatcher's own convention
+(`main backup verify cloud`) rather than a hand-assembled call.
+
+**AND I EDITED THE WORKING TREE ON A BRANCH WHOSE PR WAS UNDER CI, for work
+belonging to the NEXT branch.** The new sections reference functions that did
+not exist yet, so committing them would have turned #235 red for a reason
+unrelated to its content. Caught by reading `git status` before committing, and
+reverted with `git checkout --` -- which is correct **here**, unlike the case
+recorded above, because the file's wanted state for that branch was already
+committed and the only delta was the premature edit. The working tree is shared
+state across branches: after staging work for a later branch, check
+`git status`.
+
+**AND A FIXTURE STUB REACHED THE INNER SHELL WITH `TMP_DIR` UNSET, where one
+case then passed for the WRONG reason.** The suite's `harness()` uses an
+unquoted heredoc, so `$TMP_DIR` is expanded as it is written; my new stubs
+escaped it as `\$TMP_DIR`, which arrives in the probe literally and `set -u`
+then kills the stub. Two cases:
+
+- the nested-subvolume fixture printed nothing, so `subvolume_nested_children`
+  returned empty, no nested subvolume was detected, and the section FAILED --
+  visible, and the reason the mistake was found;
+- the absent-path fixture resolved to `/data/absent`, which is **also** absent,
+  so it produced the right answer from the wrong input. That one PASSED. A
+  fixture that happens to be right is indistinguishable from a correct one
+  until the neighbouring case breaks.
+
+`harness()` carries `TMP_DIR` into the probe now, so a section's own stubs can
+refer to it the same way the harness does. Read how a harness passes values
+before adding a stub to it -- this is the fourth fixture mistake this session
+of the same family, after stubbing a function nobody calls, a `die` that wrote
+to stdout, and a `docker` stub whose failure killed the shell.
+
+**MY OWN VERIFICATION RUNNER PRINTED `all 16 audits ok` DIRECTLY UNDER A
+`FAIL`.** The loop reported each failure and then printed the summary
+unconditionally:
+
+```
+for f in tests/*.py; do n=$((n+1)); if ! python3 -I "$f" ...; then echo "FAIL ..."; fi; done
+echo "all $n audits ok"          <- always
+```
+
+So the line an operator -- or I, reading a tail -- would take as the verdict was
+a count of files SCANNED wearing the words of a count that PASSED. It is the
+"two numbers that must agree are ONE number" rule with the degenerate case: a
+verdict computed zero times. Had I read only the summary I would have reported
+a clean run over a failing audit, which is precisely the defect this file exists
+to correct, committed in the tool used to check for it.
+
+A loop that checks N things prints the number it COUNTED and distinguishes the
+two outcomes:
+
+```
+(( bad == 0 )) && echo "all $n audits ok" || echo "$bad of $n audits FAILED"
+```
+
+The failure it hid was benign and worth recording for its own sake: the prose
+above originally backticked the CLI name followed by the subcommand and an
+ellipsis, and `tests/documented-commands-audit.py` read that as a command name,
+because that is exactly what the audit is for -- it cannot tell an illustrative
+fragment from a runbook command. Reworded to name the dispatcher arm instead of
+quoting a fragment; an exemption would have been the wrong fix, since the
+audit's whole value is that it reads prose the way an operator does.
+
+**And quoting the offending fragment in the explanation re-broke it.** The
+usual habit here -- *a comment quoting the broken form is how a fix documents
+itself* -- is wrong when the thing under assertion IS the prose. This file
+already records the same correction for the stale-protection comment in
+`image_archive_dir`: paraphrase there instead. Second occurrence, and the first
+in `CLAUDE.md` itself.
+
+---
+
+**A MUTANT HID INSIDE A LEGITIMATELY MODIFIED FILE, WHERE `git status` COULD
+NOT SHOW IT -- the same hazard as before, through the one gap the recorded rule
+left open.** 2026-11-11/12. The earlier entry records stopping
+`volume-upgrade-dispatch-smoke` part-way and finding phase 4's model-awareness
+guard neutralised in the working tree:
+
+```
+-  if [[ "$model" == "protected-tier" ]]; then
++  if [[ "$model" == "$model" ]]; then
+```
+
+It happened again, identically, and the prescribed remedy -- *after stopping a
+test task, read `git status`* -- did not catch it. **Last time the tree was
+otherwise clean, so `M bin/domum-media` stood out. This time my own patch
+legitimately modified that same file**, so `git status` showed exactly what I
+expected to see and the mutant was invisible in it.
+
+What exposed it was a suite failing, and the sequence is worth keeping because
+every intermediate conclusion was wrong:
+
+1. the suite failed in one full-verification run and had passed in the previous
+   one, with **only CLAUDE.md prose changed between them** -- so I called it
+   intermittent;
+2. three repeat runs were `rc=1` at 61s, 60s, 61s. **Reproducible**, which
+   inverted that and made the earlier PASS the thing needing explanation;
+3. the same suite against `main` in a separate worktree passed (rc=0, 222s), so
+   the cause was mine;
+4. copying my `bin/domum-media` into that worktree made it fail there too, so
+   the cause travelled with the FILE rather than with the test;
+5. `diff` against `main`'s copy listed **five** hunks where my patch made four.
+
+Only step 5 names the defect. Steps 1-4 are each a correct measurement and
+three of them point at the wrong thing.
+
+**The structural fix is that a mutation must never operate on a tracked file.**
+`git status` cannot distinguish an intended modification from residue, and
+"restore it afterwards" fails exactly when the run does not reach the restore.
+The suite's own `CLI="$MUT"` prefix already proved the alternative, so all
+three in-place mutations now edit a COPY and pass it through `CLI=`; the F5b
+case does not even re-apply, because a copy stays mutated. **F6 changed from
+"the CLI is restored" to comparing the tracked file against a pristine copy
+taken before the first section** -- strictly stronger, since it fails if any
+section mutates in place rather than only if the last restore was missed.
+
+**And the reason I interrupted the suite at all was a defect in the suite.**
+Three of its `service_upgrade` drivers do not set `UPGRADE_READY_LOG_WAIT=0`,
+and `uptime-kuma` declares a readiness pattern, so each pays the full 60-second
+default -- 222 seconds in total, which exceeded a 120-second command timeout
+and led to the interruption. That omission is already recorded here as a rule
+("`UPGRADE_READY_LOG_WAIT=0` belongs in every fixture that reaches phase 4"),
+and the note sits in this very file beside a comment saying *"CLAUDE.md says
+the fixture sets it to 0; this one did not"* -- which turned out to be true of
+three more drivers in the same suite. **A slow suite is not a cosmetic
+problem: it is what produced the interruption that produced the mutant.**
+
+**Two measurement notes.** `/usr/bin/time` does not exist on this host, so a
+timing loop needs `date +%s` arithmetic rather than that binary -- a third
+instance of concluding a tool's absence matters only after checking. And one of
+my own probes reported `$2: unbound variable` for the suite's model stub and I
+briefly took that for the defect: the helper DEFINES that stub twice and the
+second definition, `printf '%s vol\n' "$model_override"`, is the one that runs.
+Read the whole function before drawing a conclusion from the first match in it.
+
+**AND THE HAZARD IS NOT CONFINED TO ONE SUITE: THIRTEEN MUTATE THE TRACKED CLI
+IN PLACE.** Swept by looking for the tell-tale of an in-place mutation -- a
+RESTORE onto a tracked path, which only exists because something mutated it:
+
+```
+archive-identity-smoke          health-notify-smoke        state-capture-smoke (11 sites)
+archive-retention-smoke         monitoring-completeness    state-pack-retention-smoke
+health-checks-smoke (4 sites)   pack-repository-roundtrip  weekly-report-render-smoke
+restic-op-evidence-smoke        severity-taxonomy-smoke    smtp-transport-smoke
+volume-upgrade-dispatch-smoke   (fixed here)
+```
+
+Every one of them, stopped part-way, leaves a neutralised guard in
+`bin/domum-media` or `bin/domum-media-backup`. The restore-afterwards pattern
+is sound for a run that COMPLETES and provides nothing for one that does not,
+which is exactly the case that has now bitten twice. The conversion is
+mechanical -- mutate a copy, pass it to the driver -- but it is twelve suites
+of careful per-driver work, so it is recorded as a measured backlog item rather
+than rushed in beside an unrelated fix. The one suite that has caused the
+incident is converted, and its F6 now proves the property rather than
+asserting a restore happened.
+
+**IN-PLACE MUTATION MAKES CONCURRENT TEST RUNS UNSOUND, not merely interrupted
+ones -- and that produced a false failure I spent real time chasing.** Measured
+2026-11-12 from the run logs' own timestamps:
+
+```
+run8   01:13:43 -> 01:31:51
+run9   01:14:58 -> 01:33:15     overlapping run8 by 16m53s
+run10  01:34:01 -> 01:45:47     alone
+```
+
+run8 reported 82/82. run9 reported 81 with `function-definition-audit-smoke`
+failed. run10, alone, reported 82/82. That suite contains no `sleep`, no
+`date`, no `docker` and no background work, and **40 standalone runs passed
+40/40**, so it is deterministic given `bin/domum-media` and `tests/` -- which
+means an intermittent result can only come from its INPUTS changing underneath
+it. They did: **I launched run9
+before run8 had finished**, both were running the full 82-suite loop, and
+thirteen of those suites mutate the tracked `bin/domum-media` in place. run9's
+audit read that file while one of run8's suites had it mutated.
+
+Two things follow, and the second is the one that matters:
+
+- **Never run two full-suite loops at once.** The mistake was launching the
+  second before the first's completion notification arrived, which is easy to do
+  when a fix lands while a run is in flight. Wait for it, or the second run's
+  verdict is about a tree the first is editing.
+- **P7.17 is worse than it was filed as.** It was recorded as "an interrupted
+  run leaves a neutralised guard behind". It also means **any** two activities
+  touching the tree are unsound while one of them is mid-mutation -- a second
+  suite, a concurrent full run, or an operator reading the file. The residue
+  case needs an interruption; this one needs only overlap, and it manufactures a
+  failure that looks exactly like a real defect in whatever change is under
+  test.
+
+**And the chase itself is the cautionary part.** Four conclusions in sequence --
+intermittent, then reproducible, then branch-specific, then file-borne -- each a
+correct measurement, before the fifth (`diff` against `main`) named the real
+cause of the FIRST failure, and a sixth (the file timestamps) named the cause of
+the second. Nothing was wrong with the code either time. **A failing suite is
+not evidence that the change under test is wrong; it is evidence that something
+differs, and the tree is part of "something".** Measure what differs before
+reasoning about what it means.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

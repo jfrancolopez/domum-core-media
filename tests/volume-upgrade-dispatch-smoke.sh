@@ -20,6 +20,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# Every mutation below operates on a COPY of the CLI, never on the tracked
+# file. A suite that mutates a tracked file is a suite that can be stopped
+# mid-run and leave the file mutated -- which happened twice, and the second
+# time the mutant hid inside a legitimately modified file, where git status
+# could not tell it from the intended change. F6 compares the tracked file
+# against this pristine copy to prove no section touched it.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 mkdir -p "$TMP/state" "$TMP/data" "$TMP/snapshots" "$TMP/media" "$TMP/secrets" "$TMP/log"
 
 # A minimal REAL config. The gate section below runs the real load_cfg, because
@@ -182,6 +190,13 @@ phase4() {  # $1 = service, $2 = model, $3 = extra stubs
   (
     export DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state"
     export CFG_FILE="$TMP/domum-media.conf" VOLUME_UPGRADE_ENABLED=1
+    # 0 means "look once, do not sleep". uptime-kuma DECLARES a readiness
+    # pattern, so without this every section reaching phase 4 pays the full
+    # 60-second default. Three drivers in this file lacked it, the suite took
+    # 222s, that exceeded a command timeout, the run was interrupted -- and an
+    # interrupted run is what once left a neutralised guard in the working
+    # tree. No assertion reads the wait value, so 0 costs nothing.
+    export UPGRADE_READY_LOG_WAIT=0
     # shellcheck disable=SC1090
     source "$CLI" >/dev/null 2>&1
     need_root() { :; }
@@ -303,7 +318,8 @@ grep -q 'a declared log pattern that did not appear' <<< "$mout" \
 echo "  the mutant describes a declared pattern traefik does not have"
 
 sect "MUTATION: removing the model guard breaks the volume upgrade again"
-cp "$CLI" "$TMP/cli.orig.p4"
+MUTP4="$TMP/cli-p4-mutant"
+cp "$CLI" "$MUTP4"
 cat > "$TMP/mutate-p4.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -313,10 +329,9 @@ new = '  if [[ "$model" == "$model" ]]; then\n    domum_is_subvolume'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate-p4.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.p4" "$CLI"; fail "the phase-4 mutation did not apply"; }
-mout="$(phase4 uptime-kuma docker-volume '')"
-cp "$TMP/cli.orig.p4" "$CLI"
+python3 -I "$TMP/mutate-p4.py" "$MUTP4" \
+  || fail "the phase-4 mutation did not apply"
+mout="$(CLI="$MUTP4" phase4 uptime-kuma docker-volume '')"
 grep -q 'SUBVOL-ASKED' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- without the guard a volume service
 must be asked whether its absent data path is a subvolume: $mout"
@@ -329,7 +344,7 @@ sect "the production gate is CLOSED by default and refuses BEFORE the lock"
 gate_out="$(
   export DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state" CALLS="$TMP/g.log"
   : > "$CALLS"
-  export CFG_FILE="$TMP/domum-media.conf"
+  export CFG_FILE="$TMP/domum-media.conf" UPGRADE_READY_LOG_WAIT=0
   # shellcheck disable=SC1090
   source "$CLI" >/dev/null 2>&1
   need_root() { :; }
@@ -374,7 +389,7 @@ mout="$(
   export DOMUM_DATA_ROOT="$TMP/data" DOMUM_STATE_ROOT="$TMP/state" CALLS="$TMP/m.log"
   : > "$CALLS"
   # shellcheck disable=SC1090
-  export CFG_FILE="$TMP/domum-media.conf"
+  export CFG_FILE="$TMP/domum-media.conf" UPGRADE_READY_LOG_WAIT=0
   # shellcheck disable=SC1090
   source "$MUT" >/dev/null 2>&1
   need_root() { :; }
@@ -543,7 +558,8 @@ sect "F5. the two gates are DEFENCE IN DEPTH, not one check written twice"
 # failed before setting them is caught there. Mutating gate 1 away therefore
 # still refuses -- for a different reason -- which is a property of the code,
 # not a defect in the test.
-cp "$CLI" "$TMP/cli.orig.g1"
+MUTG1="$TMP/cli-g1-mutant"
+cp "$CLI" "$MUTG1"
 cat > "$TMP/mutate-g1.py" <<'PYG1'
 import io, sys
 p = sys.argv[1]
@@ -557,17 +573,16 @@ new = '    warn "TOLERATED gate 1"; : "Pre-upgrade protection failed and'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYG1
-( python3 -I "$TMP/mutate-g1.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.g1" "$CLI"; fail "F5: the gate-1 mutation did not apply"; }
+python3 -I "$TMP/mutate-g1.py" "$MUTG1" \
+  || fail "F5: the gate-1 mutation did not apply"
 # The stub FAILS but still leaves the three artefacts, which a creation that
 # failed late would do. Gate 2 therefore passes and gate 1 is the only thing
 # between this and a deploy.
-mout="$(vol_upgrade 'create_upgrade_rollback_point() {
+mout="$(CLI="$MUTG1" vol_upgrade 'create_upgrade_rollback_point() {
   echo "POINT" >> "$CALLS"
   PRE_UPGRADE_POINT=pt; PRE_UPGRADE_META=pt.recovery; PRE_UPGRADE_ARCHIVE=pt.tar
   printf "pt\\n"; return 1
 }')"
-cp "$TMP/cli.orig.g1" "$CLI"
 grep -q 'COMPOSE up -d' <<< "$mout" \
   || fail "F5: the mutation changed no ANSWER -- with gate 1 tolerated and the
 artefacts present, the deploy must happen: $mout"
@@ -577,18 +592,27 @@ sect "F5b. and with the artefacts ABSENT, gate 2 catches it anyway"
 # The other half of defence in depth, and the reason F5 had to be made
 # faithful: tolerate gate 1 AND leave the artefacts unset, and the refusal
 # still happens -- at gate 2.
-( python3 -I "$TMP/mutate-g1.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.g1" "$CLI"; fail "F5b: the mutation did not apply"; }
-mout="$(vol_upgrade 'create_upgrade_rollback_point() {
+# Already mutated above and deliberately not re-applied: it is a COPY, so it
+# stays mutated, and re-running the edit would fail its own single-match
+# assertion.
+mout="$(CLI="$MUTG1" vol_upgrade 'create_upgrade_rollback_point() {
   echo "POINT" >> "$CALLS"; printf "pt\\n"; return 1
 }')"
-cp "$TMP/cli.orig.g1" "$CLI"
 grep -q 'COMPOSE up -d' <<< "$mout" \
   && fail "F5b: with gate 1 tolerated AND no artefacts it still deployed -- gate 2
 is not catching the case it exists for: $mout"
 echo "  gate 2 refuses independently of gate 1"
 
-sect "F6. the CLI is restored"
+sect "F6. the tracked CLI was never mutated at all"
+# Stronger than restoring it: every mutation above ran against a copy, so an
+# interrupted run cannot leave the tracked file changed. This compares it
+# against the pristine copy taken before the first section.
+cmp -s "$CLI" "$PRISTINE" \
+  || { f6diff="$(diff "$PRISTINE" "$CLI" || true)"
+       fail "F6: the tracked CLI differs from the pristine copy -- a section
+mutated it in place, so stopping this suite part-way would leave a neutralised
+guard in the working tree:
+$(sed -n '1,10p' <<< "$f6diff")"; }
 grep -q 'if ! create_upgrade_rollback_point "\$service"; then' "$CLI" \
   || fail "F6: the point-creation gate is missing from the CLI"
-echo "  gate is back"
+echo "  the tracked CLI is byte-identical to the pristine copy"

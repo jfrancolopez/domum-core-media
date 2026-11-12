@@ -27,10 +27,14 @@
 # No consequential names remain on the list: every function that gates, deletes,
 # verifies or records is now driven. What is left is reporting, configuration
 # and doctor helpers -- worth covering, none of it a safety control.
-# immich_reset_db is likely a name-grep false positive -- covered by suites that
-# reference its GATE rather than the arm -- so read it before testing it.
+#   immich_reset_db           would stop and REMOVE all four Immich containers
+#                             and then refuse, because the snapshot gate fires
+#                             after the stop and /srv/data/immich is not a
+#                             subvolume. Reading it was not enough: this file
+#                             had recorded it as read and found clean.
+#   backup_cmd                dispatched to the INSTALLED backup CLI while
+#                             backup_cli_path already prefers the checkout
 apply_update_delay_profile
-backup_cmd
 backup_env_line_is_valid
 backup_target_exists
 backup_target_has_repository_source
@@ -57,7 +61,6 @@ immich_db_paths_created_after
 immich_extract_image
 immich_library_data_dir
 immich_postgres_marker
-immich_reset_db
 immich_secret_empty_error
 init_host
 json_escape
