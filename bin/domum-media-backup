@@ -268,20 +268,85 @@ get_repo_id() {
     | grep -oE '[0-9a-f]{8,}' | head -1
 }
 
-check_repo_identity() {
+# The identity question, asked WITHOUT dying. ONE implementation: the paths
+# that REFUSE and the paths that merely REPORT consume the same function, so
+# they cannot disagree about what "the pinned repository" means.
+#
+# Prints three TAB-separated fields -- state, the pinned id, the current id --
+# read by INDEX with `cut -f`, never as "the last one": appending a field to a
+# trailing-field expression silently redefines it, which this project has
+# already had to correct once.
+#
+#   match      the configured repository is the one this target pinned
+#   no-pin     no pin file exists (a fresh host, or before init)
+#   pin-empty  a pin file exists and carries no id -- a truncated write
+#   no-answer  the current id could not be READ -- not the same as a match
+#   mismatch   it is a different repository
+#
+# pin-empty is its own state rather than folded into no-pin, although both
+# PASS check_repo_identity exactly as they always have: calling a truncated pin
+# "not pinned" would describe the wrong cause, and the two have different
+# remedies. It is also the condition do_adopt_repo's atomic write now prevents,
+# so an existing one is worth naming rather than hiding.
+#
+# The prefix comparison in both directions is deliberate: ids are reported at
+# different lengths (short vs full) and either may be the prefix of the other.
+repo_identity_state() {  # $1 = target
   local target="$1"
-  local meta_file
+  local meta_file saved_id current_id
   meta_file="$(repo_meta_file "$target")"
-  [[ -f "$meta_file" ]] || return 0
-  local saved_id current_id
+  if [[ ! -f "$meta_file" ]]; then
+    printf 'no-pin\t\t'
+    return 0
+  fi
   unset REPOSITORY_ID
   # shellcheck disable=SC1090
   source "$meta_file"
   saved_id="${REPOSITORY_ID:-}"
-  [[ -n "$saved_id" ]] || return 0
+  if [[ -z "$saved_id" ]]; then
+    printf 'pin-empty\t\t'
+    return 0
+  fi
   current_id="$(get_repo_id "$target")"
-  [[ -n "$current_id" ]] || return 0
+  if [[ -z "$current_id" ]]; then
+    printf 'no-answer\t%s\t' "$saved_id"
+    return 0
+  fi
   if [[ "$current_id" != "$saved_id"* && "$saved_id" != "$current_id"* ]]; then
+    printf 'mismatch\t%s\t%s' "$saved_id" "$current_id"
+    return 0
+  fi
+  printf 'match\t%s\t%s' "$saved_id" "$current_id"
+}
+
+# One line an operator can read, for the paths that report rather than refuse.
+repo_identity_note() {  # $1 = target
+  local fields state saved current
+  fields="$(repo_identity_state "$1")"
+  state="$(cut -f1 <<< "$fields")"
+  saved="$(cut -f2 <<< "$fields")"
+  current="$(cut -f3 <<< "$fields")"
+  case "$state" in
+    match)     printf 'repository identity: matches the pinned id (%s)' "$saved" ;;
+    no-pin)    printf 'repository identity: NOT PINNED for this target -- nothing asserts this is the repository this host uses' ;;
+    pin-empty) printf 'repository identity: the pin file for this target exists but carries NO id, which is what a truncated write leaves behind -- re-adopt deliberately to restore the control' ;;
+    no-answer) printf 'repository identity: UNKNOWN -- the current id could not be read, so it is neither confirmed nor refuted (pinned: %s)' "$saved" ;;
+    mismatch)  printf 'repository identity: MISMATCH -- pinned %s, configured repository reports %s' "$saved" "$current" ;;
+    *)         printf 'repository identity: unrecognised state' ;;
+  esac
+}
+
+check_repo_identity() {
+  local target="$1"
+  local fields state saved_id current_id
+  fields="$(repo_identity_state "$target")"
+  state="$(cut -f1 <<< "$fields")"
+  saved_id="$(cut -f2 <<< "$fields")"
+  current_id="$(cut -f3 <<< "$fields")"
+  # Behaviour is unchanged: only a mismatch refuses. no-pin and no-answer pass,
+  # as they always have -- widening a safety control's failure modes is a
+  # separate decision from giving it one implementation.
+  if [[ "$state" == mismatch ]]; then
     die "ERROR: $target restic repository ID mismatch.
   Expected: $saved_id
   Current:  $current_id
@@ -990,6 +1055,22 @@ do_restore() {
   # target disabled, `--restore latest /t --repo cloud` died with
   # "No enabled backup targets found."
   [[ -n "$repo" ]] || repo="$(default_restore_target)"
+  # A restore reads the repository. Reading the WRONG one yields the wrong data
+  # and reports success, which is what the identity pin exists to prevent -- and
+  # this path applied no identity control at all. A fresh host has no pin, so
+  # the documented recovery procedure is unaffected: no-pin passes.
+  local id_state
+  id_state="$(cut -f1 <<< "$(repo_identity_state "$repo")")"
+  log "$(repo_identity_note "$repo")"
+  if [[ "$id_state" == mismatch ]]; then
+    die "Refusing to restore from $repo: $(repo_identity_note "$repo").
+The data would come from a repository other than the one this host pinned.
+Either point the configuration back at the pinned repository, name a different
+target with --repo, or adopt the new one deliberately:
+
+  sudo domum-media backup adopt-repo $repo --confirm"
+  fi
+
   log "restic restore $snap -> $target_dir (from $repo)"
   mkdir -p "$target_dir"
   restic_for_target "$repo" restore "$snap" --target "$target_dir"
@@ -1111,6 +1192,32 @@ do_verify_restore() {
   [[ -n "$target" ]] || die "Usage: domum-media-backup verify-restore <target>"
   backup_target_enabled "$target" || die "Backup target is not enabled: $target"
   cmd_exists gzip || die "gzip is required for restore verification"
+
+  # This is the function whose evidence `dr-status` promotes to RESTORE TESTED,
+  # and it applied no identity control at all -- so a run against a target whose
+  # configured repository is not the one pinned would record a DR-tier claim
+  # attributed to the target's NAME. A report naming the wrong subject is the
+  # defect this project keeps correcting, and a disaster-recovery tier is the
+  # worst place for it.
+  #
+  # A mismatch records a FAILURE rather than refusing silently: the tier is then
+  # not promoted AND the finding is visible in the evidence, which is the
+  # fail-closed direction and the shape this function already uses for every
+  # other failure. It is not merely a warning, because "warn and continue" is
+  # not a safety mechanism.
+  local id_state
+  id_state="$(cut -f1 <<< "$(repo_identity_state "$target")")"
+  log "$(repo_identity_note "$target")"
+  if [[ "$id_state" == mismatch ]]; then
+    record_restore_verification "$target" failure "" "" 0 "" \
+      "repository identity mismatch: the configured repository is not the one pinned for $target" || true
+    die "Refusing to verify a restore from $target: $(repo_identity_note "$target").
+Recording a RESTORE TESTED claim here would attribute it to $target while the
+bytes came from a different repository. Either point the configuration back at
+the pinned repository, or adopt the new one deliberately:
+
+  sudo domum-media backup adopt-repo $target --confirm"
+  fi
 
   local vdir scratch artifact bytes=0 snapshot_id="" checks="" reason=""
   vdir="$(restore_verification_dir)"
@@ -1830,11 +1937,36 @@ do_verify_target() {
   export_compose_env
 
   log "Verifying repository: $target"
+  # Reported, NOT refused. This is the inspection command, and the mismatch an
+  # operator most wants to inspect is exactly the one check_repo_identity dies
+  # on -- so dying here would remove the way to look at the repository before
+  # deciding whether to adopt it. What must not happen is printing
+  # "Verification complete." under the target's NAME with the identity never
+  # mentioned.
+  local id_state
+  id_state="$(cut -f1 <<< "$(repo_identity_state "$target")")"
+  log "$(repo_identity_note "$target")"
+
   log "--- snapshots (latest 1) ---"
   restic_for_target "$target" snapshots --latest 1
 
   log "--- metadata check ---"
-  restic_for_target "$target" check
+  # restic_check_for, not a bare `restic_for_target ... check`: it is the one
+  # place that records <target>-check.env evidence, and check_unit_verdict reads
+  # that to decide whether a stale exit-11 finding has been superseded. A manual
+  # run must be recorded exactly like a scheduled one, or the operator's
+  # remediation can never become visible.
+  #
+  # On a MISMATCH the check still runs -- that is the inspection -- but its
+  # result is not recorded, because success evidence would vouch for a
+  # repository nobody has confirmed is this target's. Recording nothing is the
+  # weaker claim and the correct one.
+  if [[ "$id_state" == mismatch ]]; then
+    log "NOTE: the identity does not match, so this check will NOT be recorded as evidence for $target."
+    restic_for_target "$target" check
+  else
+    restic_check_for "$target"
+  fi
 
   log "--- storage stats (best-effort) ---"
   restic_for_target "$target" stats --mode restore-size || true

@@ -20,8 +20,13 @@
 #   do_check_deep             reads a SUBSET; a swapped flag reads 10% and
 #   do_check_full             reports "full", the weaker claim in stronger words
 #
-# Remaining consequential ones, in the order to work in:
-#   do_verify_target
+#   do_verify_target          printed "Verification complete." under a target's
+#                             NAME without ever confirming the repository was
+#                             the pinned one, and recorded no check evidence
+#
+# No consequential names remain on the list: every function that gates, deletes,
+# verifies or records is now driven. What is left is reporting, configuration
+# and doctor helpers -- worth covering, none of it a safety control.
 # immich_reset_db is likely a name-grep false positive -- covered by suites that
 # reference its GATE rather than the arm -- so read it before testing it.
 apply_update_delay_profile
@@ -44,7 +49,6 @@ doctor_immich
 doctor_navidrome
 doctor_secrets
 doctor_traefik
-do_verify_target
 ensure_cfg_file
 ensure_networks
 generate_secret

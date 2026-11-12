@@ -8395,6 +8395,101 @@ property check needs the same suspicion as the thing it checks: when a
 verification disagrees with a passing suite, verify the verification. `diff`
 against the backup copy is the stronger form and costs nothing.
 
+---
+
+**THE REPOSITORY IDENTITY CONTROL WAS APPLIED TO EVERY WRITE AND CHECK PATH AND
+TO NONE OF THE THREE READ PATHS -- and one of those read paths records evidence
+that promotes a DISASTER-RECOVERY TIER.** Measured 2026-11-11 with comments
+stripped, because a comment naming the function is not a call to it:
+
+```
+do_daily_backup   identity=1      do_verify_target   identity=0  restic=3
+do_check          identity=1      do_restore         identity=0  restic=1
+do_check_deep     identity=1      do_verify_restore  identity=0  restic=2
+do_check_full     identity=1
+```
+
+`check_repo_identity` is what refuses to act on a repository that is not the one
+this host pinned -- *"this prevents accidental split-brain backups"*. Four
+functions consult it and three run restic against a target without it.
+
+**`do_verify_restore` is the sharpest, and it is not a near-miss.** It is the
+function whose `record_restore_verification` evidence `dr-status` promotes to
+**`RESTORE TESTED`**, so a run against a target whose configured repository is
+not the pinned one would record a disaster-recovery claim attributed to the
+target's NAME. A report naming the wrong subject is the defect this file exists
+to correct, and a DR tier is the worst place for it.
+
+**`repo_identity_state` is the ONE implementation, asked WITHOUT dying**, so a
+path that REFUSES and a path that merely REPORTS cannot disagree about what "the
+pinned repository" means. Five states, each driven:
+
+| state | meaning |
+|---|---|
+| `match` | the configured repository is the one this target pinned |
+| `no-pin` | no pin file exists -- a fresh host, or before init |
+| `pin-empty` | a pin file exists and carries NO id -- a truncated write |
+| `no-answer` | the current id could not be READ -- not the same as a match |
+| `mismatch` | it is a different repository |
+
+**`check_repo_identity` is BEHAVIOUR-IDENTICAL**: only `mismatch` refuses, with
+the same message, verified across all five. Widening a safety control's failure
+modes is a separate decision from giving it one implementation, and bundling the
+two would have made the refactor unreviewable.
+
+**`pin-empty` is its own state rather than folded into `no-pin`**, although both
+pass. Calling a truncated pin *"not pinned"* describes the wrong cause and the
+two have different remedies -- and it is precisely the condition
+`do_adopt_repo`'s new atomic write prevents, so an existing one is worth naming
+rather than hiding.
+
+**Three fields, read by INDEX.** `repo_identity_state` prints
+`state<TAB>pinned<TAB>current` and every reader uses `cut -f1/2/3`, never a
+trailing-field expression: appending a field silently redefines `${x##* }`,
+which this project has already had to correct once in `dr_sample_proof`.
+
+Each read path then consults it in the way that path requires, and the three
+differ on purpose:
+
+- **`--restore` REFUSES on a mismatch.** Reading the wrong repository yields the
+  wrong data and reports success. A fresh host has no pin, so `no-pin` passes
+  and the documented recovery procedure is untouched -- that direction is
+  asserted, because a fix that broke the recovery path would be worse than the
+  defect.
+- **`backup verify` REPORTS and does not refuse.** The mismatch an operator most
+  wants to inspect is exactly the one `check_repo_identity` dies on, so dying
+  here would remove the way to look at a repository before deciding whether to
+  adopt it. What must not happen is printing `Verification complete.` under the
+  target's NAME with the identity never mentioned.
+- **and its check now goes through `restic_check_for`**, which is the one place
+  that writes `<target>-check.env`. `check_unit_verdict` reads that to decide
+  whether a stale exit-11 finding is superseded, and *a manual run must be
+  recorded exactly like a scheduled one* -- so a second path running the same
+  `restic check` and recording nothing made the operator's remediation
+  invisible. On a mismatch the check still runs and is **not** recorded, because
+  success evidence would vouch for a repository nobody confirmed; recording
+  nothing is the weaker claim and the correct one.
+- **`verify-restore` records a FAILURE and refuses.** Not a warning: *"warn and
+  continue" is not a safety mechanism*, least of all in the path that promotes a
+  tier. Recording the failure means the tier is not promoted AND the finding is
+  visible in the evidence, which is the shape that function already uses for
+  every other failure.
+
+**The two mutations are on the ANSWER.** Treating `no-answer` as `match` is the
+conflation the five states exist to prevent; neutralising the recording guard
+makes a mismatched repository's check become evidence for the target. Both run
+against a COPY of the CLI, so a run stopped mid-way cannot leave the mutant in
+the tree.
+
+**I nearly shipped this as one line.** Switching `do_verify_target` to
+`restic_check_for` is the obvious fix for the missing evidence -- and on its own
+it would have recorded a SUCCESS vouching for an unconfirmed repository, which is
+worse than recording nothing. Adding `check_repo_identity` is the obvious fix for
+the missing control -- and on its own it would make the inspection command die on
+the mismatch an operator runs it to inspect. **The two halves interact, and
+either one alone makes the other's defect worse.** That is why the row was filed
+scoped and not bundled into the previous PR.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
