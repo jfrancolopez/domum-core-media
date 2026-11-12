@@ -8000,6 +8000,61 @@ a status after it gets `PATHRC=0` on one line. The helper emits labelled
 
 ---
 
+**EIGHTY-ONE FUNCTIONS ACROSS THE THREE CLIs ARE EXECUTED BY NO TEST, and the
+one that actually runs `restic forget --prune` on this host was among them.**
+Measured 2026-11-11 by instrumenting every function no suite names:
+
+```
+functions, three CLIs              510
+not referenced by name by any suite 193
+  of those, observed executing      112
+  NEVER EXECUTED                     81   (63 + 16 + 4 per CLI)
+marker writes                   15,429
+```
+
+The name-grep is an upper bound and has over-reported every time it was used
+(11 -> 3, then 11 -> 1, now 193 -> 81). **Report the instrumented figure.** The
+instrumenter now also handles a SINGLE-LINE definition, which the previous one
+could not see at all -- 2 of the 193 were that shape, and would have been
+silent false "not found" results.
+
+Nine of the 81 touch deletion, retention, verification or the most dangerous
+arm: `do_weekly_retention`, `do_check`, `do_check_deep`, `do_check_full`,
+`cleanup_snapshots_execute`, `do_restore`, `do_verify_target`,
+`immich_reset_db`, `do_adopt_repo`.
+
+**`do_weekly_retention` is the sharpest, because on this host it is the ONLY
+retention that runs.** `cloud` defaults to weekly and is the only enabled
+target, so `retention_targets daily` is empty -- which this file already
+records as why the nightly backup survived the 2026-10-20 stale lock. So the
+path that actually executes `forget --prune` here had never run in a test,
+while the DAILY loop it mirrors had four sections and a mutation. The daily
+half being tested is not coverage of the weekly half: they are separate
+functions with separate copies of the attempt-every-target shape, and this file
+had called them "behaviourally equivalent for one target" -- true, and
+multi-target robustness is the entire point of the guard.
+
+Five sections now drive it, and the mutation is the exact historical shape:
+`restic_forget_for "$target"` with no `|| failed=` aborts the loop under
+`set -e` at the FIRST failure. **The observable is whether the SECOND target
+was attempted** -- the command fails either way, so asserting the exit status
+would pass against the defect. Also pinned: the failure must name only the
+target that failed and not one that succeeded; the message must say snapshots
+are **retained rather than deleted** and name the exclusive lock as the cause,
+because an operator cannot otherwise tell a retention failure from data loss;
+and an EMPTY weekly list is logged and is **not** a failure, since failing
+there would mail a false alarm every week on a daily-only host.
+
+**The remaining 80 are recorded, not claimed closed.** They are a bounded
+backlog item with the list on disk, which is the honest state: a sweep that
+finds 81 gaps and fixes one has found 81 gaps. The nine consequential ones are
+the order to work in, and `immich_reset_db` is likely a false positive of the
+name-grep in the other direction -- this file records it as covered by two
+suites that reference its GATE rather than the arm, so it needs reading before
+it needs a test.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
