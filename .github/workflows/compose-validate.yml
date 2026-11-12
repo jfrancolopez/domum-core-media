@@ -436,6 +436,12 @@ jobs:
       - name: No test writes to a tracked CLI smoke test
         run: tests/no-tracked-mutation-audit-smoke.sh
 
+      - name: Secret write smoke test
+        run: tests/secret-write-smoke.sh
+
+      - name: Recovery pack email smoke test
+        run: tests/recovery-pack-email-smoke.sh
+
       - name: No conflict markers smoke test
         run: tests/no-conflict-markers-smoke.sh
 

