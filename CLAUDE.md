@@ -8319,6 +8319,82 @@ same discipline this file already requires for asserting that a mutation
 applied. Two entries above this one records a killed suite leaving a mutant in
 the tree; this is the same hazard reached through a restore that looked fine.
 
+---
+
+**`backup adopt-repo` REWROTE THE REPOSITORY IDENTITY PIN WITH NO GATE, WHILE
+`backup init --adopt-existing` HAS REFUSED THE SAME MUTATION ALL ALONG.** Two
+more never-executed functions, found 2026-11-11.
+
+`check_repo_identity` is what refuses a backup or a restore against a
+repository that is not the one this host pinned -- *"this prevents accidental
+split-brain backups"*, as `docs/SETUP-RESTIC.md` puts it. Adoption **overwrites
+that pin**. §6 of this file lists *"adoption of an existing production
+repository"* among the operations requiring explicit approval, and the setup
+document tells the operator to adopt only *"after independently verifying that
+the new target is intentional"* -- **a rule stated in prose that nothing
+applied.** Measured: `do_adopt_repo cloud` wrote the new pin immediately and
+reported `Repository adopted.`
+
+Two paths reach that same file and their gates were asymmetric:
+`do_init_repo` dies with *"Repository metadata already exists... Use
+--adopt-existing to overwrite"*, while `do_adopt_repo` had nothing. An
+asymmetric gate on one mutation is the "a fact appears twice" failure in
+executable form -- and the weaker path is the one `check_repo_identity`'s own
+error message recommends.
+
+Three things the fix does, each a rule already recorded here:
+
+- **`--confirm` is required**, and the refusal states what adopting changes and
+  names the gated command, because an unactionable refusal is as useless as a
+  missing gate;
+- **the pin being replaced is PRESERVED** as
+  `<target>-repo.env.superseded-<timestamp>`. It records the repository this
+  host was backing up to, which is the only way to answer afterwards what the
+  mismatch was *between*; overwriting a known-good recovery artefact without
+  preserving it first is forbidden. A collision on that name refuses rather
+  than overwriting;
+- **the write is atomic** -- staged in the pin's OWN directory and renamed, so
+  the live pin is never half-written. This matters here specifically:
+  `check_repo_identity` returns 0 when `REPOSITORY_ID` is empty, so a truncated
+  pin reads as *"nothing to check"* and an interrupted adopt would silently
+  disable the identity control. Same mechanism as the `config_set` fix, where
+  `mv` from `$TMPDIR` across filesystems was a copy-in-place.
+
+**`--restore` IS THE COMMAND RUN WHILE THE HOST IS GONE, and two defects made
+it describe the wrong problem.** Measured against the real function:
+
+```
+do_restore latest                     -> DIE: Unknown restore arg: latest
+--repo cloud, nothing enabled         -> DIE: No enabled backup targets found.
+--repo with no value                  -> bash: $2: unbound variable
+```
+
+The first blamed the SNAPSHOT as an unknown option and never reached the usage
+line, because `shift 2 || true` leaves `$1` as the snapshot when the option
+loop runs. The second evaluated `default_restore_target` -- which **dies** when
+nothing is enabled -- *before* parsing the flag that exists in order to replace
+it, so an explicitly named repository could not save a host whose targets are
+all disabled. The usage check now precedes the loop and the default is resolved
+after it.
+
+**THE DEFAULTER THAT DIED WAS WHAT MADE THE TEST LOOK BROKEN.** My probe's
+`die` stub echoed to **stdout**, and `repo="$(default_restore_target)"` calls
+it inside a command substitution: the message was captured INTO `$repo`, `exit`
+ended only the subshell, and the sourced CLI's own `set -euo pipefail` then
+killed the probe with no output at all. The section failed with an empty
+string, which reads as the new code producing nothing. A stub must be faithful
+in the respect being measured -- `die` writes to stderr in production, and the
+same artefact had already cost a detour in the `cleanup_summary` section
+earlier the same day.
+
+**AND A `grep -c` THAT REPORTED 0 FOR A LINE THAT IS PRESENT nearly sent me
+chasing a restore that had worked.** Verifying the mutation restore by property
+-- the rule written one entry above -- the check itself answered wrongly, and
+`diff` against the pre-mutation copy showed the file byte-identical. So the
+property check needs the same suspicion as the thing it checks: when a
+verification disagrees with a passing suite, verify the verification. `diff`
+against the backup copy is the stronger form and costs nothing.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

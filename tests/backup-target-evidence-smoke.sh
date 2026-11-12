@@ -417,4 +417,203 @@ grep -qx 'CHECK nas --read-data' <<< "$out" \
   || fail "8: a named target must override the full check's default: $out"
 echo "  8: deep reads a subset of nas, full reads every byte of cloud"
 
+
+# ---------------------------------------------------------------------------
+# 9. `--restore` IS THE COMMAND RUN WHILE THE HOST IS GONE, so its argument
+#    handling is a recovery property rather than ergonomics.
+#
+#    Two defects, both measured against the real function:
+#
+#      do_restore latest            -> DIE: Unknown restore arg: latest
+#      --repo cloud, none enabled   -> DIE: No enabled backup targets found.
+#
+#    The first blamed the SNAPSHOT as an unknown option and never reached the
+#    usage line, because `shift 2 || true` leaves $1 as the snapshot when the
+#    option loop runs. The second evaluated default_restore_target -- which
+#    DIES when nothing is enabled -- before parsing the flag that was given in
+#    order to replace it.
+# ---------------------------------------------------------------------------
+restore_probe() {  # $1 = extra stubs, $2 = the call
+  bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+log() { echo \"LOG \$*\"; }
+die() { echo \"DIE: \$*\" >&2; exit 9; }
+mkdir() { echo \"MKDIR \$*\"; }
+restic_for_target() { echo \"RESTIC target=\$1 args=\${*:2}\"; }
+$1
+$2
+" 2>&1
+}
+# die writes to STDERR, as production's does. A stub that echoed to stdout
+# would be captured INTO the variable when die is reached inside a command
+# substitution -- repo="\$(default_restore_target)" -- and `exit` would end only
+# the subshell, so the message vanished and the shell died silently under the
+# errexit the sourced CLI turns back on.
+
+BOTH_ON='backup_target_names() { printf "%s\n" nas cloud; }
+backup_target_exists() { case "$1" in nas|cloud) return 0 ;; *) return 1 ;; esac; }
+backup_target_enabled() { case "$1" in nas|cloud) return 0 ;; *) return 1 ;; esac; }'
+NONE_ON='backup_target_names() { printf "%s\n" nas cloud; }
+backup_target_exists() { case "$1" in nas|cloud) return 0 ;; *) return 1 ;; esac; }
+backup_target_enabled() { return 1; }'
+
+out="$(restore_probe "$BOTH_ON" 'do_restore latest')"
+grep -qi 'Usage:' <<< "$out" \
+  || fail "9: a forgotten target directory must give the USAGE line, not blame
+the snapshot as an unknown option: $out"
+grep -q 'Unknown restore arg: latest' <<< "$out" \
+  && fail "9: the snapshot is still being reported as an unknown argument: $out"
+grep -q 'RESTIC' <<< "$out" && fail "9: it restored with no target directory: $out"
+
+out="$(restore_probe "$BOTH_ON" 'do_restore')"
+grep -qi 'Usage:' <<< "$out" || fail "9: no arguments must give the usage line: $out"
+
+# An explicitly named target must not depend on the defaulter it replaces.
+out="$(restore_probe "$NONE_ON" 'do_restore latest /scratch/x --repo cloud')"
+grep -qx 'RESTIC target=cloud args=restore latest --target /scratch/x' <<< "$out" \
+  || fail "9: an explicit --repo must be honoured even when no target is
+enabled -- the defaulter was consulted first and died: $out"
+
+# ...and with no --repo the defaulter is still what decides, and still refuses.
+out="$(restore_probe "$NONE_ON" 'do_restore latest /scratch/x')"
+grep -qi 'No enabled backup targets' <<< "$out" \
+  || fail "9: with no --repo and nothing enabled it must still refuse: $out"
+grep -q 'RESTIC' <<< "$out" && fail "9: it restored from an empty target name: $out"
+
+out="$(restore_probe "$BOTH_ON" 'do_restore latest /scratch/x')"
+grep -qx 'RESTIC target=nas args=restore latest --target /scratch/x' <<< "$out" \
+  || fail "9: the ordinary case must restore from nas: $out"
+
+# A bare --repo used to read \$2 under set -u, which dies with a bash
+# unbound-variable error naming a positional parameter instead of the flag.
+out="$(restore_probe "$BOTH_ON" 'do_restore latest /scratch/x --repo')"
+grep -qi 'repo needs a target name' <<< "$out" \
+  || fail "9: a bare --repo must name the flag, not a positional parameter: $out"
+
+out="$(restore_probe "$BOTH_ON" 'do_restore latest /scratch/x --wat')"
+grep -q 'Unknown restore arg: --wat' <<< "$out" \
+  || fail "9: a genuinely unknown option must still be refused by name: $out"
+echo "  9: --restore names the usage, honours --repo, and refuses by name"
+
+# ---------------------------------------------------------------------------
+# 10. ADOPTING A REPOSITORY REWRITES THE IDENTITY PIN, so it is gated and the
+#     pin it replaces is PRESERVED.
+#
+#     check_repo_identity refuses a backup or a restore when the configured
+#     repository is not the one this host pinned. Adoption overwrites that pin.
+#     CLAUDE.md lists "adoption of an existing production repository" among the
+#     operations needing explicit approval, and docs/SETUP-RESTIC.md tells the
+#     operator to adopt only "after independently verifying that the new target
+#     is intentional" -- a rule stated in prose that nothing applied.
+#     `backup init --adopt-existing` has refused to overwrite an existing pin
+#     all along; this second path to the same mutation had no gate at all.
+# ---------------------------------------------------------------------------
+adopt_probe() {  # $1 = extra stubs, $2 = the call
+  bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+log() { echo \"LOG \$*\"; }
+die() { echo \"DIE: \$*\"; exit 9; }
+REPO_META_DIR='$TMP_DIR/meta'
+load_cfg() { :; }
+export_compose_env() { :; }
+backup_target_value() { echo 'sftp:host:/repo'; }
+$1
+$2
+" 2>&1
+}
+GOOD_ID='get_repo_id() { echo "newid0000000"; }'
+
+rm -rf "$TMP_DIR/meta"; mkdir -p "$TMP_DIR/meta"
+out="$(adopt_probe "$GOOD_ID" 'do_adopt_repo cloud')"
+grep -qi 'Refusing to adopt without --confirm' <<< "$out" \
+  || fail "10: adopting must require --confirm: $out"
+[ -z "$(ls -A "$TMP_DIR/meta")" ] \
+  || fail "10: it wrote a pin despite refusing: $(ls -A "$TMP_DIR/meta")"
+
+# The refusal must say what it would do and name the gated form, because an
+# unactionable refusal is as useless as a missing gate.
+grep -qi 'identity' <<< "$out" || fail "10: the refusal does not say what adopting changes: $out"
+grep -q 'adopt-repo cloud --confirm' <<< "$out" \
+  || fail "10: the refusal does not name the command that would proceed: $out"
+
+# With --confirm and no existing pin: write it, nothing to preserve.
+out="$(adopt_probe "$GOOD_ID" 'do_adopt_repo cloud --confirm')"
+[ -f "$TMP_DIR/meta/cloud-repo.env" ] || fail "10: --confirm did not write the pin: $out"
+grep -q 'REPOSITORY_ID="newid0000000"' "$TMP_DIR/meta/cloud-repo.env" \
+  || fail "10: the pin does not carry the new id: $(cat "$TMP_DIR/meta/cloud-repo.env")"
+grep -q 'ADOPTED=1' "$TMP_DIR/meta/cloud-repo.env" \
+  || fail "10: the pin does not record that it was adopted"
+[ "$(ls -1 "$TMP_DIR/meta" | wc -l)" = "1" ] \
+  || fail "10: nothing should have been preserved on a first adopt: $(ls -1 "$TMP_DIR/meta")"
+
+# With an EXISTING pin: the old one is kept. It records what the mismatch was
+# BETWEEN, which is the only way to answer that afterwards.
+printf 'TARGET="cloud"\nREPOSITORY_ID="oldid1111111"\n' > "$TMP_DIR/meta/cloud-repo.env"
+out="$(adopt_probe "$GOOD_ID" 'do_adopt_repo cloud --confirm')"
+grep -q 'REPOSITORY_ID="newid0000000"' "$TMP_DIR/meta/cloud-repo.env" \
+  || fail "10: the pin was not replaced: $(cat "$TMP_DIR/meta/cloud-repo.env")"
+kept="$(ls -1 "$TMP_DIR/meta" | grep superseded || true)"
+[ -n "$kept" ] || fail "10: the previous identity pin was DESTROYED: $(ls -1 "$TMP_DIR/meta")"
+grep -q 'REPOSITORY_ID="oldid1111111"' "$TMP_DIR/meta/$kept" \
+  || fail "10: the preserved copy does not hold the id it replaced: $(cat "$TMP_DIR/meta/$kept")"
+grep -qi 'Preserved the previous identity pin' <<< "$out" \
+  || fail "10: it preserved the pin without saying so: $out"
+
+# A failed id lookup must leave the existing pin alone. A truncated or empty
+# pin reads as "nothing to check" in check_repo_identity, so a half-done adopt
+# would silently disable the identity control.
+printf 'TARGET="cloud"\nREPOSITORY_ID="oldid1111111"\n' > "$TMP_DIR/meta/cloud-repo.env"
+before="$(cat "$TMP_DIR/meta/cloud-repo.env")"
+out="$(adopt_probe 'restic_for_target() { return 1; }' 'do_adopt_repo cloud --confirm')"
+[ "$(cat "$TMP_DIR/meta/cloud-repo.env")" = "$before" ] \
+  || fail "10: an unreachable repository changed the live pin: $(cat "$TMP_DIR/meta/cloud-repo.env")"
+grep -qi 'Failed to connect' <<< "$out" || fail "10: it did not refuse: $out"
+
+out="$(adopt_probe "$GOOD_ID" 'do_adopt_repo cloud --wat')"
+grep -qi 'Usage:' <<< "$out" || fail "10: an unknown flag must give the usage line: $out"
+out="$(adopt_probe "$GOOD_ID" 'do_adopt_repo')"
+grep -qi 'Usage:' <<< "$out" || fail "10: no target must give the usage line: $out"
+
+# The live pin is never half-written: the new one is renamed into place from
+# the SAME directory, so the rename is atomic rather than a copy.
+grep -q 'mktemp "\$REPO_META_DIR/' "$REPO_ROOT/bin/domum-media-backup" \
+  || fail "10: the new pin is not staged in the pin's own directory, so the mv
+is a cross-filesystem copy and the live pin can be left truncated"
+echo " 10: adopting is gated, preserves the pin it replaces, and is atomic"
+
+# ---------------------------------------------------------------------------
+# 11. MUTATION: removing the adopt gate must let it rewrite the pin unasked.
+# ---------------------------------------------------------------------------
+cp "$REPO_ROOT/bin/domum-media-backup" "$TMP_DIR/mut-adopt"
+cat > "$TMP_DIR/mut11.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '  if (( confirm == 0 )); then\n    die "Refusing to adopt without --confirm.'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, '  if (( confirm != confirm )); then\n    die "Refusing to adopt without --confirm.', 1))
+print("applied")
+PY
+python3 -I "$TMP_DIR/mut11.py" "$TMP_DIR/mut-adopt" >/dev/null \
+  || fail "11: the gate mutation did not apply"
+rm -rf "$TMP_DIR/meta"; mkdir -p "$TMP_DIR/meta"
+out="$(bash -c "
+set -uo pipefail
+source '$TMP_DIR/mut-adopt' >/dev/null 2>&1
+log() { echo \"LOG \$*\"; }
+die() { echo \"DIE: \$*\"; exit 9; }
+REPO_META_DIR='$TMP_DIR/meta'
+load_cfg() { :; }
+export_compose_env() { :; }
+backup_target_value() { echo 'sftp:host:/repo'; }
+$GOOD_ID
+do_adopt_repo cloud" 2>&1)"
+[ -f "$TMP_DIR/meta/cloud-repo.env" ] \
+  || fail "11: the mutation applied but the gate still held, so section 10
+would pass without it: $out"
+echo " 11: without the gate an unasked adopt rewrites the identity pin"
+rm -rf "$TMP_DIR/meta"
+
 echo "PASS: backup target evidence smoke test"

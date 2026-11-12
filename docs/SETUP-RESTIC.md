@@ -110,13 +110,24 @@ ERROR: cloud restic repository ID mismatch.
   Expected: ee134f75...
   Current:  b4827cfdd7...
 This usually means BACKUP_TARGET_CLOUD_REPOSITORY or port changed.
-Run: sudo domum-media backup adopt-repo cloud
+Run, once you have verified the new target is the one you mean:
+  sudo domum-media backup adopt-repo cloud --confirm
 ```
 
 This prevents accidental split-brain backups (two separate repositories). Resolve by either:
 1. Reverting to the correct repository URL/port, or
-2. Running `sudo domum-media backup adopt-repo cloud` after independently
-   verifying that the new target is intentional.
+2. Running `sudo domum-media backup adopt-repo cloud --confirm` after
+   independently verifying that the new target is intentional.
+
+`--confirm` is required, and that is this instruction being enforced rather
+than merely written down: adoption rewrites the identity pin, which is the
+control that refuses a backup or a restore against a repository that is not
+the one this host uses. The pin being replaced is kept beside the new one as
+`<target>-repo.env.superseded-<timestamp>`, because it records what the
+mismatch was *between* -- the only way to answer that afterwards. The new pin
+is written to a temporary file in the same directory and renamed, so the live
+pin is never half-written; a truncated pin has an empty `REPOSITORY_ID`, and
+an empty id reads as "nothing to check".
 
 See the **Cloud include profile** section below if changing to a different repository path.
 
