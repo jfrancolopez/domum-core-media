@@ -63,9 +63,21 @@
 #                             `return 1`s -- checked. "We looked and decided no"
 #                             is worth as much as a fix.
 #
-# Next, by consequence: the remaining update-state writers (write_update_state,
-# record_update_history, clear_update_candidate_state), then the doctor_* family
-# and the configure_* prompts.
+#   write_immich_db_password_fingerprint  the SAME two defects as
+#                             write_secret_file -- a bare umask and a
+#                             truncate-before-write -- which survived because
+#                             the first fix was not followed by a sweep for the
+#                             shape. Both bare umasks in the tree are now fixed.
+#
+# READ AND FOUND SOUND: write_update_state, record_update_history and
+# clear_update_candidate_state all render through write_env_kv, which already
+# uses %q, so they carry none of the quoting defects found elsewhere;
+# report_tmp_cleanup guards each path before removing it.
+#
+# What remains is the doctor_* family (read and found clean -- it prints
+# basenames and set/empty, never contents), the configure_* prompts, and
+# reporting helpers. None of them gates, deletes or writes anything a recovery
+# depends on.
 #   immich_reset_db           would stop and REMOVE all four Immich containers
 #                             and then refuse, because the snapshot gate fires
 #                             after the stop and /srv/data/immich is not a
@@ -77,7 +89,6 @@ apply_update_delay_profile
 backup_env_line_is_valid
 backup_target_exists
 backup_target_has_repository_source
-clear_update_candidate_state
 configure_backup_target
 configure_cmd
 configure_non_interactive
@@ -110,11 +121,9 @@ prompt_multiline_value
 prompt_secret_value
 prompt_with_default
 prompt_yes_no
-record_update_history
 recovery_pack_cmd
 render_traefik_dynamic
 report_render_text
-report_tmp_cleanup
 report_update_candidate
 rollback_list_cmd
 rollback_show_cmd
@@ -135,5 +144,3 @@ validate_backup_env_file
 validate_backup_env_file_or_die
 validate_immich_db_password_state
 within_reboot_window
-write_immich_db_password_fingerprint
-write_update_state

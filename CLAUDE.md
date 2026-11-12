@@ -8897,6 +8897,26 @@ other off-site copy openable -- in a project that deliberately did NOT copy
 exactly this hole from `domum-core`, and whose other mail path already had the
 fix. A pasted value with a stray newline is the realistic trigger.
 
+**I FIXED THE UMASK LEAK AND DID NOT SWEEP FOR THE SHAPE, SO A SECOND ONE
+SURVIVED.** `write_immich_db_password_fingerprint` had BOTH defects -- a bare
+`umask 077` and a truncate-before-write -- and was found only by reading the
+next function down the list. This file already says *after fixing a defect
+SHAPE, grep for the shape*; I had applied that to a false CLAIM and not to a
+code shape. Swept now: across all three CLIs and `install.sh` there are exactly
+two bare `umask` calls inside functions, and both are fixed.
+
+**An empty fingerprint is not inert.** It is a digest of the Immich database
+password, compared to detect a change, so a truncated one does not match a
+password that never changed -- the gate fires on nothing.
+
+**The sweep could not tell a fixed site from a broken one**, because a
+subshelled `umask 077` still looks like `umask 077` to a line scanner. The test
+therefore asserts the PROPERTY -- the caller's umask survives the call -- which
+is independent of how the fix is spelled. And adding the second function made
+the first function's mutation anchor match TWICE, because both now use the same
+staging form; the `matched %d times` assertion caught it and the mutation is
+scoped to one function now.
+
 **AND A FAILED SEND LEFT THE WHOLE BASE64 PACK IN THE TEMP DIRECTORY.** The
 first fix was a `trap ... RETURN`, which is wrong: `smtp_send_message` **dies**,
 and `die` exits the process, so neither a RETURN trap nor a `||` in the caller
