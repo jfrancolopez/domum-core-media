@@ -129,11 +129,33 @@ grep -qi 'heartbeat' <<< "$last_run_lines" \
   && fail "per-target run state must not be derived from the aggregate heartbeat"
 
 # ---------------------------------------------------------------------------
-# 4. A failed target must still abort the run (fail-fast is preserved).
-# ---------------------------------------------------------------------------
-loop_text="$(awk '/while IFS= read -r target; do/,/done < <\(enabled_backup_targets\)/' "$REPO_ROOT/bin/domum-media-backup")"
-grep -q 'die "Backup failed for target' <<< "$loop_text" \
-  || fail "a failing target no longer aborts the backup run"
+# 4. A failed target must still abort the run BEFORE anything is refreshed.
+#
+# This asserted the property by grepping the LOOP BODY for the die, which made
+# it unable to tell a fix from a regression -- the text-assertion family this
+# project records. The die moved OUT of the loop so that every enabled target
+# is attempted before the run fails (if `cloud` is locked, `nas` can still get
+# a backup, and zero backups is strictly worse than one), and this assertion
+# failed against correct code.
+#
+# What actually matters is the ORDERING, not the location: the refusal must
+# precede `heartbeat`, or a failed backup would refresh the marker `checkup`
+# reads and a backup that did not happen would report as current. That is what
+# is asserted now, by statement position within the function.
+#
+# The behaviour itself is driven in backup-evidence-endtoend-smoke sections
+# L1-L5 and B: both targets attempted, run fails, no heartbeat, per-target
+# evidence correct, and a mutation that moves the die back into the loop.
+fn_text="$(awk '/^do_daily_backup\(\) \{/,/^\}/' "$REPO_ROOT/bin/domum-media-backup")"
+grep -q 'die "Backup failed for target' <<< "$fn_text" \
+  || fail "a failing target no longer aborts the backup run at all"
+die_at="$(grep -n 'die "Backup failed for target' <<< "$fn_text" | head -1 | cut -d: -f1)"
+hb_at="$(grep -n '^  heartbeat$' <<< "$fn_text" | head -1 | cut -d: -f1)"
+[ -n "$die_at" ] && [ -n "$hb_at" ] \
+  || fail "could not locate both the refusal and the heartbeat in do_daily_backup"
+[ "$die_at" -lt "$hb_at" ] \
+  || fail "the backup refusal ($die_at) does not precede the heartbeat ($hb_at), so a
+failed backup would refresh the marker checkup reads as 'last backup'"
 
 # ---------------------------------------------------------------------------
 # 5. restic_backup_to must stream to the log, capture the snapshot id, and
