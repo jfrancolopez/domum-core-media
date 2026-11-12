@@ -13,21 +13,51 @@ installed and enabled the scrub timer, which falsified one of its latency
 claims. Re-read the measurements below against `git rev-parse origin/main`
 rather than trusting the heading.
 
-Reconciled **2026-11-11**, **68 commits** ahead of production. The count is
-recorded once, here, and is re-derived with
-`git rev-list --count a63ad19..origin/main` -- a running tally in prose rots the
-same way a baked hash does, and this paragraph had grown one. The `origin/main`
-hash is deliberately no longer quoted beside it: two values that go stale
-together are two chances to be wrong, and `git rev-parse origin/main` is the
-authority.
+Reconciled **2026-11-11 (late)**. The commit count is deliberately **no longer
+quoted here**: this paragraph has now gone stale three times by carrying one,
+and the plan's own rule is that a running tally in prose rots exactly like a
+baked hash. Derive both figures at read time:
 
-**What the 2026-11-11 reconciliation found: the SHAPE is unchanged.** The delta
-grew four commits that touch two installable paths -- `bin/domum-media` and
-`bin/domum-media-backup` -- and **both were already in the surface**. Measured
-on the branch: **zero** files under `systemd/`, `compose/` or `config/`. So the
-six-path table in §2 still holds, `UNIT_TARGETS` still needs nothing added, and
-§10's second deployment KIND is untouched. That is the statement worth
-recording; the count is the part that rots.
+```
+git rev-list --count a63ad19..origin/main     # how far ahead
+git rev-parse origin/main                     # what "current" means today
+git diff --name-only a63ad19..origin/main -- bin systemd compose config
+```
+
+**What the late-2026-11-11 reconciliation found: the SHAPE CHANGED.** The
+earlier entry on this date recorded *"zero files under `systemd/`"* for the four
+commits it was reconciling; that was true of those four and is false of the
+delta now. Measured with comments stripped, because a comment-only edit to a
+unit is not a directive change:
+
+| `systemd/` file in the delta | state | in `UNIT_TARGETS`? |
+|---|---|---|
+| `domum-media-weekly-report.service` | **3 directive lines changed** | **yes** -- this is §9's change |
+| `auto-enable.timers` | comment-only (0 directive lines) | no, and correctly not |
+| `domum-media-btrfs-scrub.timer` | comment-only (0 directive lines) | no, and correctly not |
+| `domum-media-state-capture.service` | **NEW** | **no -- deliberately** |
+| `domum-media-state-capture.timer` | **NEW** | **no -- deliberately** |
+
+**The two NEW units are an intentional omission, not an oversight, and this
+table exists so nobody "fixes" it.** §3 records the rule that *a substantive
+unit change must be added to `UNIT_TARGETS` first*, and read alone that rule
+would say these two belong there. They do not, for a reason the rule does not
+cover: **installing a unit is what makes its job available.** The weekly-report
+unit carries `health-notify`, and installing it was the point. These carry
+`storage capture-all-state --pack` followed by `storage prune-state-packs
+--confirm` -- a job that writes credential-bearing artefacts and a job that
+deletes packs. Neither has ever run against production, `QUIESCED_CAPTURE_ENABLED`
+is still 0, and no backup target includes a pack. So the state-capture feature
+is not part of any deployment described here; installing and enabling it is a
+separate operator decision with its own gate (`docs/OPERATOR-GATED-ACTIONS.md`
+§2-§4).
+
+`operator/rehearsals/` also grew substantially in the delta. The narrow script
+installs nothing from `operator/`, so this is carried by the fast-forward and
+installed nowhere -- see §3a, which already covers that distinction.
+
+`compose/` and `config/` hold **15** changed files, which is §10's second
+deployment KIND and is still not carried by the narrow script.
 
 §1's drift measurement was **re-verified the same day** and still holds: all
 three installed files match the production checkout byte for byte

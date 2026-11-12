@@ -616,4 +616,209 @@ would pass without it: $out"
 echo " 11: without the gate an unasked adopt rewrites the identity pin"
 rm -rf "$TMP_DIR/meta"
 
+
+# ---------------------------------------------------------------------------
+# 12. THE REPOSITORY IDENTITY CONTROL WAS APPLIED TO THE WRITE AND CHECK PATHS
+#     AND TO NONE OF THE READ PATHS.
+#
+#     Measured 2026-11-11 with comments stripped, because a comment naming the
+#     function is not a call to it:
+#
+#       do_daily_backup   identity=1    do_verify_target   identity=0  restic=3
+#       do_check          identity=1    do_restore         identity=0  restic=1
+#       do_check_deep     identity=1    do_verify_restore  identity=0  restic=2
+#       do_check_full     identity=1
+#
+#     do_verify_restore is the sharpest: it is the function whose evidence
+#     `dr-status` promotes to RESTORE TESTED, so a run against a target whose
+#     configured repository is not the one pinned would record a
+#     disaster-recovery claim attributed to the target's NAME.
+#
+#     repo_identity_state is the ONE implementation, asked without dying, so a
+#     path that REFUSES and a path that merely REPORTS cannot disagree about
+#     what "the pinned repository" means.
+# ---------------------------------------------------------------------------
+id_probe() {  # $1 = extra stubs, $2 = the call
+  bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+log() { echo \"LOG \$*\"; }
+die() { echo \"DIE: \$*\" >&2; exit 9; }
+uppercase_token() { echo T; }
+repo_meta_file() { printf '%s/%s-repo.env' '$TMP_DIR/ident' \"\$1\"; }
+$1
+$2
+" 2>&1
+}
+mkdir -p "$TMP_DIR/ident"
+printf 'REPOSITORY_ID="cur1111"\n'  > "$TMP_DIR/ident/okmatch-repo.env"
+printf 'REPOSITORY_ID="other999"\n' > "$TMP_DIR/ident/bad-repo.env"
+printf 'REPOSITORY_ID=""\n'         > "$TMP_DIR/ident/trunc-repo.env"
+HAVE_ID='get_repo_id() { echo cur111122223333; }'
+NO_ID='get_repo_id() { printf ""; }'
+
+for pair in "nopin:no-pin" "okmatch:match" "bad:mismatch" "trunc:pin-empty"; do
+  t="${pair%%:*}"; want="${pair##*:}"
+  got="$(id_probe "$HAVE_ID" "repo_identity_state $t | cut -f1")"
+  [ "$got" = "$want" ] || fail "12: $t must be '$want', got '$got'"
+done
+# "I could not read the current id" is NOT a match. A pin is present here, so
+# the only thing that changed is whether the repository could answer.
+got="$(id_probe "$NO_ID" 'repo_identity_state okmatch | cut -f1')"
+[ "$got" = "no-answer" ] \
+  || fail "12: an unreadable current id must be no-answer, not a match: '$got'"
+
+# pin-empty is its own state and not folded into no-pin: calling a TRUNCATED
+# pin "not pinned" describes the wrong cause, and they have different remedies.
+note="$(id_probe "$HAVE_ID" 'repo_identity_note trunc')"
+grep -qi 'carries NO id' <<< "$note" \
+  || fail "12: a truncated pin must say so rather than read as 'not pinned': $note"
+grep -qi 'NOT PINNED' <<< "$note" \
+  && fail "12: a truncated pin is being described as an absent one: $note"
+
+# The fields are read by INDEX. Appending one must not redefine the others.
+fields="$(id_probe "$HAVE_ID" 'repo_identity_state bad')"
+[ "$(cut -f1 <<< "$fields")" = "mismatch" ] || fail "12: field 1 is not the state: $fields"
+[ "$(cut -f2 <<< "$fields")" = "other999" ] || fail "12: field 2 is not the pinned id: $fields"
+[ "$(cut -f3 <<< "$fields")" = "cur111122223333" ] || fail "12: field 3 is not the current id: $fields"
+
+# check_repo_identity is BEHAVIOUR-IDENTICAL: only a mismatch refuses. Widening
+# a safety control's failure modes is a separate decision from giving it one
+# implementation, so no-pin, pin-empty and no-answer still pass as they always
+# have.
+for t in nopin okmatch trunc; do
+  out="$(id_probe "$HAVE_ID" "check_repo_identity $t && echo PASSED")"
+  grep -q PASSED <<< "$out" || fail "12: check_repo_identity must still pass for $t: $out"
+done
+out="$(id_probe "$NO_ID" 'check_repo_identity okmatch && echo PASSED')"
+grep -q PASSED <<< "$out" || fail "12: an unreadable id must still pass the control: $out"
+out="$(id_probe "$HAVE_ID" 'check_repo_identity bad')"
+grep -qi 'repository ID mismatch' <<< "$out" \
+  || fail "12: check_repo_identity must still refuse a mismatch: $out"
+grep -q 'adopt-repo bad --confirm' <<< "$out" \
+  || fail "12: the refusal must name the gated adopt command: $out"
+echo " 12: five identity states, one implementation, the control unchanged"
+
+# ---------------------------------------------------------------------------
+# 13. THE THREE READ PATHS NOW CONSULT IT, each in the way that path requires.
+# ---------------------------------------------------------------------------
+READ_STUBS='load_cfg() { :; }
+export_compose_env() { :; }
+backup_target_enabled() { return 0; }
+backup_target_names() { printf "%s\n" nas cloud; }
+backup_target_exists() { return 0; }
+cmd_exists() { return 0; }
+mkdir() { :; }
+restic_for_target() { echo "RESTIC target=$1 args=${*:2}"; }
+restic_check_for() { echo "RECORDED-CHECK $1"; }
+record_restore_verification() { echo "RECORDED-RESTORE-VERIFY $1 $2 reason=${7:-}"; }'
+
+# --restore REFUSES on a mismatch: reading the wrong repository yields the
+# wrong data and reports success, which is what the pin exists to prevent.
+out="$(id_probe "$HAVE_ID
+$READ_STUBS" 'do_restore latest /scratch/x --repo bad')"
+grep -qi 'Refusing to restore' <<< "$out" \
+  || fail "13: a restore from a mismatched repository must refuse: $out"
+grep -q 'RESTIC' <<< "$out" && fail "13: it restored anyway: $out"
+grep -q 'adopt-repo bad --confirm' <<< "$out" \
+  || fail "13: the refusal must say how to proceed deliberately: $out"
+
+# ...and a FRESH HOST has no pin, so the documented recovery procedure is
+# unaffected. This is the direction that must not regress.
+out="$(id_probe "$HAVE_ID
+$READ_STUBS" 'do_restore latest /scratch/x --repo nopin')"
+grep -q 'RESTIC target=nopin args=restore latest --target /scratch/x' <<< "$out" \
+  || fail "13: an unpinned target must still restore -- a fresh host has no pin: $out"
+grep -qi 'NOT PINNED' <<< "$out" \
+  || fail "13: it restored without saying the identity is unasserted: $out"
+
+# `backup verify` REPORTS rather than refuses: the mismatch an operator most
+# wants to inspect is exactly the one check_repo_identity dies on.
+out="$(id_probe "$HAVE_ID
+$READ_STUBS" 'do_verify_target bad')"
+grep -qi 'MISMATCH' <<< "$out" || fail "13: verify must report the mismatch: $out"
+grep -q 'RESTIC target=bad args=check' <<< "$out" \
+  || fail "13: verify must still run the check -- that IS the inspection: $out"
+grep -q 'RECORDED-CHECK' <<< "$out" \
+  && fail "13: a mismatched repository's check must NOT be recorded as evidence
+for this target -- success evidence would vouch for a repository nobody
+confirmed: $out"
+
+# On a confirmed identity the check goes through restic_check_for, which is the
+# one place that records <target>-check.env. A manual run must be recorded
+# exactly like a scheduled one, or the operator's remediation is invisible to
+# check_unit_verdict.
+out="$(id_probe "$HAVE_ID
+$READ_STUBS" 'do_verify_target okmatch')"
+grep -q 'RECORDED-CHECK okmatch' <<< "$out" \
+  || fail "13: a verified target's check must be RECORDED: $out"
+grep -qi 'matches the pinned id' <<< "$out" \
+  || fail "13: verify must state the identity it confirmed: $out"
+
+# verify-restore is the one whose evidence promotes a DR tier, so a mismatch
+# records a FAILURE and refuses -- not a warning, and not a silent skip.
+out="$(id_probe "$HAVE_ID
+$READ_STUBS" 'do_verify_restore bad')"
+grep -q 'RECORDED-RESTORE-VERIFY bad failure' <<< "$out" \
+  || fail "13: a mismatch must RECORD a failure so the tier is not promoted and
+the finding is visible: $out"
+grep -qi 'identity mismatch' <<< "$out" \
+  || fail "13: the recorded reason must name the cause: $out"
+grep -qi 'Refusing to verify a restore' <<< "$out" \
+  || fail "13: it must refuse rather than warn and continue: $out"
+echo " 13: restore refuses, verify reports and records only when confirmed"
+
+# ---------------------------------------------------------------------------
+# 14. MUTATIONS. Against a COPY, so a stopped run cannot leave one behind.
+# ---------------------------------------------------------------------------
+cp "$REPO_ROOT/bin/domum-media-backup" "$TMP_DIR/mut-id"
+cat > "$TMP_DIR/mut14.py" <<'PY'
+import io, sys
+p, which = sys.argv[1], sys.argv[2]
+s = io.open(p, encoding="utf-8").read()
+if which == "noanswer":
+    # Treat "could not read the current id" as a match -- the conflation the
+    # five states exist to prevent.
+    old = "    printf 'no-answer\\t%s\\t' \"$saved_id\""
+    new = "    printf 'match\\t%s\\t' \"$saved_id\""
+elif which == "record":
+    # Record the check even on a mismatch, so success evidence vouches for a
+    # repository nobody confirmed.
+    old = '  if [[ "$id_state" == mismatch ]]; then\n    log "NOTE: the identity does not match'
+    new = '  if [[ "$id_state" != "$id_state" ]]; then\n    log "NOTE: the identity does not match'
+else:
+    raise SystemExit("unknown mutation")
+assert s.count(old) == 1, "anchor %s matched %d times" % (which, s.count(old))
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+print("applied")
+PY
+mut_probe() {  # $1 = extra stubs, $2 = call
+  bash -c "
+set -uo pipefail
+source '$TMP_DIR/mut-id' >/dev/null 2>&1
+log() { echo \"LOG \$*\"; }
+die() { echo \"DIE: \$*\" >&2; exit 9; }
+uppercase_token() { echo T; }
+repo_meta_file() { printf '%s/%s-repo.env' '$TMP_DIR/ident' \"\$1\"; }
+$1
+$2
+" 2>&1
+}
+python3 -I "$TMP_DIR/mut14.py" "$TMP_DIR/mut-id" noanswer >/dev/null \
+  || fail "14: the no-answer mutation did not apply"
+got="$(mut_probe "$NO_ID" 'repo_identity_state okmatch | cut -f1')"
+[ "$got" = "match" ] \
+  || fail "14: the mutation applied but the state did not change, so section 12
+would pass without the distinction: '$got'"
+
+cp "$REPO_ROOT/bin/domum-media-backup" "$TMP_DIR/mut-id"
+python3 -I "$TMP_DIR/mut14.py" "$TMP_DIR/mut-id" record >/dev/null \
+  || fail "14: the recording mutation did not apply"
+out="$(mut_probe "$HAVE_ID
+$READ_STUBS" 'do_verify_target bad')"
+grep -q 'RECORDED-CHECK bad' <<< "$out" \
+  || fail "14: the mutation applied but the mismatched check was still not
+recorded, so section 13's assertion would pass without the guard: $out"
+echo " 14: both mutations change the answer"
+
 echo "PASS: backup target evidence smoke test"
