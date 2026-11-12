@@ -1057,9 +1057,25 @@ service_probe_version() {  # $1 = service
 }
 
 backup_last_success_epoch() {
-  local file="${DOMUM_LOG_DIR}/last-success"
+  local file="${DOMUM_LOG_DIR}/last-success" line
   [[ -f "$file" ]] || return 1
-  date -d "$(head -n1 "$file")" +%s 2>/dev/null || return 1
+  line="$(head -n1 "$file" 2>/dev/null || true)"
+  # An EMPTY marker must read as "cannot tell", never as a successful backup.
+  #
+  # `date -d ""` is NOT an error: GNU date reads an empty string as today at
+  # 00:00:00 and exits 0 -- measured, identical to `date -d 'today 00:00:00'`,
+  # and a whitespace-only string does the same. So a truncated marker used to
+  # fabricate "the backup succeeded today at midnight": checkup reported a
+  # healthy recent backup, and the stateful-update gate below
+  # ("no successful backup timestamp found") PASSED on an invented timestamp.
+  # That is the HEALTHY-must-not-mean-UNMEASURED defect inside the one check
+  # that says whether the photographs are protected.
+  #
+  # Guarding the reader rather than only the writer is deliberate: emptiness has
+  # causes the writer does not control -- a full disk, a marker restored empty,
+  # an operator truncating it.
+  [[ -n "${line//[[:space:]]/}" ]] || return 1
+  date -d "$line" +%s 2>/dev/null || return 1
 }
 
 # Where domum-media-backup records the EXCLUSIVE restic operations (the weekly

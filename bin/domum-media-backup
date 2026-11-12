@@ -810,7 +810,19 @@ latest_snapshot_json() {
 }
 
 heartbeat() {
-  date -Iseconds > "$HEARTBEAT_FILE"
+  # Staged and renamed, never truncated in place: `>` empties the marker before
+  # date writes to it, and an empty marker is indistinguishable from a missing
+  # one only if the READER checks -- which it now does. Same directory, so the
+  # publish is a rename rather than a copy.
+  # FATAL on failure, deliberately unchanged: the CLI runs `set -euo pipefail`
+  # and the old `date -Iseconds > "$HEARTBEAT_FILE"` aborted the run if the
+  # write failed. The heartbeat is a must-happen step -- a backup whose success
+  # was never recorded must fail the unit rather than report success and leave
+  # checkup to raise a separate critical about the missing marker.
+  local hb_tmp="${HEARTBEAT_FILE}.tmp.$$"
+  date -Iseconds > "$hb_tmp"
+  [[ -s "$hb_tmp" ]] || { rm -f "$hb_tmp"; die "refusing to publish an empty backup heartbeat to $HEARTBEAT_FILE"; }
+  mv -f "$hb_tmp" "$HEARTBEAT_FILE"
   if [[ -n "${BACKUP_HEARTBEAT_URL:-}" ]]; then
     curl -fsS --max-time 10 -o /dev/null "$BACKUP_HEARTBEAT_URL" || true
   fi
