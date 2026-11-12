@@ -8959,6 +8959,26 @@ session found in `send_recovery_pack_email` would need the validator to DIE,
 and `validate_backup_env_file` only ever `return 1`s -- checked. "We looked and
 decided no" is worth as much as a fix, and this file already says so.
 
+**A DENIED COMMAND RUNS NONE OF ITS PARTS, INCLUDING THE SETUP, AND I COMMITTED
+TO `main` BECAUSE OF IT.** The branch for this work was created by
+`git checkout -b … && python3 …` -- and that whole command was refused by a
+safety check reading the patch text. I took the refusal as being about the patch,
+re-issued the patch alone, and carried on. The branch had never been created, so
+every later edit and the commit itself landed on `main`, which §8 forbids.
+
+Nothing was pushed: the push failed with `src refspec … does not match any`,
+which is what surfaced it. Recovery was `git branch <name> <sha>` then
+`git reset --hard origin/main` -- and that reset discarded nothing, because the
+commit was already reachable from the new branch. That is the distinction worth
+keeping: a `reset --hard` is only destructive when the content it drops is
+reachable from nowhere else.
+
+Two habits follow. **After any refused command, check what of it did NOT run**
+-- a refusal is atomic, so setup bundled with the refused action is gone too.
+And **`git branch --show-current` before committing**, which costs nothing and
+is the one check that would have caught this immediately rather than at the
+push.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
