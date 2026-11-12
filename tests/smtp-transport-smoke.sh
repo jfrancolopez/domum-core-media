@@ -49,8 +49,15 @@ sect() { echo "== $* =="; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
+# What the drivers LOAD. Defaults to the tracked CLI and is repointed at a
+# mutated copy by mutate() below, so no mutation ever touches bin/.
+MUTCLI="$CLI"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# Taken BEFORE the first section, so the guard at the end proves the tracked
+# CLI was never mutated rather than that the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 command -v curl >/dev/null 2>&1 || { echo "SKIP: curl is not installed"; exit 0; }
 
@@ -117,7 +124,7 @@ DRIVER
 drive() {  # drive <workdir> [VAR=VAL ...]
   local work="$1"; shift
   rm -rf -- "$work"; mkdir -p "$work"
-  env WORK="$work" CLI="$CLI" \
+  env WORK="$work" CLI="$MUTCLI" \
       FIX_USER="${FIX_USER:-domum-fixture-user}" \
       FIX_PASS="${FIX_PASS:-SENTINEL-pw-7f3a9c}" \
       "$@" bash "$TMP/drive.sh" 2>&1
@@ -318,7 +325,7 @@ echo "   ok: absent from both the success and the failure path"
 
 # ===========================================================================
 sect "11. the refusals: no message, no host, missing credential files"
-out="$(env WORK="$TMP/s11" CLI="$CLI" FIX_USER=u FIX_PASS=p bash -c '
+out="$(env WORK="$TMP/s11" CLI="$MUTCLI" FIX_USER=u FIX_PASS=p bash -c '
   mkdir -p "$WORK"; source "$CLI" >/dev/null 2>&1
   die(){ echo "DIE: $*"; exit 90; }
   RECOVERY_PACK_SMTP_HOST=h RECOVERY_PACK_SMTP_PORT=465
@@ -340,7 +347,7 @@ sect "12. it behaves the same under production's shell options"
 # The probe above runs without errexit, so it cannot see an abort that
 # production would take. This section drives the function in its own
 # `set -euo pipefail` bash process.
-out="$(env WORK="$TMP/s12" CLI="$CLI" FIX_USER=u FIX_PASS='SENTINEL-strict' bash -c '
+out="$(env WORK="$TMP/s12" CLI="$MUTCLI" FIX_USER=u FIX_PASS='SENTINEL-strict' bash -c '
   set -euo pipefail
   source "$CLI" >/dev/null 2>&1
   die(){ echo "DIE: $*" >&2; exit 90; }
@@ -359,11 +366,18 @@ echo "   ok: completes under set -euo pipefail"
 # ===========================================================================
 #  Mutations. Each names the observable it actually changes.
 # ===========================================================================
+# Mutations operate on a COPY, and MUTCLI is what the drivers below load.
+# A suite that mutates the TRACKED file can be stopped mid-run and leave it
+# mutated -- which happened twice -- and makes any concurrent run unsound: a
+# deterministic suite failed because another full-suite loop had that file
+# mutated while it read it. unmutate is therefore a pointer reset, not a file
+# restore, so there is nothing to miss if the run stops early.
 mutate() {  # mutate <python-file>
-  cp "$CLI" "$TMP/cli.orig"        # the backup FIRST, unconditionally, on its own line
-  python3 -I "$1" "$CLI" || { cp "$TMP/cli.orig" "$CLI"; fail "the mutation did not apply"; }
+  MUTCLI="$TMP/cli-mutant"
+  cp "$CLI" "$MUTCLI"
+  python3 -I "$1" "$MUTCLI" || fail "the mutation did not apply"
 }
-unmutate() { cp "$TMP/cli.orig" "$CLI"; }
+unmutate() { MUTCLI="$CLI"; }
 
 sect "13. MUTATION -- putting the credential back in argv must be caught"
 cat > "$TMP/m1.py" <<'PY'
@@ -444,7 +458,10 @@ unmutate
 echo "   ok: without -q the planted 'insecure' and extra recipient both apply"
 
 # The tree must be pristine again.
-cmp -s "$CLI" "$TMP/cli.orig" || fail "the CLI was left mutated"
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first
+section -- something mutated it IN PLACE, so stopping this suite part-way would
+leave the change behind and any concurrent run would read it"
 
 echo
 echo "PASS: smtp-transport-smoke (17 sections, 4 mutants)"

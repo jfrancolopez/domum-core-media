@@ -24,12 +24,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the driver LOADS. Defaults to the tracked CLI; a mutation below repoints
+# it at a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer
+# reset rather than a file restore, so an interrupted run leaves nothing behind
+# and a concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 probe() {
   (
     export PATH="$TMP/bin:$PATH"
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     warn() { echo "WARN: $*"; }
     eval "$1"
@@ -160,7 +169,8 @@ echo "  all four verdicts reported, and the limit stated"
 
 # ---------------------------------------------------------------------------
 sect "MUTATION: without the digest comparison any archive claims the identity"
-cp "$CLI" "$TMP/cli.orig"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -170,16 +180,18 @@ new = '    if [[ "$hex" == "$hex" ]]; then printf \'verified\'; return 0; fi'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate.py" "$CLI" ) || { cp "$TMP/cli.orig" "$CLI"; fail "the mutation did not apply"; }
+python3 -I "$TMP/mutate.py" "$MUTCLI" \
+  || fail "the mutation did not apply"
 mv="$(probe "domum_archive_identity '$TMP/a.tar' 'sha256:$other'")"
-cp "$TMP/cli.orig" "$CLI"
+MUTCLI="$CLI"
 [[ "$mv" == "verified" ]] \
   || fail "the mutation changed no ANSWER -- comparing the digest to itself must
 make an archive of a DIFFERENT image claim the identity: $mv"
 echo "  killed: without the comparison, the wrong archive claims the identity"
 
 sect "MUTATION: treating an unreadable archive as verified"
-cp "$CLI" "$TMP/cli.orig2"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate2.py" <<'PYMUT2'
 import io, sys
 p = sys.argv[1]
@@ -189,12 +201,21 @@ new = "  [[ -r \"$arch\" && -n \"$want\" ]] || { printf 'verified'; return 0; }"
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT2
-( python3 -I "$TMP/mutate2.py" "$CLI" ) || { cp "$TMP/cli.orig2" "$CLI"; fail "the second mutation did not apply"; }
+python3 -I "$TMP/mutate2.py" "$MUTCLI" \
+  || fail "the second mutation did not apply"
 mv2="$(probe "domum_archive_identity '$TMP/absent.tar' 'sha256:$id'")"
-cp "$TMP/cli.orig2" "$CLI"
+MUTCLI="$CLI"
 [[ "$mv2" == "verified" ]] \
   || fail "the mutation changed no ANSWER -- an archive that is not there must
 then read as verified, which is the 'I could not check it' defect: $mv2"
 echo "  killed: an absent archive would read as proven"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "ALL ARCHIVE-IDENTITY CHECKS PASSED"

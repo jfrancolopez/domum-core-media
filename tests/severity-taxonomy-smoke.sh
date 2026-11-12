@@ -33,6 +33,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the driver LOADS. Defaults to the tracked CLI; a mutation below repoints
+# it at a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer
+# reset rather than a file restore, so an interrupted run leaves nothing behind
+# and a concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq unavailable"; exit 0; }
 
 mkdir -p "$TMP/bin" "$TMP/state/restore-verification" "$TMP/data" "$TMP/snapshots" \
@@ -66,7 +75,7 @@ probe() {  # $1 = fixture, $2 = function to run
     export SECRETS_DIR="$TMP/secrets" ENABLE_IMMICH=1
     export CFG_FILE="$TMP/domum-media.conf"
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     # The REAL load_cfg, against a real file: it is what applies the defaults
     # the aggregate collector reads, and stubbing it left BACKUP_POLICY unbound.
@@ -333,7 +342,8 @@ echo "  advice is printed, escalates nothing"
 sect "15. MUTATION: advice folded back into actions restores the false alarm"
 # The dangerous direction, and the exact production defect: if advisory
 # remedies escalate, a host with only routine maintenance mails again.
-cp "$CLI" "$TMP/cli.orig"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-advice.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -346,10 +356,10 @@ new = '''    advice)   CHECKUP_ACTIONS+=("$text") ;;'''
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate-advice.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig" "$CLI"; fail "the advice mutation did not apply"; }
+python3 -I "$TMP/mutate-advice.py" "$MUTCLI" \
+  || fail "the advice mutation did not apply"
 mout="$(probe "$MAINT_STUBS" checkup_collect_all)"
-cp "$TMP/cli.orig" "$CLI"
+MUTCLI="$CLI"
 mut_act="$(classes "$mout" ACT)"
 # The observable is the DELTA: with advice treated as action, routine
 # maintenance must start adding actions where it previously added none.
@@ -359,5 +369,13 @@ routine maintenance must add ACTIONS (unmutated $maint_act, mutant $mut_act): $m
 grep -q 'ADV|' <<< "$mout" \
   && fail "the mutant still produced advisories, so the fold did not happen: $mout"
 echo "  killed: folding advice into actions adds $(( mut_act - maint_act )) spurious actions on a quiet host"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "ALL SEVERITY TAXONOMY CHECKS PASSED"

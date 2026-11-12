@@ -8777,6 +8777,68 @@ not evidence that the change under test is wrong; it is evidence that something
 differs, and the tree is part of "something".** Measure what differs before
 reasoning about what it means.
 
+---
+
+**NO TEST WRITES TO A TRACKED CLI ANY MORE: 61 sites across 12 suites
+converted, and an audit now enforces it.** This closes the hazard recorded
+twice above -- a stopped run leaving a neutralised guard in the working tree,
+and the sharper form where two overlapping runs made a deterministic suite fail
+because one had `bin/domum-media` mutated while the other read it.
+
+**The conversion is one indirection, not a rewrite.** `MUTCLI` defaults to
+`$CLI` and is what the driver SOURCES; a mutation repoints it at a copy it just
+mutated; "unmutating" becomes a pointer reset. So there is nothing to miss if
+the run stops early, and nothing for a concurrent run to observe. Two suites
+already used a `CLI="$MUT"` prefix, so the pattern was proven rather than
+invented.
+
+**Four things the conversion taught, each found by RUNNING a suite rather than
+reading the diff:**
+
+- **an initialiser must come after everything it reads.** `MUTCLI="$CLI"`
+  placed beside the helper left it unbound for every earlier section, and
+  `PRISTINE="$TMP/..."` placed beside `CLI=` ran before `TMP` existed. Both
+  killed the suite under `set -u`, in the same conversion, twice.
+- **repointing ONE driver is not enough.** A suite with several drivers routes
+  mutations through any of them, so `monitoring-completeness` passed its first
+  mutation and failed its second. Worse, two of its drivers take the CLI as an
+  ARGUMENT (`probe_systemd "$CLI"`), which no amount of repointing `source`
+  reaches -- the call site has to pass the mutant.
+- **a suite that already passes `CLI="$MUT"` must keep sourcing `$CLI`**, or the
+  prefix silently stops taking effect. `state-capture` and
+  `weekly-report-render` were converted in their own idiom instead of having
+  mine imposed; `state-capture`'s eight `saved_cli`/`CLI=` tree swaps moved to
+  `MUTCLI` so there is one indirection rather than two.
+- **the conversion must be proved LOAD-BEARING.** For two suites the driver was
+  repointed back at the tracked CLI on purpose, and the mutation stopped
+  changing the answer -- which is what shows the repointing matters rather than
+  merely being present.
+
+**THE AUDIT NEARLY SHIPPED REJECTING ITS OWN REMEDY, TWICE.** `cp "$CLI"
+"$MUT"` and `python3 mut.py "$CLI" "$MUT2"` both READ the tracked file to
+produce a copy, which is the prescribed fix -- and both matched a naive
+"mentions a tracked path" rule. The tracked path must be the **destination**,
+i.e. the final argument. This file already records the equivalent constraint on
+the pipefail audit (`||` must not read as a pipe); the novelty is that a DRY RUN
+AGAINST THE REAL TREE is what caught it both times, not reasoning. An audit
+that rejects the remedy it prints is one somebody switches off.
+
+**The smoke test's own hostile fixtures are marked, not exempted by category.**
+A suite reproducing the shape it exists to catch needs an allowance; the
+`# tracked-mutation-audit:` marker exempts its own line only, is read before
+comments are stripped, and every exemption is PRINTED -- so an allowance cannot
+quietly cover a real defect. The marker-on-the-preceding-line case is asserted
+to NOT exempt, because a marker that drifts from the line it vouches for is the
+problem this project has already recorded for a comment between a warning and
+its remedy.
+
+**Each suite also keeps a runtime guard**, comparing the tracked CLI against a
+pristine copy taken before its first section. The audit is static and cannot see
+a runtime write; the guard cannot see a suite that is never run. Neither
+subsumes the other, which is why both are there -- and the guard is the stronger
+form of what three suites already had, since it fails if ANY section mutates in
+place rather than only if the last restore was missed.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

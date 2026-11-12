@@ -19,6 +19,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the driver LOADS. Defaults to the tracked CLI; a mutation below repoints
+# it at a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer
+# reset rather than a file restore, so an interrupted run leaves nothing behind
+# and a concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 # $1 service, $2 CAPTURED_AT, $3 basename, $4 mtime, $5 (optional) "nosha"|"badsha"|"nometa"
 mkpack() {
@@ -41,7 +50,7 @@ probe() {
   local extra="$1"; shift
   (
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     warn() { echo "WARN|$*"; }
     die()  { echo "DIE|$*"; exit 1; }
@@ -186,7 +195,8 @@ reset_packs
 mkpack navidrome 2026-11-09T04:00:00Z a.tar.age 2030-01-01
 mkpack navidrome 2026-11-10T04:00:00Z b.tar.age 2029-01-01
 mkpack navidrome 2026-11-11T04:00:00Z c.tar.age 2020-01-01
-cp "$CLI" "$TMP/cli.orig.rank"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-rank.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -200,10 +210,10 @@ assert len(hits) == 1, "anchor matched %d times" % len(hits)
 lines[hits[0]] = '      at="$(stat -c %Y "$p" 2>/dev/null || echo 0)"'
 io.open(p, "w", encoding="utf-8").write("\n".join(lines))
 PYMUT
-( python3 -I "$TMP/mutate-rank.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.rank" "$CLI"; fail "the ranking mutation did not apply"; }
+python3 -I "$TMP/mutate-rank.py" "$MUTCLI" \
+  || fail "the ranking mutation did not apply"
 mout="$(probe 'STATE_PACK_KEEP=2' state_pack_retention_decisions "$TMP/packs")"
-cp "$TMP/cli.orig.rank" "$CLI"
+MUTCLI="$CLI"
 grep -q '^superseded .*c\.tar\.age$' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- ranking by mtime must supersede the
 NEWEST capture, because the fixture gives it the oldest mtime: $mout"
@@ -213,7 +223,8 @@ sect "MUTATION: treating an unverifiable pack as superseded"
 reset_packs
 mkpack kavita 2026-11-11T04:00:00Z k1.tar.age 2026-11-11 badsha
 mkpack kavita 2026-11-10T04:00:00Z k2.tar.age 2026-11-10
-cp "$CLI" "$TMP/cli.orig.unver"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-unver.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -226,10 +237,10 @@ old = '''    if [[ "$want" != "$got" ]]; then
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
 PYMUT
-( python3 -I "$TMP/mutate-unver.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.unver" "$CLI"; fail "the unverifiable mutation did not apply"; }
+python3 -I "$TMP/mutate-unver.py" "$MUTCLI" \
+  || fail "the unverifiable mutation did not apply"
 mout="$(probe 'STATE_PACK_KEEP=1' state_pack_retention_decisions "$TMP/packs")"
-cp "$TMP/cli.orig.unver" "$CLI"
+MUTCLI="$CLI"
 grep -q '^unverifiable' <<< "$mout" \
   && fail "the mutation changed no ANSWER -- without the check nothing should be
 reported unverifiable: $mout"
@@ -240,7 +251,8 @@ reset_packs
 mkpack navidrome 2026-11-09T04:00:00Z a.tar.age 2026-11-09
 mkpack navidrome 2026-11-10T04:00:00Z b.tar.age 2026-11-10
 mkpack navidrome 2026-11-11T04:00:00Z c.tar.age 2026-11-11
-cp "$CLI" "$TMP/cli.orig.gate"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-gate.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -255,11 +267,11 @@ assert body.count(old) == 1, "anchor matched %d times inside the function" % bod
 io.open(p, "w", encoding="utf-8").write(
     s[:i] + body.replace(old, '  if (( confirm == 99 )); then\n', 1) + s[j:])
 PYMUT
-( python3 -I "$TMP/mutate-gate.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.gate" "$CLI"; fail "the gate mutation did not apply"; }
+python3 -I "$TMP/mutate-gate.py" "$MUTCLI" \
+  || fail "the gate mutation did not apply"
 probe 'STATE_PACK_KEEP=2' storage_prune_state_packs "$TMP/packs" >/dev/null
 left="$(ls -1 "$TMP/packs"/*.tar.age 2>/dev/null | wc -l)"
-cp "$TMP/cli.orig.gate" "$CLI"
+MUTCLI="$CLI"
 [[ "$left" == 3 ]] \
   && fail "the mutation changed no ANSWER -- without the gate a default run must
 delete: $left pack(s) remain"
@@ -393,5 +405,13 @@ grep -qE 'RequiresMountsFor=.*(srv/media|srv/snapshots)' "$U" \
   && fail "it requires a filesystem it does not use, so that filesystem's failure
 would stop a job which could have run"
 echo "  /srv/data only"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "PASS: state pack retention smoke test"

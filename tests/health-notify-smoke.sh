@@ -13,6 +13,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
+# What the driver LOADS. Defaults to the tracked CLI; a mutation below repoints
+# it at a mutated COPY, so bin/ is never written. "Unmutating" is then a pointer
+# reset rather than a file restore, so an interrupted run leaves nothing behind
+# and a concurrent run cannot read a half-mutated file.
+MUTCLI="$CLI"
+# Taken before the first section: the guard at the end proves the tracked CLI was
+# never mutated, which is stronger than proving the last restore ran.
+PRISTINE="$TMP/cli.pristine"
+cp "$CLI" "$PRISTINE"
 
 mkdir -p "$TMP/bin" "$TMP/state/restore-verification" "$TMP/data" "$TMP/secrets"
 # The host must be unreachable: a check that can silently read production is not
@@ -40,7 +49,7 @@ run_notify() {  # $1 = setup shell, rest = argv
     export RECOVERY_PACK_EMAIL_ENABLED=1
     export DOMUM_EMAIL=op@example.invalid
     # shellcheck disable=SC1090
-    source "$CLI" >/dev/null 2>&1
+    source "$MUTCLI" >/dev/null 2>&1
     set +e
     need_root() { :; }
     load_cfg() { :; }
@@ -156,7 +165,8 @@ grep -qi 'ATTENTION' <<< "$out" \
 echo "  one ladder, one word"
 
 sect "MUTATION: a private verdict ladder in the body disagrees with the subject"
-cp "$CLI" "$TMP/cli.orig.verdict"
+MUTCLI="$TMP/cli-mutant"
+cp "$CLI" "$MUTCLI"
 cat > "$TMP/mutate-verdict.py" <<'PYMUT'
 import io, sys
 p = sys.argv[1]
@@ -166,10 +176,10 @@ new = '  local verdict\n  if (( n_warn > 0 )); then verdict="ATTENTION"; else ve
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
-( python3 -I "$TMP/mutate-verdict.py" "$CLI" ) \
-  || { cp "$TMP/cli.orig.verdict" "$CLI"; fail "the verdict mutation did not apply"; }
+python3 -I "$TMP/mutate-verdict.py" "$MUTCLI" \
+  || fail "the verdict mutation did not apply"
 mout="$(run_notify 'checkup_collect_all() { checkup_add warning a; checkup_add warning b; checkup_add advice x; }' --dry-run)"
-cp "$TMP/cli.orig.verdict" "$CLI"
+MUTCLI="$CLI"
 grep -qi 'VERDICT: ATTENTION' <<< "$mout" \
   || fail "the mutation changed no ANSWER -- a private ladder must bring the
 disagreeing word back: $mout"
@@ -321,5 +331,13 @@ grep -q 'checkup_collect_all' <<< "$mnotify" \
 grep -qE '^  checkup_disk_health$' <<< "$mnotify" \
   || fail "the mutant does not call the four directly, so this is not the regression"
 echo "  killed: the mutant reverts to a subset that cannot see a stopped container"
+
+# The tracked CLI must never have been written. Stronger than asserting a
+# restore ran: it fails if any section mutated it IN PLACE, which would leave
+# the change behind if this run stopped early and would be read by any
+# concurrent run. tests/no-tracked-mutation-audit.py enforces the same property
+# statically; this catches a runtime write the audit cannot see.
+cmp -s "$CLI" "$PRISTINE" \
+  || fail "the tracked CLI differs from the pristine copy taken before the first section"
 
 echo "PASS: health-notify smoke test"

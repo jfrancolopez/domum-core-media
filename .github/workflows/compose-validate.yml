@@ -426,6 +426,16 @@ jobs:
       - name: No conflict markers
         run: python3 tests/no-conflict-markers-audit.py
 
+      # A suite that mutates the tracked CLI in place can be stopped mid-run and
+      # leave a neutralised guard behind -- which happened twice -- and makes any
+      # concurrent run unsound: a deterministic suite failed because another
+      # full-suite loop had that file mutated while it read it.
+      - name: No test writes to a tracked CLI
+        run: python3 tests/no-tracked-mutation-audit.py
+
+      - name: No test writes to a tracked CLI smoke test
+        run: tests/no-tracked-mutation-audit-smoke.sh
+
       - name: No conflict markers smoke test
         run: tests/no-conflict-markers-smoke.sh
 
