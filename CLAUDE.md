@@ -9025,6 +9025,127 @@ two functions falling outside both. So: no defect, left alone, recorded. The
 umask sweep found a real second site; this one did not, and saying so is the
 point -- a sweep that only ever reports findings is one nobody believes.
 
+---
+
+**THE VOLUME UPGRADE IS NOW REHEARSED AGAINST REAL CONTAINERS AND TWO REAL
+IMAGES, and the rehearsal found a defect in `bin/domum-media` that no fixture
+could.** `operator/rehearsals/volume-upgrade-rollback-real-containers.sh`,
+2026-11-12. Eight sections, all passing:
+
+```
+0  isolation asserted BEFORE anything exists: project, container name and
+   volume all free; 11 production containers recorded
+3  the volume resolves from the RUNNING container unprivileged, AND tar -C on
+   its mountpoint is still denied -- the documented root blocker verified live
+4a the REAL refusal (unreadable mountpoint) restarts the SAME container id and
+   leaves no staged evidence
+4b real point, real image archive, verified, deployed the NEW image; scope:
+   all 11 other containers unchanged; cleanup WITHHELD the old image
+6  an injected dump failure refuses before the deploy; same container, old image
+7  rollback pins back to the old image and recreates
+8  no container, no volume, no project; 11 running, as before
+```
+
+**THE DEFECT: `service_ready_log_pattern uptime-kuma` WAS VERSION-SPECIFIC.**
+Measured by starting both majors on `--network none`:
+
+```
+uptime-kuma:2   [SETUP-DATABASE] INFO: Listening on:      matched
+uptime-kuma:1   [SERVER]         INFO: Listening on 3001  did NOT
+```
+
+The declaration carried the trailing colon. **A rollback crosses versions by
+definition** -- `rollback_upgrade` restores the OLD image -- so after one, phase
+4 would have reported readiness unproven for a service that was perfectly
+ready. Safe in direction and still a claim about the wrong thing. `Listening
+on` matches both and is the only line containing those words in either image.
+
+**AND A MEASUREMENT WORTH KEEPING: a cross-major uptime-kuma upgrade WILL
+report readiness as unproven.** A v2 container migrating a v1 database takes
+about TWO MINUTES to reach its readiness line; the CLI's default wait is 60s.
+That is the designed behaviour -- absence is reported and never sets rc -- but
+an operator who sees `NOT logged within 60s` after upgrading uptime-kuma should
+know it is expected. The rehearsal asserts the CONTRACT (reported either way,
+and the upgrade still exits 0) rather than requiring the line, because
+requiring it is stricter than the code and would make the rehearsal flaky by
+design.
+
+**ONE SEAM, AND IT IS NAMED PRECISELY.** `docker_volume_mountpoint` returns a
+path under `/var/lib/docker` (`drwx--x--- root:root`), so only that call is
+replaced. Everything it feeds -- quiesce, tar, checksum, verify, restore --
+runs for real. A first attempt stubbed `dump_volume_to_file` instead and was
+**too shallow**: it wrote a file with no checksum sidecar, the verifier
+correctly reported the dump MISSING, and the upgrade correctly refused to
+deploy. The gate working is why the stub had to go.
+
+**THE FIXTURE WAS WRONG ABOUT HOW A DEPLOY HAPPENS, WHICH IS ITSELF THE
+FINDING.** Phase 3 does not pin an image: it runs `compose up -d` and lets the
+TAG resolve. My compose file pinned a literal id, so nothing moved and the
+container was never recreated. The rehearsal now creates its own tag and MOVES
+it -- which is exactly the condition traefik and uptime-kuma are in on this
+host, and exactly why recreating either for a configuration change would deploy
+a staged image as a side effect.
+
+**Five of my own mistakes, each caught by running rather than reading:** a
+suppressed `source` error that reported a missing function instead of a wrong
+path; a `REPO_ROOT` computed for `operator/rehearsals/` while the file sat in a
+scratch directory; an assertion weaker than `service_named_volumes`' real
+contract (it returns `name destination`, and asserting both is stronger); a
+`tail -24` that printed 24 image ids and hid every phase line; and a readiness
+timeout that made the rehearsal report a still-starting container as unready --
+evidence about my timeout, not about readiness.
+
+**AND THE AUDIT CAUGHT SEVEN `cmd | grep -q` SITES IN THE BRAND-NEW FILE, two
+of them in the direction that matters most.** Fourteenth instance of the family,
+written by me in a session spent reading about it. The teardown assertions were
+
+```
+docker ps -a --format '{{.Names}}' | grep -qx "$SVC" && fail "8: $SVC still exists"
+```
+
+Under `pipefail` `grep -q` exits at the first match, `docker ps` takes SIGPIPE,
+the pipeline reports 141 -- so **a container that DOES still exist reads as
+gone**. A teardown assertion that cannot fail, in the rehearsal whose whole
+claim is that it left production untouched. The isolation check at the other
+end had the same shape, so a name that was ALREADY TAKEN would have read as
+free, which is worse: it is the check standing between a disposable project and
+a production container. Also a `| head -30` stop-early consumer, replaced with
+`sed -n '1,30{...;p;}'` over a captured value -- no pipe, so nothing can
+short-circuit.
+
+**I then briefly believed the audit had a blind spot, and my own verification
+was the defect.** It reported five sites where I had fixed seven, so -- applying
+this file's rule that a surprising count means asking what the check cannot see
+-- I built a two-shape fixture and the audit reported nothing against it. The
+audit was right both times: findings print with THREE LEADING SPACES
+(`"   !! %s:%d"`) and my filter anchored `^(!!|==)`, which can match the
+unindented `==` summary line and never a finding. Run unfiltered the fixture
+reports both shapes and exits 1.
+
+So the near-miss is the same shape as the escape-unaware `awk -F` that told me
+to break three correctly-escaped backlog rows: **a verifier whose verdict was
+decided by what it could not see, believed because it was mine.** The rule
+already recorded -- ask what a check cannot see before acting on it -- has to
+include the grep you wrapped around the check. Had I acted on it I would have
+"fixed" a working audit, which is the direction that leaves no witness.
+
+**And shellcheck caught two more in a script that had already run green:** a
+BACKTICK IN A COMMENT INSIDE AN UNQUOTED HEREDOC -- third recorded instance,
+written in a comment about output suppression, where the words would have been
+executed and deleted from the generated harness -- and an `UP_RC` captured and
+never checked, now asserting that a missing readiness line leaves the exit
+status at 0.
+
+**What this does NOT cover, stated so the next reader does not have to
+re-derive it:** the two production `docker-volume` services cannot host this.
+traefik and uptime-kuma are both RUNNING and both set `container_name` equal to
+their service key, so a disposable project cannot use either name --
+`docker create --name uptime-kuma` returns Conflict. Renaming the container
+would break `stop_compose_services_verified`, which compares compose SERVICE
+names against `docker ps` NAMES and is correct only because that invariant
+holds. So the rehearsal declares its own service whose container name equals
+its service name: invariant intact, collides with nothing.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
