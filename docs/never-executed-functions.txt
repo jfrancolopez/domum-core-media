@@ -93,6 +93,21 @@
 #       service_probe_version
 #    1  writes a file: render_traefik_dynamic, above
 #
+# AN ENTRY WAS SILENTLY DROPPED FROM THE LIST, found 2026-11-12 by the header
+# disagreeing with it: the breakdown summed to 59 and the list held 58.
+# `render_traefik_dynamic` was missing while the prose above still described it
+# at length. Checked rather than assumed -- it is still defined in
+# bin/domum-media and referenced by ZERO suites, so it is genuinely still
+# never-executed and the LIST was wrong, not the header. Restored.
+#
+# A dropped entry is a function that silently stops being tracked, which is the
+# worst failure this file can have, so the counts are checkable in one command:
+#
+#   n=$(grep -c '^[a-z_]' docs/never-executed-functions.txt); echo "list=$n"
+#
+# It must equal the total in the breakdown below. Two numbers that must agree
+# are ONE number -- here they are two, in prose, so they are checked instead.
+#
 # NONE of them deletes, recreates a container, writes a credential, or gates a
 # recovery operation. Everything that does is now driven by a test. That is the
 # claim, and the command that produced it is worth re-running rather than
@@ -147,6 +162,7 @@ prompt_secret_value
 prompt_with_default
 prompt_yes_no
 recovery_pack_cmd
+render_traefik_dynamic
 report_render_text
 report_update_candidate
 rollback_list_cmd
