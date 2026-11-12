@@ -8153,6 +8153,64 @@ with the refusal placed so that nothing which implies success runs first.
 
 ---
 
+---
+
+**WHICH REPOSITORY A RESTORE AND A FULL CHECK DEFAULT TO IS A DELIBERATE
+ASYMMETRY, AND NOTHING PROTECTED IT.** Four more of the never-executed
+functions, measured 2026-11-11:
+
+```
+default_restore_target     -> nas      the fast local copy
+default_full_check_target  -> cloud    the authoritative off-site copy
+do_check_deep    nas   --read-data-subset=10%    a sample
+do_check_full    cloud --read-data               every byte
+```
+
+Both pairings are right and neither is interchangeable. A swapped FLAG makes a
+"full" check read 10% and report success -- the weaker claim in the stronger
+claim's words, which is the defect family this file exists to correct. A
+swapped DEFAULTER reads every byte of a local placeholder while the only
+off-site copy goes unverified. **Neither is visible from the exit status**, so
+the observable is the ARGUMENTS, and the test drives the real functions with
+`restic_check_for` recording what it was handed.
+
+Also pinned: nothing enabled must **refuse** rather than return an empty target
+name, which would reach `restic_for_target` and act on an unintended
+repository; and a target that is enabled but does not EXIST must not be chosen,
+which is what `backup_target_exists` is checked for.
+
+**A MUTATION THAT SWAPS A BRANCH'S GUARD WHILE ITS BODY STILL PRODUCES THE
+CORRECT ANSWER APPLIES TEXTUALLY AND CHANGES NOTHING.** My first preference
+mutation rewrote only the condition:
+
+```
+-  if backup_target_exists cloud && backup_target_enabled cloud; then
++  if backup_target_exists nas && backup_target_enabled nas; then
+     echo "cloud"          <- untouched, so the mutant still answered cloud
+```
+
+The anchor matched once, the edit applied, the suite PASSED -- and for a moment
+that read as the new section failing to bite. It bites: the faithful mutation
+swaps the guard AND the answer, and then the assertion fails naming both
+targets. This is a new mechanism for a recorded rule -- *"'assert that a
+mutation actually applied' is not enough; assert that it changed the ANSWER"* --
+and it is subtler than the `[[ … && false ]]` case, because here the mutated
+line really does execute differently while the function's output does not move.
+A guard and the value it guards are two edits.
+
+**The suite's mutation runs against a COPY of the CLI**, so it cannot leave the
+mutant in the working tree if the run is stopped mid-way -- the hazard recorded
+two entries above, where a killed suite left phase 4's model guard neutralised
+and only an unrelated `git checkout` noticed. A mutation that needs no tracked
+file touched should not touch one.
+
+**Fourth instance of stubbing a function nobody calls**: I stubbed
+`enabled_backup_targets`, and these defaulters use `backup_target_exists`,
+`backup_target_enabled` and `backup_target_names`. The stub did nothing, so a
+host with nothing enabled still reported `nas` and the refusal path looked
+covered when it had never been reached. Read the function's own calls before
+writing a stub for it.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

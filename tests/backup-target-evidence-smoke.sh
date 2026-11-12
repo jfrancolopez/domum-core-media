@@ -238,4 +238,183 @@ fi
 grep -q 'restic_for_target .* backup' "$REPO_ROOT/bin/domum-media-backup" \
   || fail "could not find the restic backup invocation; this check is not looking at anything"
 
+
+# ---------------------------------------------------------------------------
+# 5. Which repository a deep check, a full check and a restore DEFAULT to.
+#
+#    `default_restore_target` and `default_full_check_target` are both in the
+#    never-executed set, and they decide which repository three operations act
+#    on when no target is named. The preference is deliberately ASYMMETRIC and
+#    nothing protected it:
+#
+#      restore / --check-deep   prefer nas    the fast local copy
+#      --check-full             prefer cloud  the authoritative off-site copy
+#
+#    Swapping those would send a read-data check at a local placeholder and a
+#    restore across the network, and both would still "work" -- which is why
+#    the asymmetry needs pinning rather than a comment.
+#
+#    NOTE on the stubs: these functions do NOT call enabled_backup_targets.
+#    They use backup_target_exists + backup_target_enabled, and
+#    backup_target_names for the fallback scan. Stubbing the wrong one is a
+#    stub of a function nobody calls, which is how this section was first
+#    written and why it reported `nas` for a host with nothing enabled.
+# ---------------------------------------------------------------------------
+pref() {  # $1 = extra stubs, $2 = function
+  bash -c "
+set -uo pipefail
+source '${PREF_CLI:-$REPO_ROOT/bin/domum-media-backup}' >/dev/null 2>&1
+die() { echo \"DIE: \$*\"; exit 9; }
+$1
+$2
+"
+}
+
+ALL_NAMES='backup_target_names() { printf "%s\n" nas cloud archive; }
+backup_target_exists() { case "$1" in nas|cloud|archive) return 0 ;; *) return 1 ;; esac; }'
+
+out="$(pref "$ALL_NAMES
+backup_target_enabled() { case \"\$1\" in nas|cloud) return 0 ;; *) return 1 ;; esac; }" default_restore_target)"
+[ "$out" = "nas" ] \
+  || fail "5: with nas AND cloud enabled a restore must prefer nas, the fast local copy (got '$out')"
+
+out="$(pref "$ALL_NAMES
+backup_target_enabled() { case \"\$1\" in nas|cloud) return 0 ;; *) return 1 ;; esac; }" default_full_check_target)"
+[ "$out" = "cloud" ] \
+  || fail "5: with nas AND cloud enabled a FULL check must prefer cloud, the
+authoritative off-site copy -- the asymmetry with restore is deliberate (got '$out')"
+
+# nas disabled: both fall back to cloud.
+out="$(pref "$ALL_NAMES
+backup_target_enabled() { case \"\$1\" in cloud) return 0 ;; *) return 1 ;; esac; }" default_restore_target)"
+[ "$out" = "cloud" ] || fail "5: with nas disabled a restore must fall back to cloud (got '$out')"
+
+# This is production's shape: nas configured but explicitly disabled against a
+# default of 1, cloud the only enabled target.
+out="$(pref "$ALL_NAMES
+backup_target_enabled() { case \"\$1\" in cloud) return 0 ;; *) return 1 ;; esac; }" default_full_check_target)"
+[ "$out" = "cloud" ] || fail "5: production's shape must resolve to cloud (got '$out')"
+
+# A target that is enabled but does NOT exist must not be chosen.
+out="$(pref 'backup_target_names() { printf "%s\n" cloud; }
+backup_target_exists() { case "$1" in cloud) return 0 ;; *) return 1 ;; esac; }
+backup_target_enabled() { return 0; }' default_restore_target)"
+[ "$out" = "cloud" ] \
+  || fail "5: nas is 'enabled' here but does not EXIST, so it must not be
+selected -- backup_target_exists is checked for a reason (got '$out')"
+
+# Nothing enabled: refuse, rather than returning an empty target name. An empty
+# name would reach restic_for_target and act on an unintended repository.
+out="$(pref "$ALL_NAMES
+backup_target_enabled() { return 1; }" default_restore_target)"
+grep -q '^DIE:' <<< "$out" \
+  || fail "5: with nothing enabled it must refuse, not return an empty target
+that would reach restic_for_target (got '$out')"
+grep -qi 'No enabled backup targets' <<< "$out" \
+  || fail "5: the refusal does not say why: $out"
+
+out="$(pref "$ALL_NAMES
+backup_target_enabled() { return 1; }" default_full_check_target)"
+grep -q '^DIE:' <<< "$out" \
+  || fail "5: the full-check defaulter must refuse too, via the restore
+defaulter it falls back to (got '$out')"
+echo "  5: restore prefers nas, full check prefers cloud, neither invents a target"
+
+# ---------------------------------------------------------------------------
+# 6. --check-deep reads a percentage that must be defaulted, not unbound.
+# ---------------------------------------------------------------------------
+# A variable only load_cfg sets is unbound for any caller that has not run it,
+# and under `set -u` that kills the process -- the family that once made
+# `checkup` print nothing at all. load_cfg defaults it; this pins that it is
+# defaulted somewhere rather than read raw.
+grep -q 'BACKUP_DEEP_CHECK_PERCENT="\${BACKUP_DEEP_CHECK_PERCENT:-' "$REPO_ROOT/bin/domum-media-backup" \
+  || fail "6: BACKUP_DEEP_CHECK_PERCENT is not defaulted, so --check-deep dies
+under set -u for any caller that has not run load_cfg"
+echo "  6: the deep-check percentage is defaulted"
+
+
+# ---------------------------------------------------------------------------
+# 7. MUTATION: swapping the full check's preference to nas must be caught.
+#
+#    The mutation runs against a COPY, so it cannot leave the real CLI
+#    mutated -- a suite that mutates a tracked file is a suite that can be
+#    stopped mid-run and leave the mutant behind.
+# ---------------------------------------------------------------------------
+cp "$REPO_ROOT/bin/domum-media-backup" "$TMP_DIR/mut-cli"
+cat > "$TMP_DIR/mut7.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '\ndefault_full_check_target() {\n  if backup_target_exists cloud && backup_target_enabled cloud; then\n    echo "cloud"\n'
+new = '\ndefault_full_check_target() {\n  if backup_target_exists nas && backup_target_enabled nas; then\n    echo "nas"\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+print("applied")
+PY
+python3 -I "$TMP_DIR/mut7.py" "$TMP_DIR/mut-cli" >/dev/null || fail "7: the preference mutation did not apply"
+out="$(PREF_CLI="$TMP_DIR/mut-cli" pref "$ALL_NAMES
+backup_target_enabled() { case \"\$1\" in nas|cloud) return 0 ;; *) return 1 ;; esac; }" default_full_check_target)"
+[ "$out" = "nas" ] \
+  || fail "7: the mutation applied but did not change the answer, so section 5
+would pass against a swapped preference (got '$out')"
+echo "  7: swapping the full check onto nas is caught"
+
+
+# ---------------------------------------------------------------------------
+# 8. --check-deep and --check-full are DIFFERENT checks on DIFFERENT targets.
+#
+#    Both are one-liners and both were in the never-executed set. What makes
+#    them worth driving is that each pairs a flag with a defaulter, and the two
+#    pairings are not interchangeable:
+#
+#      --check-deep   nas    --read-data-subset=<percent>   a sample
+#      --check-full   cloud  --read-data                    every byte
+#
+#    A swapped flag would make a "full" check read 10% and report success,
+#    which is the weaker claim in the stronger claim's words -- and a swapped
+#    defaulter would read every byte of a local placeholder while the
+#    authoritative off-site copy went unverified. Neither is visible from the
+#    exit status, so the ARGUMENTS are the observable.
+# ---------------------------------------------------------------------------
+check_args() {  # $1 = function
+  bash -c "
+set -uo pipefail
+source '$REPO_ROOT/bin/domum-media-backup' >/dev/null 2>&1
+die() { echo \"DIE: \$*\"; exit 9; }
+BACKUP_DEEP_CHECK_PERCENT='10%'
+backup_target_names() { printf '%s\n' nas cloud; }
+backup_target_exists() { case \"\$1\" in nas|cloud) return 0 ;; *) return 1 ;; esac; }
+backup_target_enabled() { case \"\$1\" in nas|cloud) return 0 ;; *) return 1 ;; esac; }
+check_repo_identity() { echo \"IDENTITY \$1\"; }
+restic_check_for() { echo \"CHECK \$*\"; }
+$1
+"
+}
+
+out="$(check_args do_check_deep)"
+grep -qx 'CHECK nas --read-data-subset=10%' <<< "$out" \
+  || fail "8: a deep check must read a SUBSET of nas, the fast local copy: $out"
+grep -qx 'IDENTITY nas' <<< "$out" \
+  || fail "8: a deep check must verify the repository identity first: $out"
+grep -q -- '--read-data$' <<< "$out" \
+  && fail "8: a deep check must NOT read every byte -- that is the full check: $out"
+
+out="$(check_args do_check_full)"
+grep -qx 'CHECK cloud --read-data' <<< "$out" \
+  || fail "8: a FULL check must read every byte of cloud, the authoritative
+off-site copy: $out"
+grep -qx 'IDENTITY cloud' <<< "$out" \
+  || fail "8: a full check must verify the repository identity first: $out"
+grep -q 'read-data-subset' <<< "$out" \
+  && fail "8: a full check must not degrade to a subset: $out"
+
+# An explicitly named target overrides the preference in both.
+out="$(check_args 'do_check_deep cloud')"
+grep -qx 'CHECK cloud --read-data-subset=10%' <<< "$out" \
+  || fail "8: a named target must override the deep check's default: $out"
+out="$(check_args 'do_check_full nas')"
+grep -qx 'CHECK nas --read-data' <<< "$out" \
+  || fail "8: a named target must override the full check's default: $out"
+echo "  8: deep reads a subset of nas, full reads every byte of cloud"
+
 echo "PASS: backup target evidence smoke test"

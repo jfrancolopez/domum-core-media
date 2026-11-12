@@ -4,12 +4,15 @@
 # has over-reported every time it was used -- report the instrumented figure.
 #
 # CLOSED since the sweep (driven, with a mutation each):
-#   do_weekly_retention   the only retention that runs on this host
-#   do_check              skipped every later target's repository on a failure
+#   do_weekly_retention       the only retention that runs on this host
+#   do_check                  skipped every later target's repository on a failure
+#   default_restore_target    restore/deep check prefer nas, the fast local copy
+#   default_full_check_target full check prefers cloud, the authoritative copy
+#   do_check_deep             reads a SUBSET; a swapped flag reads 10% and
+#   do_check_full             reports "full", the weaker claim in stronger words
 #
 # Remaining consequential ones, in the order to work in:
-#   do_check_deep, do_check_full, cleanup_snapshots_execute, do_restore,
-#   do_verify_target, do_adopt_repo
+#   cleanup_snapshots_execute, do_restore, do_verify_target, do_adopt_repo
 # immich_reset_db is likely a name-grep false positive -- covered by suites that
 # reference its GATE rather than the arm -- so read it before testing it.
 apply_update_delay_profile
@@ -28,11 +31,7 @@ configure_traefik_dashboard_secret
 container_image_ref
 container_mount_list
 container_status_summary
-default_full_check_target
-default_restore_target
 do_adopt_repo
-do_check_deep
-do_check_full
 doctor_backups
 doctor_cmd
 doctor_immich
