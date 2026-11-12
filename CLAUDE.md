@@ -8153,6 +8153,248 @@ with the refusal placed so that nothing which implies success runs first.
 
 ---
 
+---
+
+**WHICH REPOSITORY A RESTORE AND A FULL CHECK DEFAULT TO IS A DELIBERATE
+ASYMMETRY, AND NOTHING PROTECTED IT.** Four more of the never-executed
+functions, measured 2026-11-11:
+
+```
+default_restore_target     -> nas      the fast local copy
+default_full_check_target  -> cloud    the authoritative off-site copy
+do_check_deep    nas   --read-data-subset=10%    a sample
+do_check_full    cloud --read-data               every byte
+```
+
+Both pairings are right and neither is interchangeable. A swapped FLAG makes a
+"full" check read 10% and report success -- the weaker claim in the stronger
+claim's words, which is the defect family this file exists to correct. A
+swapped DEFAULTER reads every byte of a local placeholder while the only
+off-site copy goes unverified. **Neither is visible from the exit status**, so
+the observable is the ARGUMENTS, and the test drives the real functions with
+`restic_check_for` recording what it was handed.
+
+Also pinned: nothing enabled must **refuse** rather than return an empty target
+name, which would reach `restic_for_target` and act on an unintended
+repository; and a target that is enabled but does not EXIST must not be chosen,
+which is what `backup_target_exists` is checked for.
+
+**A MUTATION THAT SWAPS A BRANCH'S GUARD WHILE ITS BODY STILL PRODUCES THE
+CORRECT ANSWER APPLIES TEXTUALLY AND CHANGES NOTHING.** My first preference
+mutation rewrote only the condition:
+
+```
+-  if backup_target_exists cloud && backup_target_enabled cloud; then
++  if backup_target_exists nas && backup_target_enabled nas; then
+     echo "cloud"          <- untouched, so the mutant still answered cloud
+```
+
+The anchor matched once, the edit applied, the suite PASSED -- and for a moment
+that read as the new section failing to bite. It bites: the faithful mutation
+swaps the guard AND the answer, and then the assertion fails naming both
+targets. This is a new mechanism for a recorded rule -- *"'assert that a
+mutation actually applied' is not enough; assert that it changed the ANSWER"* --
+and it is subtler than the `[[ … && false ]]` case, because here the mutated
+line really does execute differently while the function's output does not move.
+A guard and the value it guards are two edits.
+
+**The suite's mutation runs against a COPY of the CLI**, so it cannot leave the
+mutant in the working tree if the run is stopped mid-way -- the hazard recorded
+two entries above, where a killed suite left phase 4's model guard neutralised
+and only an unrelated `git checkout` noticed. A mutation that needs no tracked
+file touched should not touch one.
+
+**Fourth instance of stubbing a function nobody calls**: I stubbed
+`enabled_backup_targets`, and these defaulters use `backup_target_exists`,
+`backup_target_enabled` and `backup_target_names`. The stub did nothing, so a
+host with nothing enabled still reported `nas` and the refusal path looked
+covered when it had never been reached. Read the function's own calls before
+writing a stub for it.
+
+---
+
+**BOTH SNAPSHOT DELETERS PROTECTED NOTHING, WHILE `cleanup images` CAREFULLY
+PROTECTED THE OTHER HALF OF THE SAME RECOVERY POINT.** Found 2026-11-11 while
+reading `cleanup_snapshots_execute`, one of the never-executed functions.
+
+This file's most-repeated rule is that a recovery point is **service +
+snapshot + the application that wrote it**, and it records at length how
+`cleanup images` was fixed so that an image a recovery point names can never be
+deleted -- *"the snapshot would still restore the data while the application
+that wrote it became unobtainable."* The symmetric half was never done.
+`snapshot_prune` and `cleanup_snapshot_candidates` both selected victims purely
+by **age and count**, consulted no recovery evidence of any kind, and the
+protected set is trivially available: `bind_recovery_point_metadata` writes
+`<point>.recovery` into `$DOMUM_STATE_ROOT/snapshots`, and `<point>` IS the
+snapshot name.
+
+Measured read-only on this host, which is what makes it more than a symmetry
+argument:
+
+```
+calibre-web-20261009-131921-post-migration   <- oldest for calibre-web
+calibre-web-20261009-144443-pre-upgrade
+jellyfin-20260925-153317-post-migration      <- oldest for jellyfin
+kavita-20260929-001131-post-migration        <- oldest for kavita
+navidrome-20260929-175657-post-migration     <- oldest for navidrome
+plex-20261006-133511-post-migration          <- oldest for plex
+plex-20261008-121553-pre-upgrade
+```
+
+Every snapshot on this host is half of a recovery point, and **the OLDEST
+snapshot of every migrated service is its migration proof snapshot** -- which
+is the first thing an age-ordered retention policy deletes. This file says
+those *"are both retained deliberately and must not be deleted without the
+operator saying so."* Nothing enforced that.
+
+**Latent, not live, and the reason is the count.** `keep` is 14 and no service
+has more than two, so `drop` is negative for every base today and the weekly
+job deletes nothing. It arms as pre-upgrade points accumulate: the fifteenth
+snapshot of any service makes its proof snapshot the victim. Production's
+`SNAPSHOT_KEEP_PER_SUBVOL` cannot be read from this account (`0600 root`), so a
+lower value there would arm it sooner -- stated rather than assumed.
+
+**RETENTION NOW APPLIES TO THE PRUNABLE POPULATION, which is the only version
+of this fix that converges.** The obvious implementation -- skip a protected
+victim -- would mean that protecting the oldest merely stops the root
+converging: `drop` stays 1, the one victim is skipped, nothing is deleted, and
+the count grows every week. That is the same shape as a swallowed delete, which
+this function's own comment already refuses: *"nobody finds out: the operator
+sees a clean weekly run while the count grows."* So a recovery point is removed
+from the population **before** `drop` is computed, and the policy becomes
+statable: **keep N ordinary snapshots per subvolume, plus every recovery point,
+unconditionally.** The total on disk can therefore exceed N, which is correct,
+because a recovery point is not a routine snapshot.
+
+**UNREADABLE EVIDENCE IS NOT "NOTHING IS PROTECTED".** `snapshot_recovery_point_names`
+has three states: the set, `2` for evidence that exists and could not be read,
+and `0`-with-nothing for an **absent** directory -- which is the honest reading,
+since `ensure_state_dirs` creates it and it is empty before the first migration.
+Refusing on absence would stop a pre-migration host pruning at all. Both
+deleters refuse on `2`: the prune warns and returns 1, which fails the unit and
+reaches `checkup_systemd_health`, and `cleanup_snapshots_execute` dies.
+
+**The selector had to stop being read through a process substitution.**
+`done < <(cleanup_snapshot_candidates)` discards the producer's status, so a
+refusal would have read as *"no snapshots are protected"* -- the conflation this
+project keeps correcting, here in a **deletion** path. Captured first, status
+checked. `cleanup_summary` needed the same treatment for a different reason:
+`candidates | wc -l` reports the producer's status under pipefail, so a refusal
+would have aborted the summary, and the report prints only after every line is
+built -- a blank screen, indistinguishable from a healthy one, which is the
+defect that once blanked `checkup` in production.
+
+**The prune STATES what it protected, including zero.** A deletion tool that
+silently omits things gives no way to notice the protection broke -- the rule
+already recorded for `cleanup images`'s dry run.
+
+**AN ABSENCE ASSERTION IN THAT SUITE COULD NEVER FIRE, and it is the suite
+guarding the live weekly deleting job.** `snapshot_prune` runs
+`btrfs subvolume delete "$victim" >&2`, so a `btrfs` stub that echoes writes to
+**stderr**, while `out="$(bash -c ...)"` takes only stdout. Section 5's
+`grep -q 'DELETE' <<< "$out" && fail "the weekly prune would delete the only
+recovery point"` therefore matched nothing whatever the code did; the directory
+check beneath it is what had been holding the section up. Found because my own
+new section counted `^DELETE` and got 0 while `DELETE` was visibly printing to
+the terminal. The robust idiom is section 1's: a stub that **deletes for real**
+(`rm -rf`) with the assertions made against the filesystem, plus `2>&1` when a
+message is the subject -- `warn` is on stderr too.
+
+**A `docker` stub that FAILS kills the shell, because sourcing the CLI turns
+errexit back on.** The harness sets `set -uo pipefail`, and `source
+bin/domum-media` runs its own `set -euo pipefail`, so the harness's options are
+overridden. My `docker() { return 1; }` made `cleanup_summary`'s first
+assignment fail and the section measured that abort instead of the snapshot
+branch -- it produced no output at all, which read as the new code failing.
+A stub returns 0 and prints nothing when the point is to make a command
+irrelevant, not to make it fail.
+
+**AND I TRUSTED A RESTORE'S EXIT STATUS INSTEAD OF READING THE FILE.** The
+mutation restore printed `restored` from a `cp ... && echo`, and the mutant was
+still in `bin/domum-media` -- confirmed by byte count and by grepping for the
+property. The next section then failed with the mutant's message, which read as
+my new code being wrong and cost a detour. `cp` reporting success is not
+evidence that the file holds what you think: **grep the restored property**, the
+same discipline this file already requires for asserting that a mutation
+applied. Two entries above this one records a killed suite leaving a mutant in
+the tree; this is the same hazard reached through a restore that looked fine.
+
+---
+
+**`backup adopt-repo` REWROTE THE REPOSITORY IDENTITY PIN WITH NO GATE, WHILE
+`backup init --adopt-existing` HAS REFUSED THE SAME MUTATION ALL ALONG.** Two
+more never-executed functions, found 2026-11-11.
+
+`check_repo_identity` is what refuses a backup or a restore against a
+repository that is not the one this host pinned -- *"this prevents accidental
+split-brain backups"*, as `docs/SETUP-RESTIC.md` puts it. Adoption **overwrites
+that pin**. §6 of this file lists *"adoption of an existing production
+repository"* among the operations requiring explicit approval, and the setup
+document tells the operator to adopt only *"after independently verifying that
+the new target is intentional"* -- **a rule stated in prose that nothing
+applied.** Measured: `do_adopt_repo cloud` wrote the new pin immediately and
+reported `Repository adopted.`
+
+Two paths reach that same file and their gates were asymmetric:
+`do_init_repo` dies with *"Repository metadata already exists... Use
+--adopt-existing to overwrite"*, while `do_adopt_repo` had nothing. An
+asymmetric gate on one mutation is the "a fact appears twice" failure in
+executable form -- and the weaker path is the one `check_repo_identity`'s own
+error message recommends.
+
+Three things the fix does, each a rule already recorded here:
+
+- **`--confirm` is required**, and the refusal states what adopting changes and
+  names the gated command, because an unactionable refusal is as useless as a
+  missing gate;
+- **the pin being replaced is PRESERVED** as
+  `<target>-repo.env.superseded-<timestamp>`. It records the repository this
+  host was backing up to, which is the only way to answer afterwards what the
+  mismatch was *between*; overwriting a known-good recovery artefact without
+  preserving it first is forbidden. A collision on that name refuses rather
+  than overwriting;
+- **the write is atomic** -- staged in the pin's OWN directory and renamed, so
+  the live pin is never half-written. This matters here specifically:
+  `check_repo_identity` returns 0 when `REPOSITORY_ID` is empty, so a truncated
+  pin reads as *"nothing to check"* and an interrupted adopt would silently
+  disable the identity control. Same mechanism as the `config_set` fix, where
+  `mv` from `$TMPDIR` across filesystems was a copy-in-place.
+
+**`--restore` IS THE COMMAND RUN WHILE THE HOST IS GONE, and two defects made
+it describe the wrong problem.** Measured against the real function:
+
+```
+do_restore latest                     -> DIE: Unknown restore arg: latest
+--repo cloud, nothing enabled         -> DIE: No enabled backup targets found.
+--repo with no value                  -> bash: $2: unbound variable
+```
+
+The first blamed the SNAPSHOT as an unknown option and never reached the usage
+line, because `shift 2 || true` leaves `$1` as the snapshot when the option
+loop runs. The second evaluated `default_restore_target` -- which **dies** when
+nothing is enabled -- *before* parsing the flag that exists in order to replace
+it, so an explicitly named repository could not save a host whose targets are
+all disabled. The usage check now precedes the loop and the default is resolved
+after it.
+
+**THE DEFAULTER THAT DIED WAS WHAT MADE THE TEST LOOK BROKEN.** My probe's
+`die` stub echoed to **stdout**, and `repo="$(default_restore_target)"` calls
+it inside a command substitution: the message was captured INTO `$repo`, `exit`
+ended only the subshell, and the sourced CLI's own `set -euo pipefail` then
+killed the probe with no output at all. The section failed with an empty
+string, which reads as the new code producing nothing. A stub must be faithful
+in the respect being measured -- `die` writes to stderr in production, and the
+same artefact had already cost a detour in the `cleanup_summary` section
+earlier the same day.
+
+**AND A `grep -c` THAT REPORTED 0 FOR A LINE THAT IS PRESENT nearly sent me
+chasing a restore that had worked.** Verifying the mutation restore by property
+-- the rule written one entry above -- the check itself answered wrongly, and
+`diff` against the pre-mutation copy showed the file byte-identical. So the
+property check needs the same suspicion as the thing it checks: when a
+verification disagrees with a passing suite, verify the verification. `diff`
+against the backup copy is the stronger form and costs nothing.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

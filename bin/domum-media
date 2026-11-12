@@ -2423,6 +2423,48 @@ To proceed deliberately without rollback protection, set SNAPSHOT_POLICY=WARN in
 # the default rather than failing a weekly timer forever.
 #
 # This also removes the need to trust the config to know the Sunday job is safe.
+# Snapshot names that a recovery point's evidence names. ONE implementation,
+# consumed by BOTH snapshot deleters: two copies would be two chances to delete
+# the DATA half of a recovery point while `cleanup images` carefully protects
+# the application half.
+#
+# A recovery point is service + snapshot + the application that wrote it, and
+# the point's NAME is the snapshot's name -- `bind_recovery_point_metadata`
+# writes "<point>.recovery" into the metadata directory, where <point> is the
+# proof snapshot. So the protected set is exactly that directory's listing.
+#
+# Three states, because "there are none" and "I could not look" are different
+# facts and only one of them is safe to prune on:
+#   0  the set, on stdout (possibly empty)
+#   2  the evidence exists and could not be READ -- both callers refuse
+# An ABSENT directory returns 0 with nothing, which is the honest reading: it
+# is created by ensure_state_dirs and is empty before the first migration.
+snapshot_recovery_point_names() {
+  local dir f
+  dir="$(snapshot_metadata_dir)"
+  [[ -e "$dir" ]] || return 0
+  [[ -d "$dir" && -r "$dir" && -x "$dir" ]] || return 2
+  for f in "$dir"/*.recovery; do
+    [[ -e "$f" ]] || continue
+    basename -- "$f" .recovery
+  done
+}
+
+# Loads the protected set into the associative array named by $1. Returns 2 if
+# the evidence could not be read, so the caller can refuse rather than prune
+# blind. Deliberately not a captured function: it assigns, it does not print.
+load_recovery_point_protection() {  # $1 = name of an associative array
+  local -n _rp_out="$1"
+  local listing rc=0 name
+  listing="$(snapshot_recovery_point_names)" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    _rp_out["$name"]=1
+  done <<< "$listing"
+  return 0
+}
+
 snapshot_retention_keep() {
   local raw="${1:-}" keep
   if [[ "$raw" =~ ^[0-9]+$ ]]; then
@@ -2442,14 +2484,37 @@ snapshot_retention_keep() {
 snapshot_prune() {
   local keep
   keep="$(snapshot_retention_keep "${SNAPSHOT_KEEP_PER_SUBVOL:-}")"
-  local pruned=0 failed=0
+  local pruned=0 failed=0 protected_seen=0
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
+
+  # Retention applies to the PRUNABLE population. A snapshot a recovery point
+  # names is kept unconditionally and does not count toward the keep figure --
+  # otherwise protecting the oldest would merely stop the root converging, and
+  # a weekly job that silently stops converging is the defect this function's
+  # own failure handling exists to avoid. So the policy is statable: keep N
+  # ordinary snapshots per subvolume, PLUS every recovery point.
+  local -A rp_protected=()
+  if ! load_recovery_point_protection rp_protected; then
+    warn "Refusing to prune: the recovery-point evidence in $(snapshot_metadata_dir) could not be read."
+    warn "Pruning without it could delete the snapshot half of a recovery point."
+    return 1
+  fi
+
   local names
   names="$(find "$DOMUM_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
-    local snaps
-    mapfile -t snaps < <(list_snapshots_for_base "$base")
+    local all_snaps
+    mapfile -t all_snaps < <(list_snapshots_for_base "$base")
+    local -a snaps=()
+    local s_name
+    for s_name in ${all_snaps[@]+"${all_snaps[@]}"}; do
+      if [[ -n "${rp_protected[$s_name]:-}" ]]; then
+        protected_seen=$(( protected_seen + 1 ))
+        continue
+      fi
+      snaps+=("$s_name")
+    done
     local total="${#snaps[@]}"
     local drop=$(( total - keep ))
     if (( drop > 0 )); then
@@ -2472,7 +2537,9 @@ snapshot_prune() {
     fi
   done <<< "$names"
 
-  echo "[domum-media] Snapshot prune: ${pruned} deleted, ${failed} failed (keeping ${keep} per subvolume)."
+  # A deletion tool that silently omits things gives no way to notice the
+  # protection broke, so the figure is always stated -- including zero.
+  echo "[domum-media] Snapshot prune: ${pruned} deleted, ${failed} failed, ${protected_seen} kept as recovery points (keeping ${keep} prunable per subvolume)."
   (( failed == 0 ))
 }
 
@@ -5064,12 +5131,27 @@ cleanup_snapshot_candidates() {
   keep_cleanup="$(snapshot_retention_keep "${CLEANUP_OLD_SNAPSHOTS_KEEP:-$keep_policy}")"
   keep="$keep_policy"
   (( keep_cleanup > keep )) && keep="$keep_cleanup"
-  local names base total drop i
+  local names base total drop i s_name
+  local -a snaps=() all_snaps=()
   [[ -d "$DOMUM_SNAPSHOT_ROOT" ]] || return 0
+
+  # Same protection as snapshot_prune, through the same implementation. A
+  # snapshot a recovery point names is never a candidate and never counts
+  # toward the keep figure. Returning 2 when the evidence cannot be read lets
+  # cleanup_snapshots_execute refuse instead of offering recovery points for
+  # deletion; a selector that guessed would be the WIDER-than-candidates
+  # mistake in reverse.
+  local -A rp_protected=()
+  load_recovery_point_protection rp_protected || return 2
   names="$(find "$DOMUM_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sed -E 's/-[0-9]{8}-[0-9]{6}-.*$//' | sort -u || true)"
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
-    mapfile -t snaps < <(list_snapshots_for_base "$base")
+    mapfile -t all_snaps < <(list_snapshots_for_base "$base")
+    snaps=()
+    for s_name in ${all_snaps[@]+"${all_snaps[@]}"}; do
+      [[ -n "${rp_protected[$s_name]:-}" ]] && continue
+      snaps+=("$s_name")
+    done
     total="${#snaps[@]}"
     drop=$(( total - keep ))
     if (( drop > 0 )); then
@@ -5084,10 +5166,23 @@ cleanup_snapshots_execute() {
   local dry_run="${1:-1}"
   local confirm="${2:-0}"
   local -a victims=()
+  # Captured, not read through a process substitution: a process substitution
+  # discards the producer's exit status, so an unreadable recovery-point
+  # evidence directory would read as "no snapshots are protected" -- the
+  # conflation this project keeps correcting, in a DELETION path.
+  local listing rc=0
+  listing="$(cleanup_snapshot_candidates)" || rc=$?
+  if (( rc == 2 )); then
+    die "Refusing destructive cleanup: the recovery-point evidence in $(snapshot_metadata_dir) could not be read.
+Without it, a snapshot that is half of a recovery point cannot be told from an
+ordinary one, and deleting it would leave the application image protected with
+nothing for it to restore."
+  fi
+  (( rc == 0 )) || die "Could not determine which snapshots are beyond retention (status $rc)."
   while IFS= read -r snap; do
     [[ -n "$snap" ]] || continue
     victims+=("$snap")
-  done < <(cleanup_snapshot_candidates)
+  done <<< "$listing"
 
   if (( ${#victims[@]} == 0 )); then
     echo "[domum-media] No pruneable snapshots found."
@@ -5111,7 +5206,18 @@ cleanup_summary() {
   local dangling exited old_snaps
   dangling="$(docker images --filter dangling=true -q 2>/dev/null | wc -l | tr -d ' ')"
   exited="$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l | tr -d ' ')"
-  old_snaps="$(cleanup_snapshot_candidates | wc -l | tr -d ' ')"
+  # Captured first and the status checked: a pipeline reports the producer's
+  # status under pipefail, so `candidates | wc -l` would make an unreadable
+  # evidence directory abort cleanup entirely -- and the report prints only
+  # after every line is built, so that reads as nothing at all.
+  local snap_listing snap_rc=0
+  snap_listing="$(cleanup_snapshot_candidates)" || snap_rc=$?
+  if (( snap_rc == 0 )); then
+    old_snaps="$(grep -c . <<< "$snap_listing" || true)"
+    [[ -n "$snap_listing" ]] || old_snaps=0
+  else
+    old_snaps="unknown (the recovery-point evidence could not be read)"
+  fi
   echo "Cleanup summary:"
   echo "  Dangling images: $dangling"
   echo "  Exited containers: $exited"

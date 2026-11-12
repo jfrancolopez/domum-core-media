@@ -286,7 +286,8 @@ check_repo_identity() {
   Expected: $saved_id
   Current:  $current_id
   This usually means BACKUP_TARGET_$(uppercase_token "$target")_REPOSITORY or port changed.
-  Run: sudo domum-media backup adopt-repo $target"
+  Run, once you have verified the new target is the one you mean:
+    sudo domum-media backup adopt-repo $target --confirm"
   fi
 }
 
@@ -959,13 +960,23 @@ do_check_full() {
 do_restore() {
   local snap="${1:-}"
   local target_dir="${2:-}"
-  local repo
-  repo="$(default_restore_target)"
-  shift 2 || true
+  local repo=""
+  # The usage check comes BEFORE the option loop. With `shift 2 || true` and a
+  # single argument the shift fails, $1 is still the SNAPSHOT when the loop
+  # runs, and a forgotten target directory died with
+  # "Unknown restore arg: latest" -- the snapshot blamed as an unknown option,
+  # with the usage line below unreachable. This is the one command an operator
+  # runs while the host is gone, so an unactionable message costs the most here.
+  [[ -n "$snap" && -n "$target_dir" ]] || die "Usage: --restore <snapshot> <target> [--repo target-name]"
+  shift 2
   while (( $# )); do
     case "$1" in
       --repo)
-        repo="$2"
+        # "${2:-}" and an explicit check: a bare --repo used to read $2 under
+        # `set -u`, which dies with a bash unbound-variable error naming a
+        # positional parameter rather than the flag.
+        repo="${2:-}"
+        [[ -n "$repo" ]] || die "--repo needs a target name."
         shift 2
         ;;
       *)
@@ -973,7 +984,12 @@ do_restore() {
         ;;
     esac
   done
-  [[ -n "$snap" && -n "$target_dir" ]] || die "Usage: --restore <snapshot> <target> [--repo target-name]"
+  # Resolved AFTER parsing, because default_restore_target DIES when no target
+  # is enabled: evaluating it first made an explicitly named --repo depend on
+  # the defaulter it was given in order to replace. Measured -- with every
+  # target disabled, `--restore latest /t --repo cloud` died with
+  # "No enabled backup targets found."
+  [[ -n "$repo" ]] || repo="$(default_restore_target)"
   log "restic restore $snap -> $target_dir (from $repo)"
   mkdir -p "$target_dir"
   restic_for_target "$repo" restore "$snap" --target "$target_dir"
@@ -1828,7 +1844,36 @@ do_verify_target() {
 
 do_adopt_repo() {
   local target="${1:-}"
-  [[ -n "$target" ]] || die "Usage: backup adopt-repo <target>"
+  local confirm=0
+  [[ -n "$target" ]] || die "Usage: backup adopt-repo <target> --confirm"
+  shift || true
+  while (( $# )); do
+    case "$1" in
+      --confirm) confirm=1 ;;
+      *) die "Usage: backup adopt-repo <target> --confirm" ;;
+    esac
+    shift
+  done
+
+  # Adoption REWRITES the repository identity pin, which is the control
+  # check_repo_identity uses to refuse acting on a repository that is not the
+  # one this host backs up to. CLAUDE.md lists "adoption of an existing
+  # production repository" among the operations needing explicit approval, and
+  # docs/SETUP-RESTIC.md tells the operator to adopt only "after independently
+  # verifying that the new target is intentional" -- a rule stated in prose
+  # that nothing applied. `backup init --adopt-existing` has refused to
+  # overwrite an existing pin all along; this second path to the same mutation
+  # had no gate at all.
+  if (( confirm == 0 )); then
+    die "Refusing to adopt without --confirm.
+Adopting rewrites $target's repository identity pin, which is what refuses a
+backup or a restore against a repository that is not the one this host uses.
+A mismatch is the signal that the URL, the port or the repository changed;
+adopt only once you have verified independently that the new target is the one
+you mean.
+
+  sudo domum-media backup adopt-repo $target --confirm"
+  fi
 
   load_cfg
   export_compose_env
@@ -1846,12 +1891,38 @@ do_adopt_repo() {
   mkdir -p "$REPO_META_DIR"
   local meta_file
   meta_file="$(repo_meta_file "$target")"
-  cat > "$meta_file" <<EOF
+
+  # The pin being replaced is EVIDENCE: it records the repository this host was
+  # backing up to, which is the only way to tell afterwards what the mismatch
+  # was between. Overwriting a known-good recovery artefact without preserving
+  # it first is forbidden, so the old pin is kept beside the new one.
+  if [[ -f "$meta_file" ]]; then
+    local kept
+    kept="$meta_file.superseded-$(date +%Y%m%d-%H%M%S)"
+    [[ -e "$kept" ]] && die "Refusing to adopt: $kept already exists, so preserving the current pin would overwrite it."
+    cp -p -- "$meta_file" "$kept" || die "Could not preserve the current identity pin at $kept; refusing to replace it."
+    log "Preserved the previous identity pin: $kept"
+  fi
+
+  # Written to a temporary file in the SAME directory and renamed, so the live
+  # pin is never half-written: a truncated pin has an empty REPOSITORY_ID, and
+  # check_repo_identity reads an empty id as "nothing to check" -- an
+  # interrupted adopt would silently disable the identity control.
+  local tmp_meta
+  tmp_meta="$(mktemp "$REPO_META_DIR/.$(basename -- "$meta_file").XXXXXX")" \
+    || die "Could not create a temporary file beside $meta_file."
+  if ! cat > "$tmp_meta" <<EOF
 TARGET="$target"
 REPOSITORY_ID="$repo_id"
 INIT_TS="$(date -Iseconds)"
 ADOPTED=1
 EOF
+  then
+    rm -f -- "$tmp_meta"
+    die "Could not write the new identity pin."
+  fi
+  chmod 0644 -- "$tmp_meta"
+  mv -f -- "$tmp_meta" "$meta_file" || { rm -f -- "$tmp_meta"; die "Could not install the new identity pin at $meta_file."; }
   log "Repository adopted. Metadata saved to $meta_file"
 }
 
@@ -5283,7 +5354,8 @@ Usage:
                                             Initialize restic repository
   domum-media-backup plan <target>          Show what would be backed up
   domum-media-backup verify <target>        Verify repository health
-  domum-media-backup adopt-repo <target>    Adopt existing repository by ID
+  domum-media-backup adopt-repo <target> --confirm
+                                            Adopt existing repository by ID
   domum-media-backup verify-restore <target>
                                             Restore the Immich dump into an
                                             isolated scratch dir, revalidate it,
