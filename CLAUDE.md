@@ -8912,6 +8912,73 @@ for the `immich reset-db` preflight, arriving at a temp file instead of a
 container: when the failure path cannot clean up, move the check before the
 thing that would need cleaning.
 
+---
+
+**MARKING A ROLLBACK ENTRY APPLIED SILENTLY DID NOTHING WHEN THE ENTRY HAD NO
+STATUS LINE, AND A QUOTE IN THE STATUS BROKE EVERY OTHER ENTRY WITH IT.**
+`update_rollback_entry_status` was in the never-executed set. Three defects,
+each measured before being changed:
+
+```
+entry WITH    STATUS='available'  -> STATUS='applied'          correct
+entry WITHOUT a STATUS line       -> unchanged, call returns 0  SILENT NO-OP
+status "a\tb"                     -> STATUS='a<TAB>b'           escape-processed
+status "it's"                     -> STATUS='it's'              BROKEN SHELL
+```
+
+- **The silent no-op is the consequential one.** These entries record whether a
+  rollback point has been used; an entry that cannot be marked applied stays
+  **offered**, which is the failure the interactive selector's range check (two
+  entries above) exists to avoid from the other side.
+- **The broken-shell case is the one that spreads.** Both rollback loops
+  `source` every entry in turn, so a single unparseable entry does not corrupt
+  one entry -- it aborts the loop and takes every other entry with it. This file
+  already records a rollback entry being made *"permanently unusable"*; this is
+  a second route to the same place.
+- **`awk -v` escape-processes its assignment**, which this file records for
+  `config_set` -- where it silently undid `%q` quoting on the production config.
+  Second instance, found by driving a different function.
+
+The fix renders the value with **`%q`, exactly as `write_env_kv` renders every
+other key in these files** -- the hand-rolled single quotes were the whole
+problem -- passes it through `ENVIRON` rather than `-v`, and adds an `END` block
+so an absent STATUS line is appended rather than ignored. The mode is set on
+the staged file **before** the rename, so the live entry is never briefly
+readable at the temp file's umask-derived mode.
+
+**The test reads the status by SOURCING the entry**, which is the only reading
+that matters because it is how the rollback loops consume these files. Seven
+awkward values round-trip exactly, including a command substitution that must
+be **data, not code** -- asserted by sourcing the entry and requiring the
+substitution not to have run.
+
+**`validate_backup_env_content` was read and found SOUND, and that is recorded
+rather than left for someone to re-derive.** It writes backup-env content
+(credentials) to a `mktemp` at 0600 and removes it on both paths; the leak this
+session found in `send_recovery_pack_email` would need the validator to DIE,
+and `validate_backup_env_file` only ever `return 1`s -- checked. "We looked and
+decided no" is worth as much as a fix, and this file already says so.
+
+**A DENIED COMMAND RUNS NONE OF ITS PARTS, INCLUDING THE SETUP, AND I COMMITTED
+TO `main` BECAUSE OF IT.** The branch for this work was created by
+`git checkout -b … && python3 …` -- and that whole command was refused by a
+safety check reading the patch text. I took the refusal as being about the patch,
+re-issued the patch alone, and carried on. The branch had never been created, so
+every later edit and the commit itself landed on `main`, which §8 forbids.
+
+Nothing was pushed: the push failed with `src refspec … does not match any`,
+which is what surfaced it. Recovery was `git branch <name> <sha>` then
+`git reset --hard origin/main` -- and that reset discarded nothing, because the
+commit was already reachable from the new branch. That is the distinction worth
+keeping: a `reset --hard` is only destructive when the content it drops is
+reachable from nowhere else.
+
+Two habits follow. **After any refused command, check what of it did NOT run**
+-- a refusal is atomic, so setup bundled with the refused action is gone too.
+And **`git branch --show-current` before committing**, which costs nothing and
+is the one check that would have caught this immediately rather than at the
+push.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

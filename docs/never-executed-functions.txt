@@ -49,11 +49,23 @@
 #                             when the send failed, because `die` exits and no
 #                             trap can run.
 #
-# Next, by consequence: `validate_backup_env_content` writes backup-env CONTENT
-# (credentials) to a temp file with no trap, so a failure under `set -e` leaks
-# it; then the update-state writers (write_update_state,
-# update_rollback_entry_status, record_update_history,
-# clear_update_candidate_state), which are the rollback pointer's bookkeeping.
+#   update_rollback_entry_status  three defects: an entry with NO status line
+#                             silently kept none (so an applied entry stayed
+#                             offered); the value was single-quoted BY HAND, so
+#                             a quote produced broken shell in a file the
+#                             rollback loops SOURCE; and `awk -v`
+#                             escape-processed the value.
+#
+# READ AND FOUND SOUND, recorded so it is not re-derived:
+#   validate_backup_env_content   writes backup-env CONTENT to a mktemp (0600)
+#                             and removes it on both paths. The leak would need
+#                             validate_backup_env_file to DIE, and it only ever
+#                             `return 1`s -- checked. "We looked and decided no"
+#                             is worth as much as a fix.
+#
+# Next, by consequence: the remaining update-state writers (write_update_state,
+# record_update_history, clear_update_candidate_state), then the doctor_* family
+# and the configure_* prompts.
 #   immich_reset_db           would stop and REMOVE all four Immich containers
 #                             and then refuse, because the snapshot gate fires
 #                             after the stop and /srv/data/immich is not a
@@ -118,9 +130,7 @@ state_class_is_protected_tier_concern
 status_counts
 time_hhmm_to_minutes
 tracked_service_image_id
-update_rollback_entry_status
 updates_history
-validate_backup_env_content
 validate_backup_env_file
 validate_backup_env_file_or_die
 validate_immich_db_password_state

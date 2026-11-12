@@ -413,13 +413,37 @@ record_rollback_entry() {
 update_rollback_entry_status() {
   local file="$1"
   local new_status="$2"
+  local rendered tmp
   [[ -f "$file" ]] || return 0
-  awk -v status="$new_status" '
-    /^STATUS=/ { print "STATUS='\''" status "'\''"; next }
-    { print }
-  ' "$file" > "${file}.tmp"
-  mv "${file}.tmp" "$file"
-  chmod 600 "$file"
+
+  # %q, exactly as write_env_kv renders every other key in these files. The old
+  # form wrapped the value in single quotes by hand, so a status containing one
+  # produced STATUS='it's' -- broken shell. These entries are SOURCED by the
+  # rollback loops, so that does not corrupt one entry: it aborts the loop and
+  # takes every other entry with it.
+  printf -v rendered '%s=%q' STATUS "$new_status"
+
+  # ENVIRON, not `awk -v`: -v escape-processes its assignment, so a backslash in
+  # the value is interpreted rather than carried. Measured here -- a status of
+  # a-backslash-t-b became a literal TAB. Same defect already recorded for
+  # config_set, in a second place.
+  #
+  # The END block is the other half: an entry with no STATUS line silently kept
+  # none, so marking it applied changed nothing and it would be offered again.
+  # Measured: the call returned success and the file was unchanged.
+  tmp="$(mktemp "${file}.XXXXXX")" || die "Could not stage a rollback-entry update beside $file."
+  if ! STATUS_LINE="$rendered" awk '
+        /^STATUS=/ { print ENVIRON["STATUS_LINE"]; seen = 1; next }
+        { print }
+        END { if (!seen) print ENVIRON["STATUS_LINE"] }
+      ' "$file" > "$tmp"; then
+    rm -f -- "$tmp"
+    die "Could not rewrite the rollback entry $file."
+  fi
+  # The mode is set BEFORE the rename, so the live entry is never briefly
+  # readable at the temp file's umask-derived mode.
+  chmod 600 -- "$tmp"
+  mv -f -- "$tmp" "$file" || die "Could not install the rollback entry $file."
 }
 
 immich_postgres_data_dir() {
