@@ -8055,6 +8055,56 @@ it needs a test.
 
 ---
 
+**`do_check` SKIPPED EVERY LATER TARGET'S REPOSITORY ON A FAILURE -- the third
+occurrence of the unguarded-call shape, found in one of the 81 never-executed
+functions.** The loop was:
+
+```
+while IFS= read -r target; do
+  check_repo_identity "$target"
+  restic_check_for "$target"          # unguarded
+done < <(enabled_backup_targets)
+```
+
+Measured with two targets: `cloud` returning 11 meant **`nas` was never
+checked at all**. And the unit's failure naturally reads as being about the
+first target -- so the operator clears that lock, sees the unit go green the
+following week, and never learns the second repository went unverified both
+times. That is worse than the retention case it mirrors: a retention failure
+leaves snapshots in place, which this file calls the safe direction, whereas an
+unchecked repository means its integrity is simply unknown and nothing says so.
+
+Latent on this host for the same reason the daily retention loop was: only
+`cloud` is enabled, so the loop has one iteration. Enabling `nas` makes it
+live, which is the single change §F2 already pins.
+
+**THE FIX HAD A TRAP: the exit status is load-bearing.** `checkup_systemd_health`
+has a branch for `domum-media-check.service` at status **11** that says the
+repository could not be LOCKED and the check never ran. A `die` after the loop
+would have exited **1** and deleted that finding -- fixing a skipped check by
+destroying the lock diagnosis. So the FIRST failing status is propagated, not a
+flattened 1, and a test pins exit 11 specifically as well as a status-3 failure
+propagating as 3.
+
+**`check_repo_identity` is deliberately NOT guarded**, and establishing that
+mattered: it `die`s on an ID mismatch, meaning the repository is not the one the
+pinned metadata names, and continuing to check others would bury it. My first
+demonstration stubbed it to `return 1` and concluded the identity call had the
+same defect -- it does not, because the real function never returns non-zero.
+**A stub that behaves unlike the real function manufactures a defect**, which
+is the mirror of a stub that hides one.
+
+6 sections and a mutation whose observable is whether the SECOND repository was
+checked -- the command fails either way, so an exit-status assertion would pass
+against the defect.
+
+**Two of the 81 are now closed and 79 remain**, with the list kept honest in
+`docs/never-executed-functions.txt`. Both closed ones were real defects rather
+than merely untested code, which is the argument for working the list rather
+than filing it.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

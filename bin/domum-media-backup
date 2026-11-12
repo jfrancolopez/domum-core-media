@@ -891,10 +891,40 @@ do_unlock_stale() {
 }
 
 do_check() {
+  # Third occurrence of the unguarded-call shape, after do_daily_backup's
+  # retention and do_weekly_retention's loop. An unguarded
+  # `restic_check_for "$target"` under `set -e` aborts here at the FIRST
+  # failure, so every later target's repository is never verified -- and the
+  # unit's failure is naturally attributed to the first target. The operator
+  # clears that one, sees the unit go green next week, and never learns the
+  # second repository was not checked either time. Measured with two targets:
+  # cloud returning 11 meant `nas` was never attempted at all.
+  #
+  # Latent on this host, like the daily retention was: only `cloud` is enabled,
+  # so the loop has one iteration. Enabling `nas` makes it live.
+  #
+  # check_repo_identity is deliberately NOT guarded: it `die`s on an ID
+  # mismatch, which means the repository is not the one the metadata pins, and
+  # continuing to check others would bury that.
+  local first_rc=0 failed="" rc
   while IFS= read -r target; do
     check_repo_identity "$target"
-    restic_check_for "$target"
+    rc=0
+    restic_check_for "$target" || rc=$?
+    if (( rc != 0 )); then
+      failed="${failed:+$failed }$target"
+      # The FIRST failing status is propagated, not a flattened 1: restic exit
+      # 11 is the entire mechanism by which `checkup` can say the repository was
+      # LOCKED and the check never ran. Returning 1 here would delete that
+      # finding, which is the opposite of the point.
+      (( first_rc == 0 )) && first_rc=$rc
+    fi
   done < <(enabled_backup_targets)
+
+  [[ -z "$failed" ]] && return 0
+  log "Integrity check FAILED for: $failed"
+  printf '%s\n' "ERROR: integrity check failed for: $failed. Every enabled target was attempted; the others completed. restic exit 11 means the repository was LOCKED so the check never ran -- that is neither evidence of damage nor evidence of health." >&2
+  return "$first_rc"
 }
 
 do_check_deep() {
