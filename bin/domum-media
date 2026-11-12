@@ -688,10 +688,28 @@ write_immich_db_password_fingerprint() {
   fp_file="$(immich_db_password_fingerprint_file)"
   [[ -f "$secret_file" ]] || return 0
   digest="$(sha256_of_file "$secret_file")"
+  # 0700 on a directory dedicated to Immich state, not a shared one: `install -d
+  # -m` re-modes an EXISTING directory too, which is why that distinction
+  # matters here.
   install -d -m 0700 "$(dirname "$fp_file")"
-  umask 077
-  printf '%s\n' "$digest" > "$fp_file"
-  chmod 600 "$fp_file"
+
+  # The umask is set in a SUBSHELL, and the write is staged and renamed -- the
+  # same two defects as write_secret_file, in a second function. Fixing one
+  # without sweeping for the shape is how the second survived: a bare `umask`
+  # is not scoped to a function and leaked 077 to the rest of the process, and
+  # `> "$fp_file"` truncates before writing, so an interruption left an EMPTY
+  # fingerprint. An empty fingerprint does not match the password file, so the
+  # gate it feeds would fire for a password that had not changed.
+  local tmp
+  tmp="$(
+    umask 077
+    t="$(mktemp "$(dirname -- "$fp_file")/.$(basename -- "$fp_file").XXXXXX")" || exit 1
+    printf '%s\n' "$digest" > "$t" || { rm -f -- "$t"; exit 1; }
+    chmod 600 -- "$t" || { rm -f -- "$t"; exit 1; }
+    printf '%s' "$t"
+  )" || die "Could not stage the Immich password fingerprint beside $fp_file."
+  [[ -n "$tmp" ]] || die "Could not stage the Immich password fingerprint beside $fp_file."
+  mv -f -- "$tmp" "$fp_file" || die "Could not install the Immich password fingerprint."
 }
 
 validate_immich_db_password_state() {

@@ -115,17 +115,19 @@ echo "  5: no secret value reaches stdout or stderr, including on refusal"
 MUTCLI="$TMP/cli-mutant"
 cp "$CLI" "$MUTCLI"
 cat > "$TMP/mut-umask.py" <<'PY'
-import io, sys
+import io, re, sys
+# Scoped to write_secret_file's copy. The fingerprint writer now uses the
+# identical staging form, so a file-wide anchor matched TWICE -- caught by the
+# matched-%d assertion, which is why it is there.
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = '''  local tmp
-  tmp="$(
-    umask 077'''
-new = '''  local tmp
-  umask 077
-  tmp="$('''
-assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
-io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+m = re.search(r"\nwrite_secret_file\(\) \{.*?\n\}\n", s, re.S)
+assert m, "write_secret_file not found"
+body = m.group(0)
+old = '  local tmp\n  tmp="$(\n    umask 077'
+new = '  local tmp\n  umask 077\n  tmp="$('
+assert body.count(old) == 1, "anchor matched %d times inside the function" % body.count(old)
+io.open(p, "w", encoding="utf-8").write(s[:m.start()] + body.replace(old, new, 1) + s[m.end():])
 PY
 python3 -I "$TMP/mut-umask.py" "$MUTCLI" || fail "6: the umask mutation did not apply"
 out="$(probe "
@@ -163,6 +165,47 @@ ino_after="$(stat -c %i "$TMP/sec/m2")"
 it is still being renamed into place and section 3/4 would pass without the fix"
 echo "  6: a direct write rewrites the live file in place (inode $ino_after unchanged)"
 MUTCLI="$CLI"
+
+# ---------------------------------------------------------------------------
+# 7. write_immich_db_password_fingerprint had BOTH of the same defects, and
+#    they survived the first fix because I did not sweep for the shape.
+#    Asserted BEHAVIOURALLY -- the caller's umask survives -- rather than by
+#    looking for a subshell, so the assertion does not depend on how the fix
+#    is spelled.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/state/immich"
+printf 'the-db-password' > "$TMP/state/pw"
+fp_probe() {  # $1 = extra body
+  bash -c "
+set -uo pipefail
+source '$MUTCLI' >/dev/null 2>&1
+die() { echo \"DIE: \$*\"; exit 9; }
+DOMUM_STATE_ROOT='$TMP/state'
+immich_db_password_file() { printf '%s' '$TMP/state/pw'; }
+umask 022
+$1
+" 2>&1
+}
+out="$(fp_probe "
+write_immich_db_password_fingerprint
+printf 'x' > '$TMP/state/plain'
+echo \"umask=\$(umask) fp=\$(stat -c %a '$TMP/state/immich/db_password.sha256') plain=\$(stat -c %a '$TMP/state/plain')\"")"
+grep -q 'umask=0022' <<< "$out" \
+  || fail "7: the fingerprint writer leaked the caller's umask: $out"
+grep -q 'fp=600' <<< "$out" || fail "7: the fingerprint is not 600: $out"
+grep -q 'plain=644' <<< "$out" \
+  || fail "7: a file created after the fingerprint inherited a tightened umask: $out"
+[ "$(wc -c < "$TMP/state/immich/db_password.sha256")" = "65" ] \
+  || fail "7: the fingerprint is $(wc -c < "$TMP/state/immich/db_password.sha256") bytes, expected a 64-char digest and a newline"
+
+# An absent password file is a no-op, not an empty fingerprint.
+rm -f "$TMP/state/immich/db_password.sha256"
+fp_probe "immich_db_password_file() { printf '%s' '$TMP/state/absent'; }
+write_immich_db_password_fingerprint" >/dev/null
+[ ! -e "$TMP/state/immich/db_password.sha256" ] \
+  || fail "7: an absent password file produced a fingerprint anyway"
+echo "  7: the fingerprint writer does not leak the umask either"
+
 
 cmp -s "$CLI" "$PRISTINE" \
   || fail "the tracked CLI differs from the pristine copy taken before the first section"

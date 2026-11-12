@@ -8897,6 +8897,26 @@ other off-site copy openable -- in a project that deliberately did NOT copy
 exactly this hole from `domum-core`, and whose other mail path already had the
 fix. A pasted value with a stray newline is the realistic trigger.
 
+**I FIXED THE UMASK LEAK AND DID NOT SWEEP FOR THE SHAPE, SO A SECOND ONE
+SURVIVED.** `write_immich_db_password_fingerprint` had BOTH defects -- a bare
+`umask 077` and a truncate-before-write -- and was found only by reading the
+next function down the list. This file already says *after fixing a defect
+SHAPE, grep for the shape*; I had applied that to a false CLAIM and not to a
+code shape. Swept now: across all three CLIs and `install.sh` there are exactly
+two bare `umask` calls inside functions, and both are fixed.
+
+**An empty fingerprint is not inert.** It is a digest of the Immich database
+password, compared to detect a change, so a truncated one does not match a
+password that never changed -- the gate fires on nothing.
+
+**The sweep could not tell a fixed site from a broken one**, because a
+subshelled `umask 077` still looks like `umask 077` to a line scanner. The test
+therefore asserts the PROPERTY -- the caller's umask survives the call -- which
+is independent of how the fix is spelled. And adding the second function made
+the first function's mutation anchor match TWICE, because both now use the same
+staging form; the `matched %d times` assertion caught it and the mutation is
+scoped to one function now.
+
 **AND A FAILED SEND LEFT THE WHOLE BASE64 PACK IN THE TEMP DIRECTORY.** The
 first fix was a `trap ... RETURN`, which is wrong: `smtp_send_message` **dies**,
 and `die` exits the process, so neither a RETURN trap nor a `||` in the caller
@@ -8978,6 +8998,32 @@ Two habits follow. **After any refused command, check what of it did NOT run**
 And **`git branch --show-current` before committing**, which costs nothing and
 is the one check that would have caught this immediately rather than at the
 push.
+
+**WHERE THE NEVER-EXECUTED THREAD STANDS, STATED AS A MEASUREMENT BECAUSE THE
+LAST TIME I STATED IT AS A CLASSIFICATION IT WAS WRONG.** 81 at the sweep, 58
+now. Of what remains, matched against what each body actually does with
+comments stripped:
+
+```
+52  touch nothing -- pure computation or printing
+ 6  make a NETWORK call, all diagnostics (doctor_*, the readiness probes,
+    configure_cmd)
+ 1  writes a file: render_traefik_dynamic, read and found sound
+```
+
+**None of them deletes, recreates a container, writes a credential, or gates a
+recovery operation.** Everything that does is now driven by a test. The command
+that produced that split is recorded beside the list, so the next session
+re-runs it rather than trusting the sentence.
+
+**`shopt -u nullglob` is the umask leak's cousin, and was measured rather than
+churned.** Six paired `shopt -s`/`-u nullglob` sites across the CLIs each
+assume the option was unset on entry and restore it to unset -- which is wrong
+if any of them can be entered while another has it on. Checked: none can, and
+`report_generate_json`'s two pairs are sequential with its calls to the other
+two functions falling outside both. So: no defect, left alone, recorded. The
+umask sweep found a real second site; this one did not, and saying so is the
+point -- a sweep that only ever reports findings is one nobody believes.
 
 ## 15. Known open safety defects
 
