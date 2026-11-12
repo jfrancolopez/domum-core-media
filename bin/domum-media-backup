@@ -772,7 +772,18 @@ No backup was taken. The last-success marker has deliberately NOT been refreshed
     esac
   fi
 
-  local target_started
+  # Every enabled target is ATTEMPTED before the run fails. The `die` used to
+  # be inside the loop, so the first failing target ended the run and a later
+  # target's backup never happened -- if `cloud` were locked, `nas` would get
+  # nothing, and zero backups is strictly worse than one. Fourth occurrence of
+  # the shape already fixed in the daily retention, the weekly retention and
+  # do_check; latent here because only `cloud` is enabled, and live the moment a
+  # second target is.
+  #
+  # The refusal stays BEFORE retention, the heartbeat and the pack refresh. That
+  # ordering is the property that must not regress: a failed backup must refresh
+  # nothing, or `checkup` would report a backup that did not happen as current.
+  local target_started backup_failed=""
   while IFS= read -r target; do
     ran_any=1
     target_started="$(date -Iseconds)"
@@ -791,9 +802,15 @@ No backup was taken. The last-success marker has deliberately NOT been refreshed
     else
       record_backup_target_run "$target" failure "$target_started" "" \
         || log "WARNING: could not record run evidence for $target"
-      die "Backup failed for target: $target"
+      backup_failed="${backup_failed:+$backup_failed }$target"
     fi
   done < <(enabled_backup_targets)
+
+  # Before retention, the heartbeat and the pack refresh -- see above.
+  [[ -z "$backup_failed" ]] \
+    || die "Backup failed for target(s): $backup_failed. Every enabled target was attempted and
+each one's own evidence records its result, so a target that succeeded is recorded as success.
+The last-success marker has deliberately NOT been refreshed."
 
   # A RETENTION failure is not a BACKUP failure, and treating them as one
   # inverted the report. `restic_forget_for` returns restic's status, and an

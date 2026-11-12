@@ -8105,6 +8105,54 @@ than filing it.
 
 ---
 
+**THE NIGHTLY BACKUP GAVE UP ON EVERY LATER TARGET WHEN THE FIRST ONE FAILED --
+fourth and last occurrence of the unguarded-call shape, found by grepping for
+the shape after fixing `do_check`.** The `die "Backup failed for target"` lived
+INSIDE the loop, so if `cloud` were locked, `nas` would get no backup at all.
+**Zero backups is strictly worse than one**, and the per-target evidence
+already distinguishes them -- a target that succeeded after another failed is
+recorded `RESULT=success`, so there was never an ambiguity to protect.
+
+Latent here because only `cloud` is enabled, and live the moment a second
+target is -- the same single change that makes the daily retention loop live.
+
+**The property that must NOT regress is the ORDERING, not the location.** A
+failed backup must refresh nothing: the refusal has to precede `heartbeat`, the
+recovery-pack refresh and retention, or `checkup` would report a backup that
+did not happen as current. The die therefore moved to immediately after the
+loop, not to the end of the function -- measured, statement 59 against the
+heartbeat's 92.
+
+**AN EXISTING ASSERTION BROKE, AND ITS MECHANISM WAS THE WRONG ONE WHILE ITS
+PROPERTY WAS RIGHT.** `backup-target-evidence-smoke` section 4 read:
+
+```
+loop_text="$(awk '/while IFS= read -r target; do/,/done < <\(enabled_backup_targets\)/' …)"
+grep -q 'die "Backup failed for target' <<< "$loop_text"
+```
+
+A text assertion over the LOOP BODY, so it could not tell this fix from a
+regression -- the family this file already records as "a text-grep test cannot
+tell a fix from a regression". Re-expressed as the ordering property: the
+refusal must exist in the function AND precede the heartbeat, asserted by
+statement position. **Proved to bite** by moving the die after the heartbeat,
+which the original grep would have happily accepted. The replacement is
+strictly stronger than what it replaced.
+
+**And my own new sections had duplicated a section LETTER.** The suite already
+had a section `C`; the `do_check` block I added was also `C`, so two unrelated
+blocks shared a name in a 1,000-line file. Renamed to `K`, with the daily-backup
+sections as `L`. A duplicate label is the kind of thing that makes a later
+reader believe they have found the section they are looking for.
+
+**All four occurrences of this shape are now fixed and driven**: the daily
+retention, the weekly retention, `do_check`, and the backup loop itself. The
+pattern to recognise is a `while read -r target` loop whose body can fail: the
+answer is always attempt every target, record each, and fail at the end --
+with the refusal placed so that nothing which implies success runs first.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
