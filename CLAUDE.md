@@ -8211,6 +8211,114 @@ host with nothing enabled still reported `nas` and the refusal path looked
 covered when it had never been reached. Read the function's own calls before
 writing a stub for it.
 
+---
+
+**BOTH SNAPSHOT DELETERS PROTECTED NOTHING, WHILE `cleanup images` CAREFULLY
+PROTECTED THE OTHER HALF OF THE SAME RECOVERY POINT.** Found 2026-11-11 while
+reading `cleanup_snapshots_execute`, one of the never-executed functions.
+
+This file's most-repeated rule is that a recovery point is **service +
+snapshot + the application that wrote it**, and it records at length how
+`cleanup images` was fixed so that an image a recovery point names can never be
+deleted -- *"the snapshot would still restore the data while the application
+that wrote it became unobtainable."* The symmetric half was never done.
+`snapshot_prune` and `cleanup_snapshot_candidates` both selected victims purely
+by **age and count**, consulted no recovery evidence of any kind, and the
+protected set is trivially available: `bind_recovery_point_metadata` writes
+`<point>.recovery` into `$DOMUM_STATE_ROOT/snapshots`, and `<point>` IS the
+snapshot name.
+
+Measured read-only on this host, which is what makes it more than a symmetry
+argument:
+
+```
+calibre-web-20261009-131921-post-migration   <- oldest for calibre-web
+calibre-web-20261009-144443-pre-upgrade
+jellyfin-20260925-153317-post-migration      <- oldest for jellyfin
+kavita-20260929-001131-post-migration        <- oldest for kavita
+navidrome-20260929-175657-post-migration     <- oldest for navidrome
+plex-20261006-133511-post-migration          <- oldest for plex
+plex-20261008-121553-pre-upgrade
+```
+
+Every snapshot on this host is half of a recovery point, and **the OLDEST
+snapshot of every migrated service is its migration proof snapshot** -- which
+is the first thing an age-ordered retention policy deletes. This file says
+those *"are both retained deliberately and must not be deleted without the
+operator saying so."* Nothing enforced that.
+
+**Latent, not live, and the reason is the count.** `keep` is 14 and no service
+has more than two, so `drop` is negative for every base today and the weekly
+job deletes nothing. It arms as pre-upgrade points accumulate: the fifteenth
+snapshot of any service makes its proof snapshot the victim. Production's
+`SNAPSHOT_KEEP_PER_SUBVOL` cannot be read from this account (`0600 root`), so a
+lower value there would arm it sooner -- stated rather than assumed.
+
+**RETENTION NOW APPLIES TO THE PRUNABLE POPULATION, which is the only version
+of this fix that converges.** The obvious implementation -- skip a protected
+victim -- would mean that protecting the oldest merely stops the root
+converging: `drop` stays 1, the one victim is skipped, nothing is deleted, and
+the count grows every week. That is the same shape as a swallowed delete, which
+this function's own comment already refuses: *"nobody finds out: the operator
+sees a clean weekly run while the count grows."* So a recovery point is removed
+from the population **before** `drop` is computed, and the policy becomes
+statable: **keep N ordinary snapshots per subvolume, plus every recovery point,
+unconditionally.** The total on disk can therefore exceed N, which is correct,
+because a recovery point is not a routine snapshot.
+
+**UNREADABLE EVIDENCE IS NOT "NOTHING IS PROTECTED".** `snapshot_recovery_point_names`
+has three states: the set, `2` for evidence that exists and could not be read,
+and `0`-with-nothing for an **absent** directory -- which is the honest reading,
+since `ensure_state_dirs` creates it and it is empty before the first migration.
+Refusing on absence would stop a pre-migration host pruning at all. Both
+deleters refuse on `2`: the prune warns and returns 1, which fails the unit and
+reaches `checkup_systemd_health`, and `cleanup_snapshots_execute` dies.
+
+**The selector had to stop being read through a process substitution.**
+`done < <(cleanup_snapshot_candidates)` discards the producer's status, so a
+refusal would have read as *"no snapshots are protected"* -- the conflation this
+project keeps correcting, here in a **deletion** path. Captured first, status
+checked. `cleanup_summary` needed the same treatment for a different reason:
+`candidates | wc -l` reports the producer's status under pipefail, so a refusal
+would have aborted the summary, and the report prints only after every line is
+built -- a blank screen, indistinguishable from a healthy one, which is the
+defect that once blanked `checkup` in production.
+
+**The prune STATES what it protected, including zero.** A deletion tool that
+silently omits things gives no way to notice the protection broke -- the rule
+already recorded for `cleanup images`'s dry run.
+
+**AN ABSENCE ASSERTION IN THAT SUITE COULD NEVER FIRE, and it is the suite
+guarding the live weekly deleting job.** `snapshot_prune` runs
+`btrfs subvolume delete "$victim" >&2`, so a `btrfs` stub that echoes writes to
+**stderr**, while `out="$(bash -c ...)"` takes only stdout. Section 5's
+`grep -q 'DELETE' <<< "$out" && fail "the weekly prune would delete the only
+recovery point"` therefore matched nothing whatever the code did; the directory
+check beneath it is what had been holding the section up. Found because my own
+new section counted `^DELETE` and got 0 while `DELETE` was visibly printing to
+the terminal. The robust idiom is section 1's: a stub that **deletes for real**
+(`rm -rf`) with the assertions made against the filesystem, plus `2>&1` when a
+message is the subject -- `warn` is on stderr too.
+
+**A `docker` stub that FAILS kills the shell, because sourcing the CLI turns
+errexit back on.** The harness sets `set -uo pipefail`, and `source
+bin/domum-media` runs its own `set -euo pipefail`, so the harness's options are
+overridden. My `docker() { return 1; }` made `cleanup_summary`'s first
+assignment fail and the section measured that abort instead of the snapshot
+branch -- it produced no output at all, which read as the new code failing.
+A stub returns 0 and prints nothing when the point is to make a command
+irrelevant, not to make it fail.
+
+**AND I TRUSTED A RESTORE'S EXIT STATUS INSTEAD OF READING THE FILE.** The
+mutation restore printed `restored` from a `cp ... && echo`, and the mutant was
+still in `bin/domum-media` -- confirmed by byte count and by grepping for the
+property. The next section then failed with the mutant's message, which read as
+my new code being wrong and cost a detour. `cp` reporting success is not
+evidence that the file holds what you think: **grep the restored property**, the
+same discipline this file already requires for asserting that a mutation
+applied. Two entries above this one records a killed suite leaving a mutant in
+the tree; this is the same hazard reached through a restore that looked fine.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

@@ -334,10 +334,23 @@ list_snapshots_for_base jellyfin" 2>/dev/null)"
 out="$(bash -c "$(harness)
 SNAPSHOT_KEEP_PER_SUBVOL=14
 btrfs() { echo \"DELETE \${!#}\"; return 0; }
-snapshot_prune")" || fail "prune failed against the real inventory: $out"
+snapshot_prune" 2>&1)" || fail "prune failed against the real inventory: $out"
+# Captured with 2>&1 BECAUSE the stub's output lands on stderr: snapshot_prune
+# runs `btrfs subvolume delete "$victim" >&2`, so a stub that echoes is writing
+# to stderr and `$(...)` takes only stdout. Without the redirect this assertion
+# can never fire -- it was vacuous, in the suite that guards the live weekly
+# deleting job. The directory check below it is what has actually been holding
+# this section up.
 grep -q 'DELETE' <<< "$out" && fail "the weekly prune would delete the only recovery point: $out"
-grep -q '0 deleted, 0 failed (keeping 14 per subvolume)' <<< "$out" \
+# The PROPERTY, not the exact summary line: nothing deleted, nothing failed,
+# and the keep figure stated. Pinning the whole sentence broke when the summary
+# grew a recovery-point count, while what it exists to protect was untouched --
+# and this project has three production aborts caused by assertions that were
+# too specific.
+grep -qE '0 deleted, 0 failed' <<< "$out" \
   || fail "prune did not report a clean no-op: $out"
+grep -qE 'keeping 14( prunable)? per subvolume' <<< "$out" \
+  || fail "prune did not state the keep figure it applied: $out"
 [[ -d "$TMP_DIR/snapshots/jellyfin-20260925-153317-post-migration" ]] \
   || fail "the only snapshot is gone"
 
@@ -352,5 +365,184 @@ snapshot_prune" 2>&1)"
   grep -q 'DELETE' <<< "$out" \
     && fail "SNAPSHOT_KEEP_PER_SUBVOL='$keep' would delete the only recovery point: $out"
 done
+
+# ---------------------------------------------------------------------------
+# 7. A SNAPSHOT A RECOVERY POINT NAMES IS NEVER DELETED BY EITHER DELETER.
+#
+# `cleanup images` carefully protects the IMAGE a recovery point names, because
+# a recovery point is service + snapshot + the application that wrote it. Both
+# snapshot deleters selected purely by age and count and consulted no recovery
+# evidence at all -- so the DATA half was unprotected while the application
+# half was protected: the pairing failure from the other side.
+#
+# Measured on this host 2026-11-11: all seven snapshots in /srv/snapshots carry
+# the recovery-point naming shape (-post-migration, -pre-upgrade), and the
+# OLDEST snapshot of every migrated service IS its migration proof snapshot --
+# the first thing an age-ordered retention policy deletes. Latent only because
+# keep is 14 and no service has more than two.
+#
+# The stub DELETES FOR REAL, as section 1's does, so the assertions are about
+# the filesystem rather than about a message. Output is captured with 2>&1
+# because snapshot_prune redirects the delete to stderr and `warn` writes there
+# too.
+# ---------------------------------------------------------------------------
+seed_rp() {  # $1.. = point names that have .recovery evidence
+  mkdir -p "$TMP_DIR/state/snapshots"
+  local n
+  for n in "$@"; do
+    printf "SERVICE='x'\nIMAGE_ID='sha256:aaa'\n" > "$TMP_DIR/state/snapshots/$n.recovery"
+  done
+}
+REAL_DELETE='btrfs() { [[ "${1:-}" == subvolume && "${2:-}" == delete ]] && { rm -rf -- "${!#}"; return 0; }; return 0; }'
+
+rm -rf "$TMP_DIR/snapshots" "$TMP_DIR/state/snapshots"
+seed_snapshots plex 16
+oldest="$(ls -1 "$TMP_DIR/snapshots" | sort | head -1)"
+second="$(ls -1 "$TMP_DIR/snapshots" | sort | sed -n '2p')"
+seed_rp "$oldest"
+
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+$REAL_DELETE
+snapshot_prune" 2>&1)" || fail "7: prune failed: $out"
+[[ -d "$TMP_DIR/snapshots/$oldest" ]] \
+  || fail "7: the weekly prune DELETED the snapshot half of a recovery point ($oldest): $out"
+[[ ! -d "$TMP_DIR/snapshots/$second" ]] \
+  || fail "7: protecting a recovery point must not stop retention converging --
+the next oldest ($second) should have gone instead: $out"
+remaining="$(ls -1 "$TMP_DIR/snapshots" | wc -l)"
+(( remaining == 15 )) \
+  || fail "7: expected 14 prunable + 1 protected = 15, got $remaining: $out"
+grep -q '1 kept as recovery points' <<< "$out" \
+  || fail "7: the prune did not STATE what it protected -- a deletion tool that
+silently omits things gives no way to notice the protection broke: $out"
+echo "  7: the weekly prune keeps recovery points, states the count, still converges"
+
+# The same protection, through the same implementation, in the second deleter.
+rm -rf "$TMP_DIR/snapshots"; seed_snapshots plex 16
+seed_rp "$oldest"
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+CLEANUP_OLD_SNAPSHOTS_KEEP=14
+cleanup_snapshot_candidates" 2>&1)" || fail "7: candidates failed: $out"
+grep -qx "$oldest" <<< "$out" \
+  && fail "7: \`cleanup snapshots\` offered a recovery point for deletion: $out"
+grep -qx "$second" <<< "$out" \
+  || fail "7: the cleanup selector must still offer the next oldest: $out"
+[ "$(grep -c . <<< "$out")" = "1" ] \
+  || fail "7: the cleanup selector offered more than the one eligible snapshot: $out"
+echo "  7: cleanup snapshots never offers a recovery point either"
+
+# ---------------------------------------------------------------------------
+# 8. UNREADABLE EVIDENCE IS NOT "NOTHING IS PROTECTED".
+#
+# "There are no recovery points" and "I could not look" are different facts and
+# only one of them is safe to prune on. An ABSENT metadata directory is the
+# honest former -- it is created by ensure_state_dirs and is empty before the
+# first migration -- so it must NOT refuse, or a pre-migration host could never
+# prune at all.
+# ---------------------------------------------------------------------------
+rm -rf "$TMP_DIR/snapshots" "$TMP_DIR/state/snapshots"; seed_snapshots plex 16
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+$REAL_DELETE
+snapshot_prune" 2>&1)" || fail "8: an absent metadata directory must not refuse: $out"
+grep -q '0 kept as recovery points' <<< "$out" \
+  || fail "8: with no evidence directory nothing is protected, and that is correct: $out"
+[[ ! -d "$TMP_DIR/snapshots/$oldest" ]] \
+  || fail "8: with no recovery evidence the oldest is an ordinary snapshot: $out"
+
+# Present and UNREADABLE: refuse, delete nothing, and fail so the unit records it.
+rm -rf "$TMP_DIR/snapshots"; seed_snapshots plex 16
+seed_rp "$oldest"
+chmod 000 "$TMP_DIR/state/snapshots"
+rc=0
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+$REAL_DELETE
+snapshot_prune" 2>&1)" || rc=$?
+chmod 755 "$TMP_DIR/state/snapshots"
+(( rc != 0 )) \
+  || fail "8: unreadable recovery evidence must FAIL the prune, not read as
+'nothing is protected' (rc=$rc): $out"
+[ "$(ls -1 "$TMP_DIR/snapshots" | wc -l)" = "16" ] \
+  || fail "8: it pruned blind: $out"
+grep -qi 'could not be read' <<< "$out" \
+  || fail "8: the refusal does not say why: $out"
+
+# ...and the destructive cleanup refuses rather than offering them.
+chmod 000 "$TMP_DIR/state/snapshots"
+rc=0
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+$REAL_DELETE
+cleanup_snapshots_execute 0 1" 2>&1)" || rc=$?
+chmod 755 "$TMP_DIR/state/snapshots"
+(( rc != 0 )) || fail "8: cleanup proceeded with unreadable evidence: $out"
+[ "$(ls -1 "$TMP_DIR/snapshots" | wc -l)" = "16" ] \
+  || fail "8: cleanup deleted blind: $out"
+grep -qi 'Refusing destructive cleanup' <<< "$out" \
+  || fail "8: cleanup's refusal does not name the cause: $out"
+
+# cleanup_summary must not ABORT on it. The report prints only after every line
+# is built, so an aborted summary is a blank screen -- indistinguishable from a
+# healthy one, which is the defect that once blanked `checkup` in production.
+chmod 000 "$TMP_DIR/state/snapshots"
+rc=0
+out="$(bash -c "$(harness)
+SNAPSHOT_KEEP_PER_SUBVOL=14
+# Returns 0 and prints nothing: the CLI sources with \`set -euo pipefail\`, so a
+# docker stub that FAILS kills the shell at the first assignment and the section
+# would then be measuring that instead of the snapshot branch.
+docker() { return 0; }
+cleanup_summary" 2>&1)" || rc=$?
+chmod 755 "$TMP_DIR/state/snapshots"
+grep -q 'Cleanup summary:' <<< "$out" \
+  || fail "8: cleanup_summary produced no report at all (rc=$rc): $out"
+grep -qi 'Snapshots beyond retention: unknown' <<< "$out" \
+  || fail "8: cleanup_summary must say the figure is unknown rather than print a
+guess or abort: $out"
+echo "  8: unreadable evidence refuses in both deleters, absent evidence does not"
+
+# ---------------------------------------------------------------------------
+# 9. MUTATION: removing the protection must delete the recovery point.
+#
+# Against a COPY, so a run stopped mid-way cannot leave the mutant in the tree.
+# ---------------------------------------------------------------------------
+cp "$REPO_ROOT/bin/domum-media" "$TMP_DIR/mut-cli"
+cat > "$TMP_DIR/mut9.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '''      if [[ -n "${rp_protected[$s_name]:-}" ]]; then
+        protected_seen=$(( protected_seen + 1 ))
+        continue
+      fi
+'''
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+print("applied")
+PY
+python3 -I "$TMP_DIR/mut9.py" "$TMP_DIR/mut-cli" >/dev/null \
+  || fail "9: the protection mutation did not apply"
+rm -rf "$TMP_DIR/snapshots"; seed_snapshots plex 16
+seed_rp "$oldest"
+out="$(bash -c "set -uo pipefail
+DOMUM_DIR=\"$REPO_ROOT\"
+CFG_FILE=\"$TMP_DIR/absent.conf\"
+source \"$TMP_DIR/mut-cli\"
+DOMUM_SNAPSHOT_ROOT=\"$TMP_DIR/snapshots\"
+DOMUM_STATE_ROOT=\"$TMP_DIR/state\"
+DOMUM_DATA_ROOT=\"$TMP_DIR/data\"
+need_root() { :; }
+load_cfg() { :; }
+SNAPSHOT_KEEP_PER_SUBVOL=14
+$REAL_DELETE
+snapshot_prune" 2>&1)" || fail "9: the mutant failed for an unrelated reason: $out"
+[[ ! -d "$TMP_DIR/snapshots/$oldest" ]] \
+  || fail "9: the mutation applied but the recovery point survived, so section 7
+would pass without the protection: $out"
+echo "  9: without the protection the proof snapshot is deleted"
+rm -rf "$TMP_DIR/snapshots" "$TMP_DIR/state/snapshots"
 
 echo "PASS: snapshot prune safety smoke test"

@@ -6,13 +6,16 @@
 # CLOSED since the sweep (driven, with a mutation each):
 #   do_weekly_retention       the only retention that runs on this host
 #   do_check                  skipped every later target's repository on a failure
+#   cleanup_snapshots_execute neither snapshot deleter protected the snapshot
+#                             half of a recovery point, while cleanup images
+#                             protects the application half
 #   default_restore_target    restore/deep check prefer nas, the fast local copy
 #   default_full_check_target full check prefers cloud, the authoritative copy
 #   do_check_deep             reads a SUBSET; a swapped flag reads 10% and
 #   do_check_full             reports "full", the weaker claim in stronger words
 #
 # Remaining consequential ones, in the order to work in:
-#   cleanup_snapshots_execute, do_restore, do_verify_target, do_adopt_repo
+#   do_restore, do_verify_target, do_adopt_repo
 # immich_reset_db is likely a name-grep false positive -- covered by suites that
 # reference its GATE rather than the arm -- so read it before testing it.
 apply_update_delay_profile
@@ -20,7 +23,6 @@ backup_cmd
 backup_env_line_is_valid
 backup_target_exists
 backup_target_has_repository_source
-cleanup_snapshots_execute
 cleanup_summary
 clear_update_candidate_state
 configure_backup_target
