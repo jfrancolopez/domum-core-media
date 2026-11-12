@@ -455,6 +455,113 @@ grep -q 'FORGET cloud' "$TMP_DIR/wforgets2" \
 section is not observing the loop it is about"
 echo "   killed: unguarded, nas is never attempted"
 
+# ---------------------------------------------------------------------------
+# C. do_check, the third place the unguarded-call shape appeared. An
+#    unguarded `restic_check_for "$target"` under `set -e` aborted the loop at
+#    the FIRST failure, so every later target's repository was never verified --
+#    and the unit's failure reads as being about the first target. The operator
+#    clears that one, the unit goes green next week, and nothing ever says the
+#    second repository was not checked either time.
+#
+#    Latent on this host (only `cloud` is enabled, so one iteration) and live
+#    the moment `nas` is enabled -- the same single change that makes the daily
+#    retention loop live.
+#
+#    check_repo_identity is deliberately NOT guarded: it dies on an ID
+#    mismatch, which means the repository is not the one the metadata pins.
+# ---------------------------------------------------------------------------
+run_check() {
+  local name="$1" stubs="$2"
+  local dir="$TMP_DIR/$name"
+  mkdir -p "$dir/state/backups" "$dir/log"
+  cat > "$dir/harness.sh" <<HARNESS
+DOMUM_DIR="$REPO_ROOT"
+CFG_FILE="$dir/absent.conf"
+source "${CHECK_CLI:-$REPO_ROOT/bin/domum-media-backup}"
+DOMUM_LOG_DIR="$dir/log"
+DOMUM_STATE_ROOT="$dir/state"
+REPO_META_DIR="$dir/state/backups"
+ensure_dirs
+log() { printf 'LOG %s\n' "\$*"; }
+check_repo_identity() { return 0; }
+$stubs
+do_check
+HARNESS
+  bash "$dir/harness.sh" >"$dir/out.txt" 2>&1
+  printf '%s' "$?" > "$dir/rc"
+  printf '%s' "$dir"
+}
+
+sect_w "C1. a LOCKED first target must not skip the second repository"
+: > "$TMP_DIR/checks"
+d="$(run_check check-locked '
+enabled_backup_targets() { printf "%s\n" cloud nas; }
+restic_check_for() { printf "CHECK %s\n" "$1" >> "'"$TMP_DIR"'/checks"; [ "$1" = cloud ] && return 11; return 0; }')"
+grep -q 'CHECK cloud' "$TMP_DIR/checks" || fail "C1: the first target was never checked"
+grep -q 'CHECK nas' "$TMP_DIR/checks" \
+  || fail "C1: cloud's failure skipped nas, so the second repository is unverified
+and nothing says so -- this is the defect"
+echo "   both repositories attempted"
+
+sect_w "C2. restic's exit 11 is PRESERVED, not flattened to 1"
+# checkup_systemd_health has a branch for domum-media-check.service at status
+# 11 that says the repository could not be LOCKED and the check never ran.
+# Returning 1 here would delete that finding entirely.
+[ "$(cat "$d/rc")" = "11" ] \
+  || fail "C2: exit $(cat "$d/rc") instead of 11 -- checkup's lock finding reads
+ExecMainStatus and would lose the diagnosis"
+echo "   exit 11 reaches the unit"
+
+sect_w "C3. the message names the failed target and not the one that passed"
+grep -q 'cloud' "$d/out.txt" || fail "C3: the failure does not name cloud: $(cat "$d/out.txt")"
+grep -qE '(^|[^a-z])nas([^a-z]|$)' "$d/out.txt" \
+  && fail "C3: it named nas, which SUCCEEDED, as failed: $(cat "$d/out.txt")"
+grep -qi 'neither evidence of damage nor evidence of health' "$d/out.txt" \
+  || fail "C3: it does not say what exit 11 means, so a lock reads as corruption: $(cat "$d/out.txt")"
+echo "   only the failure named, and exit 11 explained"
+
+sect_w "C4. a non-11 failure propagates its own status"
+d="$(run_check check-other '
+enabled_backup_targets() { printf "%s\n" cloud nas; }
+restic_check_for() { [ "$1" = cloud ] && return 3; return 0; }')"
+[ "$(cat "$d/rc")" = "3" ] \
+  || fail "C4: a status-3 failure became $(cat "$d/rc") -- the first failing
+status is what propagates, so a different restic error is not relabelled"
+echo "   status 3 propagates as 3"
+
+sect_w "C5. every target succeeding exits 0"
+d="$(run_check check-ok '
+enabled_backup_targets() { printf "%s\n" cloud nas; }
+restic_check_for() { return 0; }')"
+[ "$(cat "$d/rc")" = "0" ] || fail "C5: a clean check failed: $(cat "$d/out.txt")"
+grep -qi 'FAILED' "$d/out.txt" && fail "C5: a clean run reported a failure: $(cat "$d/out.txt")"
+echo "   clean, and silent about failure"
+
+sect_w "C6. MUTATION: the unguarded call leaves the second repository unchecked"
+CMUT="$TMP_DIR/mutant-check"
+cp "$REPO_ROOT/bin/domum-media-backup" "$CMUT"
+cat > "$TMP_DIR/mutate-check.py" <<'PYCK'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    rc=0\n    restic_check_for "$target" || rc=$?\n'
+new = '    rc=0\n    restic_check_for "$target"\n'
+assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYCK
+python3 -I "$TMP_DIR/mutate-check.py" "$CMUT" || fail "C6: the mutation did not apply"
+: > "$TMP_DIR/checks2"
+d="$(CHECK_CLI="$CMUT" run_check check-mutant '
+enabled_backup_targets() { printf "%s\n" cloud nas; }
+restic_check_for() { printf "CHECK %s\n" "$1" >> "'"$TMP_DIR"'/checks2"; [ "$1" = cloud ] && return 11; return 0; }')"
+grep -q 'CHECK nas' "$TMP_DIR/checks2" \
+  && fail "C6: the mutation changed no ANSWER -- unguarded, cloud's failure must
+abort before nas is checked: $(cat "$TMP_DIR/checks2")"
+grep -q 'CHECK cloud' "$TMP_DIR/checks2" \
+  || fail "C6: the mutant did not check the first target either, so this section
+is not observing the loop it is about"
+echo "   killed: unguarded, nas is never checked"
+
 # The mutation: restore the unguarded call. The observable is the HEARTBEAT --
 # the run fails either way, so asserting the exit status would pass against the
 # defect. Name the observable the mutation actually changes.

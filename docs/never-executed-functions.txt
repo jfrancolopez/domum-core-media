@@ -1,3 +1,17 @@
+# Functions executed by NO test, measured by instrumentation 2026-11-11.
+# 510 functions across the three CLIs; 193 unreferenced by name; 112 observed
+# executing indirectly; 81 never executed. The name-grep is an upper bound and
+# has over-reported every time it was used -- report the instrumented figure.
+#
+# CLOSED since the sweep (driven, with a mutation each):
+#   do_weekly_retention   the only retention that runs on this host
+#   do_check              skipped every later target's repository on a failure
+#
+# Remaining consequential ones, in the order to work in:
+#   do_check_deep, do_check_full, cleanup_snapshots_execute, do_restore,
+#   do_verify_target, do_adopt_repo
+# immich_reset_db is likely a name-grep false positive -- covered by suites that
+# reference its GATE rather than the arm -- so read it before testing it.
 apply_update_delay_profile
 backup_cmd
 backup_env_line_is_valid
@@ -17,7 +31,6 @@ container_status_summary
 default_full_check_target
 default_restore_target
 do_adopt_repo
-do_check
 do_check_deep
 do_check_full
 doctor_backups
@@ -28,7 +41,6 @@ doctor_secrets
 doctor_traefik
 do_restore
 do_verify_target
-do_weekly_retention
 ensure_cfg_file
 ensure_networks
 generate_secret
