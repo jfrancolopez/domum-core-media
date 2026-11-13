@@ -9146,6 +9146,74 @@ names against `docker ps` NAMES and is correct only because that invariant
 holds. So the rehearsal declares its own service whose container name equals
 its service name: invariant intact, collides with nothing.
 
+---
+
+**`date -d ""` IS NOT AN ERROR, SO AN EMPTY BACKUP MARKER FABRICATED A
+SUCCESSFUL BACKUP -- and the fabricated value is plausible, recent, and passes
+the gate.** Found 2026-11-12 by sweeping for truncate-before-write after fixing
+several sites individually, which is the rule this file already states: after
+fixing a defect SHAPE, grep for the shape.
+
+GNU date reads an empty string as **today at 00:00:00** and exits **0**:
+
+```
+date -d ''          -> 1794459600  = 2026-11-12T00:00:00-05:00   rc=0
+date -d 'today 00:00:00' -> 1794459600                            IDENTICAL
+date -d '   '                                                     rc=0, same
+```
+
+`backup_last_success_epoch` was
+
+```
+date -d "$(head -n1 "$file")" +%s 2>/dev/null || return 1
+```
+
+so an empty `$DOMUM_LOG_DIR/last-success` did not fail -- it returned today at
+midnight. Two consequences, both the dangerous direction:
+
+- `checkup` reports a healthy backup `Nh ago` for a backup that never happened;
+- **`verify_backup_freshness` PASSES.** Its refusal is
+  `"no successful backup timestamp found"`, reached only when the accessor
+  returns non-zero; with a fabricated epoch the age is 0-23h, under the 48h
+  limit, so a stateful image update proceeds believing the photographs are
+  backed up. The gate's whole purpose is to refuse exactly then.
+
+**The sweep's result is what makes this a defect and not a style note.** Of the
+ten `date -d "$var"` sites across the three CLIs, **nine are already guarded**
+with `[[ -n ... ]]` -- including both scrub-age reads, which look like the same
+hazard and are not. This was the single outlier, and the convention being
+universal everywhere else is the evidence. Checking each rather than trusting
+the count is what kept it to one site.
+
+**Fixed at BOTH ends, and the reader is the load-bearing half.** The writer now
+stages and renames, so the empty window does not exist; but emptiness has causes
+the writer does not control -- a full `/var/log`, a marker restored empty, an
+operator truncating it -- and the realistic trigger is a full disk, which is
+exactly the condition under which accurate backup reporting matters most. The
+reader rejects a blank or whitespace-only first line, so **any** cause reads as
+"cannot tell".
+
+**The mutation names the fabrication, not the guard.** Removing the blank check
+must make an empty marker return today-midnight AND make the update gate pass;
+asserting only that the accessor "returns non-zero" would pass against a
+function that always fails. The suite also carries the positive control -- a
+FRESH marker must let the gate pass -- because every refusal assertion is
+otherwise satisfied by a gate that never passes.
+
+**The writer's rename is observed by INODE.** An in-place truncating write keeps
+the inode and empties the file first; a rename gives a new one. Both files are in
+the same directory, so the rename cannot degrade into a copy -- the distinction
+`config_set` already had to be fixed for, where `mv` from `$TMPDIR` across
+filesystems was a copy-in-place.
+
+**It is live in the INSTALLED binary**, which carries the identical function and
+8 call sites, so this is a production defect rather than a main-only one. It is
+LATENT: nothing has emptied the marker, and `checkup` reads a healthy heartbeat
+today. `tests/backup-heartbeat-smoke.sh`; 1 mutant, killed; and the suite was
+run against the UNFIXED code and fails there with
+`an empty marker read as a timestamp: OK 1794459600` -- a suite that has only
+seen a passing tree is not a guard.
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
