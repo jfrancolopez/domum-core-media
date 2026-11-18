@@ -1755,6 +1755,13 @@ Do **not** manufacture approval gates for ordinary coding work.
 `backlog/` is planning information and evidence — **not an execution order and
 not authority.** Do not execute tasks blindly by number or phase.
 
+**`docs/PROJECT-STATUS.md` is the one authoritative summary** of what is
+deployed, what is merged but not deployed, what is blocked and on which KIND of
+blocker, and what comes next. Read it before re-deriving any of that, and
+re-measure rather than repeating its figures: it carries the date of each
+measurement and the command that re-derives it, because a tally written into
+prose goes stale by construction.
+
 Reconcile each item against actual repository and production evidence before
 acting. An item may be DONE, PARTIALLY DONE, STILL VALID, SUPERSEDED, in need
 of REORDER, or replaced by something NEW.
