@@ -4254,12 +4254,19 @@ self-documenting rather than something a later session has to re-derive.
 
 ---
 
-**FOUR OF THE APPROVAL-GATED ITEMS NEED THE DEPLOYMENT FIRST, which no row
-said.** `capture-state`, `verify-state` and `restore-state` are **not in the
-installed binary** -- production is `a63ad19` and predates all of them. So
-**P1.7** (activate a target for the captures) and **P1.8**'s real run are
+**FOUR OF THE APPROVAL-GATED ITEMS NEEDED THE DEPLOYMENT FIRST, which no row
+said.** `capture-state`, `verify-state` and `restore-state` were **not in the
+installed binary** -- production was `a63ad19` and predated all of them. So
+**P1.7** (activate a target for the captures) and **P1.8**'s real run were
 gated on the deployment and only then on approval, while **P4.6**, **P3.5** and
-**P5.2** act on what is installed today.
+**P5.2** acted on what was installed then.
+
+**RETIRED 2026-11-18: the deployment happened** (`a63ad19` -> `f647aa2`), and
+all eleven `capabilities --has` tokens of that surface answer **0** against the
+installed binary where every one answered **2** before. The rule the entry
+exists for is unchanged and is the durable part: never tell the operator to run
+a command that is not DEPLOYED, and check the installed binary rather than
+`bin/`.
 
 Recommending a capture command now would hand the operator a usage error --
 precisely the recorded defect from when `storage verify-recovery` was suggested
@@ -5616,9 +5623,12 @@ downtime at all.
 away must answer `1` and **not** `2` -- advertised-but-unperformable and
 never-heard-of are different facts to a script -- and a row deleted outright
 must answer `2`, which is the case an **older installed binary actually
-presents**. Production is `a63ad19` and has none of these functions, so a
-wrapper asking today gets `2`, correctly. The mutations drive both directions
-against the real `--has`.
+presents**. Production was `a63ad19` and had none of these functions, so a
+wrapper asking then got `2`, correctly -- which is exactly why the three-answer
+contract matters; after the 2026-11-18 deployment the same tokens answer `0`,
+and a script written against the exit status alone would not have noticed
+either transition. The mutations drive both directions against the real
+`--has`.
 
 **Tokens are promises and are never renamed in place**, so these names are
 chosen once: `state-capture`, `state-capture-quiesced`,
