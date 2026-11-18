@@ -9,10 +9,17 @@
 #   operator/ scripts inside that checkout, as part of the fast-forward
 #   /etc/systemd/system/domum-media-weekly-report.{service,timer}
 #       Installed if their hashes differ, then `systemctl daemon-reload`.
-#       NEITHER IS ENABLED OR STARTED. The weekly unit carries the
-#       `health-notify` step, so installing the file is what makes the
-#       notification available; enabling the timer sends mail and stays an
-#       explicit operator decision.
+#       NEITHER IS ENABLED OR STARTED by this script. The weekly unit carries
+#       the report and `health-notify` steps, so installing the file is what
+#       makes them available; enabling the timer stays an explicit operator
+#       decision.
+#
+#       BUT INSTALLING IT IS NOT NECESSARILY INERT. If the timer is ALREADY
+#       enabled -- which it is on this host, and has been since 2026-10-20 --
+#       the new ExecStart lines run at the next firing. So the closing report
+#       reads `systemctl is-enabled` and says which of the two situations the
+#       operator is in, rather than asserting the one that happened to be true
+#       when this script was written.
 #
 # WHAT IT DOES NOT TOUCH: containers, images, compose files, systemd units,
 # timers, Restic schedules, Restic exclusions, the Immich database, originals,
@@ -276,11 +283,41 @@ fi
 printf '\n== deployed ==\n'
 say "revision  : $(git -C "$CHECKOUT" rev-parse --short HEAD)"
 if [ "${UNITS_CHANGED:-0}" -eq 1 ]; then
-  printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED but NOT"
-  printf '  %s\n' "enabled. It mails only when something needs attention. To review"
-  printf '  %s\n' "its output and then enable it:"
-  printf '\n    %s\n' "sudo domum-media health-notify --dry-run"
-  printf '    %s\n' "sudo systemctl enable --now domum-media-weekly-report.timer"
+  # Whether installing the unit is INERT depends on live state this script does
+  # not control: if the timer was already enabled before this run, the new
+  # ExecStart lines take effect at the next firing and the first of them MAILS
+  # the weekly report. The message therefore READS the timer's state instead of
+  # asserting it. Saying "installed but NOT enabled" on a host whose timer has
+  # been enabled for weeks is a report describing a state the host is not in,
+  # which is the defect this project keeps correcting -- and the operator reads
+  # this line at the one moment it decides whether to expect mail.
+  #
+  # `is-enabled` is a QUERY: it enables nothing. An unreadable or absent answer
+  # is reported as unknown rather than as either state.
+  TIMER_UNIT="domum-media-weekly-report.timer"
+  TIMER_STATE="$(systemctl is-enabled "$TIMER_UNIT" 2>/dev/null || true)"
+  case "$TIMER_STATE" in
+    enabled|enabled-runtime|static|alias|indirect|generated)
+      NEXT_FIRE="$(systemctl show -p NextElapseUSecRealtime --value "$TIMER_UNIT" 2>/dev/null || true)"
+      printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED, and its"
+      printf '  %s\n' "timer was ALREADY $TIMER_STATE before this run. This deployment"
+      printf '  %s\n' "enabled nothing, started nothing and sent nothing -- but the new"
+      printf '  %s\n' "ExecStart lines take effect at the next firing, and the FIRST of"
+      printf '  %s\n' "them mails the weekly report whether or not anything is wrong."
+      [ -n "$NEXT_FIRE" ] && printf '\n    %s\n' "next firing: $NEXT_FIRE"
+      printf '\n  %s\n' "To see exactly what it will send, without sending anything:"
+      printf '\n    %s\n' "sudo domum-media report weekly --stdout"
+      printf '    %s\n' "sudo domum-media health-notify --dry-run"
+      ;;
+    *)
+      printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED but NOT"
+      printf '  %s\n' "enabled${TIMER_STATE:+ (systemd reports: $TIMER_STATE)}. Once enabled it"
+      printf '  %s\n' "mails the weekly report EVERY Sunday, healthy or not, plus an alert"
+      printf '  %s\n' "only when something needs attention. To see both without sending:"
+      printf '\n    %s\n' "sudo domum-media health-notify --dry-run"
+      printf '    %s\n' "sudo systemctl enable --now domum-media-weekly-report.timer"
+      ;;
+  esac
 fi
 say "untouched : containers, images, compose, OTHER systemd units, timers, Restic"
 say "            schedules and exclusions, the Immich database, originals,"
