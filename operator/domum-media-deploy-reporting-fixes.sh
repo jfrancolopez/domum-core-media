@@ -9,10 +9,17 @@
 #   operator/ scripts inside that checkout, as part of the fast-forward
 #   /etc/systemd/system/domum-media-weekly-report.{service,timer}
 #       Installed if their hashes differ, then `systemctl daemon-reload`.
-#       NEITHER IS ENABLED OR STARTED. The weekly unit carries the
-#       `health-notify` step, so installing the file is what makes the
-#       notification available; enabling the timer sends mail and stays an
-#       explicit operator decision.
+#       NEITHER IS ENABLED OR STARTED by this script. The weekly unit carries
+#       the report and `health-notify` steps, so installing the file is what
+#       makes them available; enabling the timer stays an explicit operator
+#       decision.
+#
+#       BUT INSTALLING IT IS NOT NECESSARILY INERT. If the timer is ALREADY
+#       enabled -- which it is on this host, and has been since 2026-10-20 --
+#       the new ExecStart lines run at the next firing. So the closing report
+#       reads `systemctl is-enabled` and says which of the two situations the
+#       operator is in, rather than asserting the one that happened to be true
+#       when this script was written.
 #
 # WHAT IT DOES NOT TOUCH: containers, images, compose files, systemd units,
 # timers, Restic schedules, Restic exclusions, the Immich database, originals,
@@ -252,35 +259,93 @@ if [ "$SKIP_BEHAVIOUR" -ne 1 ]; then
   COV_OUT="$("$BIN_DIR/domum-media-backup" verify-snapshot-coverage cloud --json 2>/dev/null || true)"
   COV_JSON="$(sed -n '/^{/{p;q;}' <<< "$COV_OUT")"
   if [ -z "$COV_JSON" ]; then
-    abort "the new build produced no --json output for verify-snapshot-coverage"
+    # Name BOTH causes, and say what already happened. The install and the
+    # installed == checkout invariant are both above this point, so an abort
+    # here must not read as "nothing was deployed". `verify-snapshot-coverage`
+    # DIES without printing JSON when the Immich asset table cannot be read --
+    # which is a finding about the library, not about the binary.
+    abort "no --json output from verify-snapshot-coverage. The files above ARE
+installed and verified; this is a check that could not run. It dies without
+printing JSON when the Immich asset table cannot be read, so look there before
+suspecting the build."
   fi
-  jq -e 'has("missing_classified") and has("missing_backup_gap")
-         and has("missing_pending_next_backup") and has("missing_timing_unknown")' \
-     >/dev/null <<< "$COV_JSON" \
-    || abort "the installed build does not emit the classification keys"
-  jq -e '.result as $r
-         | ["covered","pending","gap","unknown"] | index($r) != null' \
-     >/dev/null <<< "$COV_JSON" \
-    || abort "the installed build reported a verdict outside the known set"
-  say "classification keys present; verdict: $(jq -r '.result' <<< "$COV_JSON")"
-  say "backed up : $(jq -r '.in_snapshot' <<< "$COV_JSON") of $(jq -r '.originals' <<< "$COV_JSON")"
-  say "gap       : $(jq -r '.missing_backup_gap' <<< "$COV_JSON")"
-  say "pending   : $(jq -r '.missing_pending_next_backup' <<< "$COV_JSON")"
-  say "unknown   : $(jq -r '.missing_timing_unknown' <<< "$COV_JSON")"
-  if [ "$(jq -r '.missing_backup_gap' <<< "$COV_JSON")" != "0" ]; then
-    printf '\n  %s\n' "NOTE: a BACKUP GAP is reported. That is a real finding, not a"
-    printf '  %s\n' "deployment problem. Investigate it separately."
+
+  # An UNKNOWN verdict WITH A REASON is the build answering, not failing.
+  #
+  # Those replies carry only target/snapshot/result/reason by design -- there is
+  # nothing to classify when the snapshot could not be listed at all -- so
+  # demanding the classification keys here would abort a COMPLETED deployment
+  # and blame the binary for a repository that was locked or unreachable. "I
+  # could not check it" is not "it is broken", and a check that names the wrong
+  # cause at the moment of deployment is the defect this project keeps
+  # correcting.
+  COV_RESULT="$(jq -r '.result // empty' <<< "$COV_JSON" 2>/dev/null || true)"
+  COV_REASON="$(jq -r '.reason // empty' <<< "$COV_JSON" 2>/dev/null || true)"
+  if [ "$COV_RESULT" = "unknown" ] && [ -n "$COV_REASON" ]; then
+    say "coverage  : UNKNOWN -- $COV_REASON"
+    printf '\n  %s\n' "NOTE: the coverage check reached no verdict ($COV_REASON)."
+    printf '  %s\n' "The files above ARE installed and verified. This is a finding about"
+    printf '  %s\n' "the repository or the library, not a deployment problem. Investigate"
+    printf '  %s\n' "it separately."
+  else
+    jq -e 'has("missing_classified") and has("missing_backup_gap")
+           and has("missing_pending_next_backup") and has("missing_timing_unknown")' \
+       >/dev/null <<< "$COV_JSON" \
+      || abort "the installed build does not emit the classification keys"
+    jq -e '.result as $r
+           | ["covered","pending","gap","unknown"] | index($r) != null' \
+       >/dev/null <<< "$COV_JSON" \
+      || abort "the installed build reported a verdict outside the known set"
+    say "classification keys present; verdict: $(jq -r '.result' <<< "$COV_JSON")"
+    say "backed up : $(jq -r '.in_snapshot' <<< "$COV_JSON") of $(jq -r '.originals' <<< "$COV_JSON")"
+    say "gap       : $(jq -r '.missing_backup_gap' <<< "$COV_JSON")"
+    say "pending   : $(jq -r '.missing_pending_next_backup' <<< "$COV_JSON")"
+    say "unknown   : $(jq -r '.missing_timing_unknown' <<< "$COV_JSON")"
+    if [ "$(jq -r '.missing_backup_gap' <<< "$COV_JSON")" != "0" ]; then
+      printf '\n  %s\n' "NOTE: a BACKUP GAP is reported. That is a real finding, not a"
+      printf '  %s\n' "deployment problem. Investigate it separately."
+    fi
   fi
 fi
 
 printf '\n== deployed ==\n'
 say "revision  : $(git -C "$CHECKOUT" rev-parse --short HEAD)"
 if [ "${UNITS_CHANGED:-0}" -eq 1 ]; then
-  printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED but NOT"
-  printf '  %s\n' "enabled. It mails only when something needs attention. To review"
-  printf '  %s\n' "its output and then enable it:"
-  printf '\n    %s\n' "sudo domum-media health-notify --dry-run"
-  printf '    %s\n' "sudo systemctl enable --now domum-media-weekly-report.timer"
+  # Whether installing the unit is INERT depends on live state this script does
+  # not control: if the timer was already enabled before this run, the new
+  # ExecStart lines take effect at the next firing and the first of them MAILS
+  # the weekly report. The message therefore READS the timer's state instead of
+  # asserting it. Saying "installed but NOT enabled" on a host whose timer has
+  # been enabled for weeks is a report describing a state the host is not in,
+  # which is the defect this project keeps correcting -- and the operator reads
+  # this line at the one moment it decides whether to expect mail.
+  #
+  # `is-enabled` is a QUERY: it enables nothing. An unreadable or absent answer
+  # is reported as unknown rather than as either state.
+  TIMER_UNIT="domum-media-weekly-report.timer"
+  TIMER_STATE="$(systemctl is-enabled "$TIMER_UNIT" 2>/dev/null || true)"
+  case "$TIMER_STATE" in
+    enabled|enabled-runtime|static|alias|indirect|generated)
+      NEXT_FIRE="$(systemctl show -p NextElapseUSecRealtime --value "$TIMER_UNIT" 2>/dev/null || true)"
+      printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED, and its"
+      printf '  %s\n' "timer was ALREADY $TIMER_STATE before this run. This deployment"
+      printf '  %s\n' "enabled nothing, started nothing and sent nothing -- but the new"
+      printf '  %s\n' "ExecStart lines take effect at the next firing, and the FIRST of"
+      printf '  %s\n' "them mails the weekly report whether or not anything is wrong."
+      [ -n "$NEXT_FIRE" ] && printf '\n    %s\n' "next firing: $NEXT_FIRE"
+      printf '\n  %s\n' "To see exactly what it will send, without sending anything:"
+      printf '\n    %s\n' "sudo domum-media report weekly --stdout"
+      printf '    %s\n' "sudo domum-media health-notify --dry-run"
+      ;;
+    *)
+      printf '\n  %s\n' "The weekly report + health notification unit is INSTALLED but NOT"
+      printf '  %s\n' "enabled${TIMER_STATE:+ (systemd reports: $TIMER_STATE)}. Once enabled it"
+      printf '  %s\n' "mails the weekly report EVERY Sunday, healthy or not, plus an alert"
+      printf '  %s\n' "only when something needs attention. To see both without sending:"
+      printf '\n    %s\n' "sudo domum-media health-notify --dry-run"
+      printf '    %s\n' "sudo systemctl enable --now domum-media-weekly-report.timer"
+      ;;
+  esac
 fi
 say "untouched : containers, images, compose, OTHER systemd units, timers, Restic"
 say "            schedules and exclusions, the Immich database, originals,"

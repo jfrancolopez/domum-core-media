@@ -84,9 +84,18 @@ mkdir -p "$CO/config"; printf 'SECRET_LOOKING=value\n' > "$CO/config/domum-media
 # so the reload can be asserted rather than assumed. The script's own check is
 # not weakened: a failing reload is still fatal.
 mkdir -p "$TMP/stub"
+# The stub RECORDS every call and can also ANSWER the two queries the script
+# makes about the timer. `is-enabled` is a query, so answering it is providing
+# an external dependency rather than weakening a check -- the same reason this
+# rehearsal supplies a systemctl at all. With the variables unset it answers
+# nothing, which is the "could not tell" case.
 cat > "$TMP/stub/systemctl" <<'SYSCTL'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${SYSCTL_LOG:?}"
+case "${1:-}" in
+  is-enabled) [ -n "${SYSCTL_IS_ENABLED:-}" ] && printf '%s\n' "$SYSCTL_IS_ENABLED" ;;
+  show)       [ -n "${SYSCTL_NEXT_ELAPSE:-}" ] && printf '%s\n' "$SYSCTL_NEXT_ELAPSE" ;;
+esac
 exit 0
 SYSCTL
 chmod +x "$TMP/stub/systemctl"
@@ -96,6 +105,8 @@ export SYSCTL_LOG="$TMP/systemctl.log"
 run() {  # rehearse as uid 0 without touching the host
   unshare -r env \
     PATH="$TMP/stub:$PATH" SYSCTL_LOG="$SYSCTL_LOG" \
+    SYSCTL_IS_ENABLED="${SYSCTL_IS_ENABLED:-}" \
+    SYSCTL_NEXT_ELAPSE="${SYSCTL_NEXT_ELAPSE:-}" \
     DOMUM_DEPLOY_CHECKOUT="$CO" DOMUM_DEPLOY_BIN_DIR="$BIN" \
     DOMUM_DEPLOY_LIB_DIR="$LIB" DOMUM_DEPLOY_UNIT_DIR="$UNITS" \
     DOMUM_DEPLOY_REMOTE=origin \
@@ -204,6 +215,45 @@ grep -q 'installed .*domum-media-weekly-report' <<< "$out2" \
   && fail "an unchanged unit was reinstalled: $out2"
 echo "  skipped on a second run"
 
+# Installing the unit is INERT only when the timer is off. On a host whose
+# timer is already enabled -- which production's is, and has been since
+# 2026-10-20 -- the new ExecStart lines run at the next firing and the first of
+# them MAILS the report. The old message asserted "INSTALLED but NOT enabled"
+# unconditionally, so it described a state that host is not in, at the one
+# moment the operator decides whether to expect mail. Both branches are driven,
+# because a message that always says the same thing cannot be right about both.
+sect "an ALREADY-ENABLED timer is reported as such, and not as not-enabled"
+printf '\n# perturbed so the unit differs and is reinstalled\n' \
+  >> "$UNITS/domum-media-weekly-report.service"
+out3="$(SYSCTL_IS_ENABLED=enabled SYSCTL_NEXT_ELAPSE='Sun 2026-11-22 08:14:26 EST' run --confirm)"
+grep -q 'timer was ALREADY enabled before this run' <<< "$out3" \
+  || fail "an already-enabled timer was not reported as such: $out3"
+grep -q 'INSTALLED but NOT' <<< "$out3" \
+  && fail "it still claims the timer is not enabled: $out3"
+grep -q 'next firing: Sun 2026-11-22 08:14:26 EST' <<< "$out3" \
+  || fail "it does not say when the new lines first take effect: $out3"
+grep -q 'mails the weekly report whether or not anything is wrong' <<< "$out3" \
+  || fail "it does not say the first ExecStart sends mail regardless: $out3"
+grep -q 'report weekly --stdout' <<< "$out3" \
+  || fail "it offers no way to preview what will be sent: $out3"
+# It still must not have enabled or started anything itself.
+grep -qE '^(enable|start|restart)' "$SYSCTL_LOG" \
+  && fail "the deployment enabled or started a unit: $(cat "$SYSCTL_LOG")"
+echo "  says ALREADY enabled, names the firing, offers a preview, enables nothing"
+
+sect "a timer that is NOT enabled still gets the deliberate-enable remedy"
+printf '\n# perturbed again\n' >> "$UNITS/domum-media-weekly-report.service"
+out4="$(SYSCTL_IS_ENABLED=disabled run --confirm)"
+grep -q 'INSTALLED but NOT' <<< "$out4" \
+  || fail "a disabled timer was not reported as not enabled: $out4"
+grep -q 'systemd reports: disabled' <<< "$out4" \
+  || fail "it does not quote what systemd actually said: $out4"
+grep -q 'systemctl enable --now domum-media-weekly-report.timer' <<< "$out4" \
+  || fail "the enable remedy is gone: $out4"
+grep -q 'timer was ALREADY' <<< "$out4" \
+  && fail "a disabled timer was reported as already enabled: $out4"
+echo "  reports not-enabled, quotes systemd, offers the enable command"
+
 sect "the untracked production configuration survived"
 [[ -f "$CO/config/domum-media.conf" ]] || fail "the production config was removed"
 grep -q 'SECRET_LOOKING=value' "$CO/config/domum-media.conf" \
@@ -232,6 +282,35 @@ out="$(run --confirm)"
 grep -q 'does not emit the classification keys' <<< "$out" \
   || fail "a build without the classification was accepted: $out"
 echo "  a regressed build fails the deployment's own behaviour check"
+
+# An UNKNOWN reply is the build ANSWERING. `verify-snapshot-coverage` emits
+# target/snapshot/result/reason and nothing else when the snapshot could not be
+# listed -- a locked or unreachable repository -- so demanding the
+# classification keys there would abort a deployment whose install had already
+# completed and verified, and blame the binary for the repository. The counts
+# are the part that must still be demanded when a real verdict comes back,
+# which the section above pins.
+sect "an UNKNOWN coverage verdict is a finding, not a build regression"
+cat > "$UP/bin/domum-media-backup" <<'UNKBK'
+#!/usr/bin/env bash
+if [ "${1:-}" = "verify-snapshot-coverage" ]; then
+  printf '%s\n' '{"target":"cloud","snapshot_id":"deadbeef","result":"unknown","reason":"listing failed"}'
+  printf '  result            : UNKNOWN -- the snapshot could not be listed\n'
+  exit 2
+fi
+UNKBK
+chmod +x "$UP/bin/domum-media-backup"
+git -C "$UP" add -A; git -C "$UP" -c user.email=t@e -c user.name=t commit -qm unknown
+out="$(run --confirm)"
+grep -q 'does not emit the classification keys' <<< "$out" \
+  && fail "an UNKNOWN reply was blamed on the build: $out"
+grep -q 'coverage  : UNKNOWN -- listing failed' <<< "$out" \
+  || fail "the reason the check could not answer was not reported: $out"
+grep -q 'ARE installed and verified' <<< "$out" \
+  || fail "it does not say the install already completed: $out"
+grep -q '== deployed ==' <<< "$out" \
+  || fail "a deployment that installed everything did not complete: $out"
+echo "  reports the reason, keeps the deployment, blames neither wrongly"
 
 sect "a reported BACKUP GAP is a finding, not a deployment failure"
 cat > "$UP/bin/domum-media-backup" <<'GAPBK'

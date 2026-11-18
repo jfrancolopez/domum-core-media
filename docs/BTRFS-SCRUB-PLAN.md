@@ -258,11 +258,30 @@ the photo tier. `checkup_btrfs_health` reports it as one.
 5. A single corrected metadata error is not an emergency. **Repeated or growing
    counters are a device-replacement signal**, not a scrub-again signal.
 
-## 7. The recurring schedule — written, NOT installed, NOT enabled
+## 7. The recurring schedule — INSTALLED and ENABLED by the operator, 2026-11-03
 
-`systemd/domum-media-btrfs-scrub.service` and `.timer` now exist in the
-repository. Neither is installed on the host and the timer is **not** in
-`systemd/auto-enable.timers`, so installation and convergence cannot enable it.
+This section said *"written, NOT installed, NOT enabled"* and that was true
+until 2026-11-03. Re-measured 2026-11-18:
+
+```
+/etc/systemd/system/domum-media-btrfs-scrub.service   sha256 == the repository's
+domum-media-btrfs-scrub.timer    enabled, active
+next elapse                      Sun 2026-12-06 05:41:50 EST
+LastTriggerUSec                  (none -- no scrub has run from the timer)
+```
+
+The timer is still **not** in `systemd/auto-enable.timers`, and that remains
+deliberate: installation and convergence must not be able to enable it. The
+operator enabled it explicitly, which is the only route the design allows, and
+a test asserts the unit file exists while the timer stays off that list.
+
+**One consequence belongs here rather than only in the deployment plan.** The
+installed `domum-media` predates `btrfs_scrub_running`, so if a scrub is
+already running when the timer fires, `btrfs scrub start` returns non-zero,
+falls into the generic failure arm, fails the unit, and is mailed as a
+CRITICAL -- for an entirely normal condition. Deploying the current `main`
+before 2026-12-06 removes that, and `docs/DEPLOYMENT-PLAN.md` §4 holds the
+measurement.
 
 ```
 # domum-media-btrfs-scrub.timer
@@ -277,9 +296,11 @@ ExecStart=/usr/local/bin/domum-media storage scrub start --limit 150M
 TimeoutStartSec=6h
 ```
 
-`systemd-analyze verify` passes on both, and
-`systemd-analyze calendar 'Sun *-*-01..07 05:30:00'` next elapses
-Sun 2026-11-01 05:30 EST.
+`systemd-analyze verify` passes on both. The calendar expression resolves to
+the first Sunday of each month; the live next elapse is read from the timer
+itself rather than quoted here, because a date written into prose goes stale by
+construction -- this paragraph used to say `Sun 2026-11-01 05:30 EST`, which
+has long since passed.
 
 Four deliberate decisions, each asserted by a test:
 

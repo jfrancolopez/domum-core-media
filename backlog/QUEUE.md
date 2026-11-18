@@ -41,10 +41,20 @@ $ sudo -n -l | grep -c NOPASSWD
 ```
 
 That is not a judgement call, and it settles every remaining row at once.
-`/srv/data/backups/images` (P2.1), installing a unit (P4.6), traversing
-`/var/lib/docker` (P3.4), the deployment that P1.7 and P1.8 depend on, and
-`install.sh` for P5.3 all need root, and root is unobtainable here. CLAUDE.md
-§10 says so and now the queue has the measurement.
+`/srv/data/backups/images` (P2.1), traversing `/var/lib/docker` (P3.4), the
+deployment that P1.7 and P1.8 depend on, and `install.sh` for P5.3 all need
+root, and root is unobtainable here. CLAUDE.md §10 says so and now the queue
+has the measurement.
+
+**P4.6 used to be in that list and is not any more: the operator installed and
+enabled the scrub timer on 2026-11-03.** Re-measured 2026-11-18 -- the unit
+file's sha256 equals the repository's, the timer is `enabled, active`, and its
+next elapse is **Sun 2026-12-06 05:41:50 EST**. Three copies of this fact had
+gone stale here while the P4.6 row below carried it correctly, which is the
+recorded failure mode: changing one copy of a fact is worse than changing
+neither, because the remaining copies get a neighbour vouching for them. A
+stale row that UNDERSTATES what exists is the worse direction, since nothing
+ever contradicts it.
 
 **A command existing in the installed binary is not the same as being runnable
 by this account**, and an earlier note conflated them: "works against the
@@ -60,7 +70,6 @@ So each remaining item is blocked by at least one of:
 | P2.1 `du` the archives | root | — |
 | P3.4 volume rehearsal | **substantially DONE 2026-11-12** — rehearsed against real containers and real image ids; the container-name half was retired by DECLARING a new service rather than borrowing a production one. One stubbed call remains (`docker_volume_mountpoint`, a `/var/lib/docker` path), so only `tar -C` on docker's own reported path is unproven | — |
 | P3.5 production upgrade | — | "upgrade production applications" |
-| P4.6 enable the scrub timer | root | "enable timers" |
 | P5.2 off-host key copy | — | "do not make credential copies" |
 | P5.3 fresh-host restore | root + a second machine | — |
 | P5.5 full Immich restore | ~130 GiB + the UGREEN hardware | — |
@@ -73,9 +82,17 @@ operator-approval items split into two groups, and the order matters:
 
 | needs the deployment FIRST | works against the installed binary today |
 |---|---|
-| **P1.7** (activate a target for the captures) | **P4.6** (install + enable the scrub timer) |
-| **P1.8** real run (`capture-state --quiesce`) | **P5.2** (off-host key copy — no command on this host at all) |
-| | **P3.5** (`updates apply --service …`; `volume-pre-upgrade-point` is installed) |
+| **P1.7** (activate a target for the captures) | **P5.2** (off-host key copy — no command on this host at all) |
+| **P1.8** real run (`capture-state --quiesce`) | **P3.5** (`updates apply --service …`; `volume-pre-upgrade-point` is installed) |
+
+**P4.6 has left this table, and finishing it DATED the deployment rather than
+closing a row.** The timer is enabled and fires Sun 2026-12-06; the installed
+binary predates `btrfs_scrub_running`, so a scrub already running at that
+moment lands in the generic failure arm, fails the oneshot unit, and
+`health-notify` mails a CRITICAL for an entirely normal condition. Mail
+delivery is proven, so that alarm would reach the operator. The measurement and
+the exact margin are in `docs/DEPLOYMENT-PLAN.md` §4; this is the one item in
+the delta with a calendar date attached to it.
 
 Recommending a capture command today would give the operator a usage error —
 the recorded defect from when `storage verify-recovery` was suggested off an
@@ -238,7 +255,7 @@ dispatch, the closed gate, and phase 4's model-awareness.
 
 | # | item | status |
 |---|---|---|
-| P4.1 | scrub unit + timer written, not installed | **done; schedule now TESTED too** — `systemd-analyze calendar` resolves `Sun *-*-01..07 05:30:00` to the first Sunday monthly (next elapse 2026-12-06), which is the only part of a timer testable without installing it. Both units verify clean and neither is installed. The timer's comment justified `Persistent=true` with "this job deletes nothing" — true but the wrong reason for a READ-WRITE job; corrected to the real mitigations (`RandomizedDelaySec=20m`, and `--limit 150M` making it ~25 min rather than the measured 7m14s) |
+| P4.1 | scrub unit + timer written, not installed | **done; schedule now TESTED too** — `systemd-analyze calendar` resolves `Sun *-*-01..07 05:30:00` to the first Sunday monthly (next elapse 2026-12-06), which is the only part of a timer testable without installing it. Both units verify clean, and the operator has since installed and enabled them (P4.6). The timer's comment justified `Persistent=true` with "this job deletes nothing" — true but the wrong reason for a READ-WRITE job; corrected to the real mitigations (`RandomizedDelaySec=20m`, and `--limit 150M` making it ~25 min rather than the measured 7m14s) |
 | P4.2 | per-filesystem dedup so one filesystem is scrubbed once | **done** — `btrfs_unique_roots`, both directions tested |
 | P4.3 | exit status contract (`0`/`1`/`3`) and a failed scrub failing the unit | **done** |
 | P4.4 | SMART wear reaching the notifier | **done, and re-verified against the real host 2026-11-03** — driving the checks unprivileged confirmed a permission failure reports `UNKNOWN` as a WARNING with **zero CRITICAL** (the recorded defect, fixed), and exposed a new one: `mreport_smart_interpretable` collapsed "no table at all" into "placeholders", so /dev/sda — interpretable as root — was reported as holding vendor placeholders. Three states now (0/1/2), advice worded per cause, pinned by a section no fixture could have reached |
