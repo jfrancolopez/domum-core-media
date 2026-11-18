@@ -7,35 +7,50 @@ change, how to verify it afterwards, and how to undo it.
 
 Two things decide the order, and both were measured rather than assumed.
 
-## 0. The deployment comes first, and nothing else works without it
+## 0. The deployment is DONE, and that is what makes 2-5 runnable
+
+Deployed 2026-11-18. Re-measured against the installed binary immediately
+afterwards -- every token of the selective-backup surface:
 
 ```
-$ /usr/local/bin/domum-media capabilities --has state-capture        -> exit 2
-$ /usr/local/bin/domum-media capabilities --has state-pack           -> exit 2
-$ /usr/local/bin/domum-media capabilities --has state-unpack         -> exit 2
-$ /usr/local/bin/domum-media capabilities --has verify-state-pack    -> exit 2
-$ /usr/local/bin/domum-media capabilities --has state-pack-retention -> exit 2
-$ /usr/local/bin/domum-media capabilities --has state-capture-all    -> exit 2
-$ /usr/local/bin/domum-media capabilities --has image-archive-retention -> exit 2
+$ for t in state-capture state-capture-quiesced state-capture-consistent-via-helper \
+           state-verify state-restore state-pack state-unpack verify-state-pack \
+           state-pack-retention state-capture-all image-archive-retention; do
+    /usr/local/bin/domum-media capabilities --has "$t"; echo "$t -> $?"
+  done
+  -> all eleven exit 0
 ```
 
-Exit **2** is "token unknown": the installed binary has never heard of any of
-them. So **the entire selective-backup surface is undeployed**, and items 2-5
-below would produce a usage error today even with approval. This repository
-records the defect of recommending a command that is not deployed; stating the
-order is how that is avoided here.
+Exit **0** is "supported". Before the deployment all eleven exited **2**,
+"token unknown": the installed binary had never heard of them, so items 2-5
+would have produced a usage error even with approval. That is why the ordering
+was stated rather than assumed, and re-running the loop above is how a later
+session confirms it rather than trusting this paragraph.
 
-`capabilities --has` is the right question because it distinguishes three
+`capabilities --has` remains the right question because it distinguishes three
 answers -- `0` supported, `1` implementation absent, `2` token unknown -- so an
 older binary cannot be mistaken for a missing feature.
 
+**Item 1 below is retained as the record of what was deployed**, not as work
+outstanding.
+
 ---
 
-## 1. Deploy the binaries  (prerequisite for 2-5)
+## 1. Deploy the binaries  (DONE 2026-11-18 -- kept as the record)
 
 See `docs/DEPLOYMENT-PLAN.md` §9 for the reviewed plan. Deployment **A** only:
-three binaries and the two weekly-report units, via
+three binaries and the weekly-report unit, via
 `operator/domum-media-deploy-reporting-fixes.sh`.
+
+**Executed 2026-11-18** with `--expect-revision=f647aa2e197c --confirm`.
+`a63ad199bfa2 -> f647aa2e197c`; the script handed over to its own replacement
+exactly once, as designed; four files installed and all five verified by
+sha256; `systemd reloaded; no unit was enabled or started`; the behaviour check
+reported `covered, 23267 of 23267, gap 0`. The weekly timer was already enabled
+beforehand, so the deployment's first visible effect is the Sun 2026-11-22
+08:10 EST firing. One measured side effect worth knowing: `daemon-reload`
+re-rolls `RandomizedDelaySec=45m`, so the next elapse moved from 08:14:26 to
+08:10:55 although the timer file is byte-identical.
 
 - **changes**: `/usr/local/bin/domum-media`, `/usr/local/bin/domum-media-backup`,
   `/usr/local/lib/domum-media/domum-media-report`, two unit files, one

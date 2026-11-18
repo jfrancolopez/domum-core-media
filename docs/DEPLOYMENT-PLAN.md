@@ -1,8 +1,22 @@
-# Deployment plan — production `a63ad19` → current `origin/main`
+# Deployment plan — production `a63ad19` → `f647aa2`
 
-**Reviewed, not executed.** Changing `/opt/domum-core-media` or anything running
-on the host is an approval boundary of its own; landing code on `main` is not.
-Nothing below has been run.
+**EXECUTED 2026-11-18**, with the operator's approval, as
+`operator/domum-media-deploy-reporting-fixes.sh --expect-revision=f647aa2e197c
+--confirm`. `a63ad199bfa2 -> f647aa2e197c`; four files installed and five
+verified by sha256; the script handed over to its own replacement exactly
+once; no container created, recreated, restarted or stopped; no image
+deployed; no timer enabled. The measurements below are the record of what was
+reviewed beforehand and are kept as that record — **they describe the
+pre-deployment position, not the current one.** `docs/PROJECT-STATUS.md` holds
+the current position, and §1 there gives the commands that re-derive it.
+
+Two things the execution added that no review had predicted, both measured
+afterwards and worth keeping: `daemon-reload` re-rolls `RandomizedDelaySec`,
+so the weekly timer's next elapse moved although its unit file is
+byte-identical; and the fast-forward put the **Compose** change set into
+production's checkout without applying it, so anything that reconciles would
+now apply the hardening — and, for two services whose images are dangling with
+newer ones staged, an unreviewed application upgrade with it.
 
 **This file used to be `DEPLOYMENT-PLAN-2026-11-02.md`, and the date in the
 filename was the problem.** A plan is a living document about two revisions,

@@ -11,7 +11,7 @@ re-derives it.** A running tally written into prose rots -- this project has
 corrected the same stale count three times -- so nothing below should be
 repeated to the operator without re-running the check beside it.
 
-Last reconciled: **2026-11-18**.
+Last reconciled: **2026-11-18**, after the reporting deployment.
 
 ```
 git rev-parse origin/main                      # what "current" means today
@@ -25,9 +25,9 @@ git rev-list --count $(git -C /opt/domum-core-media rev-parse HEAD)..origin/main
 
 | | value | measured |
 |---|---|---|
-| `origin/main` | `9824e48` | 2026-11-18 |
-| production checkout | `a63ad19` (clean, on `main`, an ancestor of `origin/main`) | 2026-11-18 |
-| installed binaries | sha256-identical to the production checkout | 2026-11-18 |
+| `origin/main` | `f647aa2` | 2026-11-18 |
+| production checkout | `f647aa2` (clean, on `main`) -- **equal to `origin/main`** | 2026-11-18, after the deployment |
+| installed binaries | sha256-identical to the production checkout, all four files re-verified against the `origin/main` blobs | 2026-11-18, after the deployment |
 | CI on `main` | green, 113 steps, one workflow (`compose-validate`) | 2026-11-18 |
 | open pull requests | none | 2026-11-18 |
 | development worktrees | one: the primary checkout, on `main` | 2026-11-18 |
@@ -49,34 +49,53 @@ domum service's last run exited 0.
 | five migrated services | real Btrfs subvolumes with retained proof snapshots |
 | Btrfs scrub timer | installed and **enabled** by the operator 2026-11-03; next firing Sun 2026-12-06; no scrub has run from it |
 | image-refresh timer | `disabled`, `inactive` -- as required |
+| weekly report + alert unit | **three `ExecStart` lines installed** (`report --write`, `report weekly --email --scheduled`, `health-notify --unless-reported`); timer `enabled, active`, next firing Sun 2026-11-22 08:10 EST |
+| backup-freshness reader | an empty or whitespace-only heartbeat now answers *cannot tell* (rc=1) instead of fabricating *today 00:00* -- driven against the installed binary with `DOMUM_LOG_DIR` redirected |
+| selective-backup surface | all eleven `capabilities --has` tokens answer **0**; they answered **2** (token unknown) before the deployment |
 | protected tier | `/srv/data` 24 % used |
 
 ---
 
 ## 3. MERGED BUT UNDEPLOYED
 
-Production is behind `origin/main`. Three consequences are live rather than
-theoretical, and the second has a date attached.
+**The three reporting consequences are CLOSED.** Deployed 2026-11-18 via
+`operator/domum-media-deploy-reporting-fixes.sh --confirm`, which installed
+three binaries and the weekly-report unit, handed over to its own replacement
+exactly once, verified every file by sha256, and recreated no container,
+enabled no timer and deployed no image. Each is re-derived rather than
+asserted:
 
-| # | consequence of the gap | severity |
+| # | former consequence | now |
 |---|---|---|
-| 1 | **An emptied backup heartbeat reads as a successful backup.** The installed `backup_last_success_epoch` predates the fix: `date -d ""` is not an error, so a truncated marker becomes *today 00:00* and the stateful-update gate passes on an invented timestamp | latent; the realistic trigger is a full disk |
-| 2 | **A scrub already running when the timer fires mails a CRITICAL for a normal condition.** The installed binary predates `btrfs_scrub_running`, so the refusal lands in the generic failure arm and fails the oneshot unit. Mail delivery is proven, so the alarm would arrive | **dated: Sun 2026-12-06** |
-| 3 | **The weekly HTML report is never sent.** The deployed unit has two `ExecStart` lines and does not invoke the report at all; `health-notify`'s silence gate mails only on an action or a critical, so a healthy week produces nothing and cannot be told apart from a broken reporter | the operator receives no weekly report |
+| 1 | an emptied backup heartbeat read as a successful backup | **closed** -- empty, whitespace-only and absent all answer rc=1; a valid marker still answers rc=0 |
+| 2 | a scrub already running when the timer fires would mail a CRITICAL | **closed before its date** -- `btrfs_scrub_running` is in the installed binary; the Sun 2026-12-06 firing is no longer a known false alarm |
+| 3 | the weekly HTML report was never sent | **closed** -- the unit's second `ExecStart` is `report weekly --email --scheduled`. First send: Sun 2026-11-22 08:10 EST |
 
-Also merged and undeployed, and deliberately a **separate** deployment kind
-because it recreates every container:
+The deployment also retired a prerequisite: every `capabilities --has` token of
+the selective-backup surface answered **2** (token unknown) before it and
+answers **0** now, so `docs/OPERATOR-GATED-ACTIONS.md` items 2-5 are reachable
+where they previously would have produced a usage error.
 
-| | note |
-|---|---|
-| `no-new-privileges` on 11 Compose fragments | deployed containers report an empty `SecurityOpt` |
-| Traefik behind a read-only Docker socket proxy | Traefik still binds the Docker socket directly; no proxy container exists |
-| `domum-media-state-capture.{service,timer}` | **new units, deliberately not in the narrow deploy script's target list.** Installing a unit is what makes its job available, and these carry a capture that writes credential-bearing artefacts plus a prune that deletes packs -- neither has run against production |
+### What is still undeployed, and it is one deployment kind
 
-**Deployment hazard that governs the Compose rollout.** Two running images are
-dangling (no tags, no digests) *and* have newer images staged under the same
-tag, so recreating either for a configuration-only change deploys an
-application upgrade as a side effect. Pin the running image IDs first.
+The fast-forward moved the production **checkout** to `f647aa2`, so the Compose
+change set is now *present in production and not applied*. Measured 2026-11-18:
+
+| | in the checkout | in effect |
+|---|---|---|
+| `no-new-privileges` | 11 fragments | **no** -- traefik, plex and immich_server all report `SecurityOpt=[]` |
+| Traefik behind a read-only Docker socket proxy | fragment present | **no** -- no `docker-socket-proxy` container exists |
+| `domum-media-state-capture.{service,timer}` | present | **no** -- absent from `/etc/systemd/system` |
+
+**This is sharper than it was before the fast-forward, not softer.** Any
+command that reconciles -- `domum-media apply`, and therefore `update` --
+would now apply the hardening to every container as a side effect, because the
+fragments it reads are already there. `compose up -d` recreates any container
+whose image changed, and two running images are dangling with newer images
+staged under the same tag, so such a reconcile would carry an unreviewed
+application upgrade for traefik and uptime-kuma. Pin the running image IDs
+before any deliberate rollout, and do not reach for `apply` as a convenience
+in the meantime.
 
 ---
 
@@ -90,8 +109,8 @@ feature.**
 
 | kind | items |
 |---|---|
-| **privilege** (root; `sudo -n` answers *a password is required*, 0 NOPASSWD entries, measured 2026-11-18) | reading the image-archive sizes; traversing the Docker volume root; installing units; the reporting deployment itself |
-| **approval** (production boundary) | the reporting deployment; the Compose hardening rollout; the kernel reboot; activating a backup target; a real quiesced capture; a production image upgrade |
+| **privilege** (root; `sudo -n` answers *a password is required*, 0 NOPASSWD entries, measured 2026-11-18) | reading the image-archive sizes; traversing the Docker volume root; installing the state-capture units; running any `storage` subcommand |
+| **approval** (production boundary) | the Compose hardening rollout; the kernel reboot; activating a backup target; a real quiesced capture; a production image upgrade |
 | **instruction** (standing prohibition) | copying the off-host recovery key; capturing live production state to a scratch directory, because the capture's declared purpose is to copy credentials |
 | **hardware / scale** | a fresh-host restore (a second machine); a full Immich restore (~130 GiB) |
 
@@ -107,24 +126,29 @@ off-site protection.
 
 ## 5. NEXT ACTIONS, in order
 
-1. **Deploy the reporting fixes** -- three binaries and the weekly-report unit,
-   via the narrow operator script. Recreates no container, enables no timer,
-   deploys no image. Closes consequences 1 and 3 above, and consequence 2
-   before its date. *Needs approval.*
-2. **Verify after deployment**: that the weekly report renders, that the
-   backup-freshness reader rejects an empty marker, and that the unit's new
-   steps are the ones installed. No external mail is sent to verify this.
-3. **Plan the kernel reboot** -- a newer kernel is installed and not running.
-   Every timer is `Persistent=true`, so missed jobs run immediately on boot,
-   `snapshot prune` among them; check each timer's last trigger against its
-   next elapse before rebooting. *Needs approval.*
-4. **Stage the Compose security rollout** -- per service, with each running
-   image ID pinned so a configuration change cannot carry an upgrade. Immich
-   last, in its own phase. *Needs approval.*
-5. **Finish off-site application-state backup** -- the artefacts and the whole
-   chain are proven; what remains is activating a target for them, which needs
-   the deployment first, and the operator's key custody step, which no work on
-   this host can replace.
+1. **Confirm Sunday's report arrived.** The first scheduled send is
+   Sun 2026-11-22 08:10 EST and it is the only part of the reporting work no
+   check here can stand in for -- a delivery failure is recorded by
+   `--scheduled` and raised as a CRITICAL by `checkup_weekly_report_delivery`,
+   so silence after that date means the mail arrived or the unit did not run,
+   and `systemctl list-timers` tells the two apart. Nothing to do before then.
+2. **Plan the kernel reboot** -- 6.12.117 is installed and 6.12.111 is
+   running. Every timer is `Persistent=true`, so missed jobs run immediately
+   on boot, `snapshot prune` among them; check each timer's last trigger
+   against its next elapse first. *Needs approval.*
+3. **Stage the Compose security rollout** -- per service, with each running
+   image ID pinned so a configuration change cannot carry an upgrade, Immich
+   last in its own phase. More urgent to schedule than before, because the
+   fragments now sit in production's checkout where a reconcile would apply
+   them unreviewed. *Needs approval.*
+4. **Finish off-site application-state backup** -- the commands are now
+   deployed, so `docs/OPERATOR-GATED-ACTIONS.md` items 2-5 are runnable. What
+   remains is the operator's: a destination for the packs, installing and
+   enabling the capture timer, and the key-custody step that no work on this
+   host can replace.
+5. **Verify recovery independently** -- a fresh-host restore needs a second
+   machine, and a full Immich restore is ~130 GiB. Nothing on this host is
+   `FULL RECOVERY VERIFIED` and nothing here changes that.
 
 ---
 
