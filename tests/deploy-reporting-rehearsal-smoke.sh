@@ -283,6 +283,35 @@ grep -q 'does not emit the classification keys' <<< "$out" \
   || fail "a build without the classification was accepted: $out"
 echo "  a regressed build fails the deployment's own behaviour check"
 
+# An UNKNOWN reply is the build ANSWERING. `verify-snapshot-coverage` emits
+# target/snapshot/result/reason and nothing else when the snapshot could not be
+# listed -- a locked or unreachable repository -- so demanding the
+# classification keys there would abort a deployment whose install had already
+# completed and verified, and blame the binary for the repository. The counts
+# are the part that must still be demanded when a real verdict comes back,
+# which the section above pins.
+sect "an UNKNOWN coverage verdict is a finding, not a build regression"
+cat > "$UP/bin/domum-media-backup" <<'UNKBK'
+#!/usr/bin/env bash
+if [ "${1:-}" = "verify-snapshot-coverage" ]; then
+  printf '%s\n' '{"target":"cloud","snapshot_id":"deadbeef","result":"unknown","reason":"listing failed"}'
+  printf '  result            : UNKNOWN -- the snapshot could not be listed\n'
+  exit 2
+fi
+UNKBK
+chmod +x "$UP/bin/domum-media-backup"
+git -C "$UP" add -A; git -C "$UP" -c user.email=t@e -c user.name=t commit -qm unknown
+out="$(run --confirm)"
+grep -q 'does not emit the classification keys' <<< "$out" \
+  && fail "an UNKNOWN reply was blamed on the build: $out"
+grep -q 'coverage  : UNKNOWN -- listing failed' <<< "$out" \
+  || fail "the reason the check could not answer was not reported: $out"
+grep -q 'ARE installed and verified' <<< "$out" \
+  || fail "it does not say the install already completed: $out"
+grep -q '== deployed ==' <<< "$out" \
+  || fail "a deployment that installed everything did not complete: $out"
+echo "  reports the reason, keeps the deployment, blames neither wrongly"
+
 sect "a reported BACKUP GAP is a finding, not a deployment failure"
 cat > "$UP/bin/domum-media-backup" <<'GAPBK'
 #!/usr/bin/env bash

@@ -259,24 +259,52 @@ if [ "$SKIP_BEHAVIOUR" -ne 1 ]; then
   COV_OUT="$("$BIN_DIR/domum-media-backup" verify-snapshot-coverage cloud --json 2>/dev/null || true)"
   COV_JSON="$(sed -n '/^{/{p;q;}' <<< "$COV_OUT")"
   if [ -z "$COV_JSON" ]; then
-    abort "the new build produced no --json output for verify-snapshot-coverage"
+    # Name BOTH causes, and say what already happened. The install and the
+    # installed == checkout invariant are both above this point, so an abort
+    # here must not read as "nothing was deployed". `verify-snapshot-coverage`
+    # DIES without printing JSON when the Immich asset table cannot be read --
+    # which is a finding about the library, not about the binary.
+    abort "no --json output from verify-snapshot-coverage. The files above ARE
+installed and verified; this is a check that could not run. It dies without
+printing JSON when the Immich asset table cannot be read, so look there before
+suspecting the build."
   fi
-  jq -e 'has("missing_classified") and has("missing_backup_gap")
-         and has("missing_pending_next_backup") and has("missing_timing_unknown")' \
-     >/dev/null <<< "$COV_JSON" \
-    || abort "the installed build does not emit the classification keys"
-  jq -e '.result as $r
-         | ["covered","pending","gap","unknown"] | index($r) != null' \
-     >/dev/null <<< "$COV_JSON" \
-    || abort "the installed build reported a verdict outside the known set"
-  say "classification keys present; verdict: $(jq -r '.result' <<< "$COV_JSON")"
-  say "backed up : $(jq -r '.in_snapshot' <<< "$COV_JSON") of $(jq -r '.originals' <<< "$COV_JSON")"
-  say "gap       : $(jq -r '.missing_backup_gap' <<< "$COV_JSON")"
-  say "pending   : $(jq -r '.missing_pending_next_backup' <<< "$COV_JSON")"
-  say "unknown   : $(jq -r '.missing_timing_unknown' <<< "$COV_JSON")"
-  if [ "$(jq -r '.missing_backup_gap' <<< "$COV_JSON")" != "0" ]; then
-    printf '\n  %s\n' "NOTE: a BACKUP GAP is reported. That is a real finding, not a"
-    printf '  %s\n' "deployment problem. Investigate it separately."
+
+  # An UNKNOWN verdict WITH A REASON is the build answering, not failing.
+  #
+  # Those replies carry only target/snapshot/result/reason by design -- there is
+  # nothing to classify when the snapshot could not be listed at all -- so
+  # demanding the classification keys here would abort a COMPLETED deployment
+  # and blame the binary for a repository that was locked or unreachable. "I
+  # could not check it" is not "it is broken", and a check that names the wrong
+  # cause at the moment of deployment is the defect this project keeps
+  # correcting.
+  COV_RESULT="$(jq -r '.result // empty' <<< "$COV_JSON" 2>/dev/null || true)"
+  COV_REASON="$(jq -r '.reason // empty' <<< "$COV_JSON" 2>/dev/null || true)"
+  if [ "$COV_RESULT" = "unknown" ] && [ -n "$COV_REASON" ]; then
+    say "coverage  : UNKNOWN -- $COV_REASON"
+    printf '\n  %s\n' "NOTE: the coverage check reached no verdict ($COV_REASON)."
+    printf '  %s\n' "The files above ARE installed and verified. This is a finding about"
+    printf '  %s\n' "the repository or the library, not a deployment problem. Investigate"
+    printf '  %s\n' "it separately."
+  else
+    jq -e 'has("missing_classified") and has("missing_backup_gap")
+           and has("missing_pending_next_backup") and has("missing_timing_unknown")' \
+       >/dev/null <<< "$COV_JSON" \
+      || abort "the installed build does not emit the classification keys"
+    jq -e '.result as $r
+           | ["covered","pending","gap","unknown"] | index($r) != null' \
+       >/dev/null <<< "$COV_JSON" \
+      || abort "the installed build reported a verdict outside the known set"
+    say "classification keys present; verdict: $(jq -r '.result' <<< "$COV_JSON")"
+    say "backed up : $(jq -r '.in_snapshot' <<< "$COV_JSON") of $(jq -r '.originals' <<< "$COV_JSON")"
+    say "gap       : $(jq -r '.missing_backup_gap' <<< "$COV_JSON")"
+    say "pending   : $(jq -r '.missing_pending_next_backup' <<< "$COV_JSON")"
+    say "unknown   : $(jq -r '.missing_timing_unknown' <<< "$COV_JSON")"
+    if [ "$(jq -r '.missing_backup_gap' <<< "$COV_JSON")" != "0" ]; then
+      printf '\n  %s\n' "NOTE: a BACKUP GAP is reported. That is a real finding, not a"
+      printf '  %s\n' "deployment problem. Investigate it separately."
+    fi
   fi
 fi
 
