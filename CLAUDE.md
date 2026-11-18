@@ -2145,11 +2145,17 @@ the backup-scope correction above decides whether that is even possible
 services NOT COVERED). Both DUP copies are on the same physical SSD, so DUP
 protects against a bad block, not against the device failing.
 
-**No scrub has been started, and no scrub timer exists.**
-`docs/BTRFS-SCRUB-PLAN.md` holds the duration arithmetic, the windows to avoid,
-what a checksum error means, the recovery actions, and a proposed monthly unit
-that is deliberately not written. Starting a scrub and enabling a timer are
-operator actions.
+**This paragraph used to say "no scrub has been started, and no scrub timer
+exists", and it was stale in three ways.** A scrub HAS run -- 2026-10-21,
+215.87 GiB, 7m14s, zero errors -- the monthly unit IS written, and the operator
+installed and enabled its timer on 2026-11-03 (`enabled, active`, next elapse
+Sun 2026-12-06). `docs/BTRFS-SCRUB-PLAN.md` holds the duration arithmetic, the
+windows to avoid, what a checksum error means and the recovery actions.
+Starting a scrub by hand and enabling a timer remain operator actions, and the
+timer is still deliberately absent from `systemd/auto-enable.timers` so that
+installation and convergence cannot enable it. The entry further down that
+records enabling it as having "put a date on a deployment" is the current
+statement; this one was its stale neighbour.
 
 **`btrfs_unique_roots` is the ONE implementation of the per-filesystem
 dedup.** `checkup_btrfs_health` carried its own copy, and `storage scrub`
