@@ -9237,6 +9237,69 @@ run against the UNFIXED code and fails there with
 `an empty marker read as a timestamp: OK 1794459600` -- a suite that has only
 seen a passing tree is not a guard.
 
+**`f "$x"; rc=$?` EXITS THE SHELL UNDER `set -e`, AND IT BLANKED THE THREE
+COMMANDS THAT TELL THE OPERATOR ANYTHING.** Production, 2026-11-19: the
+operator ran `sudo domum-media report weekly --stdout` and it returned in 6
+seconds having printed NOTHING -- not a header, not an error.
+
+That line reads as "run it and keep the status". It is not: a simple command
+that fails IS the errexit trigger, so the shell dies before `rc=$?` runs and
+the `case` written to handle the non-zero answers is unreachable. The
+function's ORDINARY answers become fatal.
+
+```
+mreport_smart_interpretable "$dev"; interp=$?
+```
+
+returns **1** for a drive whose SMART attributes all read alike and **2** for a
+table it cannot read. `/dev/sdb` here reports all 30 attributes at `value=100`
+-- a fact this file already records -- so it returns 1, and `checkup_disk_wear`
+died inside `checkup_collect_all`, which `checkup`, `health-notify` AND
+`report weekly` each run before printing a line. **All three went silent at
+once**, and silence is this project's healthy signal, so a host that could no
+longer report anything looked healthy.
+
+**A DEPLOYED regression, which is why it is worth the entry**: `a63ad199bfa2`
+-- production for the previous 16 days -- has **zero** occurrences of the shape
+and `f647aa2`, deployed 2026-11-18, has **two**. The installed binary carried
+both. A deployment that fixes three reporting defects can introduce a fourth,
+and the deployment's own verification was by sha256, which proves what was
+installed and not that it RUNS.
+
+**NO SUITE COULD HAVE CAUGHT IT, for two independent reasons**, and both are
+rules this file already states. `weekly-report-render-smoke` runs `set +e`
+immediately before driving the command -- *a test that relaxes production's
+shell options is not a test of production* -- and its `smartctl` stub returns a
+table with two DISTINCT values, so the non-zero branches were unreachable
+anyway: *a fixture that cannot reach the branch proves nothing about it.* Every
+driver in `tests/errexit-bare-call-smoke.sh` keeps errexit ON and drives the
+answers that are non-zero.
+
+**The sweep found four sites and the second one was live too.**
+`do_backup_scope` ran `dr_path_configured "$path" "$target"; rc=$?`, and that
+function returns 1 for "not in scope" and 2 for "could not resolve" -- the two
+answers the command exists to give. Measured: `backup-scope
+/srv/data/backups/images` printed **nothing** and exited 1, so the verdict
+vanished exactly when a path is NOT protected off-site. Same shape as the
+coverage check that lost its own `INCOMPLETE` verdict to a SIGPIPE.
+
+**The three hits in `operator/*.sh` are NOT instances**, and checking rather
+than assuming is what kept this to four fixes: those scripts run `set -u` only.
+
+Write `rc=0; f ... || rc=$?`. The `||` suppresses errexit inside `f`, which is
+what lets it run to completion and return its status -- the same mechanism that
+makes `f || true` safe, and the same one that makes a bare call fatal.
+
+**AND MY OWN SWEEP FIRST REPORTED "none".** The scanner's regex was wrong and
+it found zero sites in a tree with four. This file already holds that *a
+sweep's "none" is a claim about the scanner until the scanner has been shown
+finding the thing*; the negative control took one minute and turned a false
+clean verdict into four fixes. The shipped check in that suite therefore
+carries its own planted instance, and a clean verdict is reported only after
+the scan has rejected it.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

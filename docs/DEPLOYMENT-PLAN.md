@@ -1,4 +1,50 @@
-# Deployment plan — production `a63ad19` → `f647aa2`
+# Deployment plan
+
+## PENDING — production `f647aa2` → `b9ddc39`
+
+**Why, and it is not routine.** The 2026-11-18 deployment below introduced a
+regression: `checkup`, `health-notify` and `report weekly` each die inside
+`checkup_collect_all` and print nothing at all. `docs/PROJECT-STATUS.md` §2a
+has the mechanism and the measurement. Production can currently neither report
+nor alert.
+
+**What changes**, measured 2026-11-19 (`git diff --name-only f647aa2 b9ddc39`):
+
+| file | installed sha256 | target sha256 | action |
+|---|---|---|---|
+| `bin/domum-media` | `18882a8b5c4d` | `ec6dcfea692c` | **install** |
+| `bin/domum-media-backup` | `313d48c37aa8` | `495f7a039802` | **install** |
+| `bin/domum-media-report` | `14a5f7334adf` | `14a5f7334adf` | unchanged |
+| `systemd/*` | — | — | **no change in this gap** |
+
+Everything else in the gap is documentation and tests, which the narrow script
+does not install.
+
+**Two things that differ from the 2026-11-18 run, both worth stating because
+they were surprises last time:**
+
+- **No unit file changes**, so `UNITS_CHANGED` stays 0, there is no
+  `daemon-reload`, and the weekly timer's next elapse is **not** re-randomised.
+  Last time `RandomizedDelaySec=45m` was re-rolled by the reload and the firing
+  moved from 08:14:26 to 08:10:55, which had to be explained after the fact.
+  Sunday 2026-11-22 08:10:55 EST stands.
+- **The deploy script itself does not change in this gap**, so there is no
+  self-handover. Last time there was one, exactly once, by design.
+
+**Verification afterwards** is simpler than last time, because the defect's
+whole signature is silence:
+
+```
+sudo domum-media report weekly --stdout | head -5     # must print a header
+sudo domum-media checkup | head -5                    # must print a header
+sudo domum-media health-notify --dry-run              # must state what it WOULD do
+```
+
+A blank response from any of the three means the deployment did not take.
+
+---
+
+# Deployment plan — production `a63ad19` → `f647aa2` (EXECUTED 2026-11-18)
 
 **EXECUTED 2026-11-18**, with the operator's approval, as
 `operator/domum-media-deploy-reporting-fixes.sh --expect-revision=f647aa2e197c

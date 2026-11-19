@@ -11,7 +11,9 @@ re-derives it.** A running tally written into prose rots -- this project has
 corrected the same stale count three times -- so nothing below should be
 repeated to the operator without re-running the check beside it.
 
-Last reconciled: **2026-11-18**, after the reporting deployment.
+Last reconciled: **2026-11-19**, after a REGRESSION was found in what
+2026-11-18 deployed. Read section 2a first: three commands are currently
+dead in production.
 
 ```
 git rev-parse origin/main                      # what "current" means today
@@ -25,12 +27,12 @@ git rev-list --count $(git -C /opt/domum-core-media rev-parse HEAD)..origin/main
 
 | | value | measured |
 |---|---|---|
-| `origin/main` | `f647aa2` | 2026-11-18 |
-| production checkout | `f647aa2` (clean, on `main`) -- **equal to `origin/main`** | 2026-11-18, after the deployment |
-| installed binaries | sha256-identical to the production checkout, all four files re-verified against the `origin/main` blobs | 2026-11-18, after the deployment |
-| CI on `main` | green, 113 steps, one workflow (`compose-validate`) | 2026-11-18 |
-| open pull requests | none | 2026-11-18 |
-| development worktrees | one: the primary checkout, on `main` | 2026-11-18 |
+| `origin/main` | `b9ddc39` | 2026-11-19 |
+| production checkout | `f647aa2` -- **two commits behind**, and the gap includes a fix for a live regression | 2026-11-19 |
+| installed binaries | sha256-identical to the production checkout, and the checkout is stale: `domum-media` and `domum-media-backup` both change in the gap | 2026-11-19 |
+| CI on `main` | green (`compose-validate`) | 2026-11-19 |
+| open pull requests | none | 2026-11-19 |
+| development worktrees | one: the primary checkout, on `main` | 2026-11-19 |
 
 ---
 
@@ -49,7 +51,7 @@ domum service's last run exited 0.
 | five migrated services | real Btrfs subvolumes with retained proof snapshots |
 | Btrfs scrub timer | installed and **enabled** by the operator 2026-11-03; next firing Sun 2026-12-06; no scrub has run from it |
 | image-refresh timer | `disabled`, `inactive` -- as required |
-| weekly report + alert unit | **three `ExecStart` lines installed** (`report --write`, `report weekly --email --scheduled`, `health-notify --unless-reported`); timer `enabled, active`, next firing Sun 2026-11-22 08:10 EST |
+| weekly report + alert unit | the three `ExecStart` lines ARE installed and the timer is `enabled, active`, next firing Sun 2026-11-22 08:10 EST -- but **two of the three commands cannot run**. See section 2a. |
 | backup-freshness reader | an empty or whitespace-only heartbeat now answers *cannot tell* (rc=1) instead of fabricating *today 00:00* -- driven against the installed binary with `DOMUM_LOG_DIR` redirected |
 | selective-backup surface | all eleven `capabilities --has` tokens answer **0**; they answered **2** (token unknown) before the deployment |
 | protected tier | `/srv/data` 24 % used |
@@ -69,12 +71,63 @@ asserted:
 |---|---|---|
 | 1 | an emptied backup heartbeat read as a successful backup | **closed** -- empty, whitespace-only and absent all answer rc=1; a valid marker still answers rc=0 |
 | 2 | a scrub already running when the timer fires would mail a CRITICAL | **closed before its date** -- `btrfs_scrub_running` is in the installed binary; the Sun 2026-12-06 firing is no longer a known false alarm |
-| 3 | the weekly HTML report was never sent | **closed** -- the unit's second `ExecStart` is `report weekly --email --scheduled`. First send: Sun 2026-11-22 08:10 EST |
+| 3 | the weekly HTML report was never sent | **NOT closed.** The unit line is right and the command it names dies before printing a byte -- see section 2a. Claiming this closed on 2026-11-18 was correct about the unit and wrong about the outcome. |
 
 The deployment also retired a prerequisite: every `capabilities --has` token of
 the selective-backup surface answered **2** (token unknown) before it and
 answers **0** now, so `docs/OPERATOR-GATED-ACTIONS.md` items 2-5 are reachable
 where they previously would have produced a usage error.
+
+---
+
+## 2a. LIVE REGRESSION -- three commands print nothing
+
+**Found 2026-11-19 from the operator's own terminal**, where
+`sudo domum-media report weekly --stdout` returned in 6 seconds having printed
+nothing at all: not a header, not an error.
+
+```
+mreport_smart_interpretable "$dev"; interp=$?
+```
+
+Under `set -e` a bare simple command that fails IS the errexit trigger, so the
+shell exits before `interp=$?` runs and the `case` written to handle the
+non-zero answers is unreachable. That function returns **1** for a drive whose
+SMART attributes all read alike and **2** for a table it cannot read; `/dev/sdb`
+on this host reports all 30 attributes at `value=100`, so it returns 1.
+
+It dies inside `checkup_collect_all`, which three commands run before printing
+a line. Measured against the INSTALLED binary by line number:
+
+| installed line | command | state |
+|---|---|---|
+| 7726 | `report weekly` | dead |
+| 7873 | `health-notify` | dead |
+| 8337 | `checkup` | dead |
+
+**So the host can currently neither report nor alert, and silence is this
+project's healthy signal.** A host that has gone quiet looks exactly like a
+healthy one.
+
+**It arrived with the 2026-11-18 deployment**, which is why it is recorded here
+rather than in the backlog: `a63ad199bfa2` -- production until that day -- has
+**zero** occurrences of the shape and `f647aa2` has **two**.
+
+What Sunday 2026-11-22 08:10:55 will do if nothing is deployed before it:
+`report --write` succeeds (the report *library* does not carry the shape, so
+the evidence file is still written), `report weekly --email --scheduled` dies
+and is tolerated by its `-` prefix, and `health-notify` dies **unprefixed** --
+so the unit fails, no mail is sent, and no delivery record is written either,
+which means the absent record reads as *advice* rather than as a finding.
+
+Fixed on `main` in `b9ddc39` (PR #245), which also swept the shape and found
+three more sites, one of them live: `do_backup_scope` printed nothing and
+exited 1 for a path that is **not** in any enabled target's scope -- the
+verdict vanished exactly when there was one to give.
+
+**Not deployed.** That is next action 1.
+
+---
 
 ### What is still undeployed, and it is one deployment kind
 
@@ -126,27 +179,39 @@ off-site protection.
 
 ## 5. NEXT ACTIONS, in order
 
-1. **Confirm Sunday's report arrived.** The first scheduled send is
+1. **Redeploy the reporting fix.** Production runs a binary in which
+   `checkup`, `health-notify` and `report weekly` all print nothing (section
+   2a). The narrow operator script covers it: both changed files are in its
+   `TARGETS`, **no unit file changes in this gap**, so there is no
+   `daemon-reload` and Sunday's elapse does not move -- unlike the 2026-11-18
+   deployment, where it did. The script itself is also unchanged in the gap,
+   so there is no self-handover this time. *Needs approval.*
+2. **Confirm Sunday's report arrived.** Only meaningful once 1 is done. The first scheduled send is
    Sun 2026-11-22 08:10 EST and it is the only part of the reporting work no
    check here can stand in for -- a delivery failure is recorded by
    `--scheduled` and raised as a CRITICAL by `checkup_weekly_report_delivery`,
    so silence after that date means the mail arrived or the unit did not run,
    and `systemctl list-timers` tells the two apart. Nothing to do before then.
-2. **Plan the kernel reboot** -- 6.12.117 is installed and 6.12.111 is
-   running. Every timer is `Persistent=true`, so missed jobs run immediately
-   on boot, `snapshot prune` among them; check each timer's last trigger
-   against its next elapse first. *Needs approval.*
-3. **Stage the Compose security rollout** -- per service, with each running
+3. **Plan the kernel reboot** -- 6.12.117 is installed and 6.12.111 is
+   running, `reboot-required` since 2026-11-15 06:03. Every timer is
+   `Persistent=true`, so missed jobs run immediately on boot, `snapshot prune`
+   among them. Measured 2026-11-19: every domum timer has a current stamp in
+   `/var/lib/systemd/timers` with its next elapse in the future -- including
+   `btrfs-scrub`, stamped 2026-11-03 when it was enabled -- so **nothing is
+   overdue and a prompt reboot replays nothing**. The window to avoid is being
+   *down across* 02:30-05:00 or Sunday 03:00-08:30. Do it AFTER 1, or
+   post-reboot verification runs through a dead `checkup`. *Needs approval.*
+4. **Stage the Compose security rollout** -- per service, with each running
    image ID pinned so a configuration change cannot carry an upgrade, Immich
    last in its own phase. More urgent to schedule than before, because the
    fragments now sit in production's checkout where a reconcile would apply
    them unreviewed. *Needs approval.*
-4. **Finish off-site application-state backup** -- the commands are now
+5. **Finish off-site application-state backup** -- the commands are now
    deployed, so `docs/OPERATOR-GATED-ACTIONS.md` items 2-5 are runnable. What
    remains is the operator's: a destination for the packs, installing and
    enabling the capture timer, and the key-custody step that no work on this
    host can replace.
-5. **Verify recovery independently** -- a fresh-host restore needs a second
+6. **Verify recovery independently** -- a fresh-host restore needs a second
    machine, and a full Immich restore is ~130 GiB. Nothing on this host is
    `FULL RECOVERY VERIFIED` and nothing here changes that.
 
