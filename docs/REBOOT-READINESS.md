@@ -1,11 +1,32 @@
 # Reboot readiness
 
-`/var/run/reboot-required` has been set since the 2026-10-05 host upgrade:
+> **The header of this file described a reboot that had already happened.** It
+> read *"set since the 2026-10-05 host upgrade ... running 6.12.107"* -- but
+> that reboot was performed, and its outcome is recorded further down. A stale
+> premise at the top of the document an operator reads BEFORE rebooting is the
+> defect this project keeps correcting. Corrected 2026-11-19.
+
+## The reboot that is pending NOW
+
+Measured 2026-11-19:
 
 ```
-linux-image-6.12.111+deb13-amd64
-running: 6.12.107+deb13-amd64      installed: 6.12.107, 6.12.111
+running:   6.12.111+deb13-amd64
+installed: 6.12.111, 6.12.117
+/var/run/reboot-required  set 2026-11-15 06:03
 ```
+
+A kernel upgrade, nothing more. A reboot neither changes an application image
+nor touches application data, and the 2026-10-05 reboot demonstrated that
+(section *Outcome*, below): all eleven containers came back as the same
+objects, and four services with a newer image staged under the same tag stayed
+on the old one.
+
+**One sequencing note that is not about the kernel.** As of 2026-11-19 the
+installed `domum-media` carries a regression in which `checkup`,
+`health-notify` and `report weekly` all print nothing
+(`docs/PROJECT-STATUS.md` §2a). Post-reboot verification runs through
+`checkup`, so **deploy the fix first** or the verification step is blind.
 
 A kernel upgrade, nothing more. A reboot neither changes an application image nor
 touches application data, which is what makes it a cleaner next experiment than
@@ -230,21 +251,41 @@ Every enabled timer sets `Persistent=true`, so systemd runs a *missed* job
 immediately at boot. One of them deletes: `domum-media-btrfs-snapshot.service` is
 `snapshot prune`.
 
-Measured 2026-10-05 13:54 EDT — every enabled timer had already run for its
-current period, so a reboot now triggers no catch-up:
+**Re-measured 2026-11-19** (`systemctl list-timers --all`, and the stamp files
+under `/var/lib/systemd/timers`). Every enabled timer has already run for its
+current period, so a prompt reboot triggers **no catch-up**:
 
 | timer | last trigger | next elapse | catch-up at boot? |
 |---|---|---|---|
-| `domum-media-backup.timer` | Mon 2026-10-05 02:39 | Tue 2026-10-06 02:35 | no |
-| `domum-media-check.timer` | Sun 2026-10-04 03:36 | Sun 2026-10-11 03:47 | no |
-| `domum-media-btrfs-snapshot.timer` | Sun 2026-10-04 04:48 | Sun 2026-10-11 04:49 | no |
-| `domum-media-host-update.timer` | Mon 2026-10-05 06:10 | Mon 2026-10-12 06:11 | no |
+| `domum-media-backup.timer` | Thu 2026-11-19 02:36 | Fri 2026-11-20 02:37 | no |
+| `domum-media-check.timer` | Sun 2026-11-15 03:31 | Sun 2026-11-22 03:33 | no |
+| `domum-media-btrfs-snapshot.timer` | Sun 2026-11-15 04:44 | Sun 2026-11-22 04:40 | no |
+| `domum-media-weekly-report.timer` | Sun 2026-11-15 08:15 | Sun 2026-11-22 08:10 | no |
+| `domum-media-host-update.timer` | Mon 2026-11-16 06:11 | Mon 2026-11-23 06:03 | no |
+| `domum-media-btrfs-scrub.timer` | — (never fired) | Sun 2026-12-06 05:45 | **no** — see below |
 | `domum-media-dr-reminder.timer` | Thu 2026-10-01 09:00 | Fri 2027-01-01 09:00 | no |
 | `domum-media-image-refresh.timer` | — | — | `disabled`/`inactive`; a disabled timer does not start at boot |
 
-This is a point-in-time fact and it decays. Rebooting before Sunday 03:30 keeps
-all of it true; a reboot after a long power-off, or on a Sunday morning, could
-fire the backup, the restic check and the prune at once. The pre-reboot capture
+**The scrub timer is the one row where "never triggered" could have
+surprised.** It is `Persistent=true` and has never fired, which reads like a
+missed job waiting to happen. It is not: systemd writes the stamp file when a
+timer is first enabled, and
+`/var/lib/systemd/timers/stamp-domum-media-btrfs-scrub.timer` is dated
+**2026-11-03**, when the operator enabled it. Persistence compares against that
+stamp, not against "never", so a reboot now does not start a scrub. Verified by
+reading the stamp rather than reasoning from the empty `LAST` column.
+
+Two units are written and **not installed**, so they cannot fire at all:
+`domum-media-state-capture.*` and `domum-media-power-sample.*`.
+
+This is a point-in-time fact and it decays — which is why it was re-measured
+rather than repeated. **What matters is not the clock at which you reboot but
+whether the host is DOWN across a scheduled time**: persistence replays a job
+whose moment passed while the machine was off. The windows to stay out of are
+02:30–05:00 any night (backup, then the restic check whose second `ExecStart`
+is `--weekly-retention`, i.e. `restic forget --prune`, then `snapshot prune`)
+and Sunday 03:00–08:30. A mid-morning weekday reboot that completes in minutes
+crosses none of them. The pre-reboot capture
 records these stamps so the verifier can confirm afterwards what did and did not
 run.
 
