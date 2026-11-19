@@ -1068,8 +1068,13 @@ s = io.open(p, encoding="utf-8").read()
 # NEWLINE-anchored, so the 2-space indent is exact. The weekly report gained an
 # 8-space copy of this same line when its own three-state guard was fixed, and a
 # substring anchor matches both -- the defect this suite itself ran into.
-old = '\n  mreport_smart_interpretable "$dev"; interp=$?\n'
-new = '\n  mreport_smart_interpretable "$dev"; interp=0\n'
+# The call is `interp=0; f ... || interp=$?` because a BARE `f ...; interp=$?`
+# EXITS the shell under set -e -- that shape blanked checkup, health-notify and
+# report weekly in production. Neutralising the guard therefore means making the
+# failure branch assign 0 as well, which keeps the mutant's ANSWER wrong without
+# reintroducing the abort (that one has its own suite).
+old = '\n  interp=0; mreport_smart_interpretable "$dev" || interp=$?\n'
+new = '\n  interp=0; mreport_smart_interpretable "$dev" || interp=0\n'
 assert s.count(old) == 1, "anchor matched %d times" % s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYMUT
