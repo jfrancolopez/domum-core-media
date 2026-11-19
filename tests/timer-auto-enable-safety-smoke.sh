@@ -35,7 +35,16 @@ DEPLOYMENT_TIMERS=(domum-media-image-refresh.timer)
 # ones. Both are operator decisions. It is also the only job here that writes an
 # artefact holding credentials -- a Fernet key, a JWT signing key and a server
 # token -- so it is never auto-enabled.
-OPERATOR_ONLY_TIMERS=(domum-media-btrfs-scrub.timer domum-media-state-capture.timer)
+#
+# The power sampler is the weakest case of the three and is still listed. It
+# deploys nothing, deletes nothing and sends nothing -- it reads a sysfs
+# counter and appends one line every 15 minutes -- so the DEPLOYMENT argument
+# does not apply to it. It stays operator-enabled because enabling a timer is
+# an operator decision on this host, and because a sampler that starts itself
+# during convergence would begin writing state nobody asked for. Recorded
+# rather than argued each time: the cost of leaving it off is one command.
+OPERATOR_ONLY_TIMERS=(domum-media-btrfs-scrub.timer domum-media-state-capture.timer
+                     domum-media-power-sample.timer)
 
 # ---------------------------------------------------------------------------
 # 1. The canonical list exists and excludes every deployment timer.

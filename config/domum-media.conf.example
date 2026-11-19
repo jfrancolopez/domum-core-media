@@ -388,3 +388,46 @@ CLEANUP_IMAGES_AFTER_UPDATE=1
 # retention policy. It used to default to 7 against a policy of 14, which meant
 # cleanup silently removed seven more snapshots per service than the policy kept.
 CLEANUP_OLD_SNAPSHOTS_KEEP=14
+
+# ============================================================
+# SECTION: Power reporting
+# ============================================================
+
+# WHAT IS MEASURED, and the heading of the report's section says the same
+# thing. Intel RAPL package energy covers the CPU package -- cores, uncore and
+# the memory controller. It does NOT cover the two SSDs, the fans, the NIC or
+# the PSU's conversion loss, so the figure at the wall is HIGHER. Nothing here
+# scales the reading up to a whole-system number: measure that with a meter.
+#
+# Nothing is sampled until the timer is installed and enabled, which is an
+# operator action:
+#   sudo install -m 0644 /opt/domum-core-media/systemd/domum-media-power-sample.* \
+#        /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now domum-media-power-sample.timer
+
+# Your electricity price per kWh, as a plain number. EMPTY BY DEFAULT and
+# deliberately so: this host cannot know what electricity costs where it is,
+# and a plausible default would be an invented number printed beside measured
+# ones. With no tariff the report states energy and says why there is no cost.
+POWER_TARIFF_PER_KWH=""
+
+# Prefixed to the cost. Cosmetic only -- no conversion is performed.
+POWER_CURRENCY="$"
+
+# The window the report averages over.
+POWER_WINDOW_DAYS=7
+
+# How long individual samples are kept. Each is one short line.
+POWER_SAMPLE_RETENTION_DAYS=90
+
+# The ceiling used to decide whether a SECOND counter wrap can be ruled out
+# between two samples. The RAPL counter wraps at max_energy_range_uj -- 262,143
+# J on this hardware -- which is every 14.6 h at 5 W and every 1.1 h at 65 W,
+# so one wrap and two are indistinguishable over a long gap. An interval longer
+# than (range / this value) is EXCLUDED from the average and counted, rather
+# than corrected on a guess that would silently undercount. This is also why
+# the timer samples every 15 minutes and not daily.
+#
+# Raising it makes the guard STRICTER (a shorter maximum interval), not looser.
+POWER_MAX_PLAUSIBLE_WATTS=65

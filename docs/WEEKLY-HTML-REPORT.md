@@ -73,9 +73,18 @@ recomputes the ratios so a future palette edit cannot silently regress them.
 
 ### What was deliberately not copied
 
-- **The POWER section.** It reads Raspberry Pi wattage through `vcgencmd`. There
-  is no trustworthy power measurement on an N100, and inventing one is worse
-  than omitting the section. A test requires `POWER` to be **absent**.
+- **The POWER section — refused, then REPLACED.** `domum-core` reads Raspberry
+  Pi wattage through `vcgencmd`, and that is still never copied. The reason
+  given here was that *"there is no trustworthy power measurement on an N100"*,
+  and that **premise was wrong**: measured 2026-11-19, this host exposes Intel
+  RAPL (`package-0`, `core`, `uncore`). A `POWER (CPU PACKAGE)` section now
+  reports that counter. The rule the refusal protected is unchanged — never
+  invent a measurement, never state a narrow one in a broad one's words — so
+  the scope is in the heading, the section says what it does not cover, and a
+  test asserts the report makes no whole-system claim and that `vcgencmd`
+  appears nowhere. The old assertion required `POWER` to be **absent**; it now
+  requires the section to be **present and scoped**, which is strictly
+  stronger. See `docs/POWER-REPORTING.md`.
 - **Its missing header sanitisation.** `send_email_body` there interpolates the
   subject into the message with no CR/LF guard — a header-injection hole by
   construction, not currently exploitable because its subject is a controlled

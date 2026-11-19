@@ -9297,6 +9297,65 @@ finding the thing*; the negative control took one minute and turned a false
 clean verdict into four fixes. The shipped check in that suite therefore
 carries its own planted instance, and a clean verdict is reported only after
 the scan has rejected it.
+**A RECORDED REFUSAL CAN REST ON A PREMISE THAT WAS NEVER TRUE, AND THE RULE
+IT PROTECTED USUALLY SURVIVES THE PREMISE.** This file recorded that
+`domum-core`'s POWER section was deliberately not copied because *"there is no
+trustworthy power measurement on an N100"*, and a test required `POWER` to be
+ABSENT. Measured 2026-11-19, the premise is false:
+
+```
+/sys/class/powercap/intel-rapl:0     name=package-0   energy_uj  (0400)
+/sys/class/powercap/intel-rapl:0:0   name=core
+/sys/class/powercap/intel-rapl:0:1   name=uncore
+```
+
+A real hardware counter was there the whole time. **What was right, and is
+unchanged, is the RULE**: never invent a measurement, and never state a narrow
+one in a broad one's words. `vcgencmd` is still never used and a test asserts
+it appears nowhere. So the section exists now and is labelled **CPU PACKAGE in
+its heading** -- RAPL covers cores, uncore and the memory controller and NOT
+the SSDs, fans, NIC or PSU loss, so the wall figure is higher and nothing
+scales the reading toward it. The old assertion required the section's
+absence; it now requires it to be present AND scoped, which is strictly
+stronger. *Before adapting a test to a change, ask which of the two is wrong*
+-- here it was neither the test nor the code but the premise underneath both.
+
+**THE SAMPLING CADENCE IS A CORRECTNESS REQUIREMENT, NOT A RESOLUTION
+PREFERENCE, and the obvious design was wrong.** The request was for DAILY
+samples. Measured from this host's own `max_energy_range_uj` of 262,143 J, the
+counter wraps every **14.6 h at 5 W**, 2.9 h at 25 W and 1.1 h at 65 W -- so a
+daily sample is longer than the wrap period at EVERY plausible power, one wrap
+is indistinguishable from two, and a daily series would silently UNDERCOUNT.
+The timer samples every 15 minutes, and the READER enforces the same
+arithmetic rather than trusting it: an interval longer than
+`range / POWER_MAX_PLAUSIBLE_WATTS` (4,033 s) is excluded and counted, because
+beyond it a correction is a guess. **Compute the period of any counter before
+choosing how often to read it.**
+
+**A DECREASE IS AMBIGUOUS, so the boot id is recorded with every sample.** The
+counter also RESETS on reboot, and reading a reset as a wrap fabricates very
+nearly a whole range -- about 72.8 Wh -- out of an interval that drew almost
+nothing. That is the suite's sharpest mutation, and the first version of its
+fixture put the two energy values the wrong way round, where the same mutation
+fabricates only 2 J and the assertion failed against a mutant that HAD got past
+the guard. *Name the observable the mutation actually changes*, and check the
+fixture produces the harm rather than merely reaching the line.
+
+**EXCLUSIONS MUST NAME THEIR OWN CAUSE.** A reboot and an over-long interval
+are counted separately, because one counter would make the report assert a
+reboot for an interval that was merely too long -- and the remedies differ
+(nothing to do, versus sample more often). When EVERY interval is excluded the
+section says which cause rather than falling back to *"not enough samples"*,
+which is true of a new host and false there.
+
+**AND A MUTATION FOUND A REAL DEFECT IN THE CODE IT WAS WRITTEN TO TEST.** The
+cost line read `"${POWER_TARIFF_PER_KWH}"` bare. `load_cfg` sets it, so the
+name is UNBOUND for any caller that has not run `load_cfg`, and under `set -u`
+the shell dies the moment `power_cost` succeeds from a default rather than
+from the variable -- the `DISK_WEAR_WARN_PERCENT` rule, in new code written by
+someone who had just re-read it. Defaulted at the use site, and a structural
+scan now requires every `POWER_*` read to carry one, with its own planted
+negative control.
 
 ---
 

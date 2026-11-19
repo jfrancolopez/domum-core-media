@@ -44,6 +44,21 @@ J
 }
 mk_coverage 23155 23155 0 0 0 0 known
 
+# The RAPL fixture: a package domain and two samples 30 minutes apart at 5 W.
+# 1800 s is well inside the second-wrap guard (262,143 J / 65 W = 4033 s), so
+# the POWER section renders its MEASURED form rather than "not enough
+# samples" -- without it the section is reachable but its scope sentence, the
+# line that stops a CPU-package figure being read as the server's
+# consumption, is never exercised.
+mkdir -p "$TMP/powercap/intel-rapl:0" "$TMP/state/power"
+printf 'package-0'    > "$TMP/powercap/intel-rapl:0/name"
+printf '262143328850' > "$TMP/powercap/intel-rapl:0/max_energy_range_uj"
+printf '1000000'      > "$TMP/powercap/intel-rapl:0/energy_uj"
+{ printf 'TS=%s BOOT=aaa ENERGY_UJ=1000000 MAX_UJ=262143328850\n' "$(( $(date +%s) - 1800 ))"
+  printf 'TS=%s BOOT=aaa ENERGY_UJ=9001000000 MAX_UJ=262143328850\n' "$(date +%s)"
+} > "$TMP/state/power/samples.env"
+
+
 # Drive the REAL command. Externals are stubbed so nothing can reach the host;
 # load_cfg is NOT stubbed, because it applies every default the chain reads --
 # stubbing it left variables unbound and killed the shell before any output.
@@ -52,6 +67,7 @@ drive() {
   local extra="$1"; shift
   (
     export CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state" DOMUM_DATA_ROOT="$TMP/data"
+    export DOMUM_POWERCAP_ROOT="$TMP/powercap"
     export REPO_META_DIR="$TMP/meta"
     export CAPTURE="$TMP/captured.eml"
     # shellcheck disable=SC1090
@@ -120,9 +136,28 @@ for s in "IMMICH & DISASTER RECOVERY" BACKUPS SYSTEM "TRENDS (LAST 8 OBSERVATION
          "DRIVE HEALTH" SERVICES UPDATES "LOG ERRORS (7 DAYS)" FINDINGS "SUGGESTED ACTIONS"; do
   grep -qF "$s" <<< "$out" || fail "section missing: $s"
 done
-grep -qF "POWER" <<< "$out" && fail "a POWER section was emitted. There is no trustworthy
-power measurement on an N100; domum-core's Pi wattage must not be copied."
-echo "  all ten sections present, and POWER correctly absent"
+
+# This assertion used to require POWER to be ABSENT, on the stated grounds that
+# "there is no trustworthy power measurement on an N100". That PREMISE was
+# falsified by measurement -- this host exposes Intel RAPL with package-0, core
+# and uncore domains -- while the RULE it protected is unchanged: never invent
+# a measurement, and never state a narrow one in a broad one's words. Before
+# adapting a test to a change, ask which of the two is wrong; here it was the
+# premise. So the section is now REQUIRED, and required to be honest about
+# what it covers, which is strictly stronger than requiring its absence.
+grep -qF "POWER (CPU PACKAGE)" <<< "$out" \
+  || fail "the POWER section is missing, or is not labelled CPU PACKAGE in its
+heading. The heading is what a skimming reader takes away, so the scope cannot
+live only in a footnote."
+grep -qF "CPU package only" <<< "$out" || fail "the POWER section does not state its scope"
+for claim in "total power" "whole system" "system power"; do
+  grep -qi "$claim" <<< "$out" \
+    && fail "the report made a whole-system power claim: $claim. RAPL is the CPU
+package; the wall figure is higher and is not measurable from here."
+done
+# domum-core's Raspberry Pi wattage, which is still never copied.
+grep -qF "vcgencmd" <<< "$out" && fail "vcgencmd reached the report"
+echo "  all ten sections present, plus POWER scoped to the CPU package"
 
 sect "the Immich section reports RECORDED coverage, never a live query"
 out="$(drive "" --stdout)"
@@ -570,6 +605,7 @@ sect "the argv path reaches the implementation, and report stays compatible"
 dispatch() {  # $1.. = argv
   (
     export CFG_FILE="$TMP/c.conf" DOMUM_STATE_ROOT="$TMP/state" DOMUM_DATA_ROOT="$TMP/data"
+    export DOMUM_POWERCAP_ROOT="$TMP/powercap"
     export REPO_META_DIR="$TMP/meta"
     export DOMUM_DIR="$REPO_ROOT" REPORT_LIB_DEFAULT="$TMP/no-such-lib"
     # shellcheck disable=SC1090
