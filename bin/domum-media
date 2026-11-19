@@ -6552,7 +6552,14 @@ checkup_disk_wear() {  # $1 = device name
   # Resolving at the use site is the rule this file records for
   # DISK_WEAR_WARN_PERCENT, and for the same reason.
   local dev="$1" wear interp smartctl_path
-  mreport_smart_interpretable "$dev"; interp=$?
+  # NOT `f "$dev"; interp=$?`. A bare simple command that fails under
+  # `set -e` EXITS THE SHELL, and this function returns 1 for placeholders
+  # and 2 for an unreadable table -- both ordinary answers. On this host
+  # /dev/sdb reports every attribute alike, so the 2026-11-18 deployment
+  # made `checkup`, `health-notify` and `report weekly` all die HERE,
+  # printing nothing at all. A blank report is indistinguishable from a
+  # healthy one, and silence is this project's healthy signal.
+  interp=0; mreport_smart_interpretable "$dev" || interp=$?
   if (( interp == 2 )); then
     # Not the same finding as placeholders, and it must not borrow its words.
     checkup_add advice "wear for /dev/$dev could not be READ -- smartctl returned no attribute table (it needs root; \`checkup\` under sudo does have it). Unknown, which is not evidence of health either."
@@ -7376,7 +7383,9 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
         # fixing exactly that in `checkup_disk_wear`; the report kept the
         # defect, which is the "one end of a report fixed and not the other"
         # family.
-        mreport_smart_interpretable "$dev"; interp=$?
+        # A bare failing call exits the shell under `set -e`; this returns
+        # 1 and 2 as ordinary answers. See checkup_disk_wear.
+        interp=0; mreport_smart_interpretable "$dev" || interp=$?
         if (( interp == 0 )); then
           wear="$("$smartctl_path" -j -A "/dev/$dev" 2>/dev/null \
                   | jq -r '[.ata_smart_attributes.table[]? | select(.name|test("Wear_Leveling|Percent_Lifetime|Media_Wearout"))][0].value | if . == null then "" else tostring end' 2>/dev/null || true)"

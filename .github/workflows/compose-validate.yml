@@ -358,6 +358,13 @@ jobs:
       # `unshare -r`, with the real checks unmodified.
       - name: Backup heartbeat (an empty marker must not read as a backup)
         run: tests/backup-heartbeat-smoke.sh
+
+      # `f "$x"; rc=$?` EXITS under set -e, so an ordinary non-zero answer
+      # became fatal: checkup, health-notify and report weekly all printed
+      # nothing at all in production. Every driver here keeps errexit ON,
+      # because a suite that relaxes production's options could not see it.
+      - name: Bare-call errexit smoke test
+        run: tests/errexit-bare-call-smoke.sh
       - name: Deploy reporting rehearsal
         run: tests/deploy-reporting-rehearsal-smoke.sh
 

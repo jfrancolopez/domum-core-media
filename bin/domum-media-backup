@@ -2311,7 +2311,9 @@ originals_matched_by_patterns() {  # $@ = patterns
 # turn a cost optimisation into an outage.
 exclusion_safe_to_apply() {  # $@ = patterns -> 0 safe, 1 unsafe/unknown
   local offences rc
-  offences="$(originals_matched_by_patterns "$@")"; rc=$?
+  # Same shape: rc 1 and 2 are the REFUSAL answers below, so a bare
+  # assignment whose substitution fails would exit before the warn.
+  rc=0; offences="$(originals_matched_by_patterns "$@")" || rc=$?
   case "$rc" in
     0) return 0 ;;
     1) warn "Exclusion REFUSED: these patterns would stop an Immich ORIGINAL being backed up."
@@ -3230,7 +3232,12 @@ do_backup_scope() {
   while IFS= read -r target; do
     [[ -n "$target" ]] || continue
     any=1
-    dr_path_configured "$path" "$target"; rc=$?
+    # NOT a bare call: `dr_path_configured` returns 1 for "not in scope" and
+    # 2 for "could not resolve", which are the two answers this command
+    # exists to give -- and under `set -e` a bare failing call EXITS,
+    # losing the verdict exactly when there is one to report. Measured:
+    # `backup-scope /srv/data/backups/images` printed nothing and exited 1.
+    rc=0; dr_path_configured "$path" "$target" || rc=$?
     case "$rc" in
       0) in_scope+=("$target") ;;
       2) unresolved+=("$target"); unknown=1 ;;
