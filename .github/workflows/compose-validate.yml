@@ -376,6 +376,13 @@ jobs:
       - name: Health checks smoke test
         run: tests/health-checks-smoke.sh
 
+      # Intel RAPL, and ONLY what RAPL measures: the CPU package, never a
+      # whole-system figure. The counter wraps every 14.6 h at 5 W and resets
+      # on reboot, so both discontinuities are driven -- a reset read as a wrap
+      # fabricates a whole counter range of energy.
+      - name: Power reporting smoke test
+        run: tests/power-reporting-smoke.sh
+
       # One scrub per FILESYSTEM, `-B` always, and exit 3 (uncorrectable errors)
       # propagated rather than flattened -- a scrub that found corruption must
       # fail its unit, which is what escalates it to a notification.

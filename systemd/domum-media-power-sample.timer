@@ -1,0 +1,31 @@
+[Unit]
+Description=domum-media: schedule Intel RAPL package-energy sampling
+
+[Timer]
+# EVERY 15 MINUTES, and the cadence is a CORRECTNESS requirement rather than a
+# resolution preference. Measured on this host:
+#
+#   max_energy_range_uj = 262143328850  (262,143 J)
+#
+# so the counter WRAPS every 14.6 h at 5 W, 2.9 h at 25 W and 1.1 h at 65 W. A
+# DAILY sample is longer than the wrap period at EVERY plausible package power,
+# and a reader cannot tell one wrap from two -- so daily sampling would
+# silently undercount, which is the shape of defect this project exists to
+# avoid. The window math is enforced in the reader too: an interval long enough
+# that a second wrap cannot be ruled out is EXCLUDED and counted, never
+# corrected on a guess.
+#
+# The cost is a sysfs read and one appended line, so 96 runs a day is nothing.
+OnCalendar=*:0/15
+# Spreads the run off the quarter-hour so it cannot line up with other jobs.
+RandomizedDelaySec=2m
+# A missed run is simply a missing sample. Persistent=false on purpose: a
+# catch-up sample taken at boot would sit an arbitrary distance from its
+# neighbours and the interval it forms spans the downtime, which the reader
+# would have to exclude anyway. Nothing here deletes, so there is nothing to
+# replay.
+Persistent=false
+Unit=domum-media-power-sample.service
+
+[Install]
+WantedBy=timers.target

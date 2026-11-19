@@ -1,0 +1,19 @@
+[Unit]
+Description=domum-media: record one Intel RAPL package-energy sample
+Documentation=file:///opt/domum-core-media/docs/POWER-REPORTING.md
+ConditionPathExists=/usr/local/bin/domum-media
+# The RAPL counter is in sysfs, not on any of this project's filesystems, and
+# the sample history lives under the state root. No RequiresMountsFor: making
+# a measurement depend on /srv/data would let a storage failure stop the one
+# job that could still run, and this job writes nothing to the protected tier.
+
+[Service]
+Type=oneshot
+# Reads /sys/class/powercap/intel-rapl:*/energy_uj (mode 0400) and appends one
+# line. No `-` prefix: a sample that cannot be STORED is a real failure and
+# should fail the unit. A host with no RAPL counter is NOT a failure -- the
+# command says so and exits 0, because a permanent limitation must not fail a
+# unit every 15 minutes.
+ExecStart=/usr/local/bin/domum-media power sample
+# A sample is a file read and one appended line.
+TimeoutStartSec=2m

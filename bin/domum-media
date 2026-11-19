@@ -82,6 +82,17 @@ load_cfg() {
   # Samsung 870 EVO is at 99 with 0.52% of its 600 TBW used, so this cannot
   # fire here today and is a guard rather than a live finding.
   DISK_WEAR_WARN_PERCENT="${DISK_WEAR_WARN_PERCENT:-20}"
+  # Power. The tariff has NO default on purpose: this host cannot know what
+  # electricity costs here, and a plausible default would be an invented
+  # number printed beside measured ones.
+  POWER_TARIFF_PER_KWH="${POWER_TARIFF_PER_KWH:-}"
+  POWER_CURRENCY="${POWER_CURRENCY:-$}"
+  POWER_WINDOW_DAYS="${POWER_WINDOW_DAYS:-7}"
+  POWER_SAMPLE_RETENTION_DAYS="${POWER_SAMPLE_RETENTION_DAYS:-90}"
+  # The ceiling used to decide whether a SECOND counter wrap can be ruled
+  # out. 65 W is far above an N100 package, so the guard errs toward
+  # EXCLUDING an interval rather than undercounting one.
+  POWER_MAX_PLAUSIBLE_WATTS="${POWER_MAX_PLAUSIBLE_WATTS:-65}"
   AUTO_ROLLBACK_ENABLED="${AUTO_ROLLBACK_ENABLED:-1}"
   RECOVERY_PACK_ENABLED="${RECOVERY_PACK_ENABLED:-1}"
   RECOVERY_PACK_ENCRYPTION="${RECOVERY_PACK_ENCRYPTION:-age}"
@@ -295,6 +306,7 @@ ensure_state_dirs() {
   install -d -m 0700 "$DOMUM_STATE_ROOT/snapshots"
   install -d -m 0700 "$DOMUM_STATE_ROOT/rollback"
   install -d -m 0700 "$DOMUM_STATE_ROOT/update-history"
+  install -d -m 0700 "$DOMUM_STATE_ROOT/power"
   install -d -m 0700 "$RECOVERY_PACK_DEST"
 }
 
@@ -7124,6 +7136,332 @@ mreport_disk_temp_c() {
 #
 # Both non-zero statuses stay falsy, so every existing `if ! f` caller is
 # unaffected.
+# ---------------------------------------------------------------------------
+#  POWER -- Intel RAPL, and ONLY what RAPL measures.
+# ---------------------------------------------------------------------------
+# `domum-core`'s POWER section reads Raspberry Pi wattage through `vcgencmd`
+# and was deliberately not copied, on the stated grounds that there is no
+# trustworthy power measurement on an N100. That PREMISE was wrong. Measured
+# 2026-11-19, this host exposes Intel RAPL:
+#
+#   /sys/class/powercap/intel-rapl:0     name=package-0   energy_uj  (0400)
+#   /sys/class/powercap/intel-rapl:0:0   name=core
+#   /sys/class/powercap/intel-rapl:0:1   name=uncore
+#
+# So a real hardware counter exists. The rule the old decision protected is
+# unchanged and is the durable half: never invent a measurement, and never
+# state a narrow one in a broad one's words. `vcgencmd` is still never used.
+#
+# WHAT THIS MEASURES, which is why every line is labelled CPU PACKAGE: RAPL
+# package energy covers the cores, the uncore and the memory controller. It
+# does NOT cover the two SSDs, the fans, the NIC, or the PSU's conversion
+# loss. On a mini PC the package is a large fraction of the total and is not
+# the total, so reporting it as "the power this server uses" would be exactly
+# the weaker-claim-in-the-stronger-claim's-words defect. Nothing here is
+# scaled, extrapolated or grossed up to a whole-system figure: an operator who
+# wants that measures it at the wall with a meter.
+#
+# `energy_uj` is a FREE-RUNNING COUNTER with two discontinuities, and both are
+# handled rather than averaged over:
+#
+#   * it WRAPS at max_energy_range_uj (262143328850 uJ here);
+#   * it RESETS to 0 on reboot.
+#
+# A DECREASE is therefore ambiguous, and the boot id is what disambiguates it:
+# the same boot means a wrap and the range is added back; a different boot
+# means a reset and the interval is DISCARDED rather than guessed at. Skipped
+# intervals are COUNTED and reported, because an interval nobody can account
+# for must not silently shrink the denominator a mean is divided by.
+
+# The powercap root is overridable for the same reason DOMUM_SYSBLOCK_ROOT is:
+# `energy_uj` is mode 0400, so without a seam the readable path could only be
+# driven as root and every test would pass for the wrong reason.
+power_rapl_dir() {  # stdout: the package domain's sysfs directory
+  local root="${DOMUM_POWERCAP_ROOT:-/sys/class/powercap}" d name
+  for d in "$root"/intel-rapl:*; do
+    [[ -d "$d" && -r "$d/name" ]] || continue
+    name="$(cat "$d/name" 2>/dev/null || true)"
+    [[ "$name" == package-* ]] || continue
+    printf '%s' "$d"
+    return 0
+  done
+  return 1
+}
+
+power_sample_file() { printf '%s' "${DOMUM_STATE_ROOT:-/var/lib/domum-media}/power/samples.env"; }
+
+power_boot_id() {
+  local b
+  b="$(cat "${DOMUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null || true)"
+  b="${b//-/}"
+  printf '%s' "${b:-unknown}"
+}
+
+# 0 recorded, 1 no counter on this host, 2 the sample could not be stored.
+# "No counter" is a LIMITATION and not a failure: an AMD host or a VM has no
+# intel-rapl, and the scheduled unit must not fail every night for that.
+power_sample_once() {
+  local dir energy maxr file tmp
+  dir="$(power_rapl_dir)" || return 1
+  [[ -r "$dir/energy_uj" ]] || return 1
+  energy="$(cat "$dir/energy_uj" 2>/dev/null || true)"
+  [[ "$energy" =~ ^[0-9]+$ ]] || return 1
+  maxr="$(cat "$dir/max_energy_range_uj" 2>/dev/null || true)"
+  [[ "$maxr" =~ ^[0-9]+$ ]] || maxr=0
+  file="$(power_sample_file)"
+  install -d -m 0700 "$(dirname "$file")" 2>/dev/null || return 2
+  # Appended, never rewritten: a sample is an observation and the history is
+  # the evidence. Pruning is a separate, explicit step below.
+  printf 'TS=%s BOOT=%s ENERGY_UJ=%s MAX_UJ=%s\n' \
+    "$(date +%s)" "$(power_boot_id)" "$energy" "$maxr" >> "$file" || return 2
+  chmod 0600 "$file" 2>/dev/null || true
+  power_prune_samples
+  return 0
+}
+
+# Staged and renamed, never truncated in place: a history rewritten in place is
+# a history that an interruption empties, and an empty sample file reads as
+# "no measurements" rather than as a failed prune.
+power_prune_samples() {
+  local file cutoff tmp keep
+  file="$(power_sample_file)"
+  [[ -f "$file" ]] || return 0
+  keep="${POWER_SAMPLE_RETENTION_DAYS:-90}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=90
+  cutoff=$(( $(date +%s) - keep * 86400 ))
+  tmp="$(mktemp "$(dirname "$file")/.samples.XXXXXX")" || return 1
+  if awk -v c="$cutoff" '{ ts=""; for(i=1;i<=NF;i++) if ($i ~ /^TS=/) { sub(/^TS=/,"",$i); ts=$i }
+                           if (ts != "" && ts+0 >= c) print }' "$file" > "$tmp" 2>/dev/null; then
+    chmod 0600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"; return 1
+  fi
+  return 0
+}
+
+# stdout: "<seconds> <millijoules> <pairs> <excluded_reboot> <excluded_gap>".
+# Integer arithmetic throughout -- awk's floats would be fine here, but the
+# totals are reported to the operator and a drift nobody can explain is worse
+# than a rounding rule that is stated.
+power_window_stats() {  # $1 = days
+  local file days out
+  file="$(power_sample_file)"
+  days="${1:-7}"
+  [[ -f "$file" ]] || { printf '0 0 0 0 0'; return 0; }
+  local maxw="${POWER_MAX_PLAUSIBLE_WATTS:-65}"
+  [[ "$maxw" =~ ^[0-9]+$ ]] && (( maxw > 0 )) || maxw=65
+  out="$(awk -v maxw="$maxw" -v cutoff="$(( $(date +%s) - days * 86400 ))" '
+    {
+      ts=""; boot=""; e=""; mx=0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^TS=/)        { v=$i; sub(/^TS=/,"",v);        ts = v }
+        else if ($i ~ /^BOOT=/) { v=$i; sub(/^BOOT=/,"",v);      boot = v }
+        else if ($i ~ /^ENERGY_UJ=/) { v=$i; sub(/^ENERGY_UJ=/,"",v); e = v }
+        else if ($i ~ /^MAX_UJ=/)    { v=$i; sub(/^MAX_UJ=/,"",v);    mx = v }
+      }
+      if (ts == "" || e == "" || ts+0 < cutoff) next
+      if (have) {
+        d = e - pe
+        dur = ts - pts
+        range = (pmx > 0 ? pmx : mx)
+        # The longest interval over which a SECOND wrap can be RULED OUT, at
+        # the most power this package could plausibly draw. Measured on this
+        # host the range is 262,143 J, so the counter wraps every 14.6 h at
+        # 5 W, 2.9 h at 25 W and 1.1 h at 65 W. A DAILY sample is longer than
+        # the wrap period at EVERY plausible power, which is why the timer is
+        # every 15 minutes: beyond the guard a negative delta is ambiguous
+        # between one wrap and two, and correcting it would be a guess that
+        # silently UNDERCOUNTS.
+        guard = (maxw > 0 && range > 0) ? range / (maxw * 1000000.0) : 0
+        if (boot != pboot) {
+          # A RESET, not a wrap. The energy drawn across a reboot is
+          # unknowable from this counter, so the interval is excluded and
+          # counted rather than estimated.
+          sk_boot++
+        } else if (dur <= 0 || guard <= 0 || dur > guard) {
+          # Counted SEPARATELY from a reboot, because a report that blamed
+          # this on a reboot would name the wrong cause.
+          sk_gap++
+        } else {
+          if (d < 0) d += range                  # exactly one wrap, same boot
+          # Still negative after adding the range back: the counter did
+          # something this code cannot account for. Counted, never dropped
+          # silently -- an interval nobody can explain must not vanish from
+          # the denominator and leave the mean looking well-founded.
+          if (d >= 0) { secs += dur; mj += d / 1000; pairs++ } else sk_gap++
+        }
+      }
+      pts = ts; pe = e; pboot = boot; pmx = mx; have = 1
+    }
+    END { printf "%d %d %d %d %d", secs+0, mj+0, pairs+0, sk_boot+0, sk_gap+0 }
+  ' "$file" 2>/dev/null || true)"
+  [[ -n "$out" ]] || { printf '0 0 0 0 0'; return 0; }
+  # ALWAYS returns 0. "No sample file" and "no usable pair" are the same
+  # actionable state -- not enough samples yet -- and the pairs field already
+  # says so. Returning non-zero would make every call site a bare-call
+  # errexit hazard, which is the defect that blanked three commands here.
+  printf '%s' "$out"
+}
+
+# Average watts over the window, to one decimal, as a STRING. Empty when there
+# is nothing to average -- never 0, which would read as "it drew no power".
+power_avg_watts() {  # $1 = seconds, $2 = millijoules
+  local secs="$1" mj="$2"
+  (( secs > 0 )) || return 1
+  awk -v s="$secs" -v m="$mj" 'BEGIN { printf "%.1f", (m / 1000.0) / s }'
+}
+
+power_kwh() {  # $1 = millijoules
+  awk -v m="$1" 'BEGIN { printf "%.3f", m / 3600000000.0 }'
+}
+
+# Cost is printed ONLY when a tariff is configured. A default tariff would be
+# an invented number wearing a measurement's clothes, and this host's own
+# electricity price is not something the software can know.
+power_cost() {  # $1 = kwh -> stdout: formatted cost, or nothing
+  local kwh="$1" tariff="${POWER_TARIFF_PER_KWH:-}"
+  [[ -n "$tariff" ]] || return 1
+  [[ "$tariff" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  awk -v k="$kwh" -v t="$tariff" 'BEGIN { printf "%.2f", k * t }'
+}
+
+# The shared renderer, so `power status` and the weekly report's POWER section
+# cannot disagree about a number -- two readings of one counter printed under
+# one label is the "two numbers that must agree are ONE number" defect.
+power_report_lines() {  # stdout: the body of the POWER block, already indented
+  local days stats secs mj pairs sk_boot sk_gap watts kwh cost
+  days="${POWER_WINDOW_DAYS:-7}"
+  [[ "$days" =~ ^[0-9]+$ ]] || days=7
+  stats="$(power_window_stats "$days")"
+  read -r secs mj pairs sk_boot sk_gap <<< "$stats"
+
+  if ! power_rapl_dir >/dev/null 2>&1; then
+    # A LIMITATION, stated as one. Not a warning: there is nothing to fix.
+    printf '  %-22s NOT AVAILABLE -- this host exposes no Intel RAPL counter\n' "CPU package power"
+    return 0
+  fi
+  if (( pairs == 0 )); then
+    # THREE causes, not one. "Not enough samples" is true of a new host and
+    # FALSE when samples exist and every interval between them was excluded --
+    # naming the wrong cause is the defect this project keeps correcting, and
+    # the remedies differ: wait, versus sample more often, versus nothing to
+    # do because the host rebooted.
+    if (( sk_gap > 0 )); then
+      printf '  %-22s NOT MEASURED -- every interval was too long to rule out a\n' "CPU package power"
+      printf '  %-22s second counter wrap. Sample more often: the counter wraps\n' ""
+      printf '  %-22s every 14.6 h at 5 W and 1.1 h at 65 W on this hardware.\n' ""
+    elif (( sk_boot > 0 )); then
+      printf '  %-22s NOT MEASURED -- every interval spanned a reboot, across\n' "CPU package power"
+      printf '  %-22s which the counter resets and the energy is unknowable.\n' ""
+    else
+      printf '  %-22s not enough samples yet -- two are needed to measure\n' "CPU package power"
+      printf '  %-22s an interval. One is taken per scheduled run.\n' ""
+    fi
+    return 0
+  fi
+
+  watts="$(power_avg_watts "$secs" "$mj")" || watts=""
+  kwh="$(power_kwh "$mj")"
+  # Hours of MEASURED time, which is not the same as the window: intervals
+  # spanning a reboot are excluded, so the denominator is stated rather than
+  # assumed to be the whole window.
+  # MEASURED time, which is not the window: excluded intervals are not in it,
+  # so the denominator is stated rather than assumed to be the whole period.
+  # Minutes below an hour, because `0h` reads as "nothing was measured" for a
+  # window that genuinely measured 30 minutes.
+  local span
+  if (( secs >= 3600 )); then span="$(( secs / 3600 ))h $(( (secs % 3600) / 60 ))m"
+  else span="$(( secs / 60 ))m"; fi
+  printf '  %-22s %s W  (mean over %s of measured time)\n' \
+    "CPU package" "${watts:-?}" "$span"
+  printf '  %-22s %s kWh over the last %s day(s)\n' "CPU package energy" "$kwh" "$days"
+  if cost="$(power_cost "$kwh")"; then
+    # Defaulted AT THE USE SITE. POWER_TARIFF_PER_KWH is set by load_cfg, so
+    # any caller that has not run it leaves the name unbound and `set -u`
+    # kills the shell here -- the rule this project already records for
+    # DISK_WEAR_WARN_PERCENT, and a mutation found it in this very line.
+    printf '  %-22s %s%s at %s%s/kWh\n' "Estimated cost" \
+      "${POWER_CURRENCY:-\$}" "$cost" "${POWER_CURRENCY:-\$}" "${POWER_TARIFF_PER_KWH:-}"
+  else
+    # Saying WHY there is no cost line is what makes the absence actionable;
+    # an invented default tariff would be a number wearing a measurement's
+    # clothes.
+    printf '  %-22s not costed -- set POWER_TARIFF_PER_KWH in the config\n' "Estimated cost"
+  fi
+  # Two causes, reported separately. One counter would make the report assert
+  # a reboot for an interval that was merely too long -- a confident wrong
+  # cause in the document the operator reads.
+  (( sk_boot > 0 )) && printf '  %-22s %s interval(s) spanned a reboot -- EXCLUDED\n' \
+    "Excluded" "$sk_boot"
+  (( sk_gap > 0 )) && printf '  %-22s %s interval(s) too long to rule out a second counter wrap\n  %-22s -- EXCLUDED rather than corrected on a guess\n' \
+    "Excluded" "$sk_gap" ""
+  # The scope sentence is not optional and is not a footnote. RAPL is the CPU
+  # package; presenting it as the server's consumption is the exact defect
+  # this project keeps correcting.
+  printf '  %-22s CPU package only (cores, uncore, memory controller).\n' "What this covers"
+  printf '  %-22s NOT the SSDs, fans, NIC or PSU loss, so the wall figure\n' ""
+  printf '  %-22s is HIGHER. Measure that with a meter, not from here.\n' ""
+  return 0
+}
+
+power_cmd() {
+  # energy_uj is mode 0400 and the sample history is 0600 root, so both
+  # subcommands need root. The guard is FIRST: a command that cannot read its
+  # input must refuse before it creates a directory to put nothing in.
+  need_root
+  load_cfg
+  ensure_dirs
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    sample)
+      local rc=0
+      power_sample_once || rc=$?
+      case "$rc" in
+        0) echo "[domum-media] power sample recorded." ;;
+        1) echo "[domum-media] no Intel RAPL counter on this host; nothing to sample."
+           # Deliberately exit 0: a host without the counter is not a failed
+           # run, and a nightly unit must not fail for a permanent limitation.
+           ;;
+        *) die "The power sample could not be stored under $(dirname "$(power_sample_file)")." ;;
+      esac
+      ;;
+    status)
+      local json=0 a
+      while (( $# )); do
+        a="$1"; shift
+        case "$a" in
+          --json) json=1 ;;
+          *) die "Usage: domum-media power status [--json]" ;;
+        esac
+      done
+      if (( json == 1 )); then
+        local days stats secs mj pairs sk_boot sk_gap watts kwh cost avail
+        days="${POWER_WINDOW_DAYS:-7}"; [[ "$days" =~ ^[0-9]+$ ]] || days=7
+        stats="$(power_window_stats "$days")"
+        read -r secs mj pairs sk_boot sk_gap <<< "$stats"
+        avail=false; power_rapl_dir >/dev/null 2>&1 && avail=true
+        watts="$(power_avg_watts "$secs" "$mj")" || watts=""
+        kwh="$(power_kwh "$mj")"
+        cost="$(power_cost "$kwh")" || cost=""
+        # `scope` is a FIELD, not a comment, so a consumer cannot read these
+        # numbers as whole-system without ignoring a key that says otherwise.
+        printf '{"counter_available":%s,"scope":"cpu-package","window_days":%s,' "$avail" "$days"
+        printf '"measured_seconds":%s,"intervals":%s,' "$secs" "$pairs"
+        printf '"excluded_reboot_intervals":%s,"excluded_long_intervals":%s,' "$sk_boot" "$sk_gap"
+        printf '"avg_watts":%s,"kwh":%s,"cost":%s,"currency":"%s"}\n' \
+          "${watts:-null}" "$kwh" "${cost:-null}" "${POWER_CURRENCY:-\$}"
+      else
+        echo "POWER (CPU PACKAGE)"
+        power_report_lines
+      fi
+      ;;
+    *) die "Usage: domum-media power [sample|status [--json]]" ;;
+  esac
+}
+
+
 mreport_smart_interpretable() {  # $1 = device name
   local n
   cmd_exists jq || return 2
@@ -7333,6 +7671,14 @@ mreport_render_text() {  # $1 = output file, $2 = mode: full|alert
         [[ -n "$pct" ]] || continue
         printf '  %-22s %s%% used, %s free%s\n' "Disk $root" "$pct" "$free" "$(mreport_flag "$pct" 70 80 90)"
       done
+      printf '\n'
+
+      # --- POWER (CPU PACKAGE) ---------------------------------------------
+      # Named CPU PACKAGE in the HEADING, not only in a footnote, because the
+      # heading is what a skimming reader takes away. RAPL is not a wall
+      # measurement and this section never implies that it is.
+      mreport_hdr "POWER (CPU PACKAGE)"
+      power_report_lines
       printf '\n'
 
       mreport_trends
@@ -13916,6 +14262,8 @@ state-unpack|storage unpack-state|service_state_unpack
 verify-state-pack|storage verify-pack|service_state_pack_verify
 state-pack-retention|storage prune-state-packs|storage_prune_state_packs
 state-capture-all|storage capture-all-state|storage_capture_all_state
+power-sample|power sample|power_sample_once
+power-status|power status|power_window_stats
 EOF
 }
 
@@ -14475,6 +14823,7 @@ main() {
     snapshot)  shift; snapshot_cmd "$@" ;;
     rollback)  shift; rollback_cmd "$@" ;;
     checkup)   shift; checkup_cmd "$@" ;;
+    power)     shift; power_cmd "$@" ;;
     health-notify) shift; health_notify_cmd "$@" ;;
     report)    shift; report_entry "$@" ;;
     storage)   shift; storage_cmd "$@" ;;
