@@ -9359,6 +9359,42 @@ negative control.
 
 ---
 
+**A FILE BIND-MOUNTED FROM THE CHECKOUT IS DEPLOYED BY THE FAST-FORWARD, NOT
+BY THE CONTAINER RECREATE -- and #199 put a container-dependent change into
+one.** Production, found 2026-11-20: the running traefik bind-mounts
+`/opt/domum-core-media/compose/proxy/traefik` as `/etc/traefik`, with
+`--configFile=/etc/traefik/traefik.yml`, `/var/run/docker.sock` mounted, and a
+creation date of 2026-08-17. #199 changed `traefik.yml`'s docker endpoint to
+`tcp://docker-socket-proxy:2375` in the same commit that added the proxy
+container. The 2026-11-18 fast-forward therefore rewrote the static config of a
+RUNNING container whose definition had not changed and whose proxy did not
+exist. Traefik reads static config only at startup, so nothing broke -- and the
+next reboot would have lost every label-defined route. Reproduced with
+disposable containers from the exact running image id: the shipped file gave
+`failed to connect to the docker API at tcp://docker-socket-proxy:2375` and no
+routers; the restored file discovered all seven.
+
+The two halves of a change deploy at DIFFERENT moments, and nothing in review
+showed it:
+
+| change lives in | takes effect |
+|---|---|
+| a compose fragment (mounts, networks, command, new service) | when the container is RECREATED |
+| a bind-mounted file read at startup (`traefik.yml`) | the next START of the existing container -- reboot, Docker restart |
+| a bind-mounted WATCHED file (`traefik/dynamic/`) | IMMEDIATELY on fast-forward |
+
+**The rule: a change to a live-mounted file must work with the container
+definition that is RUNNING, not the one in the repository.** A change that
+depends on a new container definition goes to a NEW path that only the new
+definition selects -- here `traefik-socket-proxy.yml`, chosen by
+`--configFile=` in `compose/proxy/traefik.yml` -- so the switch is atomic with
+the recreate. `tests/socket-proxy-smoke.sh` pins it with a negative control
+(the #199 shape must be rejected). Measured 2026-11-20: this is the ONLY
+checkout path bind-mounted into any container, so the rule has exactly one
+subject today; a second such mount inherits it.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when

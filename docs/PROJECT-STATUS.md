@@ -183,6 +183,15 @@ new one has nothing to talk to. Either the Compose rollout (pinned images) or a
 deliberate revert of that one file has to precede any restart. Both are
 production changes and the operator's decision.
 
+**Fixed in the repository, NOT yet deployed.** `traefik.yml` is restored
+byte-for-byte to the file the running Traefik loaded at its 2026-11-09 start
+(sha256 `7e5ba716…`, identical to `a63ad19`'s), and the proxy endpoint moved to
+`traefik-socket-proxy.yml`, selected only by the compose definition's
+`--configFile=`. Validated with disposable containers from the running image
+id `9c3b91d5…`: the restored file discovered all seven label routers; the file
+production has now discovered none. Until the fast-forward lands, the hazard
+stands.
+
 **This is sharper than it was before the fast-forward, not softer.** Any
 command that reconciles -- `domum-media apply`, and therefore `update` --
 would now apply the hardening to every container as a side effect, because the
@@ -235,10 +244,9 @@ check on this host can stand in for.
    that day's `SENT_DATE`; a `failure` there is raised by `checkup` as a
    CRITICAL. If no mail and no record, `systemctl status
    domum-media-weekly-report.service` tells whether the unit ran at all.
-3. **Resolve the Traefik static-config hazard BEFORE any restart** (section 3):
-   the live Traefik's bind-mounted `traefik.yml` already points at a
-   docker-socket-proxy that does not exist. Either do item 5's rollout first, or
-   revert that one file deliberately. *Needs approval.*
+3. **Deploy the Traefik static-config fix BEFORE any restart** (section 3).
+   Fixed in the repository; deploying it is a checkout fast-forward only -- no
+   restart, no recreate, no image. *Needs approval.*
 4. **Plan the kernel reboot** -- **blocked by item 3**, and 6.12.117 is installed and 6.12.111 is
    running, `reboot-required` since 2026-11-15 06:03 (re-checked 2026-11-20).
    Every timer is `Persistent=true`, so missed jobs run immediately on boot,

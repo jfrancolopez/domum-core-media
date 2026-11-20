@@ -1,0 +1,52 @@
+# Static configuration for Traefik BEHIND the read-only Docker socket proxy.
+#
+# This is deliberately NOT traefik.yml. The directory is bind-mounted live from
+# the production checkout into the RUNNING container, so a git fast-forward
+# changes these bytes immediately -- while the container keeps the definition
+# it was created with. A running Traefik created before the proxy existed loads
+# /etc/traefik/traefik.yml on its next start (reboot, Docker restart), still
+# has /var/run/docker.sock mounted, and has no docker-socket-proxy to reach.
+#
+# So the proxy endpoint lives in its own file and is selected by the compose
+# definition (`--configFile=` in compose/proxy/traefik.yml). The switch from the
+# socket to the proxy then happens only when the container is RECREATED from
+# that definition -- the same moment the socket mount is removed and the proxy
+# network attached. Never point traefik.yml at the proxy; see CLAUDE.md.
+api:
+  dashboard: true
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "tcp://docker-socket-proxy:2375"
+    exposedByDefault: false
+    network: domum-proxy
+  file:
+    directory: "/etc/traefik/dynamic"
+    watch: true
+
+certificatesResolvers:
+  cf:
+    acme:
+      storage: "/letsencrypt/acme.json"
+      dnsChallenge:
+        provider: cloudflare
+        delayBeforeCheck: 0
+        resolvers:
+          - "1.1.1.1:53"
+          - "1.0.0.1:53"
+
+log:
+  level: INFO
+accessLog: {}
