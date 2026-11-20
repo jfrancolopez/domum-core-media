@@ -12,7 +12,8 @@ corrected the same stale count three times -- so nothing below should be
 repeated to the operator without re-running the check beside it.
 
 Last reconciled: **2026-11-20**, after `a598abd` was deployed on 2026-11-19
-and closed the reporting regression recorded in section 2a.
+and closed the reporting regression recorded in section 2a; reporting
+verification and one received test email recorded in section 2b.
 
 ```
 git rev-parse origin/main                      # what "current" means today
@@ -71,7 +72,7 @@ asserted:
 |---|---|---|
 | 1 | an emptied backup heartbeat read as a successful backup | **closed** -- empty, whitespace-only and absent all answer rc=1; a valid marker still answers rc=0 |
 | 2 | a scrub already running when the timer fires would mail a CRITICAL | **closed before its date** -- `btrfs_scrub_running` is in the installed binary; the Sun 2026-12-06 firing is no longer a known false alarm |
-| 3 | the weekly HTML report was never sent | **unit and command now both correct** -- the command was dead from 2026-11-18 to 2026-11-19 (section 2a) and renders since `a598abd`. **Delivery is NOT yet observed**: the first scheduled send is Sun 2026-11-22. Claiming this closed on 2026-11-18 was correct about the unit and wrong about the outcome, which is why it is not claimed closed again until mail arrives. |
+| 3 | the weekly HTML report was never sent | **the transport and the report are proven; the SCHEDULED send is not yet observed.** A manual `report weekly --email` on 2026-11-20 15:49 EST exited 0 and the operator **received** it. The first scheduled send is Sun 2026-11-22. Claiming this closed on 2026-11-18 was correct about the unit and wrong about the outcome, so it is not claimed closed until the timer's own send arrives. |
 
 The deployment also retired a prerequisite: every `capabilities --has` token of
 the selective-backup surface answered **2** (token unknown) before it and
@@ -131,9 +132,21 @@ verdict vanished exactly when there was one to give. **Deployed with
 | Sunday's unit runs the right commands, in the right order, with the right prefixes | **verified** | installed unit text read 2026-11-20 |
 | a send failure is recorded and raised | **verified in code and by 10 local suites** | curl failure -> `RESULT=failure` -> `checkup_weekly_report_delivery` CRITICAL -> mailed by the alert step; undeliverable alert fails the unit; delivery switched off or transport missing is CRITICAL in `checkup_notification_path` |
 | no duplicate send | **verified in code** | `--scheduled` refuses a second send on a day with a recorded success; `--unless-reported` matches `INVOCATION_ID`, so a manual run never silences an alert |
-| `checkup` and `health-notify` execute in production | **pending operator output** -- root-only | |
-| SMTP host, port, sender, recipient and TLS handshake | **pending operator output** -- root-only, no credential printed | |
-| one controlled HTML report email | **prepared, not sent** -- needs operator approval | `report weekly --dry-run`, then `report weekly --email` (manual: records nothing, cannot suppress Sunday) |
+| `checkup` and `health-notify` execute in production | **verified** (operator, 2026-11-20 20:34 UTC) | `checkup` prints its report, 0 critical; `health-notify --dry-run` reports `ACTION REQUIRED (1)` -- 0 critical, 1 action, 6 warnings, 26 healthy. The one action is the docker-socket-proxy finding below, so a real `health-notify` would mail it. |
+| SMTP host, port, sender, recipient and TLS handshake | **verified** (operator, 2026-11-20), no credential printed | `enabled=1`; recipient the operator's own address; port 465 implicit TLS; both credential files `600 root:root`, non-empty (27 and 20 bytes); TLSv1.3 handshake completed with `-verify_return_error`, peer `CN=smtp.gmail.com`. The `Verification:` line itself was cut by the block's `head -8`; the handshake completing under `-verify_return_error` is what establishes it. |
+| one controlled HTML report email | **sent, accepted, RECEIVED** (2026-11-20 15:49 EST) | `report weekly --email` printed `weekly report emailed -- domum-media weekly report - ACTION REQUIRED (1)` and exited 0. curl exits non-zero on any SMTP rejection including authentication, so exit 0 is server acceptance and proves the credentials. Inbox arrival is the operator's confirmation, not an inference. |
+| the test cannot suppress Sunday | **verified** | the delivery record read `none` before AND after the send -- a manual `--email` writes nothing, so Sunday's `--scheduled` same-day check has nothing to match. Side effect: one 11-20 trend row was appended (every non-dry run does this). |
+
+**Every weekly report will say ACTION REQUIRED until the docker-socket-proxy
+finding is resolved, and the finding is misworded.** That container has never
+been created -- the Compose change set is in the checkout and not applied -- so
+`checkup` reports a service that was never deployed as *stopped*, and its
+remedy `compose start docker-socket-proxy` would only fail (there is no
+container to start). Never substitute `up -d`: that applies the whole change
+set and recreates traefik and uptime-kuma on their staged images. On Sunday the
+report is sent first and `--unless-reported` then suppresses the alert, so one
+mail arrives, not two. Distinguishing "declared but never created" from
+"stopped" in `checkup` is a small code change, not done here.
 
 **One known gap, not fixed:** a scheduled report that dies BEFORE curl (a
 render or MIME failure, a transport refusal, or delivery switched off) writes no
@@ -155,6 +168,20 @@ change set is now *present in production and not applied*. Measured 2026-11-18:
 | `no-new-privileges` | 11 fragments | **no** -- traefik, plex and immich_server all report `SecurityOpt=[]` |
 | Traefik behind a read-only Docker socket proxy | fragment present | **no** -- no `docker-socket-proxy` container exists |
 | `domum-media-state-capture.{service,timer}` | present | **no** -- absent from `/etc/systemd/system` |
+| Traefik's static config `traefik.yml` | `providers.docker.endpoint: tcp://docker-socket-proxy:2375` | **not yet -- and it takes effect on the next Traefik start.** See below. |
+
+**TRAEFIK WILL LOSE EVERY LABEL-DEFINED ROUTE ON ITS NEXT RESTART.** Measured
+2026-11-20: the running traefik bind-mounts
+`/opt/domum-core-media/compose/proxy/traefik` as `/etc/traefik`, so the
+fast-forward rewrote the static config of a RUNNING container. Traefik reads
+static config only at startup (it started 2026-11-09, before the deployment),
+so nothing has changed yet. But a reboot, a Docker restart or a Traefik restart
+makes it look for the Docker API at `docker-socket-proxy:2375`, which does not
+exist, and every service routed by labels becomes unreachable over HTTPS. Its
+mounts still include `/var/run/docker.sock`, so the old config would work; the
+new one has nothing to talk to. Either the Compose rollout (pinned images) or a
+deliberate revert of that one file has to precede any restart. Both are
+production changes and the operator's decision.
 
 **This is sharper than it was before the fast-forward, not softer.** Any
 command that reconciles -- `domum-media apply`, and therefore `update` --
@@ -179,7 +206,7 @@ feature.**
 | kind | items |
 |---|---|
 | **privilege** (root; `sudo -n` answers *a password is required*, 0 NOPASSWD entries, measured 2026-11-18) | reading the image-archive sizes; traversing the Docker volume root; installing the state-capture units; running any `storage` subcommand |
-| **approval** (production boundary) | the Compose hardening rollout; the kernel reboot; activating a backup target; a real quiesced capture; a production image upgrade |
+| **approval** (production boundary) | the Compose hardening rollout; the kernel reboot -- now **also gated on the Traefik config** (section 3);  activating a backup target; a real quiesced capture; a production image upgrade |
 | **instruction** (standing prohibition) | copying the off-host recovery key; capturing live production state to a scratch directory, because the capture's declared purpose is to copy credentials |
 | **hardware / scale** | a fresh-host restore (a second machine); a full Immich restore (~130 GiB) |
 
@@ -199,34 +226,39 @@ off-site protection.
 scheduled weekly report.** It is the one part of the reporting work that no
 check on this host can stand in for.
 
-1. **Finish the reporting verification** (section 2b): the operator's root-only
-   read of `checkup`, `health-notify --dry-run` and the SMTP settings, then --
-   with approval -- one manual `report weekly --email`. *Needs operator.*
-2. **Confirm Sunday's report arrived.** Afterwards,
+1. ~~Finish the reporting verification~~ -- **done 2026-11-20** (section 2b):
+   checkup and health-notify run, SMTP and TLS verified, one manual report
+   sent and received, delivery record untouched.
+2. **Confirm Sunday's report arrived.** It is the only part not yet observed:
+   the transport is proven, the timer's own send is not. Afterwards,
    `/var/lib/domum-media/weekly-report.env` should read `RESULT=success` with
    that day's `SENT_DATE`; a `failure` there is raised by `checkup` as a
    CRITICAL. If no mail and no record, `systemctl status
    domum-media-weekly-report.service` tells whether the unit ran at all.
-3. **Plan the kernel reboot** -- 6.12.117 is installed and 6.12.111 is
+3. **Resolve the Traefik static-config hazard BEFORE any restart** (section 3):
+   the live Traefik's bind-mounted `traefik.yml` already points at a
+   docker-socket-proxy that does not exist. Either do item 5's rollout first, or
+   revert that one file deliberately. *Needs approval.*
+4. **Plan the kernel reboot** -- **blocked by item 3**, and 6.12.117 is installed and 6.12.111 is
    running, `reboot-required` since 2026-11-15 06:03 (re-checked 2026-11-20).
    Every timer is `Persistent=true`, so missed jobs run immediately on boot,
    `snapshot prune` among them. Measured 2026-11-19: nothing is overdue, so a
    prompt reboot replays nothing. Avoid being *down across* 02:30-05:00 or
    Sunday 03:00-08:30, and prefer AFTER Sunday's report so the first scheduled
    send is not confounded with a reboot. *Needs approval.*
-4. **Stage the Compose security rollout** -- per service, with each running
+5. **Stage the Compose security rollout** -- per service, with each running
    image ID pinned so a configuration change cannot carry an upgrade, Immich
    last in its own phase. The fragments sit in production's checkout, so
    `domum-media apply` and `update` stay off-limits until then: either would
    apply them unreviewed and recreate traefik and uptime-kuma on their staged
    newer images. *Needs approval.*
-5. **Finish off-site application-state backup** -- the commands are deployed,
+6. **Finish off-site application-state backup** -- the commands are deployed,
    so `docs/OPERATOR-GATED-ACTIONS.md` items 2-5 are runnable. What remains is
    the operator's: a destination for the packs, installing and enabling the
    capture timer, and the key-custody step no work on this host can replace.
-6. **Add a staleness check to the weekly-report delivery finding** (section
+7. **Add a staleness check to the weekly-report delivery finding** (section
    2b). Small, needs a deployment; not urgent while the first send is pending.
-7. **Verify recovery independently** -- a fresh-host restore needs a second
+8. **Verify recovery independently** -- a fresh-host restore needs a second
    machine, and a full Immich restore is ~130 GiB. Nothing on this host is
    `FULL RECOVERY VERIFIED` and nothing here changes that.
 
