@@ -26,7 +26,7 @@ services:
       - ${TRAEFIK_DASHBOARD_USERS_FILE:-/etc/domum-core-media/secrets/traefik_dashboard_users}:/run/secrets/traefik_dashboard_users:ro
 
     command:
-      - --configFile=/etc/traefik/traefik.yml
+      - --configFile=/etc/traefik/traefik-socket-proxy.yml
       - --certificatesresolvers.cf.acme.email=${DOMUM_EMAIL}
 
     extra_hosts:

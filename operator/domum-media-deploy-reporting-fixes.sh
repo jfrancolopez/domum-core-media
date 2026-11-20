@@ -21,12 +21,18 @@
 #       operator is in, rather than asserting the one that happened to be true
 #       when this script was written.
 #
-# WHAT IT DOES NOT TOUCH: containers, images, compose files, systemd units,
-# timers, Restic schedules, Restic exclusions, the Immich database, originals,
-# Btrfs subvolumes, snapshots, recovery archives, and the production
+# WHAT IT DOES NOT TOUCH: containers, images, systemd units other than the
+# two above, timers, Restic schedules, Restic exclusions, the Immich database,
+# originals, Btrfs subvolumes, snapshots, recovery archives, and the production
 # configuration (untracked, so a fast-forward cannot disturb it).
 #
-# No service is stopped, started or recreated. These are three text files.
+# No service is stopped, started or recreated. BUT THE FAST-FORWARD CHANGES
+# EVERY TRACKED FILE IN THE CHECKOUT, compose files included, and one directory
+# of them is LIVE: compose/proxy/traefik is bind-mounted into the running
+# traefik, so traefik.yml takes effect on that container's next start and
+# dynamic/ immediately. This header used to say "compose files" were untouched,
+# which is how #199's container-dependent traefik.yml change reached a running
+# container unnoticed (2026-11-18 to 11-20). See CLAUDE.md.
 #
 # WHY NO BAKED-IN REVISION. A revision constant inside the repository it pins
 # goes stale by construction, and a deployment script asserting an absolute
@@ -347,7 +353,9 @@ if [ "${UNITS_CHANGED:-0}" -eq 1 ]; then
       ;;
   esac
 fi
-say "untouched : containers, images, compose, OTHER systemd units, timers, Restic"
+say "checkout  : every tracked file fast-forwarded -- compose/proxy/traefik is LIVE in"
+say "            the running traefik (static config on its next start, dynamic/ now)"
+say "untouched : containers, images, OTHER systemd units, timers, Restic"
 say "            schedules and exclusions, the Immich database, originals,"
 say "            Btrfs subvolumes, snapshots, recovery archives, and the"
 say "            production configuration"

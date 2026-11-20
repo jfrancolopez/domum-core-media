@@ -5,7 +5,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/bin/domum-media"
 PROXY_COMPOSE="$REPO_ROOT/compose/proxy/docker-socket-proxy.yml"
 TRAEFIK_COMPOSE="$REPO_ROOT/compose/proxy/traefik.yml"
-TRAEFIK_CONFIG="$REPO_ROOT/compose/proxy/traefik/traefik.yml"
+TRAEFIK_CONFIG="$REPO_ROOT/compose/proxy/traefik/traefik-socket-proxy.yml"
+# The file a Traefik container created BEFORE the proxy existed loads on its
+# next start. The directory is bind-mounted live from the production checkout,
+# so a fast-forward rewrites it under a running container; it must therefore
+# keep working with the socket mount that container still has.
+TRAEFIK_DEFAULT_CONFIG="$REPO_ROOT/compose/proxy/traefik/traefik.yml"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 compose_files() {  # $1 = ENABLE_TRAEFIK
@@ -91,10 +96,44 @@ grep -Fq 'tcp://docker-socket-proxy:2375' "$TRAEFIK_CONFIG" \
 if grep -Fq '/var/run/docker.sock' "$TRAEFIK_COMPOSE"; then
   fail "Traefik still mounts the Docker socket"
 fi
-socket_files="$(grep -RIl --include='*.yml' '/var/run/docker.sock' "$REPO_ROOT/compose" \
+# A MOUNT, i.e. "/var/run/docker.sock:" -- the static config names the socket
+# as an endpoint URL, which is not a mount and must not count as one.
+socket_files="$(grep -RIl --include='*.yml' '/var/run/docker.sock:' "$REPO_ROOT/compose" \
   | sed "s#^$REPO_ROOT/##" | sort)"
 [[ "$socket_files" == "compose/proxy/docker-socket-proxy.yml" ]] \
   || fail "the socket mount is not isolated to the proxy fragment"
 echo "  read-only socket, GET-only API, internal network, no published port"
+
+echo "== a restart of a PRE-proxy Traefik keeps working (2026-11-20) =="
+# Production: the fast-forward to f647aa2 rewrote traefik.yml to point at the
+# proxy while the running container (created 2026-08-17, socket mounted, no
+# proxy anywhere) kept --configFile=/etc/traefik/traefik.yml. Its next start
+# would have lost every label-defined route. The proxy endpoint therefore lives
+# in its own file, selected by the compose definition, so the switch happens
+# only when the container is recreated from that definition.
+restart_safe() {  # $1 = static config a pre-proxy container would load
+  grep -Fq 'endpoint: "unix:///var/run/docker.sock"' "$1" || return 1
+  if grep -Fq 'docker-socket-proxy' "$1"; then return 1; fi
+  return 0
+}
+restart_safe "$TRAEFIK_DEFAULT_CONFIG" \
+  || fail "traefik.yml no longer works for a Traefik created before the proxy: it must keep the unix socket endpoint"
+grep -Fq -- '- --configFile=/etc/traefik/traefik-socket-proxy.yml' "$TRAEFIK_COMPOSE" \
+  || fail "the compose definition does not select the proxy static config"
+if grep -Fq -- '--configFile=/etc/traefik/traefik.yml' "$TRAEFIK_COMPOSE"; then
+  fail "the compose definition still loads traefik.yml, so the proxy file is never used"
+fi
+case "$TRAEFIK_CONFIG" in
+  */dynamic/*) fail "the proxy static config sits in the WATCHED dynamic directory" ;;
+esac
+# Negative control: the shape that shipped in #199 must be rejected, or the
+# check above could pass by matching nothing.
+neg="$(mktemp)"; trap 'rm -f "$neg"' EXIT
+sed 's#endpoint: "unix:///var/run/docker.sock"#endpoint: "tcp://docker-socket-proxy:2375"#' \
+  "$TRAEFIK_DEFAULT_CONFIG" > "$neg"
+if restart_safe "$neg"; then
+  fail "negative control: a traefik.yml pointing at the proxy was accepted"
+fi
+echo "  traefik.yml keeps the socket; the proxy file is selected only by the compose definition"
 
 echo "PASS: socket-proxy smoke"
