@@ -368,6 +368,11 @@ jobs:
       - name: Deploy reporting rehearsal
         run: tests/deploy-reporting-rehearsal-smoke.sh
 
+      # The weekly host-update must never upgrade Docker Engine: that restarts
+      # dockerd and every container (production outage, 2026-11-23).
+      - name: Host update excludes Docker Engine
+        run: tests/host-update-docker-exclusion-smoke.sh
+
       # Silence must mean healthy: no mail when nothing needs doing, one mail
       # when it does, and never a claim of delivery that did not happen.
       - name: Health notify smoke test

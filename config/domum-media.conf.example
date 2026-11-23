@@ -222,10 +222,11 @@ IMMICH_DB_DATABASE_NAME="immich"
 # ============================================================
 
 # Security-only patches via unattended-upgrades (Debian Security origin only).
-# Docker CE is excluded — it is upgraded via host-upgrade only.
+# Docker Engine is excluded here AND from host-upgrade: upgrading it restarts
+# every container, so it is attended maintenance (docs/SECURITY-PATCHES.md).
 HOST_SECURITY_AUTO_UPDATE_ENABLED=1
 
-# General package upgrades (Docker, Tailscale, restic, rclone, etc.)
+# General package upgrades (Tailscale, restic, rclone, etc.; never Docker Engine)
 HOST_PACKAGE_AUTO_UPDATE_ENABLED=0
 HOST_PACKAGE_AUTO_UPDATE_AT=Mon\ 05:45
 HOST_PACKAGE_AUTO_UPDATE_RANDOMIZED_DELAY=45m
