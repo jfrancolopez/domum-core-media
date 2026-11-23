@@ -1,0 +1,5 @@
+#!/bin/sh
+# Bind-mounted read-only over /usr/local/bin/yt-dlp and /usr/local/bin/cloudflared
+# inside the Aurral experiment, so neither can run whatever a setting says.
+echo "disabled in the domum-core-media Aurral experiment" >&2
+exit 126
