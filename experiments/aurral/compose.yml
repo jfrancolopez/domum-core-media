@@ -3,11 +3,13 @@
 # Deliberately OUTSIDE compose/: nothing in production (compose_files_for_enabled_services,
 # install.sh, `domum-media apply/update`, CI's fragment layering) reads this
 # directory. Its own project name keeps `docker compose` from touching any
-# production container. Started only by the operator, by hand:
+# production container. Started only by the operator, by hand. Nothing here is
+# started by any timer.
 #
-#   docker compose -f experiments/aurral/compose.yml -p aurral-experiment up -d
-#
-# See README.md before running it. Nothing here is started by any timer.
+# Aurral HAS outbound internet access. Isolation from the LAN, the tailnet,
+# the host and the production Docker networks is enforced by firewall.sh, NOT
+# by this file -- a NAT bridge on its own cannot express "internet yes,
+# private no". Apply the policy BEFORE `up -d`; see README.md section 6.
 #
 # Addresses come from an UNTRACKED env file (see aurral.env.example), passed
 # with --env-file; the repository carries no infrastructure address. Every
@@ -22,6 +24,10 @@ services:
     # never `latest`, never auto-updated.
     image: ghcr.io/lklynet/aurral:3.1.0@sha256:17d1f8ff2aaa3907d846c38b47eebdd44b10fbe00b2c993373a6da940ac2504f
     container_name: aurral-experiment
+    # Load-bearing, not a preference: the firewall rules live only in the
+    # running kernel ruleset, so after a reboot the policy is gone. With
+    # `no`, the container is gone too. Never change this to unless-stopped
+    # without making the policy survive a boot first.
     restart: "no"
     # A dedicated uid owning nothing else. The entrypoint only switches user
     # when started as root; started non-root it just execs node, so no
@@ -29,11 +35,18 @@ services:
     user: "61001:61001"
     read_only: true
     tmpfs:
-      - /tmp:size=256m,mode=1777
+      - /tmp:size=512m,mode=1777
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
     privileged: false
+    # A PUBLIC resolver, deliberately. The host's own resolver is Tailscale
+    # MagicDNS, which this experiment must not reach; and a resolver the
+    # embedded DNS forwards to over the bridge would be blocked by the
+    # host-isolation rule. A public one is reached over the egress path that
+    # is open anyway, so DNS works whichever namespace does the forwarding.
+    dns:
+      - ${AURRAL_DNS:?}
     environment:
       HOME: /config/home
       AURRAL_DATA_DIR: /config
@@ -49,11 +62,13 @@ services:
       - /srv/media/experiments/aurral/library:/data/library
       - /srv/media/experiments/aurral/staging:/data/staging
       - /srv/media/experiments/aurral/exports:/data/exports
-      # Defence in depth behind the UI switches: these binaries cannot run.
-      - /srv/data/experiments/aurral/stubs/disabled:/usr/local/bin/yt-dlp:ro
+      # cloudflared stays neutralised even though yt-dlp no longer is: it
+      # exists to open a Cloudflare quick tunnel for share links, which is a
+      # PUBLIC route to this UI. yt-dlp is now testable; publishing the UI to
+      # the internet is still refused.
       - /srv/data/experiments/aurral/stubs/disabled:/usr/local/bin/cloudflared:ro
     networks:
-      aurral-internal:
+      aurral-net:
         ipv4_address: ${AURRAL_APP_IP:?}
     mem_limit: 1536m
     cpus: 1.5
@@ -61,6 +76,9 @@ services:
     labels:
       traefik.enable: "false"
 
+  # The ONLY ingress. Aurral's own port is never published, so every inbound
+  # request arrives here and has its X-Forwarded-For overwritten -- which is
+  # what keeps the two advisories mitigated at 3.1.0.
   aurral-proxy:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     container_name: aurral-experiment-proxy
@@ -81,9 +99,8 @@ services:
       - "${AURRAL_LAN_IP:?}:3001:8080"
       - "${AURRAL_TAILSCALE_IP:?}:3001:8080"
     networks:
-      aurral-internal:
+      aurral-net:
         ipv4_address: ${AURRAL_PROXY_IP:?}
-      aurral-edge: {}
     mem_limit: 64m
     cpus: 0.25
     pids_limit: 64
@@ -92,17 +109,18 @@ services:
     depends_on: [aurral]
 
 networks:
-  # internal: no route off the host. gateway_mode_ipv4=isolated: the bridge
-  # gets NO host address, so the container cannot reach the host itself either
-  # (Traefik's 0.0.0.0:443, sshd, ...). Docker >= 28.
-  aurral-internal:
-    internal: true
+  # An ordinary NAT bridge: that is what gives Aurral the internet. What it
+  # does NOT give is isolation -- a NAT bridge can reach the LAN, the tailnet
+  # and every host port bound on 0.0.0.0. firewall.sh is what blocks those.
+  #
+  # The bridge NAME is pinned so the firewall rules can match an interface
+  # that does not change when the network is recreated; Docker's default
+  # `br-<network id>` would change and silently orphan every rule.
+  aurral-net:
+    driver: bridge
     enable_ipv6: false
     driver_opts:
-      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.name: aurral0
     ipam:
       config:
         - subnet: ${AURRAL_SUBNET:?}
-  # Exists only so the proxy's ports can be published. Aurral is not on it.
-  aurral-edge:
-    enable_ipv6: false

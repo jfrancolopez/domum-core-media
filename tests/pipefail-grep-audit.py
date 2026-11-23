@@ -49,7 +49,13 @@ TARGETS = (["bin/domum-media", "bin/domum-media-backup", "bin/domum-media-report
            # pushed awk's output past the pipe buffer -- the documented
            # intermittency, arriving as a mysterious failure in a suite nobody
            # had touched.
-           + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("*.sh")))
+           + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("*.sh"))
+           # The Aurral experiment's scripts write firewall rules on this host
+           # and drive isolation assertions. An assertion that silently stops
+           # asserting is the worst place for this family, and "it is only an
+           # experiment" is not a reason to leave it unscanned.
+           + sorted(str(p.relative_to(ROOT))
+                    for p in (ROOT / "experiments" / "aurral").glob("*.sh")))
 
 # A pipe into a consumer that STOPS EARLY. `grep -q` was the known one; the
 # same SIGPIPE mechanism applies to anything that closes its input before the
