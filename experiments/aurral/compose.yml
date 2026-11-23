@@ -1,0 +1,108 @@
+# Aurral -- ISOLATED EXPERIMENT. Not part of Domum-Core-Media.
+#
+# Deliberately OUTSIDE compose/: nothing in production (compose_files_for_enabled_services,
+# install.sh, `domum-media apply/update`, CI's fragment layering) reads this
+# directory. Its own project name keeps `docker compose` from touching any
+# production container. Started only by the operator, by hand:
+#
+#   docker compose -f experiments/aurral/compose.yml -p aurral-experiment up -d
+#
+# See README.md before running it. Nothing here is started by any timer.
+#
+# Addresses come from an UNTRACKED env file (see aurral.env.example), passed
+# with --env-file; the repository carries no infrastructure address. Every
+# variable is required (`:?`), so a missing one refuses rather than binding
+# a wildcard.
+name: aurral-experiment
+
+services:
+  aurral:
+    # 3.1.0 (2026-11-23). >= 3.0.0 is required: GHSA-94q7-rfcf-xq9g (high) and
+    # GHSA-4fgw-3fq7-w4mp (medium) are fixed in 3.0.0. Pinned by INDEX digest;
+    # never `latest`, never auto-updated.
+    image: ghcr.io/lklynet/aurral:3.1.0@sha256:17d1f8ff2aaa3907d846c38b47eebdd44b10fbe00b2c993373a6da940ac2504f
+    container_name: aurral-experiment
+    restart: "no"
+    # A dedicated uid owning nothing else. The entrypoint only switches user
+    # when started as root; started non-root it just execs node, so no
+    # setpriv/useradd/chown runs and no capability is needed.
+    user: "61001:61001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    environment:
+      HOME: /config/home
+      AURRAL_DATA_DIR: /config
+      LIBRARY_FOLDER: /data/library
+      FILE_BROWSE_ROOTS: /data/library,/data/staging,/data/exports
+      # Trust X-Forwarded-For ONLY from the proxy below. Unset, Aurral trusts
+      # every private address -- i.e. every LAN client.
+      TRUST_PROXY: ${AURRAL_PROXY_IP:?}
+      # Every plugin off, whatever is installed.
+      AURRAL_SAFE_MODE: "true"
+    volumes:
+      - /srv/data/experiments/aurral/config:/config
+      - /srv/media/experiments/aurral/library:/data/library
+      - /srv/media/experiments/aurral/staging:/data/staging
+      - /srv/media/experiments/aurral/exports:/data/exports
+      # Defence in depth behind the UI switches: these binaries cannot run.
+      - /srv/data/experiments/aurral/stubs/disabled:/usr/local/bin/yt-dlp:ro
+      - /srv/data/experiments/aurral/stubs/disabled:/usr/local/bin/cloudflared:ro
+    networks:
+      aurral-internal:
+        ipv4_address: ${AURRAL_APP_IP:?}
+    mem_limit: 1536m
+    cpus: 1.5
+    pids_limit: 512
+    labels:
+      traefik.enable: "false"
+
+  aurral-proxy:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    container_name: aurral-experiment-proxy
+    restart: "no"
+    user: "101:101"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /srv/data/experiments/aurral/nginx.conf:/etc/nginx/nginx.conf:ro
+    # LAN address and Tailscale address ONLY -- never 0.0.0.0, never IPv6.
+    # If tailscale0 is down at start, the bind fails and the proxy does not
+    # start; that is the safe direction.
+    ports:
+      - "${AURRAL_LAN_IP:?}:3001:8080"
+      - "${AURRAL_TAILSCALE_IP:?}:3001:8080"
+    networks:
+      aurral-internal:
+        ipv4_address: ${AURRAL_PROXY_IP:?}
+      aurral-edge: {}
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 64
+    labels:
+      traefik.enable: "false"
+    depends_on: [aurral]
+
+networks:
+  # internal: no route off the host. gateway_mode_ipv4=isolated: the bridge
+  # gets NO host address, so the container cannot reach the host itself either
+  # (Traefik's 0.0.0.0:443, sshd, ...). Docker >= 28.
+  aurral-internal:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: ${AURRAL_SUBNET:?}
+  # Exists only so the proxy's ports can be published. Aurral is not on it.
+  aurral-edge:
+    enable_ipv6: false
