@@ -65,14 +65,18 @@ REEXECED="${DOMUM_DEPLOY_REEXECED:-0}"
 CONFIRM=0
 EXPECT_REV=""
 SKIP_BEHAVIOUR=0
+ACCEPT_MOUNTED=0
 for a in "$@"; do
   case "$a" in
     --confirm)          CONFIRM=1 ;;
     --expect-revision=*) EXPECT_REV="${a#*=}" ;;
     --no-behaviour-check) SKIP_BEHAVIOUR=1 ;;
+    --accept-mounted-changes) ACCEPT_MOUNTED=1 ;;
     -h|--help)
-      printf 'Usage: %s [--confirm] [--expect-revision=<sha>] [--no-behaviour-check]\n' "${0##*/}"
+      printf 'Usage: %s [--confirm] [--expect-revision=<sha>] [--no-behaviour-check] [--accept-mounted-changes]\n' "${0##*/}"
       printf '  Without --confirm, reports what WOULD change and exits 0.\n'
+      printf '  --accept-mounted-changes: the fast-forward changes a file a RUNNING\n'
+      printf '  container bind-mounts, and the operator has checked it is safe.\n'
       exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$a" >&2; exit 64 ;;
   esac
@@ -139,6 +143,60 @@ fast-forward would be a rewrite. Investigate before deploying."
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Files the fast-forward would change UNDER A RUNNING CONTAINER'S MOUNT.
+#
+# The fast-forward is a deployment of every tracked file, and a file a running
+# container bind-mounts from the checkout takes effect on that container's next
+# START -- a reboot, a Docker upgrade, a `docker restart` -- not when anyone
+# reviews it. Production, 2026-11-18 -> 11-23: the fast-forward rewrote
+# compose/proxy/traefik/traefik.yml for a container definition that did not
+# exist yet; a Docker upgrade restarted traefik five days later and every
+# HTTPS route returned 404. Whether such a change is compatible cannot be
+# decided here, so it is NAMED, and --confirm refuses unless the operator says
+# they checked it. Mounts are read from the running containers, never from a
+# list, so a new mount is covered without an edit.
+# ---------------------------------------------------------------------------
+MOUNTED_CHANGES=""
+if [ "$BEFORE_REV" != "$TARGET_REV" ]; then
+  command -v docker >/dev/null 2>&1 \
+    || abort "docker is required to find files mounted into running containers"
+  RUNNING_IDS="$(docker ps -q)" \
+    || abort "could not list running containers; cannot tell what the fast-forward reaches"
+  MOUNT_LINES=""
+  if [ -n "$RUNNING_IDS" ]; then
+    # shellcheck disable=SC2086  # one id per word, by construction
+    MOUNT_LINES="$(docker inspect -f '{{$n := .Name}}{{range .Mounts}}{{if eq .Type "bind"}}{{$n}}{{"\t"}}{{.Source}}{{"\n"}}{{end}}{{end}}' $RUNNING_IDS)" \
+      || abort "could not read container mounts; cannot tell what the fast-forward reaches"
+  fi
+  while IFS="$(printf '\t')" read -r cname src; do
+    [ -n "$src" ] || continue
+    case "$src" in
+      "$CHECKOUT")   rel="." ;;
+      "$CHECKOUT"/*) rel="${src#"$CHECKOUT"/}" ;;
+      *) continue ;;
+    esac
+    changed="$(git -C "$CHECKOUT" diff --name-only "$BEFORE_REV" "$TARGET_REV" -- "$rel")" \
+      || abort "git diff failed for $rel"
+    [ -n "$changed" ] || continue
+    while IFS= read -r f; do
+      MOUNTED_CHANGES="${MOUNTED_CHANGES}${cname#/}: ${f}
+"
+    done <<< "$changed"
+  done <<< "$MOUNT_LINES"
+fi
+if [ -n "$MOUNTED_CHANGES" ]; then
+  printf '\n  %s\n' "LIVE-MOUNTED: this fast-forward changes files a RUNNING container"
+  printf '  %s\n' "bind-mounts. They take effect on that container's next start (reboot,"
+  printf '  %s\n' "Docker upgrade, restart) and must work with the definition RUNNING now:"
+  printf '%s' "$MOUNTED_CHANGES" | sed 's/^/      /'
+  if [ "$ACCEPT_MOUNTED" -eq 1 ]; then
+    say "accepted by the operator (--accept-mounted-changes)"
+  else
+    say "--confirm REFUSES these unless --accept-mounted-changes is given."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 3. State the hashes BEFORE changing anything.
 # ---------------------------------------------------------------------------
 # installed path : path within the repository
@@ -184,6 +242,11 @@ fi
 # 4. Apply: fast-forward the checkout, then install only what differs.
 # ---------------------------------------------------------------------------
 printf '\n'
+if [ -n "$MOUNTED_CHANGES" ] && [ "$ACCEPT_MOUNTED" -ne 1 ]; then
+  abort "the fast-forward changes files mounted into running containers (listed
+above). Nothing was changed. Check each works with the RUNNING container
+definition, then re-run with --accept-mounted-changes."
+fi
 if [ "$BEFORE_REV" != "$TARGET_REV" ]; then
   git -C "$CHECKOUT" merge --ff-only "$REMOTE/$BRANCH" >/dev/null \
     || abort "fast-forward failed"

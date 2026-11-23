@@ -9393,6 +9393,30 @@ the recreate. `tests/socket-proxy-smoke.sh` pins it with a negative control
 checkout path bind-mounted into any container, so the rule has exactly one
 subject today; a second such mount inherits it.
 
+**IT FIRED FIVE DAYS LATER, AND THE TRIGGER WAS A TIMER NOBODY HAD CLASSIFIED
+AS A RESTART PATH.** Production, 2026-11-23 05:50: `domum-media-host-update`
+ran `host-upgrade`, which installed docker-ce 29.9.3 -> 29.10.0 **by name**
+-- unattended-upgrades already blacklisted it, and that was taken as the
+whole answer. dockerd restarted, every container restarted (same objects,
+same images), and traefik loaded the #199 static config: seven HTTPS routes
+returned 404 until a manual `docker restart traefik` at 12:18. Two rules:
+
+- **A Docker Engine upgrade is a restart of every container, so neither
+  unattended tier installs one.** `docker_engine_packages` is the one list,
+  used as the unattended blacklist AND excluded from `host-upgrade`, which
+  reports what it held back; `checkup` warns. Upgrading is attended
+  maintenance (`docs/SECURITY-PATCHES.md`). `tests/host-update-docker-exclusion-smoke.sh`.
+- **The deployment names every file it changes under a RUNNING container's
+  bind mount, and `--confirm` refuses them** without
+  `--accept-mounted-changes`. Mounts are read from `docker inspect` of the
+  running containers, never from a list, and an unreadable daemon fails
+  closed. Compatibility cannot be judged by a script; an explicit operator
+  decision can be required. Rehearsed, with a mutation.
+
+Classify every path that restarts a container -- `update`/`apply`, a reboot,
+**a Docker package upgrade**, `docker restart` -- because each one activates
+whatever is live-mounted, reviewed or not.
+
 ---
 
 ## 15. Known open safety defects

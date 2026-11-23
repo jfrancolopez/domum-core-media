@@ -99,6 +99,20 @@ esac
 exit 0
 SYSCTL
 chmod +x "$TMP/stub/systemctl"
+# docker is ANSWERED, never reached: the live-mount gate asks which running
+# containers bind-mount what. Unset variables answer "no containers", which is
+# what every section before the live-mount ones needs. DOCKER_FAIL makes the
+# daemon unreachable, to prove the gate fails closed.
+cat > "$TMP/stub/docker" <<'DOCKER'
+#!/usr/bin/env bash
+[ -n "${DOCKER_FAIL:-}" ] && exit 1
+case "${1:-}" in
+  ps)      [ -n "${DOCKER_IDS:-}" ] && printf '%s\n' "$DOCKER_IDS" ;;
+  inspect) [ -n "${DOCKER_MOUNTS:-}" ] && printf '%b' "$DOCKER_MOUNTS" ;;
+esac
+exit 0
+DOCKER
+chmod +x "$TMP/stub/docker"
 export SYSCTL_LOG="$TMP/systemctl.log"
 : > "$SYSCTL_LOG"
 
@@ -107,10 +121,12 @@ run() {  # rehearse as uid 0 without touching the host
     PATH="$TMP/stub:$PATH" SYSCTL_LOG="$SYSCTL_LOG" \
     SYSCTL_IS_ENABLED="${SYSCTL_IS_ENABLED:-}" \
     SYSCTL_NEXT_ELAPSE="${SYSCTL_NEXT_ELAPSE:-}" \
+    DOCKER_IDS="${DOCKER_IDS:-}" DOCKER_MOUNTS="${DOCKER_MOUNTS:-}" \
+    DOCKER_FAIL="${DOCKER_FAIL:-}" \
     DOMUM_DEPLOY_CHECKOUT="$CO" DOMUM_DEPLOY_BIN_DIR="$BIN" \
     DOMUM_DEPLOY_LIB_DIR="$LIB" DOMUM_DEPLOY_UNIT_DIR="$UNITS" \
     DOMUM_DEPLOY_REMOTE=origin \
-    bash "$SCRIPT" "$@" 2>&1
+    bash "${RUN_SCRIPT:-$SCRIPT}" "$@" 2>&1
 }
 
 sect "the rehearsal really runs the root check as written"
@@ -367,5 +383,75 @@ grep -q 'the list above may grow' <<< "$out" \
   || fail "it does not say the file list is not final: $out"
 grep -q 'NEW-SCRIPT-RAN' <<< "$out" && fail "a dry run must not run the replacement: $out"
 echo "  warns the list may grow, and runs nothing"
+
+# ---------------------------------------------------------------------------
+# A fast-forward that changes a file a RUNNING container bind-mounts.
+# Production, 2026-11-18 -> 11-23: the fast-forward rewrote traefik.yml for a
+# container definition that did not exist yet; a Docker upgrade restarted
+# traefik and every HTTPS route returned 404. The gate cannot judge such a
+# change, so it names it and --confirm refuses without an explicit acceptance.
+# ---------------------------------------------------------------------------
+cp "$SCRIPT" "$UP/operator/domum-media-deploy-reporting-fixes.sh"
+mkdir -p "$UP/compose/proxy/traefik" "$UP/compose/photos"
+printf 'endpoint: tcp://docker-socket-proxy:2375\n' > "$UP/compose/proxy/traefik/traefik.yml"
+printf 'x\n' > "$UP/compose/photos/immich.yml"
+git -C "$UP" add -A
+git -C "$UP" -c user.email=t@e -c user.name=t commit -qm 'change a live-mounted file'
+REV_MOUNT="$(git -C "$UP" rev-parse HEAD)"
+TRAEFIK_MOUNT="/traefik\t$CO/compose/proxy/traefik\n/traefik\t/var/run/docker.sock\n"
+
+sect "a change under a running container's mount is NAMED by the dry run"
+git -C "$CO" reset -q --hard "$REV1"
+out="$(DOCKER_IDS=abc DOCKER_MOUNTS="$TRAEFIK_MOUNT" run)"; rc=$?
+(( rc == 0 )) || fail "the dry run did not exit 0: $out"
+grep -q 'LIVE-MOUNTED' <<< "$out" || fail "the live-mounted change is not reported: $out"
+grep -q 'traefik: compose/proxy/traefik/traefik.yml' <<< "$out" \
+  || fail "it does not name the container AND the file: $out"
+grep -q 'compose/photos' <<< "$out" && fail "an UNMOUNTED change was reported as mounted: $out"
+echo "  names traefik and the file, and nothing unmounted"
+
+sect "--confirm REFUSES it, and changes nothing"
+before_bk="$(sha256sum "$BIN/domum-media-backup" | cut -d' ' -f1)"
+out="$(DOCKER_IDS=abc DOCKER_MOUNTS="$TRAEFIK_MOUNT" run --confirm)" && fail "it did not refuse: $out"
+grep -q 'mounted into running containers' <<< "$out" || fail "the refusal does not say why: $out"
+[[ "$(git -C "$CO" rev-parse HEAD)" == "$REV1" ]] || fail "the checkout MOVED despite the refusal"
+[[ "$(sha256sum "$BIN/domum-media-backup" | cut -d' ' -f1)" == "$before_bk" ]] \
+  || fail "a binary was installed despite the refusal"
+echo "  refused before the fast-forward; checkout and binaries untouched"
+
+sect "a mount the fast-forward does NOT touch is not gated (negative control)"
+out="$(DOCKER_IDS=abc DOCKER_MOUNTS="/plex\t$CO/somewhere-else\n" run)"
+grep -q 'LIVE-MOUNTED' <<< "$out" && fail "an untouched mount was gated: $out"
+echo "  untouched mounts pass"
+
+sect "a daemon that cannot be asked FAILS CLOSED"
+out="$(DOCKER_FAIL=1 run)" && fail "an unreadable mount set was treated as none: $out"
+grep -q 'cannot tell what the fast-forward reaches' <<< "$out" \
+  || fail "the refusal does not say it could not look: $out"
+echo "  refuses when it cannot look"
+
+sect "MUTATION: without the refusal, the change would be deployed"
+MUT="$TMP/deploy-mutant.sh"; cp "$SCRIPT" "$MUT"
+python3 - "$MUT" <<'MUTPY' || fail "mutation did not apply"
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = 'if [ -n "$MOUNTED_CHANGES" ] && [ "$ACCEPT_MOUNTED" -ne 1 ]; then'
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, 'if [ -n "$MOUNTED_CHANGES" ] && [ "$ACCEPT_MOUNTED" != "$ACCEPT_MOUNTED" ]; then'))
+MUTPY
+git -C "$CO" reset -q --hard "$REV1"
+out="$(RUN_SCRIPT="$MUT" DOCKER_IDS=abc DOCKER_MOUNTS="$TRAEFIK_MOUNT" run --confirm)"
+[[ "$(git -C "$CO" rev-parse HEAD)" == "$REV_MOUNT" ]] \
+  || fail "the mutant did not deploy -- the refusal is not what stops it: $out"
+echo "  mutant fast-forwarded onto the live-mounted change: the refusal is load-bearing"
+
+sect "--accept-mounted-changes is the operator's explicit acceptance"
+git -C "$CO" reset -q --hard "$REV1"
+out="$(DOCKER_IDS=abc DOCKER_MOUNTS="$TRAEFIK_MOUNT" run --confirm --accept-mounted-changes)" \
+  || fail "an accepted run failed: $out"
+grep -q 'accepted by the operator' <<< "$out" || fail "the acceptance is not stated: $out"
+[[ "$(git -C "$CO" rev-parse HEAD)" == "$REV_MOUNT" ]] || fail "the accepted run did not fast-forward: $out"
+grep -q '== deployed ==' <<< "$out" || fail "the accepted run did not complete: $out"
+echo "  accepted, fast-forwarded, deployed"
 
 echo "PASS: deploy-reporting-rehearsal"

@@ -2928,10 +2928,34 @@ Persistent=true
 EOF
 }
 
+# Packages whose upgrade restarts the Docker daemon -- and with it EVERY
+# container -- or replaces the compose that recreates them. Neither unattended
+# tier may install them: production, 2026-11-23, the weekly host-update upgraded
+# docker-ce 29.9.3 -> 29.10.0 at 05:50, dockerd restarted, every container
+# restarted, and Traefik came back on a bind-mounted static config that had
+# changed since it last started -- seven HTTPS routes returned 404 for 11 hours.
+# Upgrading these is attended maintenance. ONE list, used by both tiers, so the
+# blacklist and the exclusion cannot drift apart.
+docker_engine_packages() {
+  printf '%s\n' docker-ce docker-ce-cli docker-buildx-plugin docker-compose-plugin containerd.io
+}
+
+# Which Docker Engine packages an `apt-get -s upgrade` simulation would install.
+# Reads the simulation text passed in; runs nothing itself.
+docker_engine_pending() {
+  local sim="$1" pkg
+  while IFS= read -r pkg; do
+    if grep -q "^Inst ${pkg//./\\.} " <<< "$sim"; then
+      printf '%s\n' "$pkg"
+    fi
+  done < <(docker_engine_packages)
+}
+
 sync_unattended_upgrades() {
   local auto_cfg="/etc/apt/apt.conf.d/20auto-upgrades"
   local domum_cfg="/etc/apt/apt.conf.d/50domum-unattended-upgrades"
-  local reboot_flag="false"
+  local reboot_flag="false" blacklist
+  blacklist="$(docker_engine_packages | sed 's/.*/  "&";/')"
 
   if [[ "${HOST_AUTO_REBOOT_ENABLED:-0}" == "1" ]]; then
     reboot_flag="true"
@@ -2947,11 +2971,7 @@ Unattended-Upgrade::Origins-Pattern {
   "origin=Debian,codename=\${distro_codename}-security,label=Debian-Security";
 };
 Unattended-Upgrade::Package-Blacklist {
-  "docker-ce";
-  "docker-ce-cli";
-  "docker-buildx-plugin";
-  "docker-compose-plugin";
-  "containerd.io";
+${blacklist}
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
@@ -3820,11 +3840,22 @@ daemon underneath that operation."
   echo "[domum-media] Updating host packages from configured apt repos..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
+  # Docker Engine is deliberately NOT in this list -- see docker_engine_packages.
+  # Nothing upgraded here restarts dockerd or a container.
   apt-get install -y --only-upgrade \
-    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
     tailscale restic btrfs-progs jq apparmor nfs-common rclone gettext-base \
     unattended-upgrades apt-listchanges age
   record_update_history "host" "applied" "" "" "" "success" "apt host-upgrade completed"
+
+  # Report what was held back, so silence never means "Docker is current".
+  local sim held
+  sim="$(apt-get -s upgrade 2>/dev/null || true)"
+  held="$(docker_engine_pending "$sim")"
+  if [[ -n "$held" ]]; then
+    echo "[domum-media] HELD BACK, not upgraded unattended: $(tr '\n' ' ' <<< "$held")"
+    echo "[domum-media] Upgrading them restarts the Docker daemon and EVERY container."
+    echo "[domum-media] Do it in an attended maintenance window; see docs/SECURITY-PATCHES.md."
+  fi
   if [[ -f /var/run/reboot-required ]]; then
     echo "[domum-media] Reboot required by the latest package upgrade."
     if [[ "${HOST_AUTO_REBOOT_ENABLED:-0}" == "1" ]] && within_reboot_window; then
@@ -8652,6 +8683,14 @@ checkup_collect_all() {
   if (( sim_general > 0 )); then
     checkup_add warning "${sim_general} general package updates are available."
     checkup_add advice "apt-get -s upgrade   # read-only simulation; the weekly host-update timer applies these"
+  fi
+  # Docker Engine is excluded from BOTH unattended tiers, so nothing will ever
+  # apply these on its own -- the line above would otherwise imply it does.
+  local engine_pending
+  engine_pending="$(docker_engine_pending "$sim_updates")"
+  if [[ -n "$engine_pending" ]]; then
+    checkup_add warning "Docker Engine updates are pending and are NOT applied unattended: $(tr '\n' ' ' <<< "$engine_pending")"
+    checkup_add advice "cat /opt/domum-core-media/docs/SECURITY-PATCHES.md   # attended only: upgrading restarts dockerd and EVERY container"
   fi
 
   # Host, storage and off-site checks. Added because nothing covered failed
