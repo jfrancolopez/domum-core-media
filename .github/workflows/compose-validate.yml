@@ -507,6 +507,11 @@ jobs:
       - name: Aurral blocked-egress logging smoke test
         run: tests/aurral-egress-drop-log-smoke.sh
 
+      # render_traefik_dynamic DIES on an unresolved ${VAR}, so a template using a
+      # variable the envsubst allowlist does not name breaks `apply`.
+      - name: Aurral Traefik router template smoke test
+        run: tests/aurral-traefik-router-smoke.sh
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI
