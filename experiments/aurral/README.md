@@ -141,17 +141,17 @@ reachable.
    to work. A connection the container itself opens has no conntrack entry yet,
    so it still falls through to the drops — which is precisely "may not
    **initiate**".
-3. `-s <the proxy> -j DROP` — the proxy initiates nothing off this bridge. It
+3. `-s <the proxy> -j AURRAL-EGRESS-DROP` — the proxy initiates nothing off this bridge. It
    is an nginx serving one static config, and it resolves its single upstream
    through Docker's embedded resolver on the container's own loopback, which
    never crosses the bridge. So the external surface is one container rather
    than two. Replies to inbound requests were already returned by rule 2,
    which is why this cannot break the UI — and `validate.sh` proves it with a
    positive control before it believes the negative result.
-4. `-o tailscale0`, `-o docker0`, `-o br-+` → DROP. By interface, so a tailnet
+4. `-o tailscale0`, `-o docker0`, `-o br-+` → `AURRAL-EGRESS-DROP`. By interface, so a tailnet
    subnet router advertising ordinary public routes is blocked too; an address
    list cannot catch that.
-5. `-d <range> -j DROP` for every range in `AURRAL_BLOCK_CIDRS` (the operator
+5. `-d <range> -j AURRAL-EGRESS-DROP` for every range in `AURRAL_BLOCK_CIDRS` (the operator
    lists 10/8, 172.16/12, 192.168/16 and 100.64/10 as full CIDRs) plus
    loopback, link-local — which contains the cloud metadata address —
    multicast and the reserved ranges, which are hardcoded because they are
@@ -162,6 +162,46 @@ reachable.
    kernel log rather than guessed. The rate limit is stated because a dropped
    log line is a missed observation.
 7. `RETURN` — Docker's own rules then NAT it to the internet.
+
+**`AURRAL-EGRESS-DROP` is where rules 3, 4 and 5 send a blocked packet: it
+LOGS and then DROPS.** Enforcement is unchanged — same rules, same order, same
+verdict — only the target differs.
+
+```
+AURRAL-EGRESS-DROP
+  1. --ctstate NEW -m limit --limit 60/min --limit-burst 20 \
+       -j LOG --log-prefix 'aurral-egress-blocked '
+  2. -j DROP
+```
+
+It exists because **rule 6 above logs only traffic that was ALLOWED.** Rule 6
+sits after the drops, so a dropped packet never reaches it, and before this
+chain existed blocked egress was recorded nowhere at all. Measured 2026-11-24:
+four of `validate.sh`'s seven host probes were dropped in complete silence, and
+nothing would have recorded Aurral probing a production container, the LAN or
+the tailnet.
+
+Those four are the **DNAT** case, and it is why `-o br-+` matters as much as the
+address ranges. traefik publishes 443 on `0.0.0.0`, so Docker's
+`nat/PREROUTING -m addrtype --dst-type LOCAL -j DOCKER` rewrites *any* local
+address on port 443 to traefik's own address on the `domum-proxy` bridge
+— which is inside the blocked `172.16/12` range, written here in the
+two-octet form because this repository's identifier audit rejects a full
+RFC1918 literal in a tracked file. DNAT happens **before** the routing
+decision, so the packet is no longer destined to a local address: it goes to
+FORWARD rather than INPUT, never reaches `AURRAL-HOST`, and it is
+`AURRAL-EGRESS` that stops it. Ports nothing publishes (22, 111) stay local and
+do reach `AURRAL-HOST`, which already logged before dropping. That asymmetry is
+why both chains are needed, and why both now log.
+
+`--ctstate NEW` keeps it to one line per connection: a dropped SYN is
+retransmitted about five times, which would otherwise multiply every
+observation by five. The 60/min is one bucket shared by every drop reason, and
+the trade-off is stated rather than hidden — a flood of one kind of blocked
+traffic can exhaust it and hide another. Nothing on this bridge is known to be
+chatty, so a shared bucket is the honest starting point; split it if the journal
+ever shows it saturating. `LOG` records headers only, never payload, so no
+application data can reach the journal through it.
 
 ### What it is inserted into — measured, 2026-11-23
 
@@ -233,6 +273,11 @@ or CGNAT literal in a tracked file.
 | Aurral ↔ its own proxy | allowed | rule 1 |
 | aurral-proxy → anything off the bridge | blocked | rule 3 |
 
+Every **allowed** connection is logged `aurral-egress`, and every **blocked**
+one `aurral-egress-blocked` (off this host) or `aurral-host-blocked` (to this
+host), so both halves of the policy are observable rather than only the
+permissive half.
+
 **The resolvers are `1.1.1.1` and `1.0.0.1`** — the approved primary and
 fallback, and compose's defaults, so the operator's decision is recorded in
 the repository rather than only in an untracked file. They are the one
@@ -256,7 +301,7 @@ experiment, so no rule can match production traffic. Nothing existing is read,
 reordered, flushed or replaced. **Measured**: this host runs no ufw, firewalld
 or nftables service, and Docker's firewall backend is iptables — so
 `firewall.sh` uses the same tool Docker itself uses and adds no new framework.
-`firewall.sh remove` deletes the four jumps and the two chains and leaves
+`firewall.sh remove` deletes the four jumps and the three chains and leaves
 nothing behind.
 
 ### Residual exposure, stated
@@ -319,6 +364,47 @@ Then, by hand in the UI: create the admin; confirm **local-network auto-login
 is OFF**; Settings › Plugins shows safe mode; set the download limits from
 section 8; confirm no share-link tunnel appears (it cannot — `cloudflared` is
 a stub — but the UI should say so rather than silently failing).
+
+### Inspecting what Aurral reached, and what it was stopped from reaching
+
+Three prefixes, three different questions. **All of them need root**, because
+`journalctl -k` requires `adm` or `systemd-journal` membership.
+
+`aurral-egress-blocked` begins with `aurral-egress`, so a bare
+`grep aurral-egress` matches BOTH. The trailing space is what separates them,
+and every command below carries it.
+
+```
+# What Aurral SUCCESSFULLY reached -- the allowed destinations.
+sudo journalctl -k --since today \
+  | sed -nE 's/.*aurral-egress .*DST=([0-9.]+).*DPT=([0-9]+).*/\1:\2/p' \
+  | sort | uniq -c | sort -rn
+
+# What Aurral was STOPPED from reaching off this host: production containers,
+# the LAN, the tailnet, link-local, and anything DNATed to a Docker bridge.
+# An empty result is the expected state.
+sudo journalctl -k --since today \
+  | sed -nE 's/.*aurral-egress-blocked .*DST=([0-9.]+).*DPT=([0-9]+).*/\1:\2/p' \
+  | sort | uniq -c | sort -rn
+
+# What Aurral was stopped from reaching ON this host (unpublished ports such
+# as 22 and 111). NOT expected to be zero after a validate.sh run: section 4
+# proves the host is unreachable BY attempting it, five SYNs per probe, so a
+# zero count would mean those probes never ran.
+sudo journalctl -k --since today \
+  | sed -nE 's/.*aurral-host-blocked .*DST=([0-9.]+).*DPT=([0-9]+).*/\1:\2/p' \
+  | sort | uniq -c | sort -rn
+
+# With timestamps, to tell a validate.sh run apart from ongoing activity.
+sudo journalctl -k --since today \
+  | sed -nE 's/^(\S+ +\S+ +\S+).*aurral-egress-blocked .*DST=([0-9.]+).*DPT=([0-9]+).*/\1  \2:\3/p'
+
+# Packet counters per rule, which say the same thing without reading the log.
+sudo ./firewall.sh show /srv/data/experiments/aurral/aurral.env
+```
+
+A blocked line names the source, destination, protocol and ports only. `LOG`
+never records payload, so nothing from the application itself appears.
 
 Portability (later phase): copy a few of your own files into `library/`, let
 Aurral index/tag them, then confirm on the host that they are still plain
@@ -417,7 +503,10 @@ sudo rm -rf /srv/data/experiments/aurral /srv/media/experiments/aurral
 ```
 
 `down` removes only this project's two containers and its one network.
-`firewall.sh remove` deletes only the four jumps and two chains it created.
+`firewall.sh remove` deletes only the four jumps and three chains it created
+(`AURRAL-EGRESS`, `AURRAL-HOST`, `AURRAL-EGRESS-DROP`). All three are flushed
+before any is deleted, because the egress chain references the drop chain and
+iptables refuses to delete a chain that is still referenced.
 Production containers, networks, Traefik, timers and firewall rules are
 untouched by every step.
 
@@ -442,9 +531,11 @@ download.
   it, do not wait it out with a script, and report it instead.
 * **No proxy or VPN to evade a restriction**, and only content you have the
   right to download.
-* Review `journalctl -k | grep aurral-egress` after the first session: that is
-  the list of everything Aurral actually contacted, and it is the point of
-  having the log.
+* Review the destination logs after the first session — the commands are in
+  *Inspecting what Aurral reached, and what it was stopped from reaching* in
+  section 5. Note that a bare `grep aurral-egress` matches the BLOCKED prefix
+  too, because `aurral-egress-blocked` begins with it; the trailing space is
+  what separates them.
 
 ## 9. Still refused, and why
 

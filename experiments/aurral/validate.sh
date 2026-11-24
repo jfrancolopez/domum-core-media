@@ -111,10 +111,24 @@ rc=$?
 if [[ "$rc" -ne 0 ]]; then
   bad "firewall.sh show failed (run it as root); the blocked results below prove nothing"
 else
-  for want in "AURRAL-EGRESS" "AURRAL-HOST"; do
+  for want in "AURRAL-EGRESS" "AURRAL-HOST" "AURRAL-EGRESS-DROP"; do
     hit="$(grep -cF "$want" <<< "$fw")"
     [[ "$hit" -gt 0 ]] && ok "$want chain present" || bad "$want chain missing"
   done
+  # A blocked packet must be LOGGED before it is dropped. The allowed-egress
+  # LOG sits AFTER the drops, so before this chain existed a dropped packet was
+  # recorded nowhere -- measured, four of the seven host probes below were
+  # blocked in complete silence. The ORDER is asserted rather than assumed,
+  # because a chain that dropped first would still read as "present".
+  dropsec="$(sed -n '/^== AURRAL-EGRESS-DROP/,$p' <<< "$fw")"
+  lgs="$(grep -n 'aurral-egress-blocked' <<< "$dropsec" || true)"
+  dps="$(grep -n ' DROP ' <<< "$dropsec" || true)"
+  lg="${lgs%%:*}"; dp="${dps%%:*}"
+  if [[ -n "$lg" && -n "$dp" ]] && (( lg < dp )); then
+    ok "AURRAL-EGRESS-DROP logs (line $lg) before it drops (line $dp)"
+  else
+    bad "AURRAL-EGRESS-DROP does not log before dropping (log=${lg:-none} drop=${dp:-none})"
+  fi
   jumps="$(grep -c "$BRIDGE" <<< "$fw")"
   [[ "$jumps" -ge 4 ]] && ok "jump rules on $BRIDGE present ($jumps)" \
     || bad "expected 4 jump rules on $BRIDGE, found $jumps"
