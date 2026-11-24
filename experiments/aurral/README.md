@@ -168,10 +168,19 @@ Read as root before approving, which is what turns "no production rule is
 disturbed" from an argument into an observation:
 
 ```
-iptables -S DOCKER-USER     ->  -N DOCKER-USER          (the chain, and NO rules)
-iptables -S INPUT           ->  -P INPUT ACCEPT
+iptables  -S DOCKER-USER    ->  -N DOCKER-USER          (the chain, and NO rules)
+iptables  -S INPUT          ->  -P INPUT ACCEPT
+                                -A INPUT -j ts-input
+ip6tables -S DOCKER-USER    ->  -N DOCKER-USER          (present, and NO rules)
+ip6tables -S INPUT          ->  -P INPUT ACCEPT
                                 -A INPUT -j ts-input
 ```
+
+The IPv6 half is measured rather than inferred, which matters because
+`ipv6_forward_chain` chooses by what exists: ip6tables HAS `DOCKER-USER`
+here, so `apply` inserts the v6 drop there and not into `FORWARD`. Both
+chains are empty, so neither insertion displaces anything, and the v6 INPUT
+jump sits ahead of Tailscale's chain exactly as the v4 one does.
 
 So `-I DOCKER-USER 1` displaces nothing: the chain is empty, and our rule is
 the only one in it. `-I INPUT 1` puts the host-isolation jump ahead of
