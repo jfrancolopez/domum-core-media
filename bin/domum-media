@@ -6825,6 +6825,104 @@ checkup_weekly_report_delivery() {
   esac
 }
 
+# Which addresses a container's resolver actually forwards to. Pure text, so a
+# test can drive every branch without docker or root.
+#
+# Docker records the choice it made AT CREATION in a comment:
+#   # ExtServers: [host(127.0.0.1) host(::1)]
+# `host(X)` means "X, reached in the host's namespace". On a user-defined network
+# the container's own nameserver is the embedded resolver 127.0.0.11, so that
+# comment is the only statement of where queries really go.
+container_dns_effective_upstreams() {
+  local rc="$1" ext
+  ext="$(sed -nE 's/^#[[:space:]]*ExtServers:[[:space:]]*\[(.*)\].*/\1/p' <<< "$rc" | head -1)"
+  if [[ -n "$ext" ]]; then
+    tr ' ' '\n' <<< "$ext" \
+      | sed -nE 's/^host\((.+)\)$/\1/p; s/^([0-9A-Fa-f.:]+)$/\1/p' \
+      | sort -u
+    return 0
+  fi
+  # No embedded resolver (the default bridge): the nameservers ARE the upstreams.
+  sed -nE 's/^[[:space:]]*nameserver[[:space:]]+([^[:space:]]+).*/\1/p' <<< "$rc" \
+    | grep -v '^127\.0\.0\.11$' | sort -u || true
+}
+
+# current | stale | configured | unknown
+#
+# STALE is the case that matters and it is SILENT: Docker writes the host's
+# resolvers into a container when the container is CREATED and never revisits
+# them. Measured 2026-11-24 on this host -- the containers carried
+# `ExtServers: [host(127.0.0.1)]` from before the host moved to Tailscale DNS,
+# so not one of them could resolve an external name, and the 2026-11-23 reboot
+# restarted them all without clearing it. A RESTART does not fix this; only a
+# recreate does.
+#
+# CONFIGURED is not stale. A container given an explicit `dns:` is deliberately
+# different from the host and must not be reported -- the Aurral experiment sets
+# public resolvers on purpose, and flagging that would be a false alarm every
+# single run.
+container_dns_upstream_state() {
+  local explicit_dns="$1" container_rc="$2" host_rc="$3"
+  [[ -z "${explicit_dns//[[:space:]\[\]]/}" ]] || { printf 'configured'; return 0; }
+  local cu hu
+  cu="$(container_dns_effective_upstreams "$container_rc")"
+  hu="$(sed -nE 's/^[[:space:]]*nameserver[[:space:]]+([^[:space:]]+).*/\1/p' <<< "$host_rc" | sort -u)"
+  if [[ -z "$cu" || -z "$hu" ]]; then printf 'unknown'; return 0; fi
+  # Disjoint sets mean every address this container forwards to is one the host
+  # no longer uses. An overlap of one is enough to resolve, so it is not stale.
+  if [[ -n "$(comm -12 <(printf '%s\n' "$cu") <(printf '%s\n' "$hu"))" ]]; then
+    printf 'current'
+  else
+    printf 'stale'
+  fi
+}
+
+# Whether running containers can still resolve anything externally.
+#
+# Nothing watched this, and the consequence is not hypothetical: Traefik could
+# not reach the ACME directory, so no certificate could be issued or RENEWED,
+# and the failure is invisible until an existing certificate expires. The same
+# defect breaks every outbound lookup an application makes.
+checkup_container_dns() {
+  cmd_exists docker || { checkup_add advice "docker not found; container DNS not checked."; return 0; }
+  local host_rc_file="${DOMUM_HOST_RESOLV_CONF:-/etc/resolv.conf}"
+  local host_rc=""
+  [[ -r "$host_rc_file" ]] && host_rc="$(cat "$host_rc_file")"
+  if [[ -z "$host_rc" ]]; then
+    checkup_add warning "Could not read $host_rc_file, so container DNS was not checked. Unknown is not healthy here."
+    checkup_add advice "ls -l $host_rc_file   # read-only: the host resolver list this check compares against"
+    return 0
+  fi
+  local ids id name rc_path rc dns state stale="" unknown=0 checked=0
+  ids="$(docker ps -q 2>/dev/null || true)"
+  [[ -n "$ids" ]] || { checkup_add healthy "No running containers to check DNS for."; return 0; }
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    name="$(docker inspect "$id" --format '{{.Name}}' 2>/dev/null | sed 's|^/||' || true)"
+    dns="$(docker inspect "$id" --format '{{json .HostConfig.Dns}}' 2>/dev/null || true)"
+    rc_path="$(docker inspect "$id" --format '{{.ResolvConfPath}}' 2>/dev/null || true)"
+    rc=""
+    [[ -n "$rc_path" && -r "$rc_path" ]] && rc="$(cat "$rc_path" 2>/dev/null || true)"
+    if [[ -z "$rc" ]]; then unknown=$((unknown + 1)); continue; fi
+    checked=$((checked + 1))
+    state="$(container_dns_upstream_state "$dns" "$rc" "$host_rc")"
+    case "$state" in
+      stale)   stale="${stale:+$stale }${name:-$id}" ;;
+      unknown) unknown=$((unknown + 1)) ;;
+    esac
+  done <<< "$ids"
+  if [[ -n "$stale" ]]; then
+    checkup_add critical "These containers forward DNS to a resolver this host no longer uses, so they cannot resolve external names: $stale. Traefik in that state cannot reach the ACME directory, so certificates cannot be issued OR RENEWED and HTTPS breaks when the current ones expire; applications lose every outbound lookup. A restart does NOT fix it -- Docker writes the resolver list at container CREATION."
+    checkup_add action "sudo domum-media checkup   # after recreating the affected containers; a recreate is what rewrites the list, and it needs its own approval"
+  else
+    checkup_add healthy "Container DNS upstreams match the host ($checked checked)."
+  fi
+  if (( unknown > 0 )); then
+    checkup_add warning "$unknown container(s) could not be checked for DNS staleness. Unknown is not healthy."
+    checkup_add advice "sudo docker ps -q | xargs -r -n1 sudo docker inspect --format '{{.Name}} {{.ResolvConfPath}}'   # read-only: which file could not be read"
+  fi
+}
+
 checkup_notification_path() {
   local notifier
   notifier="$(systemctl is-enabled domum-media-weekly-report.timer 2>/dev/null || true)"
@@ -8709,6 +8807,9 @@ checkup_collect_all() {
   # tolerates a failed send so it cannot suppress the alert; this is what stops
   # that tolerance turning into silence.
   checkup_weekly_report_delivery
+  # Whether containers can resolve anything externally. Nothing watched this,
+  # and it silently blocked certificate issuance AND renewal.
+  checkup_container_dns
   # Whether a warranted alert can leave the host at all. Last, because it is
   # the check that decides whether any of the above would ever be seen.
   checkup_notification_path
