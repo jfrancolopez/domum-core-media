@@ -13,7 +13,13 @@ set -uo pipefail
 
 ENV_FILE="${1:-/srv/data/experiments/aurral/aurral.env}"
 # shellcheck disable=SC1090
-source "$ENV_FILE" || { echo "cannot read $ENV_FILE" >&2; exit 2; }
+# A value containing spaces must be QUOTED in that file: it is sourced, so
+# bash would read the second word as a command.
+source "$ENV_FILE" || {
+  echo "cannot source $ENV_FILE -- a value containing spaces must be quoted," >&2
+  echo "e.g. AURRAL_BLOCK_CIDRS=\"<range> <range> <range> <range>\"" >&2
+  exit 2
+}
 : "${AURRAL_LAN_IP:?}" "${AURRAL_TAILSCALE_IP:?}" "${AURRAL_PROXY_IP:?}" \
   "${AURRAL_LAN_ROUTER_IP:?}" "${AURRAL_DNS:?}" "${AURRAL_BLOCK_CIDRS:?}"
 A=aurral-experiment
@@ -106,6 +112,10 @@ echo "== 3. the approved connectivity WORKS"
 r="$(resolve data.aurral.org)"
 case "$r" in NXDOMAIN*) bad "DNS does not work: $r" ;; *) ok "DNS resolves via the configured resolver ($r)" ;; esac
 must_reach "$AURRAL_DNS" 53 "the approved resolver"
+# The fallback is reached only when the primary does not answer, so a run
+# that never needed it would leave it unproven. Asserted explicitly, with
+# compose's own default where the env file does not name one.
+must_reach "${AURRAL_DNS_FALLBACK:-1.0.0.1}" 53 "the approved fallback resolver"
 for hp in data.aurral.org musicbrainz.org coverartarchive.org api.listenbrainz.org www.youtube.com; do
   r="$(https_status "$hp")"
   case "$r" in HTTP\ *) ok "$hp answers ($r)" ;; *) bad "$hp unreachable ($r)" ;; esac

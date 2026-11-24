@@ -165,12 +165,22 @@ reachable.
 An **empty block list refuses to apply**: a policy that opened the LAN while
 reporting success is the failure this project exists to avoid.
 
+And a **count is not a completeness check.** The first version of this script
+required four or more entries and said so in a message naming four specific
+ranges — which four `/32` entries would have satisfied while leaving the LAN,
+the tailnet and the other Docker networks reachable. `assert_block_coverage`
+now proves each required range is actually COVERED by some listed CIDR, with
+a longer prefix (a mere subset) and a wrong network base both refused. The
+required ranges are built with integer arithmetic rather than written as
+dotted quads, because this repository's identifier audit rejects an RFC1918
+or CGNAT literal in a tracked file.
+
 ### The result
 
 | Connection | Result | Enforced by |
 |---|---|---|
 | Aurral → internet HTTPS | allowed | Docker NAT; rule 7 |
-| Aurral → DNS | allowed, to one **public** resolver only | `dns:` in compose |
+| Aurral → DNS | allowed, to the two approved **public** resolvers only | `dns:` in compose |
 | Aurral → YouTube, metadata APIs | allowed | same as internet |
 | Aurral → other Docker containers / networks | blocked | rules 4, 5 |
 | Aurral → host management (22, 80, 443, 111) | blocked | `AURRAL-HOST` |
@@ -184,7 +194,13 @@ reporting success is the failure this project exists to avoid.
 | Aurral ↔ its own proxy | allowed | rule 1 |
 | aurral-proxy → anything off the bridge | blocked | rule 3 |
 
-**The resolver must be public, and that is a correctness requirement rather
+**The resolvers are `1.1.1.1` and `1.0.0.1`** — the approved primary and
+fallback, and compose's defaults, so the operator's decision is recorded in
+the repository rather than only in an untracked file. They are the one
+address pair here that may be named in a tracked file, because a public
+resolver is not infrastructure information about this host.
+
+**A resolver must be public, and that is a correctness requirement rather
 than a preference.** This host's own resolver is Tailscale MagicDNS
 (**measured** from `/etc/resolv.conf`), which the experiment must not reach;
 and a resolver reached over the bridge would be blocked by `AURRAL-HOST`. A
