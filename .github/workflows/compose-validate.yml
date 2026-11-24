@@ -507,6 +507,11 @@ jobs:
       - name: Aurral blocked-egress logging smoke test
         run: tests/aurral-egress-drop-log-smoke.sh
 
+      # nginx's $host strips the port, which made Aurral's isCrossSite() classify
+      # every same-origin request as cross-site. The behavioural section skips
+      # where no nginx image is already local; the text assertions always run.
+      - name: Aurral proxy Host header smoke test
+        run: tests/aurral-proxy-host-header-smoke.sh
       # render_traefik_dynamic DIES on an unresolved ${VAR}, so a template using a
       # variable the envsubst allowlist does not name breaks `apply`.
       - name: Aurral Traefik router template smoke test
