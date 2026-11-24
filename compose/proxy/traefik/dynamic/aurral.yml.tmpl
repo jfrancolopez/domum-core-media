@@ -1,0 +1,41 @@
+# Traefik router for the Aurral experiment, so it is reachable at
+# https://aurral.${DOMUM_DOMAIN} instead of by IP and port.
+#
+# WHY THIS IS A FILE AND NOT CONTAINER LABELS. Every production service routes
+# through the DOCKER provider, which is pinned to `network: domum-proxy`, and
+# every one of those containers is attached to it. Aurral deliberately is not:
+# it lives alone on `aurral0`. Attaching aurral-experiment-proxy to domum-proxy
+# would make labels work and would VOID THE ISOLATION -- AURRAL-EGRESS matches
+# `-i aurral0`, so traffic leaving through a domum-proxy interface never enters
+# the chain and rule 3 ("the proxy initiates nothing off this bridge") would
+# stop applying. So the router is identical to the others in every respect that
+# matters -- same `websecure` entrypoint, same `securityHeaders`, same `cf`
+# resolver -- and differs only in naming the upstream by URL.
+#
+# THE UPSTREAM IS THE LAN ADDRESS, NOT host.docker.internal. Measured: that name
+# resolves to the docker0 gateway inside traefik, and Aurral is published on the
+# LAN and Tailscale addresses only. Proven reachable from inside the running
+# traefik container: wget http://<lan>:3001/api/health -> HTTP/1.1 200 OK,
+# Server: nginx. No network is joined and no firewall rule changes: this is
+# INBOUND to Aurral, and its replies are already RETURNed as ESTABLISHED.
+#
+# Rendered by `render_traefik_dynamic`, whose envsubst allowlist must include
+# both variables below -- it DIES on an unresolved placeholder, so adding a
+# variable here without adding it there breaks `apply`.
+http:
+  routers:
+    aurral:
+      rule: 'Host(`aurral.${DOMUM_DOMAIN}`)'
+      entryPoints:
+        - websecure
+      service: aurral
+      middlewares:
+        - securityHeaders
+      tls:
+        certResolver: cf
+
+  services:
+    aurral:
+      loadBalancer:
+        servers:
+          - url: "http://${DOMUM_LAN_IP}:3001"

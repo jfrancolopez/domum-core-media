@@ -1727,6 +1727,7 @@ render_traefik_dynamic() {
 
   : "${TRAEFIK_DASHBOARD_HOST:?TRAEFIK_DASHBOARD_HOST is empty}"
   : "${DOMUM_DOMAIN:?DOMUM_DOMAIN is empty}"
+  : "${DOMUM_LAN_IP:?DOMUM_LAN_IP is empty}"
 
   if ! cmd_exists envsubst; then
     die "envsubst not found. Install gettext-base (apt install -y gettext-base) and retry."
@@ -1738,7 +1739,7 @@ render_traefik_dynamic() {
     dst="${src%.tmpl}"
     # envsubst takes the literal '${VAR}' allowlist; we do not want shell expansion here.
     # shellcheck disable=SC2016
-    rendered="$(envsubst '${TRAEFIK_DASHBOARD_HOST} ${DOMUM_DOMAIN}' < "$src")"
+    rendered="$(envsubst '${TRAEFIK_DASHBOARD_HOST} ${DOMUM_DOMAIN} ${DOMUM_LAN_IP}' < "$src")"
     if [[ "$rendered" == *'{{'* ]] || grep -qE '\$\{[A-Z_][A-Z0-9_]*\}' <<< "$rendered"; then
       die "Unresolved placeholder in $src after render — refusing to write $dst"
     fi
