@@ -49,6 +49,17 @@ TARGETS = (["bin/domum-media", "bin/domum-media-backup", "bin/domum-media-report
            # pushed awk's output past the pipe buffer -- the documented
            # intermittency, arriving as a mysterious failure in a suite nobody
            # had touched.
+           #
+           # The Aurral experiment's scripts write firewall rules on this host
+           # and drive isolation assertions. An assertion that silently stops
+           # asserting is the worst place for this family, and "it is only an
+           # experiment" is not a reason to leave a script that configures a
+           # firewall unscanned. Placed BEFORE the tests clause deliberately:
+           # pipefail-grep-audit-smoke.sh's glob mutation anchors on that
+           # clause including its closing parens, so it stays last and
+           # byte-identical.
+           + sorted(str(p.relative_to(ROOT))
+                    for p in (ROOT / "experiments" / "aurral").glob("*.sh"))
            + sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("*.sh")))
 
 # A pipe into a consumer that STOPS EARLY. `grep -q` was the known one; the

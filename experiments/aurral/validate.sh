@@ -1,90 +1,237 @@
 #!/usr/bin/env bash
-# Isolation tests for the Aurral experiment. Run by the operator AFTER the
-# approved `up -d`. Read-only: it inspects containers and opens test sockets;
-# it changes nothing. Exit 0 only if every check passes.
+# Isolation and connectivity tests for the Aurral experiment. Run by the
+# operator AFTER the approved `firewall.sh apply` and `up -d`.
+#
+# Read-only: it inspects containers, opens test sockets and reads the live
+# firewall rules. It changes nothing. Exit 0 only if every check passes.
+#
+# It asserts BOTH directions deliberately. A suite that only proved things are
+# blocked would pass against an experiment that cannot reach anything at all,
+# which is not the configuration being approved -- and one that only proved
+# the internet works would pass against no isolation whatsoever.
 set -uo pipefail
 
 ENV_FILE="${1:-/srv/data/experiments/aurral/aurral.env}"
 # shellcheck disable=SC1090
-source "$ENV_FILE" || { echo "cannot read $ENV_FILE" >&2; exit 2; }
-: "${AURRAL_LAN_IP:?}" "${AURRAL_TAILSCALE_IP:?}" "${AURRAL_PROXY_IP:?}" "${AURRAL_LAN_ROUTER_IP:?}"
+# A value containing spaces must be QUOTED in that file: it is sourced, so
+# bash would read the second word as a command.
+source "$ENV_FILE" || {
+  echo "cannot source $ENV_FILE -- a value containing spaces must be quoted," >&2
+  echo "e.g. AURRAL_BLOCK_CIDRS=\"<range> <range> <range> <range>\"" >&2
+  exit 2
+}
+: "${AURRAL_LAN_IP:?}" "${AURRAL_TAILSCALE_IP:?}" "${AURRAL_PROXY_IP:?}" \
+  "${AURRAL_LAN_ROUTER_IP:?}" "${AURRAL_DNS:?}" "${AURRAL_BLOCK_CIDRS:?}"
 A=aurral-experiment
 P=aurral-experiment-proxy
+BRIDGE=aurral0
 LAN_IP="$AURRAL_LAN_IP"
 TS_IP="$AURRAL_TAILSCALE_IP"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fails=0; n=0
 ok()  { n=$((n+1)); printf '  ok    %s\n' "$*"; }
 bad() { n=$((n+1)); fails=$((fails+1)); printf '  FAIL  %s\n' "$*"; }
 
-# Connect from INSIDE Aurral with its own node; prints OPEN or BLOCKED.
+# TCP reachability from INSIDE Aurral, using the node its own image ships.
 probe() {
   docker exec "$A" node -e '
-    const s = require("net").connect({host: process.argv[1], port: +process.argv[2], timeout: 4000});
-    s.on("connect", () => { console.log("OPEN"); process.exit(0); });
+    const s = require("net").connect({host: process.argv[1], port: +process.argv[2], timeout: 5000});
+    s.on("connect", () => { console.log("OPEN"); s.destroy(); process.exit(0); });
     s.on("timeout", () => { console.log("BLOCKED timeout"); process.exit(1); });
     s.on("error", (e) => { console.log("BLOCKED " + e.code); process.exit(1); });
   ' "$1" "$2" 2>&1 || true
+}
+# A full DNS + TCP + TLS + HTTP exchange, which is what "the API works" means.
+# A TCP handshake alone would pass against a captive portal.
+https_status() {
+  docker exec "$A" node -e '
+    const r = require("https").request({host: process.argv[1], path: process.argv[2] || "/",
+      method: "GET", timeout: 12000, headers: {"User-Agent": "aurral-experiment-validate"}},
+      (res) => { console.log("HTTP " + res.statusCode); res.destroy(); process.exit(0); });
+    r.on("timeout", () => { console.log("ERR timeout"); process.exit(1); });
+    r.on("error", (e) => { console.log("ERR " + e.code); process.exit(1); });
+    r.end();
+  ' "$1" "${2:-/}" 2>&1 || true
+}
+resolve() {
+  docker exec "$A" node -e '
+    require("dns").resolve4(process.argv[1], (e, a) => {
+      if (e) { console.log("NXDOMAIN " + e.code); process.exit(1); }
+      console.log(a.join(",")); process.exit(0);
+    });
+  ' "$1" 2>&1 || true
 }
 must_block() {  # host port label
   local r; r="$(probe "$1" "$2")"
   case "$r" in BLOCKED*) ok "$3 blocked ($r)" ;; *) bad "$3 REACHABLE: $1:$2 ($r)" ;; esac
 }
+must_reach() {  # host port label
+  local r; r="$(probe "$1" "$2")"
+  case "$r" in OPEN) ok "$3 reachable" ;; *) bad "$3 NOT reachable: $1:$2 ($r)" ;; esac
+}
 
-echo "== containers and hardening"
+echo "== 1. firewall policy is installed"
+# Asked FIRST. Every "blocked" result below is meaningless if the policy is
+# not actually loaded -- a container that happens to be down looks blocked too.
+fw="$("$HERE/firewall.sh" show "$ENV_FILE" 2>&1)"
+rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  bad "firewall.sh show failed (run it as root); the blocked results below prove nothing"
+else
+  for want in "AURRAL-EGRESS" "AURRAL-HOST"; do
+    hit="$(grep -cF "$want" <<< "$fw")"
+    [[ "$hit" -gt 0 ]] && ok "$want chain present" || bad "$want chain missing"
+  done
+  jumps="$(grep -c "$BRIDGE" <<< "$fw")"
+  [[ "$jumps" -ge 4 ]] && ok "jump rules on $BRIDGE present ($jumps)" \
+    || bad "expected 4 jump rules on $BRIDGE, found $jumps"
+fi
+
+echo "== 2. containers and hardening"
 for c in "$A" "$P"; do
   st="$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo missing)"
   [[ "$st" == true ]] && ok "$c running" || bad "$c not running ($st)"
 done
-h="$(docker inspect -f '{{.Config.User}}|{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.Privileged}}|{{.HostConfig.CapDrop}}|{{.HostConfig.CapAdd}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.RestartPolicy.Name}}' "$A")"
-[[ "$h" == "61001:61001|true|false|[ALL]|[]|"*"|no" ]] && ok "aurral hardening: $h" || bad "aurral hardening: $h"
+h="$(docker inspect -f '{{.Config.User}}|{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.Privileged}}|{{.HostConfig.CapDrop}}|{{.HostConfig.CapAdd}}|{{.HostConfig.RestartPolicy.Name}}' "$A")"
+[[ "$h" == "61001:61001|true|false|[ALL]|[]|no" ]] && ok "aurral hardening: $h" || bad "aurral hardening: $h"
+lim="$(docker inspect -f '{{.HostConfig.Memory}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.PidsLimit}}' "$A")"
+[[ "$lim" == "1610612736|1500000000|512" ]] && ok "resource limits: $lim" || bad "resource limits: $lim"
+img="$(docker inspect -f '{{.Config.Image}}' "$A")"
+case "$img" in *@sha256:*) ok "image pinned by digest" ;; *) bad "image not pinned by digest: $img" ;; esac
 mounts="$(docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}} rw={{.RW}}{{"\n"}}{{end}}' "$A")"
-grep -q 'docker.sock' <<< "$mounts" && bad "docker socket is mounted" || ok "no docker socket"
-others="$(grep -v -E '^/srv/(data|media)/experiments/aurral/' <<< "$mounts" | grep -v '^$' || true)"
+sock="$(grep -cF 'docker.sock' <<< "$mounts")"
+[[ "$sock" -eq 0 ]] && ok "no docker socket" || bad "docker socket is mounted"
+others="$(grep -v -E '^/srv/(data|media)/experiments/aurral/' <<< "$mounts" | grep -v '^$')"
 [[ -z "$others" ]] && ok "every mount is under the experiment paths" || bad "unexpected mounts: $others"
-r="$(docker exec "$A" yt-dlp --version 2>&1 || true)"
-grep -q 'disabled in the domum' <<< "$r" && ok "yt-dlp neutralised" || bad "yt-dlp ran: $r"
-r="$(docker exec "$A" cloudflared --version 2>&1 || true)"
-grep -q 'disabled in the domum' <<< "$r" && ok "cloudflared neutralised" || bad "cloudflared ran: $r"
+r="$(docker exec "$A" cloudflared --version 2>&1)"
+cf="$(grep -cF 'disabled in the domum' <<< "$r")"
+[[ "$cf" -eq 1 ]] && ok "cloudflared neutralised (no public share-link tunnel)" || bad "cloudflared ran: $r"
 r="$(docker exec "$A" id -u 2>&1)"; [[ "$r" == 61001 ]] && ok "runs as uid 61001" || bad "uid is $r"
 
-echo "== egress from Aurral (all must be BLOCKED)"
-must_block one.one.one.one 443 "internet by name"
-for ip in $(getent ahostsv4 one.one.one.one | awk '{print $1}' | sort -u); do
-  must_block "$ip" 443 "internet by IP"
+echo "== 3. the approved connectivity WORKS"
+r="$(resolve data.aurral.org)"
+case "$r" in NXDOMAIN*) bad "DNS does not work: $r" ;; *) ok "DNS resolves via the configured resolver ($r)" ;; esac
+must_reach "$AURRAL_DNS" 53 "the approved resolver"
+# The fallback is reached only when the primary does not answer, so a run
+# that never needed it would leave it unproven. Asserted explicitly, with
+# compose's own default where the env file does not name one.
+must_reach "${AURRAL_DNS_FALLBACK:-1.0.0.1}" 53 "the approved fallback resolver"
+for hp in data.aurral.org musicbrainz.org coverartarchive.org api.listenbrainz.org www.youtube.com; do
+  r="$(https_status "$hp")"
+  case "$r" in HTTP\ *) ok "$hp answers ($r)" ;; *) bad "$hp unreachable ($r)" ;; esac
 done
-must_block "$LAN_IP" 443 "this host's Traefik via LAN IP"
-must_block "$LAN_IP" 22 "this host's sshd"
-must_block "$AURRAL_LAN_ROUTER_IP" 80 "LAN router"
-for net in domum-proxy domum-internal; do
-  gw="$(docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$net" 2>/dev/null || true)"
-  [[ -n "$gw" ]] && must_block "$gw" 443 "$net network gateway" || bad "could not read $net gateway"
-done
-must_block "$TS_IP" 443 "this host via Tailscale"
-for name in immich_postgres immich_server traefik data.aurral.org musicbrainz.org www.youtube.com; do
-  r="$(docker exec "$A" getent hosts "$name" 2>&1 || true)"
-  [[ -z "$r" ]] && ok "DNS: $name does not resolve" || bad "DNS: $name resolves to $r"
-done
-r="$(probe "$AURRAL_PROXY_IP" 8080)"; [[ "$r" == OPEN ]] && ok "the proxy is the one reachable peer" || bad "proxy not reachable from aurral ($r)"
+r="$(docker exec "$A" yt-dlp --version 2>&1)"
+case "$r" in [0-9][0-9][0-9][0-9].*) ok "yt-dlp is available for testing ($r)" ;; *) bad "yt-dlp not usable: $r" ;; esac
 
-echo "== ingress"
-for ip in "$LAN_IP" "$TS_IP"; do
-  c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$ip:3001/" || true)"
-  [[ "$c" =~ ^(200|302)$ ]] && ok "reachable on $ip:3001 ($c)" || bad "not reachable on $ip:3001 ($c)"
+echo "== 4. everything private is BLOCKED"
+must_block "$LAN_IP" 443 "this host's Traefik via its LAN address"
+must_block "$LAN_IP" 22 "this host's sshd"
+must_block "$LAN_IP" 111 "this host's rpcbind"
+must_block "$TS_IP" 443 "this host via its Tailscale address"
+# Read from the host, not from inside the container: the image is not
+# guaranteed to carry iproute2, and a missing `ip` would make this report OK
+# without having looked at anything.
+gwip="$(docker network inspect aurral-experiment_aurral-net \
+          -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)"
+if [[ -n "$gwip" ]]; then must_block "$gwip" 22 "this host via the bridge gateway"
+else bad "could not read the aurral bridge gateway; the host-isolation check had no subject"; fi
+must_block "$AURRAL_LAN_ROUTER_IP" 80 "the LAN router"
+must_block 169.254.169.254 80 "link-local cloud metadata"
+# Production containers, by their real addresses rather than by gateway alone.
+for net in domum-proxy domum-internal; do
+  peers="$(docker network inspect "$net" -f '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}' 2>/dev/null \
+            | sed 's#/[0-9]*$##' | grep -v '^$')"
+  if [[ -z "$peers" ]]; then bad "could not read $net membership"; continue; fi
+  while read -r pname pip; do
+    [[ -n "$pip" ]] || continue
+    must_block "$pip" 443 "production container $pname on $net"
+  done <<< "$peers"
+  gw="$(docker network inspect "$net" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)"
+  [[ -n "$gw" ]] && must_block "$gw" 443 "$net gateway" || bad "could not read $net gateway"
 done
-c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:3001/ || true)"
+if [[ -n "${AURRAL_LAN_PEER_IP:-}" ]]; then must_block "$AURRAL_LAN_PEER_IP" 22 "a LAN device"
+else ok "no AURRAL_LAN_PEER_IP set (optional; set one to test a real LAN device)"; fi
+if [[ -n "${AURRAL_TAILSCALE_PEER_IP:-}" ]]; then must_block "$AURRAL_TAILSCALE_PEER_IP" 22 "a tailnet device"
+else ok "no AURRAL_TAILSCALE_PEER_IP set (optional; set one to test a real tailnet device)"; fi
+# Production service names must not resolve: Docker's DNS is per network and
+# Aurral shares none with them.
+for name in immich_postgres immich_server traefik navidrome; do
+  r="$(resolve "$name")"
+  case "$r" in NXDOMAIN*) ok "DNS: $name does not resolve" ;; *) bad "DNS: $name resolves to $r" ;; esac
+done
+# IPv6: no global address at all, so there is nothing to route anywhere.
+v6="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$A" 2>/dev/null)"
+[[ -z "$v6" ]] && ok "no global IPv6 address" || bad "container has a global IPv6 address: $v6"
+
+echo "== 5. the proxy is the only ingress"
+# The proxy serves one static config and initiates nothing, so its egress is
+# dropped too: the external surface is one container, not two. Asserted,
+# because a tightening nobody tests is a comment.
+# A POSITIVE CONTROL first, with the same tool: the proxy must be able to
+# reach Aurral on this bridge. Without it, an absent or differently-flagged
+# `nc` would report "blocked" for everything and the section would pass while
+# having tested nothing -- which is worse than not having the check.
+pnc() { docker exec "$P" sh -c "nc -w 4 '$1' '$2' </dev/null >/dev/null 2>&1; echo \$?" 2>/dev/null; }
+ctl="$(pnc aurral 3001)"
+if [[ "$ctl" != 0 ]]; then
+  bad "the proxy's own probe tool does not work (rc=$ctl reaching aurral:3001); its egress is UNTESTED"
+else
+  ok "proxy probe control: it can reach aurral on this bridge"
+  pr="$(pnc "$AURRAL_DNS" 53)"
+  [[ "$pr" != 0 ]] && ok "the proxy cannot initiate egress (rc=$pr to the resolver Aurral can reach)" \
+    || bad "the proxy reached off-bridge, which only Aurral should be able to do"
+fi
+r="$(probe "$AURRAL_PROXY_IP" 8080)"
+[[ "$r" == OPEN ]] && ok "the proxy is reachable from aurral" || bad "proxy not reachable from aurral ($r)"
+for ip in "$LAN_IP" "$TS_IP"; do
+  c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$ip:3001/")"
+  [[ "$c" =~ ^(200|302)$ ]] && ok "UI reachable on $ip:3001 ($c)" || bad "UI not reachable on $ip:3001 ($c)"
+done
+c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:3001/)"
 [[ "$c" == 000 ]] && ok "not bound on 127.0.0.1" || bad "bound on 127.0.0.1 ($c)"
-c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 --resolve aurral.ladomum.com:443:127.0.0.1 https://aurral.ladomum.com/ || true)"
+c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 --resolve aurral.ladomum.com:443:127.0.0.1 https://aurral.ladomum.com/)"
 [[ "$c" == 404 ]] && ok "no Traefik route (404)" || bad "Traefik answered $c for aurral"
 pp="$(docker port "$P" 2>/dev/null)"
-grep -q -E '0\.0\.0\.0|\[::\]' <<< "$pp" && bad "published on a wildcard: $pp" || ok "published only on LAN + Tailscale"
-# X-Forwarded-For must be overwritten by the proxy, not appended.
-r="$(docker exec "$P" grep -c 'X-Forwarded-For \$remote_addr' /etc/nginx/nginx.conf 2>&1 || true)"
-[[ "$r" == 1 ]] && ok "proxy overwrites X-Forwarded-For" || bad "proxy XFF handling: $r"
+wild="$(grep -c -E '0\.0\.0\.0|\[::\]' <<< "$pp")"
+[[ "$wild" -eq 0 ]] && ok "published only on LAN + Tailscale" || bad "published on a wildcard: $pp"
+aport="$(docker port "$A" 2>/dev/null)"
+[[ -z "$aport" ]] && ok "aurral publishes no port of its own" || bad "aurral publishes: $aport"
+xff="$(docker exec "$P" grep -c 'X-Forwarded-For \$remote_addr' /etc/nginx/nginx.conf 2>&1)"
+[[ "$xff" == 1 ]] && ok "the proxy overwrites X-Forwarded-For" || bad "proxy XFF handling: $xff"
+tp="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$A" | sed -nE 's/^TRUST_PROXY=(.*)$/\1/p')"
+[[ "$tp" == "$AURRAL_PROXY_IP" ]] && ok "TRUST_PROXY is the proxy only" || bad "TRUST_PROXY is '$tp'"
 
-echo "== production untouched"
+echo "== 6. the music stays yours"
+lib=/srv/media/experiments/aurral/library
+if [[ -d "$lib" ]]; then
+  ok "library directory exists on the host: $lib"
+  f="$(find "$lib" -type f -print -quit 2>/dev/null)"
+  if [[ -n "$f" ]]; then
+    head -c 1 "$f" >/dev/null 2>&1 && ok "a library file is readable outside the container" \
+      || bad "a library file is NOT readable outside the container: $f"
+  else
+    ok "library is empty (nothing to read yet)"
+  fi
+else
+  bad "library directory is missing: $lib"
+fi
+
+echo "== 7. production untouched"
 running="$(docker ps --format '{{.Names}}' | grep -v -x -E "$A|$P" | sort | tr '\n' ' ')"
 printf '  production containers: %s\n' "$running"
-nc="$(wc -w <<< "$running")"; [[ "$nc" -eq 11 ]] && ok "11 production containers running" || bad "$nc production containers running"
+nc="$(wc -w <<< "$running")"
+[[ "$nc" -eq 11 ]] && ok "11 production containers running" || bad "$nc production containers running"
+unhealthy="$(docker ps --filter health=unhealthy --format '{{.Names}}' | tr '\n' ' ')"
+[[ -z "$unhealthy" ]] && ok "no unhealthy production container" || bad "unhealthy: $unhealthy"
 
 printf '\n%d of %d checks failed\n' "$fails" "$n"
+if [[ "$fails" -eq 0 ]]; then
+  cat <<'NOTE'
+
+What Aurral actually contacted, since the policy was applied:
+  sudo journalctl -k --since today | sed -nE 's/.*aurral-egress .*DST=([0-9.]+).*DPT=([0-9]+).*/\1:\2/p' | sort | uniq -c | sort -rn
+Blocked attempts at this host, if any:
+  sudo journalctl -k --since today | grep -c aurral-host-blocked
+NOTE
+fi
 (( fails == 0 ))
