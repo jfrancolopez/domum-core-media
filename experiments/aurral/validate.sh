@@ -11,6 +11,39 @@
 # the internet works would pass against no isolation whatsoever.
 set -uo pipefail
 
+# ---------------------------------------------------------------------------
+# Whether the container holds a GLOBAL IPv6 address, as its own function so a
+# test can drive it with no container and no root: source this file with
+# AURRAL_VALIDATE_LIB=1 and it defines its helpers and returns.
+#
+# It deliberately does NOT read `docker inspect -f '{{.GlobalIPv6Address}}'`.
+# Measured on Docker 29.10.0: that field is typed `netip.Addr`, and the ZERO
+# value's String() is the literal "invalid IP" -- a string that is not an
+# address and cannot be told apart from one, so an ABSENT address read as a
+# present one and this check reported a false failure. It is Docker-wide
+# rather than anything about this container: production traefik renders
+# "invalid IP", and navidrome, attached to two networks, renders
+# "invalid IPinvalid IP". `{{json}}` encodes the same zero value as "".
+#
+# The kernel's own answer has no formatter in the way. In /proc/net/if_inet6
+# field 1 is the address and field 4 is the SCOPE: 00 global, 20 link-local,
+# 10 host (::1 on lo). So only scope 00 is reportable here -- a link-local
+# address is not routable off-link and is not what `enable_ipv6: false` is
+# about.
+#
+# Exit 2 means the file could not be read at all. A running container always
+# has at least ::1 on lo, so empty output is a failed read rather than an
+# absence of addresses -- and "could not check it" must not read as a pass.
+container_global_ipv6() {
+  local raw
+  raw="$(docker exec "$1" cat /proc/net/if_inet6 2>/dev/null)" || return 2
+  [[ -n "$raw" ]] || return 2
+  awk '$4 == "00" { print $1 }' <<< "$raw"
+  return 0
+}
+
+if [[ -n "${AURRAL_VALIDATE_LIB:-}" ]]; then return 0; fi
+
 ENV_FILE="${1:-/srv/data/experiments/aurral/aurral.env}"
 # shellcheck disable=SC1090
 # A value containing spaces must be QUOTED in that file: it is sourced, so
@@ -159,9 +192,21 @@ for name in immich_postgres immich_server traefik navidrome; do
   r="$(resolve "$name")"
   case "$r" in NXDOMAIN*) ok "DNS: $name does not resolve" ;; *) bad "DNS: $name resolves to $r" ;; esac
 done
-# IPv6: no global address at all, so there is nothing to route anywhere.
-v6="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$A" 2>/dev/null)"
-[[ -z "$v6" ]] && ok "no global IPv6 address" || bad "container has a global IPv6 address: $v6"
+# IPv6: no GLOBAL address at all, so there is nothing to route anywhere.
+# Asked twice, independently: the kernel inside the container's own netns, and
+# Docker's metadata read as JSON rather than through Go's String().
+v6_rc=0
+v6="$(container_global_ipv6 "$A")" || v6_rc=$?
+if (( v6_rc == 2 )); then
+  bad "could not read /proc/net/if_inet6 in $A -- IPv6 state UNKNOWN, not proven absent"
+elif [[ -n "$v6" ]]; then
+  bad "container has a global IPv6 address: $v6"
+else
+  ok "no global IPv6 address in the container's netns"
+fi
+v6_meta="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{json .GlobalIPv6Address}}{{end}}' "$A" 2>/dev/null | tr -d '"')"
+[[ -z "$v6_meta" ]] && ok "docker reports no global IPv6 on any attached network" \
+                    || bad "docker reports a global IPv6: $v6_meta"
 
 echo "== 5. the proxy is the only ingress"
 # The proxy serves one static config and initiates nothing, so its egress is
