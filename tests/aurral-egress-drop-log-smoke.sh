@@ -109,9 +109,11 @@ sect "4. EVERY egress drop goes through the chain -- including the Docker DNAT p
 # before this chain is reached. What IS assertable, and what matters, is that
 # the two rules which catch a post-DNAT packet route through the log-then-drop
 # chain -- `-o br-+` (it leaves via a Docker bridge) and the 172.16/12 address
-# range (traefik's 172.18.0.2). Measured on the real host: a probe to any local
-# address on port 443 is DNAT'd to traefik and takes this path, which is why
-# four host probes were previously dropped in silence.
+# range, which is where traefik's own bridge address sits. Measured on the real
+# host: a probe to any local address on port 443 is DNAT'd to traefik and takes
+# this path, which is why four host probes were previously dropped in silence.
+# The address is described rather than quoted: tests/identifier-audit.py rejects
+# a 4-octet RFC1918 literal in a tracked file, and it caught this very line.
 for rule in "-o tailscale0" "-o docker0" "-o br-+" "-s 203.0.113.10" \
             "-d $R8" "-d $R12" "-d $R16" "-d $RCG" \
             "-d 127.0.0.0/8" "-d 169.254.0.0/16" "-d 224.0.0.0/4" \
