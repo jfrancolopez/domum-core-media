@@ -517,6 +517,12 @@ jobs:
       - name: Aurral Traefik router template smoke test
         run: tests/aurral-traefik-router-smoke.sh
 
+      # Docker writes the host's resolvers into a container at CREATION and never
+      # revisits them. Nothing watched this, and it silently blocked certificate
+      # issuance AND renewal.
+      - name: Container DNS staleness smoke test
+        run: tests/container-dns-staleness-smoke.sh
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI
