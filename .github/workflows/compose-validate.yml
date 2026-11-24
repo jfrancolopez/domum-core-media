@@ -492,6 +492,11 @@ jobs:
       - name: Documented commands audit
         run: python3 tests/documented-commands-audit.py
 
+      # A preflight that can only ever say STOP is not a gate. Section 1 is the
+      # load-bearing case: a counter-only difference must read as MATCH.
+      - name: Aurral firewall preflight smoke test
+        run: tests/aurral-preflight-smoke.sh
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI
