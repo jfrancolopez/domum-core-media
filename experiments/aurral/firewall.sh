@@ -154,14 +154,23 @@ ipv6_forward_chain() {
 }
 
 remove_policy() {
-  local v6fwd; v6fwd="$(ipv6_forward_chain)"
   while "$IPT" -D DOCKER-USER -i "$BRIDGE" -j "$FWD_CHAIN" 2>/dev/null; do :; done
   while "$IPT" -D INPUT -i "$BRIDGE" -j "$IN_CHAIN" 2>/dev/null; do :; done
   "$IPT" -F "$FWD_CHAIN" 2>/dev/null || true
   "$IPT" -X "$FWD_CHAIN" 2>/dev/null || true
   "$IPT" -F "$IN_CHAIN" 2>/dev/null || true
   "$IPT" -X "$IN_CHAIN" 2>/dev/null || true
-  while "$IPT6" -D "$v6fwd" -i "$BRIDGE" -j DROP 2>/dev/null; do :; done
+  # BOTH candidate chains, not the one `ipv6_forward_chain` picks now.
+  # `apply` chooses by what exists at the time, so if Docker gains (or loses)
+  # an ip6tables DOCKER-USER between apply and remove, asking again would
+  # target the other chain and leave a stray `-i aurral0 -j DROP` behind. It
+  # would be harmless once the interface is gone, and it would also mean
+  # `show` could never report the policy fully removed. Each delete is
+  # already tolerant of absence, so trying both costs nothing.
+  local v6chain
+  for v6chain in DOCKER-USER FORWARD; do
+    while "$IPT6" -D "$v6chain" -i "$BRIDGE" -j DROP 2>/dev/null; do :; done
+  done
   while "$IPT6" -D INPUT -i "$BRIDGE" -j DROP 2>/dev/null; do :; done
 }
 
@@ -216,6 +225,22 @@ apply_policy() {
   # interface. DNS survives because the configured resolver is public, so it
   # is reached over the forward path above and never over INPUT.
   "$IPT" -N "$IN_CHAIN"
+  # Replies to a connection THIS HOST opened to the container. Measured on
+  # this host: `EnableUserlandProxy` is true, so docker-proxy binds each
+  # published port. Whether a LAN client is served by the nat-table DNAT
+  # (which routes the packet to the container, so INPUT is never involved) or
+  # by docker-proxy (which terminates on the host and opens its OWN
+  # connection to the container, whose replies DO arrive here on INPUT) is a
+  # property of Docker's port-publishing mechanism, not of this policy -- and
+  # without this rule the second case drops the UI's replies and the
+  # experiment is unreachable from the one place it is meant to work.
+  #
+  # It does not weaken the claim. The claim is that Aurral may not INITIATE a
+  # connection to this host, and a container-initiated connection has no
+  # conntrack entry, so it still falls through to the DROP below. This is the
+  # same rule, for the same reason, as rule 2 of the forward chain; the two
+  # chains were asymmetric and only the forward half had it.
+  "$IPT" -A "$IN_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
   "$IPT" -A "$IN_CHAIN" -m conntrack --ctstate NEW \
       -m limit --limit 60/min --limit-burst 20 \
       -j LOG --log-prefix 'aurral-host-blocked ' --log-level info

@@ -162,6 +162,44 @@ reachable.
    log line is a missed observation.
 7. `RETURN` — Docker's own rules then NAT it to the internet.
 
+### What it is inserted into — measured, 2026-11-23
+
+Read as root before approving, which is what turns "no production rule is
+disturbed" from an argument into an observation:
+
+```
+iptables  -S DOCKER-USER    ->  -N DOCKER-USER          (the chain, and NO rules)
+iptables  -S INPUT          ->  -P INPUT ACCEPT
+                                -A INPUT -j ts-input
+ip6tables -S DOCKER-USER    ->  -N DOCKER-USER          (present, and NO rules)
+ip6tables -S INPUT          ->  -P INPUT ACCEPT
+                                -A INPUT -j ts-input
+```
+
+The IPv6 half is measured rather than inferred, which matters because
+`ipv6_forward_chain` chooses by what exists: ip6tables HAS `DOCKER-USER`
+here, so `apply` inserts the v6 drop there and not into `FORWARD`. Both
+chains are empty, so neither insertion displaces anything, and the v6 INPUT
+jump sits ahead of Tailscale's chain exactly as the v4 one does.
+
+So `-I DOCKER-USER 1` displaces nothing: the chain is empty, and our rule is
+the only one in it. `-I INPUT 1` puts the host-isolation jump ahead of
+Tailscale's `ts-input`, giving:
+
+| # | INPUT rule | effect |
+|---|---|---|
+| 1 | `-i aurral0 -j AURRAL-HOST` | only packets off this experiment's bridge |
+| 2 | `-j ts-input` | everything else, exactly as before |
+
+**It is compatible with `ts-input`, and strictly more restrictive.** Nothing
+Tailscale needs arrives on `aurral0`: its own traffic is `-i tailscale0`, its
+WireGuard listener is reached over `enp1s0`, and its self-address rule is on
+`lo`. `ts-input`'s anti-spoofing drop (`! -i tailscale0 -s <CGNAT> -j DROP`)
+would have caught a packet forged with a tailnet source on `aurral0`; this
+policy drops **every** new packet from that interface to the host, so that
+protection is subsumed rather than bypassed. For every other interface the
+chain is unchanged and `ts-input` is still the first thing consulted.
+
 An **empty block list refuses to apply**: a policy that opened the LAN while
 reporting success is the failure this project exists to avoid.
 
@@ -295,7 +333,20 @@ rules match an interface name, which iptables accepts whether or not the
 interface exists yet, so this is safe and is the only ordering that has no
 window.
 
+**Run every step from the DEVELOPMENT checkout.** `firewall.sh` exists only
+from `49b380a` onward and the production checkout does not carry it, so from
+`/opt/domum-core-media` step 4 fails while step 5 would still start the
+containers — with no isolation at all. Step 0 makes that impossible to do by
+accident, and every path below is absolute for the same reason.
+
 ```
+# 0. the right checkout, and the revision that has the policy
+R=/home/jfranco/src/domum-core-media-dev
+cd "$R"
+git -C "$R" rev-parse --short HEAD                      # expect 49b380a or later
+test -x "$R/experiments/aurral/firewall.sh" \
+  || { echo "WRONG CHECKOUT: no firewall.sh here -- do NOT continue"; }
+
 # 1. directories
 sudo install -d -o 61001 -g 61001 -m 0700 /srv/data/experiments/aurral/config \
                                           /srv/data/experiments/aurral/config/home
@@ -305,24 +356,24 @@ sudo install -d -o 61001 -g 61001 -m 0750 /srv/media/experiments/aurral/staging
 sudo install -d -m 0755 /srv/data/experiments/aurral/stubs
 
 # 2. the two files that are COPIED, never mounted from the checkout
-sudo install -m 0644 experiments/aurral/nginx.conf /srv/data/experiments/aurral/nginx.conf
-sudo install -m 0755 experiments/aurral/stubs/disabled /srv/data/experiments/aurral/stubs/disabled
+sudo install -m 0644 "$R/experiments/aurral/nginx.conf" /srv/data/experiments/aurral/nginx.conf
+sudo install -m 0755 "$R/experiments/aurral/stubs/disabled" /srv/data/experiments/aurral/stubs/disabled
 
 # 3. the env file
-sudo install -m 0600 experiments/aurral/aurral.env.example /srv/data/experiments/aurral/aurral.env
+sudo install -m 0600 "$R/experiments/aurral/aurral.env.example" /srv/data/experiments/aurral/aurral.env
 sudoedit /srv/data/experiments/aurral/aurral.env        # fill in every value
 E=/srv/data/experiments/aurral/aurral.env
 
 # 4. THE FIREWALL POLICY, BEFORE THE CONTAINERS
-sudo experiments/aurral/firewall.sh apply $E
-sudo experiments/aurral/firewall.sh show  $E
+sudo "$R/experiments/aurral/firewall.sh" apply "$E"
+sudo "$R/experiments/aurral/firewall.sh" show  "$E"
 
 # 5. the containers
-sudo docker compose --env-file $E -f experiments/aurral/compose.yml -p aurral-experiment pull
-sudo docker compose --env-file $E -f experiments/aurral/compose.yml -p aurral-experiment up -d
+sudo docker compose --env-file "$E" -f "$R/experiments/aurral/compose.yml" -p aurral-experiment pull
+sudo docker compose --env-file "$E" -f "$R/experiments/aurral/compose.yml" -p aurral-experiment up -d
 
 # 6. prove it
-sudo experiments/aurral/validate.sh $E
+sudo "$R/experiments/aurral/validate.sh" "$E"
 ```
 
 (`-p aurral-experiment` always — it keeps compose from ever addressing the
@@ -331,10 +382,11 @@ production project.)
 ## 7. Rollback / removal
 
 ```
+R=/home/jfranco/src/domum-core-media-dev
 E=/srv/data/experiments/aurral/aurral.env
-sudo docker compose --env-file $E -f experiments/aurral/compose.yml -p aurral-experiment down
-sudo experiments/aurral/firewall.sh remove $E
-sudo experiments/aurral/firewall.sh show   $E     # must report NOT installed
+sudo docker compose --env-file "$E" -f "$R/experiments/aurral/compose.yml" -p aurral-experiment down
+sudo "$R/experiments/aurral/firewall.sh" remove "$E"
+sudo "$R/experiments/aurral/firewall.sh" show   "$E"   # must report NOT installed
 docker image rm ghcr.io/lklynet/aurral@sha256:17d1f8ff2aaa3907d846c38b47eebdd44b10fbe00b2c993373a6da940ac2504f \
                nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
 # data, only once you have decided you do not want it:
