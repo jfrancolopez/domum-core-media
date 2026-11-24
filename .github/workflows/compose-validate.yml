@@ -507,6 +507,12 @@ jobs:
       - name: Aurral blocked-egress logging smoke test
         run: tests/aurral-egress-drop-log-smoke.sh
 
+      # nginx's $host strips the port, which made Aurral's isCrossSite() classify
+      # every same-origin request as cross-site. The behavioural section skips
+      # where no nginx image is already local; the text assertions always run.
+      - name: Aurral proxy Host header smoke test
+        run: tests/aurral-proxy-host-header-smoke.sh
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI
