@@ -502,6 +502,11 @@ jobs:
       - name: Aurral IPv6 check smoke test
         run: tests/aurral-ipv6-check-smoke.sh
 
+      # A blocked egress packet must be LOGGED before it is dropped: the
+      # allowed-egress LOG sits after the drops, so blocked traffic was silent.
+      - name: Aurral blocked-egress logging smoke test
+        run: tests/aurral-egress-drop-log-smoke.sh
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI

@@ -8,7 +8,7 @@
 # 111 (rpcbind). So the isolation is firewall-enforced, and this is the whole
 # of it.
 #
-# WHAT IT TOUCHES. Two custom chains and four jump rules, every one of them
+# WHAT IT TOUCHES. Three custom chains and four jump rules, every one of them
 # scoped to the interface `aurral0` -- a bridge that exists only for this
 # experiment. No production rule is read, moved, flushed or replaced, and no
 # new firewall framework is introduced: DOCKER-USER is Docker's own documented
@@ -31,6 +31,14 @@ set -euo pipefail
 BRIDGE=aurral0
 FWD_CHAIN=AURRAL-EGRESS
 IN_CHAIN=AURRAL-HOST
+# Every egress DROP jumps here instead of dropping inline, so a blocked packet
+# is LOGGED and then dropped. It exists because the allowed-egress LOG sits
+# after the drops and therefore only ever recorded traffic that was PERMITTED:
+# measured 2026-11-24, four of validate.sh's seven host probes were blocked
+# silently, and nothing would have recorded Aurral probing a production
+# container, the LAN or the tailnet. Enforcement is unchanged -- same rules,
+# same order, same verdict -- only the target differs.
+DROP_CHAIN=AURRAL-EGRESS-DROP
 # Blocked whatever the operator lists, because none of these is a legitimate
 # destination for an application and none of them is an RFC1918 or CGNAT
 # literal (which this repository's identifier audit rejects in tracked files,
@@ -54,8 +62,13 @@ ACTION="${1:-}"
 ENV_FILE="${2:-/srv/data/experiments/aurral/aurral.env}"
 case "$ACTION" in apply|remove|show) ;; *) die "usage: $0 {apply|remove|show} [env-file]" ;; esac
 
-IPT="$(command -v iptables || echo /usr/sbin/iptables)"
-IPT6="$(command -v ip6tables || echo /usr/sbin/ip6tables)"
+# Overridable so a test can record the exact ruleset this would build without
+# touching a real one. Both default to the production binaries, so nothing
+# about production behaviour depends on these existing. The root check above is
+# NOT weakened for testing -- the suite satisfies it by running under
+# `unshare -r`, where the caller really does map to uid 0.
+IPT="${AURRAL_IPTABLES:-$(command -v iptables || echo /usr/sbin/iptables)}"
+IPT6="${AURRAL_IP6TABLES:-$(command -v ip6tables || echo /usr/sbin/ip6tables)}"
 [[ -x "$IPT" ]] || die "iptables not found"
 
 # ---------------------------------------------------------------------------
@@ -156,10 +169,17 @@ ipv6_forward_chain() {
 remove_policy() {
   while "$IPT" -D DOCKER-USER -i "$BRIDGE" -j "$FWD_CHAIN" 2>/dev/null; do :; done
   while "$IPT" -D INPUT -i "$BRIDGE" -j "$IN_CHAIN" 2>/dev/null; do :; done
+  # Flush ALL THREE before deleting any: $DROP_CHAIN is referenced by
+  # $FWD_CHAIN, and iptables refuses to delete a chain that is still
+  # referenced. Flushing first removes every reference, so the deletes below
+  # cannot fail for ordering reasons. Each one tolerates absence, so this is
+  # safe on a host where the policy was never applied.
   "$IPT" -F "$FWD_CHAIN" 2>/dev/null || true
-  "$IPT" -X "$FWD_CHAIN" 2>/dev/null || true
   "$IPT" -F "$IN_CHAIN" 2>/dev/null || true
+  "$IPT" -F "$DROP_CHAIN" 2>/dev/null || true
+  "$IPT" -X "$FWD_CHAIN" 2>/dev/null || true
   "$IPT" -X "$IN_CHAIN" 2>/dev/null || true
+  "$IPT" -X "$DROP_CHAIN" 2>/dev/null || true
   # BOTH candidate chains, not the one `ipv6_forward_chain` picks now.
   # `apply` chooses by what exists at the time, so if Docker gains (or loses)
   # an ip6tables DOCKER-USER between apply and remove, asking again would
@@ -177,6 +197,30 @@ remove_policy() {
 apply_policy() {
   read_block_cidrs
   remove_policy   # idempotent: a re-apply replaces, never stacks
+
+  # -- blocked egress: log, then drop ------------------------------------
+  # Created BEFORE the chain that jumps to it, because iptables refuses a jump
+  # to a chain that does not exist yet.
+  #
+  # ctstate NEW, so one line per CONNECTION rather than per retransmitted SYN
+  # -- a dropped SYN is retransmitted about five times, which would otherwise
+  # multiply every observation by five. Rate-limited at the same 60/min as the
+  # host chain, because both are "something was blocked" and a shared vocabulary
+  # should have a shared cost.
+  #
+  # The limit is one bucket shared by every drop reason, and the trade-off is
+  # stated rather than hidden: a flood of one kind of blocked traffic can
+  # exhaust it and hide another kind. Nothing on this bridge is known to be
+  # chatty, so a shared bucket is the simpler and honest starting point; if the
+  # journal ever shows it saturating, split it then.
+  #
+  # It logs headers only. LOG never records payload, so no application data,
+  # credential or music metadata can reach the journal through this.
+  "$IPT" -N "$DROP_CHAIN"
+  "$IPT" -A "$DROP_CHAIN" -m conntrack --ctstate NEW \
+      -m limit --limit 60/min --limit-burst 20 \
+      -j LOG --log-prefix 'aurral-egress-blocked ' --log-level info
+  "$IPT" -A "$DROP_CHAIN" -j DROP
 
   # -- container -> anywhere but this host -------------------------------
   "$IPT" -N "$FWD_CHAIN"
@@ -196,17 +240,17 @@ apply_policy() {
   #    bridge. So egress belongs to Aurral alone and the surface is one
   #    container rather than two. Replies to inbound requests are already
   #    RETURNed by rule 2 above, which is why this cannot break the UI.
-  "$IPT" -A "$FWD_CHAIN" -s "$AURRAL_PROXY_IP" -j DROP
+  "$IPT" -A "$FWD_CHAIN" -s "$AURRAL_PROXY_IP" -j "$DROP_CHAIN"
   # 4. by interface: the tailnet and the other Docker bridges, whatever they
   #    are addressed with. This catches a tailnet subnet router advertising
   #    ordinary public routes, which an address list cannot.
-  "$IPT" -A "$FWD_CHAIN" -o tailscale0 -j DROP
-  "$IPT" -A "$FWD_CHAIN" -o docker0 -j DROP
-  "$IPT" -A "$FWD_CHAIN" -o 'br-+' -j DROP
+  "$IPT" -A "$FWD_CHAIN" -o tailscale0 -j "$DROP_CHAIN"
+  "$IPT" -A "$FWD_CHAIN" -o docker0 -j "$DROP_CHAIN"
+  "$IPT" -A "$FWD_CHAIN" -o 'br-+' -j "$DROP_CHAIN"
   # 5. by address: the LAN, the CGNAT range, and the never-legitimate ranges.
   local c
   for c in "${BLOCK_CIDRS[@]}" "${ALWAYS_BLOCK[@]}"; do
-    "$IPT" -A "$FWD_CHAIN" -d "$c" -j DROP
+    "$IPT" -A "$FWD_CHAIN" -d "$c" -j "$DROP_CHAIN"
   done
   # 6. whatever survived is an external destination: log it once per
   #    connection, so "which services does Aurral actually contact" is
@@ -273,6 +317,8 @@ show_policy() {
   "$IPT" -L "$FWD_CHAIN" -v -n --line-numbers 2>/dev/null | sed 's/^/  /' || present=1
   printf '== %s (packet counters)\n' "$IN_CHAIN"
   "$IPT" -L "$IN_CHAIN" -v -n --line-numbers 2>/dev/null | sed 's/^/  /' || present=1
+  printf '== %s (packet counters)\n' "$DROP_CHAIN"
+  "$IPT" -L "$DROP_CHAIN" -v -n --line-numbers 2>/dev/null | sed 's/^/  /' || present=1
   [[ "$present" -eq 0 ]] || { printf 'the policy is NOT installed\n'; return 1; }
 }
 
