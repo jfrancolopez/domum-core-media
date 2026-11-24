@@ -497,6 +497,11 @@ jobs:
       - name: Aurral firewall preflight smoke test
         run: tests/aurral-preflight-smoke.sh
 
+      # Docker >= 29 types these fields as netip.Addr, whose ZERO value String()s
+      # to the literal "invalid IP" -- so an absent address read as a present one.
+      - name: Aurral IPv6 check smoke test
+        run: tests/aurral-ipv6-check-smoke.sh
+
       # Every test file must be named above. A suite that exists but is not run is
       # worse than no suite: it is reported as coverage.
       - name: Every test is wired into CI
