@@ -44,6 +44,7 @@ independently verified beyond the Dockerfile's pins and checksum.
 |---|---|
 | `compose.yml` | the minimal deployment: Aurral + a one-purpose nginx ingress |
 | `firewall.sh` | the egress policy — `apply` / `remove` / `show`. This is where the isolation lives |
+| `preflight.sh` | gates the apply: the saved rulesets are usable and the live one still matches them. Exit `0` match / `3` already applied / `1` drift / `2` could not tell |
 | `nginx.conf` | the only ingress; overwrites `X-Forwarded-For` |
 | `stubs/disabled` | mounted read-only over `cloudflared` |
 | `validate.sh` | the connectivity and isolation tests (section 5), read-only |
@@ -339,40 +340,62 @@ from `49b380a` onward and the production checkout does not carry it, so from
 containers — with no isolation at all. Step 0 makes that impossible to do by
 accident, and every path below is absolute for the same reason.
 
+**A FAILED PREREQUISITE MUST TERMINATE THE PROCEDURE, so steps 1-2 and 4-5
+each run in ONE privileged shell under `set -e`.** Measured 2026-11-24: an
+earlier version of this procedure ran the preflight as a separate command ending
+in `|| echo "BACKUP VERIFICATION FAILED -- do not continue"`. That swallowed the
+non-zero status, the following commands were separate statements, and the
+firewall was applied anyway -- the check printed the harm and then let it happen.
+"Warn and continue" is not a safety mechanism, least of all in a gate. One shell
+with `set -e` is what makes the abort real; a `&&` chain is not enough, because a
+step the operator pastes as its own line is its own statement.
+
 ```
-# 0. the right checkout, and the revision that has the policy
+# 0. the right checkout, and the revision that has the policy   (no privilege)
 R=/home/jfranco/src/domum-core-media-dev
 cd "$R"
 git -C "$R" rev-parse --short HEAD                      # expect 49b380a or later
 test -x "$R/experiments/aurral/firewall.sh" \
   || { echo "WRONG CHECKOUT: no firewall.sh here -- do NOT continue"; }
 
-# 1. directories
-sudo install -d -o 61001 -g 61001 -m 0700 /srv/data/experiments/aurral/config \
-                                          /srv/data/experiments/aurral/config/home
-sudo install -d -o 61001 -g 61001 -m 0755 /srv/media/experiments/aurral/library \
-                                          /srv/media/experiments/aurral/exports
-sudo install -d -o 61001 -g 61001 -m 0750 /srv/media/experiments/aurral/staging
-sudo install -d -m 0755 /srv/data/experiments/aurral/stubs
+# 1-2. directories, and the two files that are COPIED rather than mounted from
+#      the checkout. One shell, `set -e`: any failure stops here.
+sudo bash -euo pipefail -s <<'PREP'
+D=/srv/data/experiments/aurral
+M=/srv/media/experiments/aurral
+R=/home/jfranco/src/domum-core-media-dev
+install -d -o 61001 -g 61001 -m 0700 "$D/config" "$D/config/home"
+install -d -o 61001 -g 61001 -m 0755 "$M/library" "$M/exports"
+install -d -o 61001 -g 61001 -m 0750 "$M/staging"
+install -d -m 0755 "$D/stubs"
+install -m 0644 "$R/experiments/aurral/nginx.conf"     "$D/nginx.conf"
+install -m 0755 "$R/experiments/aurral/stubs/disabled" "$D/stubs/disabled"
+PREP
 
-# 2. the two files that are COPIED, never mounted from the checkout
-sudo install -m 0644 "$R/experiments/aurral/nginx.conf" /srv/data/experiments/aurral/nginx.conf
-sudo install -m 0755 "$R/experiments/aurral/stubs/disabled" /srv/data/experiments/aurral/stubs/disabled
-
-# 3. the env file
-sudo install -m 0600 "$R/experiments/aurral/aurral.env.example" /srv/data/experiments/aurral/aurral.env
-sudoedit /srv/data/experiments/aurral/aurral.env        # fill in every value
+# 3. the env file. Interactive, so it is deliberately its own step.
 E=/srv/data/experiments/aurral/aurral.env
+sudo install -m 0600 "$R/experiments/aurral/aurral.env.example" "$E"
+sudoedit "$E"                                           # fill in every value
 
-# 4. THE FIREWALL POLICY, BEFORE THE CONTAINERS
-sudo "$R/experiments/aurral/firewall.sh" apply "$E"
-sudo "$R/experiments/aurral/firewall.sh" show  "$E"
+# 4-5. THE PREFLIGHT AND THE FIREWALL, BEFORE THE CONTAINERS. One shell,
+#      `set -e`, so the policy is applied ONLY from a state the preflight
+#      passed. preflight.sh exits 0 match / 3 already applied / 1 drift /
+#      2 could not tell, and under `set -e` only 0 continues.
+sudo bash -euo pipefail -s <<'FW'
+E=/srv/data/experiments/aurral/aurral.env
+R=/home/jfranco/src/domum-core-media-dev
+"$R/experiments/aurral/preflight.sh"
+[ -s "$E" ] || { echo "env file missing or empty: $E"; exit 1; }
+stat -c 'env file: %A %U:%G %s bytes' "$E"
+"$R/experiments/aurral/firewall.sh" apply "$E"
+"$R/experiments/aurral/firewall.sh" show  "$E"
+FW
 
-# 5. the containers
+# 6. the containers -- only after the chains above have been read and accepted
 sudo docker compose --env-file "$E" -f "$R/experiments/aurral/compose.yml" -p aurral-experiment pull
 sudo docker compose --env-file "$E" -f "$R/experiments/aurral/compose.yml" -p aurral-experiment up -d
 
-# 6. prove it
+# 7. prove it
 sudo "$R/experiments/aurral/validate.sh" "$E"
 ```
 
