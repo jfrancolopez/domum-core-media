@@ -359,6 +359,21 @@ jobs:
       - name: Backup heartbeat (an empty marker must not read as a backup)
         run: tests/backup-heartbeat-smoke.sh
 
+      # A config-only `compose up -d` RECONCILES, so it deploys any image whose
+      # tag has moved. An exported <SERVICE>_IMAGE pin could never work:
+      # load_cfg sources the config, which assigns that variable explicitly, so
+      # the pin was overwritten before export_env_for_compose's ${VAR:-default}
+      # ever saw it. That is how a DNS-only recreate upgraded uptime-kuma and
+      # forward-migrated kuma.db.
+      - name: Compose image pin and gate (maintenance must not deploy an image)
+        run: tests/compose-image-pin-smoke.sh
+
+      # `doctor` reported status.<domain> while the label routes
+      # status-media.<domain>, so the listing an operator would use to spot a
+      # missing DNS record named a hostname that does not exist.
+      - name: Route hostnames agree with the compose labels
+        run: tests/route-hostnames-smoke.sh
+
       # `f "$x"; rc=$?` EXITS under set -e, so an ordinary non-zero answer
       # became fatal: checkup, health-notify and report weekly all printed
       # nothing at all in production. Every driver here keeps errexit ON,

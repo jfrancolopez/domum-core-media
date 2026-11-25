@@ -1717,6 +1717,29 @@ export_env_for_compose() {
   export RECOVERY_PACK_SMTP_USERNAME_FILE="${RECOVERY_PACK_SMTP_USERNAME_FILE:-$SECRETS_DIR/recovery_pack_smtp_username}"
   export RECOVERY_PACK_SMTP_PASSWORD_FILE="${RECOVERY_PACK_SMTP_PASSWORD_FILE:-$SECRETS_DIR/recovery_pack_smtp_password}"
   load_runtime_secrets
+
+  # The pin is applied HERE, after the config has been sourced, because
+  # load_cfg does `source "$CFG_FILE"` and the production config assigns
+  # <SERVICE>_IMAGE explicitly. An operator who exports a pin before running
+  # `domum-media compose` has it OVERWRITTEN by that source, and the
+  # ${VAR:-default} forms above then see the config tag and keep it -- so the
+  # pin silently does nothing and `up -d` deploys whatever the tag now
+  # resolves to. Measured 2026-11-25: that is how a DNS-only recreate of
+  # uptime-kuma upgraded it and forward-migrated kuma.db.
+  #
+  # DOMUM_PIN_RUNNING_IMAGES is read from the ENVIRONMENT, which load_cfg
+  # never assigns, so it is the one channel the config cannot clobber.
+  if [[ "${DOMUM_PIN_RUNNING_IMAGES:-0}" == "1" ]]; then
+    local _pin_var _pin_val _pin_line
+    while IFS= read -r _pin_line; do
+      [[ -n "$_pin_line" ]] || continue
+      _pin_var="${_pin_line%%=*}"
+      _pin_val="${_pin_line#*=}"
+      [[ -n "$_pin_var" && -n "$_pin_val" ]] || continue
+      export "$_pin_var=$_pin_val"
+      echo "[domum-media] pinned $_pin_var=$_pin_val" >&2
+    done < <(compose_running_image_pins)
+  fi
 }
 
 render_traefik_dynamic() {
@@ -9413,7 +9436,12 @@ doctor_traefik() {
   [[ "${ENABLE_NAVIDROME:-0}" == "1" ]]   && hosts+=("navidrome|${NAVIDROME_HOST:-}")
   [[ "${ENABLE_CALIBRE_WEB:-0}" == "1" ]] && hosts+=("calibre-web|${CALIBRE_WEB_HOST:-}")
   [[ "${ENABLE_KAVITA:-0}" == "1" ]]      && hosts+=("kavita|${KAVITA_HOST:-}")
-  [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]] && hosts+=("uptime-kuma|status.${DOMUM_DOMAIN:-}")
+  # status-media, not status: the compose label is
+  # Host(`status-media.${DOMUM_DOMAIN}`). This listing told the operator the
+  # wrong hostname, which is a report naming the wrong subject -- and it is
+  # the listing they would have used to notice that status-media has no DNS
+  # record. tests/route-hostnames-smoke.sh pins it against the label.
+  [[ "${ENABLE_UPTIME_KUMA:-0}" == "1" ]] && hosts+=("uptime-kuma|status-media.${DOMUM_DOMAIN:-}")
   [[ "${ENABLE_IMMICH:-0}" == "1" ]]      && hosts+=("immich|photos.${DOMUM_DOMAIN:-}")
 
   echo "Configured hosts:"
@@ -11259,6 +11287,103 @@ migrate_verify_recovery_point() {  # $1 = .premigration, $2 = proof snapshot, $3
   return 0
 }
 
+# Every RUNNING container of this compose project, as <IMAGEVAR>=<image id> lines.
+#
+# The variable name is derived the same way the compose files spell it:
+# uppercase_token(<compose service>) + _IMAGE -- uptime-kuma -> UPTIME_KUMA_IMAGE,
+# immich_machine_learning -> IMMICH_MACHINE_LEARNING_IMAGE. Derived rather than
+# listed because immich is deliberately absent from managed_image_specs, so a
+# list would silently omit the four containers holding the photo library.
+#
+# A service with no container yields nothing: there is no "current" image to
+# preserve, and creating it is the intended outcome.
+compose_running_image_pins() {
+  local proj ids id svc img var
+  proj="${COMPOSE_PROJECT_NAME:-domum-media}"
+  cmd_exists docker || return 0
+  ids="$(docker ps -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null || true)"
+  [[ -n "$ids" ]] || return 0
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    svc="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$id" 2>/dev/null || true)"
+    img="$(docker inspect --format '{{.Image}}' "$id" 2>/dev/null || true)"
+    [[ -n "$svc" && -n "$img" ]] || continue
+    var="$(printf '%s_IMAGE' "$(uppercase_token "$svc")")"
+    printf '%s=%s\n' "$var" "$img"
+  done <<< "$ids"
+}
+
+# What `up -d` would do to the image of each running container, reported as
+# CHANGE/UNKNOWN lines. The comparison is against the image reference compose
+# will ACTUALLY use -- the exported <SERVICE>_IMAGE if set, else the reference
+# the container was created from -- so it reflects any pin already applied.
+compose_image_change_plan() {
+  local proj ids id svc run var ref target
+  proj="${COMPOSE_PROJECT_NAME:-domum-media}"
+  cmd_exists docker || return 0
+  ids="$(docker ps -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null || true)"
+  [[ -n "$ids" ]] || return 0
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    svc="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$id" 2>/dev/null || true)"
+    run="$(docker inspect --format '{{.Image}}' "$id" 2>/dev/null || true)"
+    [[ -n "$svc" && -n "$run" ]] || continue
+    var="$(printf '%s_IMAGE' "$(uppercase_token "$svc")")"
+    ref="${!var:-}"
+    [[ -n "$ref" ]] || ref="$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null || true)"
+    [[ -n "$ref" ]] || continue
+    target="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+    if [[ -z "$target" ]]; then
+      # The reference is not present locally, so `up -d` would PULL it and there
+      # is nothing here to compare against. Reported, never swallowed.
+      printf 'UNKNOWN %s %s %s\n' "$svc" "$run" "$ref"
+    elif [[ "$target" != "$run" ]]; then
+      printf 'CHANGE %s %s %s\n' "$svc" "$run" "$target"
+    fi
+  done <<< "$ids"
+}
+
+# Refuse a reconciling compose command that would change a running container's
+# image. `up` RECONCILES -- it recreates any container whose image reference has
+# moved -- so a configuration-only maintenance recreate is an image-deployment
+# vector unless every affected image is pinned.
+#
+# The refusal happens BEFORE compose runs: a gate that still recreates the
+# container is not a gate. It checks every running service rather than parsing
+# which ones the arguments name, because a wider check cannot miss one and the
+# remedy pins them all anyway.
+compose_assert_no_unpinned_image_change() {
+  local verb reconciles=0 plan
+  for verb in "$@"; do
+    case "$verb" in
+      up|create) reconciles=1; break ;;
+      -*) ;;
+    esac
+  done
+  (( reconciles == 1 )) || return 0
+  [[ "${DOMUM_ALLOW_IMAGE_CHANGE:-0}" == "1" ]] && return 0
+
+  plan="$(compose_image_change_plan || true)"
+  [[ -n "$plan" ]] || return 0
+
+  warn "this would change the image of a RUNNING container:"
+  local line kind svc from to
+  while IFS=' ' read -r kind svc from to; do
+    [[ -n "$kind" ]] || continue
+    case "$kind" in
+      CHANGE)  warn "  $svc: ${from#sha256:} -> ${to#sha256:}" ;;
+      UNKNOWN) warn "  $svc: ${from#sha256:} -> reference '$to' is not present locally; up would PULL" ;;
+    esac
+  done <<< "$plan"
+  warn ""
+  warn "A configuration-only recreate must not deploy an image. To keep the"
+  warn "images that are running now, re-run with the pin:"
+  warn "  sudo env DOMUM_PIN_RUNNING_IMAGES=1 domum-media compose $*"
+  warn "To accept the image change deliberately, re-run with:"
+  warn "  sudo env DOMUM_ALLOW_IMAGE_CHANGE=1 domum-media compose $*"
+  die "refusing to deploy an image as a side effect of a compose command."
+}
+
 # A hand-built `docker compose` command is wrong here, and wrong in a way that
 # only shows up during recovery. This project has no compose.yml: the stack is
 # assembled from fragments chosen by which services are enabled, so a bare
@@ -11272,6 +11397,7 @@ compose_passthrough() {
   load_cfg
   export_env_for_compose
   (( $# > 0 )) || die "Usage: domum-media compose <docker compose arguments...>"
+  compose_assert_no_unpinned_image_change "$@"
   compose_cmd "$@"
 }
 
