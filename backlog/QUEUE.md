@@ -9,14 +9,67 @@ after the reporting deployment.
 
 | | |
 |---|---|
-| production | `f647aa2` since **2026-11-18**, and **now two commits behind `main`** — the gap carries `b9ddc39`, which fixes a REGRESSION that deployment introduced: `checkup`, `health-notify` and `report weekly` all print nothing. See `docs/PROJECT-STATUS.md` §2a. The hash verification below was true of what was installed and says nothing about whether it RUNS: **verified by hash, not repeated**: all four deployed files' sha256 equal the `origin/main` blobs, and the installed and checkout copies of both CLIs are byte-identical (the deployment's own invariant). It was `a63ad19` for the 16 days before that, which is the premise most rows below were written under |
+| production | **`ef789a4` since 2026-11-25** (stage 1 of the DNS/pin maintenance; installed binary `8808f67e5566`). Now behind `main` again by the aurral fixes in `b8ce40d`, which stage 6 needs. The previous value of this row, retained because the rows below were written under it: `f647aa2` since **2026-11-18**, and **then two commits behind `main`** — the gap carries `b9ddc39`, which fixes a REGRESSION that deployment introduced: `checkup`, `health-notify` and `report weekly` all print nothing. See `docs/PROJECT-STATUS.md` §2a. The hash verification below was true of what was installed and says nothing about whether it RUNS: **verified by hash, not repeated**: all four deployed files' sha256 equal the `origin/main` blobs, and the installed and checkout copies of both CLIs are byte-identical (the deployment's own invariant). It was `a63ad19` for the 16 days before that, which is the premise most rows below were written under |
 | development / `main` | re-check with `git rev-parse origin/main` — it was `accc366` when this row was written and has moved many times since. A revision constant inside the repository it pins goes stale by construction, which is why the deployment script refuses to carry one; this row is a header a new session reads first, so it names the command rather than a value |
 | rule | an item is only `done` with evidence named here |
 | caution | **`581d94a`'s subject describes a premise that same PR corrected** — `gh pr merge --squash` took the FIRST commit's subject, not the PR title. `git log --oneline` therefore reads as though the pack check asks "is it in the backup set"; it does not. See `CLAUDE.md`, which is the authority, and pass `--subject` explicitly when squashing a branch whose first commit was later corrected |
 
-Statuses: `open` · `in progress` · `done (sha)` · `BLOCKED (reason)`.
-A blocker must name what would unblock it, and blocked items stay in the queue
-rather than being deleted.
+**Statuses (CLAUDE.md §0, 2026-11-25).** Six states, and this file is the ONE
+authoritative backlog — no second queue, no parallel tracker:
+
+`READY` · `IN PROGRESS` · `COMPLETED (sha)` · `BLOCKED` ·
+`OPERATOR ACTION REQUIRED` · `DEFERRED`
+
+The older words below map onto them and are not being mass-rewritten, because a
+sweeping edit of 300 rows would risk the row damage this file has already
+suffered once: `open` → `READY`, `done (sha)` → `COMPLETED (sha)`,
+`BLOCKED (reason)` → `BLOCKED` or `OPERATOR ACTION REQUIRED` depending on
+whether the blocker is a privilege/decision the operator holds. Rows are
+updated to the new words as they are touched.
+
+A blocked row must name what is blocked, why, what is already done, the exact
+action that unblocks it, and whether anything depends on it. Blocked items stay
+in the queue rather than being deleted.
+
+`OPERATOR ACTION REQUIRED` is distinct from `BLOCKED` on purpose: it means the
+work is finished and only a privileged or off-host step remains. Those are
+collected into one idempotent script rather than asked one at a time.
+
+---
+
+## Current maintenance — 2026-11-25/26
+
+| state | item |
+|---|---|
+| `COMPLETED` | **Stage 1** CLI deploy. Production fast-forwarded `124204d` → `ef789a4`; `/usr/local/bin/domum-media` = `8808f67e5566`; pin, gate and `status-media` fix all present in the INSTALLED binary; nine routes enforced with trusted TLS |
+| `COMPLETED` | **Stage 2** superseded uptime-kuma image `a8610b3b4c38` archived, 600,544,256 bytes, file checksum verified AND identity verified by a blob named for the image id. Referenced by 0 containers, so this is its only copy |
+| `COMPLETED` | **Stage 3** recovery pack of the migrated database created (`...20261126-041717`, 91,703 B, checksum matches the value recorded at creation, contents `traefik-acme uptime-kuma`). The pre-upgrade pack `...20261125-073220` is preserved and unchanged |
+| `READY` | **Stage 4** traefik DNS recreate + #199 socket proxy. The empty-image abort was an output-handling defect in the maintenance script, fixed: `compose config --format json` + `jq`, not an awk range whose start line also matched its end pattern. Rerun with `--from=4` |
+| `READY` | **Stage 6** Aurral blocked-egress logging. Needs stage 1 re-run first so `b8ce40d`'s `preflight.sh`/`validate.sh` fixes reach `/opt` |
+| `OPERATOR ACTION REQUIRED` | **Stage 5** Split DNS. Add `status-media` and `traefik-media` A records → `100.122.251.17` on **domum-core**. Not doable here: different host, and CLAUDE.md §13 forbids modifying it. Nothing else depends on it; until then both names resolve to domum-core through normal DNS while serving correctly via `--resolve` |
+| `OPERATOR ACTION REQUIRED` | **Offline recovery-pack decryption — never verified.** This host holds only the age PUBLIC key, so it cannot decrypt what it writes. On a machine with the private key: `age -d -i <identity> recovery-pack-<stamp>.tar.age \| tar -tf -`. Until then every pack is proven *intact*, not proven *recoverable*, and the whole off-site chain rests on that one key. P5-class; blocks any claim of tested recovery |
+
+**Firewall drift: reconciled, not ignored.** `preflight.sh` reported v4 DRIFT
+with 9 additions and 9 removals. Measured: the two sets are **identical** — the
+same nine Docker per-container `PREROUTING` guards in a different ORDER, every
+address belonging to a live container (kavita, navidrome, jellyfin, plex ×2,
+immich_redis, immich_server, calibre-web). Cause: the 14:46 container
+recreation restarted containers in a different sequence. Nothing was added or
+removed, and the baseline `/root/iptables-before-aurral.txt` was NOT
+overwritten. `preflight.sh` now classifies this as `ORDER-ONLY` (exit 4),
+non-zero and printing the rules, since within a chain order IS semantics in
+general.
+
+**`firewall.sh show` failing is expected until stage 6 runs.** It returns 1 when
+any of its three chains is missing, and `AURRAL-EGRESS-DROP` is the new chain
+that stage 6 installs.
+
+**The earlier "8 of 31 checks failed" is explained and retired.** That was the
+OLD `validate.sh` (5,256 B, pre-fast-forward) asserting that Aurral had no
+internet egress — which the current design deliberately grants — plus the stale
+404 route assertion. After the fast-forward the new validator reports 2 of 68,
+both now addressed: the route assertion is corrected in `b8ce40d`, and the
+`firewall.sh show` failure is stage 6's job.
 
 ---
 
