@@ -10,6 +10,12 @@
 #                   them scoped to the aurral0 bridge. Expected AFTER `apply`;
 #                   not a defect, and deliberately not 0, because "already
 #                   applied" and "nothing applied" are different facts.
+#   4  order-only  the non-Aurral differences are the SAME rules in a different
+#                   ORDER -- nothing added, nothing removed. Docker re-emits its
+#                   per-container PREROUTING guards in container-start order, so
+#                   recreating the stack shuffles them. Safe to apply; kept
+#                   non-zero and printed, because within a chain order IS
+#                   semantics in general and this must not read as MATCH.
 #   1  drift        something that is neither a counter nor Aurral's differs.
 #                   A REMOVED production rule lands here, which is the case
 #                   that matters most.
@@ -117,9 +123,26 @@ classify_family() {
       printf 'aurral-only'
     fi
   else
-    note "$family: DRIFT -- $o_add addition(s) and $o_rem removal(s) are NOT Aurral's:"
-    grep -E '^[+-]' "$d" | grep -vE "$AURRAL_RE" | sed -n '1,40{s/^/      /;p;}'
-    printf 'drift'
+    # A REORDERING is not a rule change, and conflating them sends the operator
+    # hunting for a lost production rule that is still there. Docker emits one
+    # PREROUTING guard per container and re-emits them in container-start order,
+    # so recreating the stack shuffles them -- measured 2026-11-25: 9 "removals"
+    # and 9 "additions" that were the SAME nine rules, every IP belonging to a
+    # live container. Reported as its own verdict, never folded into MATCH:
+    # within a chain order IS semantics in general, so this stays non-zero and
+    # prints the rules.
+    grep '^+' "$d" | grep -vE "$AURRAL_RE" | sed 's/^+//' | sort >"$TMP/$family.oadd" || true
+    grep '^-' "$d" | grep -vE "$AURRAL_RE" | sed 's/^-//' | sort >"$TMP/$family.orem" || true
+    if (( o_add > 0 && o_add == o_rem )) && cmp -s "$TMP/$family.oadd" "$TMP/$family.orem"; then
+      note "$family: ORDER-ONLY -- the $o_add non-Aurral difference(s) are the SAME"
+      note "$family: rules in a different ORDER. Nothing was added or removed."
+      sed -n '1,40{s/^/      /;p;}' "$TMP/$family.oadd" >&2
+      printf 'order-only'
+    else
+      note "$family: DRIFT -- $o_add addition(s) and $o_rem removal(s) are NOT Aurral's:"
+      grep -E '^[+-]' "$d" | grep -vE "$AURRAL_RE" | sed -n '1,40{s/^/      /;p;}' >&2
+      printf 'drift'
+    fi
   fi
 }
 
@@ -133,6 +156,8 @@ printf '== verdict: v4=%s v6=%s\n' "$v4" "$v6"
 case "$v4 $v6" in
   *cannot-answer*) printf 'CANNOT ANSWER -- do not treat this as a pass.\n'; exit 2 ;;
   *drift*)         printf 'DRIFT -- a non-Aurral rule changed. STOP and investigate.\n'; exit 1 ;;
+  *order-only*)    printf 'ORDER-ONLY -- same rules, different order (a container restart does\n'
+                   printf 'this). No production rule was added or removed. Safe to apply.\n'; exit 4 ;;
   "match match")   printf 'MATCH -- no Aurral rules present; safe to apply the policy.\n'; exit 0 ;;
   *)               printf 'AURRAL-ONLY -- the policy is applied and nothing else changed.\n'; exit 3 ;;
 esac

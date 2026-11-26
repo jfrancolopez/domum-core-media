@@ -105,5 +105,84 @@ if [[ $? -ne 0 ]]; then bad "7: the mutation did not apply"; else
   grep -q 'DRIFT' "$TMP/mout" && ok "mutant prints the false DRIFT" || bad "mutant did not print DRIFT"
 fi
 
+sect "8. SAME RULES, DIFFERENT ORDER -- must be ORDER-ONLY (exit 4), not DRIFT"
+# Measured in production 2026-11-25: recreating the stack made Docker re-emit
+# its per-container PREROUTING guards in a different order, and the comparison
+# reported 9 additions and 9 removals that were the SAME nine rules -- every IP
+# belonging to a live container. Reported as DRIFT it reads as a lost
+# production rule, which is the one thing this check exists to find.
+GUARDS_A='-A PREROUTING -d 198.51.100.3/32 ! -i br-x -j DROP
+-A PREROUTING -d 198.51.100.6/32 ! -i br-y -j DROP
+-A PREROUTING -d 198.51.100.9/32 ! -i br-y -j DROP'
+GUARDS_B='-A PREROUTING -d 198.51.100.9/32 ! -i br-y -j DROP
+-A PREROUTING -d 198.51.100.3/32 ! -i br-x -j DROP
+-A PREROUTING -d 198.51.100.6/32 ! -i br-y -j DROP'
+ruleset 1000 "$GUARDS_A" > "$TMP/ob4"; ruleset 1000 "$GUARDS_B" > "$TMP/ol4"
+ruleset 1000 > "$TMP/ob6"; ruleset 1000 > "$TMP/ol6"
+rc="$(run "$TMP/ob4" "$TMP/ol4" "$TMP/ob6" "$TMP/ol6")"
+[[ "$rc" == 4 ]] && ok "a reordering is ORDER-ONLY (exit 4)" || bad "reordering gave exit $rc, expected 4"
+grep -q 'ORDER-ONLY' "$TMP/out" && ok "it says ORDER-ONLY" || bad "missing the ORDER-ONLY verdict"
+grep -q 'No production rule was added or removed' "$TMP/out" \
+  && ok "it states nothing was added or removed" || bad "missing the nothing-added statement"
+grep -q 'PREROUTING' "$TMP/out" && ok "it still PRINTS the rules rather than hiding them" \
+                                || bad "the rules were not shown"
+
+sect "9. the verdict is CLEAN on stdout -- this function's stdout IS its return value"
+# preflight.sh says so in its own header. Both the DRIFT and ORDER-ONLY branches
+# printed their rule listing to stdout, so the rules were captured INTO the
+# verdict: production showed "== verdict: v4=      --A PREROUTING ..." with the
+# word drift buried mid-line. The glob in the case statement still matched, so
+# the exit status was right and the report was mangled.
+AURRAL_PREFLIGHT_V4_LIVE="$TMP/ol4" AURRAL_PREFLIGHT_V6_LIVE="$TMP/ol6" \
+  bash "$PF" "$TMP/ob4" "$TMP/ob6" >"$TMP/sout" 2>/dev/null
+vline="$(grep '^== verdict' "$TMP/sout" || true)"
+[[ "$vline" == "== verdict: v4=order-only v6=match" ]] \
+  && ok "verdict line is exactly the two words: $vline" \
+  || bad "verdict line is contaminated: $vline"
+grep -q 'PREROUTING' "$TMP/sout" && bad "rule text leaked onto stdout" \
+                                 || ok "no rule text on stdout"
+
+sect "10. ORDER-ONLY must not MASK a real loss -- a removal alongside a shuffle is DRIFT"
+# If it did, the benign case would become a hiding place for the dangerous one.
+GUARDS_C='-A PREROUTING -d 198.51.100.9/32 ! -i br-y -j DROP
+-A PREROUTING -d 198.51.100.3/32 ! -i br-x -j DROP'
+ruleset 1000 "$GUARDS_C" > "$TMP/ol4b"
+rc="$(run "$TMP/ob4" "$TMP/ol4b" "$TMP/ob6" "$TMP/ol6")"
+[[ "$rc" == 1 ]] && ok "shuffle PLUS a removal is still DRIFT (exit 1)" \
+                 || bad "a shuffle hiding a removal gave exit $rc, expected 1"
+
+sect "11. MUTATION: make the set comparison always true -- a real loss must read ORDER-ONLY"
+MUT2="$TMP/preflight-mutant2.sh"
+cp "$PF" "$MUT2"
+python3 - "$MUT2" <<'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = 'if (( o_add > 0 && o_add == o_rem )) && cmp -s "$TMP/$family.oadd" "$TMP/$family.orem"; then'
+assert s.count(old) == 1, f"anchor matched {s.count(old)} times"
+new = 'if (( o_add > 0 )); then'
+open(p, "w").write(s.replace(old, new))
+PY2
+if [[ $? -ne 0 ]]; then bad "11: the mutation did not apply"; else
+  # The fixture must produce the HARM, not merely reach the mutated line. A pure
+  # removal has o_add == 0, so even the weakened condition refuses it -- the
+  # first version of this fixture did that and the mutant "survived" for the
+  # wrong reason. A rule SWAPPED for a different one gives o_add == o_rem == 1
+  # with DIFFERENT sets, which is exactly what the comparison distinguishes.
+  GUARDS_SWAP='-A PREROUTING -d 198.51.100.3/32 ! -i br-x -j DROP
+-A PREROUTING -d 198.51.100.6/32 ! -i br-y -j DROP
+-A PREROUTING -d 203.0.113.7/32 ! -i br-y -j DROP'
+  ruleset 1000 "$GUARDS_A"    > "$TMP/mb4"
+  ruleset 1000 "$GUARDS_SWAP" > "$TMP/ml4"
+  # The REAL code must call that DRIFT, or the mutation proves nothing.
+  rc="$(run "$TMP/mb4" "$TMP/ml4" "$TMP/ob6" "$TMP/ol6")"
+  [[ "$rc" == 1 ]] && ok "a SWAPPED rule is DRIFT in the real code (exit 1)" \
+                   || bad "the real code gave exit $rc for a swapped rule, expected 1"
+  AURRAL_PREFLIGHT_V4_LIVE="$TMP/ml4" AURRAL_PREFLIGHT_V6_LIVE="$TMP/ol6" \
+    bash "$MUT2" "$TMP/mb4" "$TMP/ob6" >"$TMP/m2out" 2>&1; m2rc=$?
+  [[ "$m2rc" == 4 ]] && ok "the mutant calls a REMOVED rule order-only (exit $m2rc) -- the comparison is what prevents it" \
+                      || bad "mutant gave exit $m2rc; the set comparison is not what distinguishes the two"
+fi
+
 printf '\n%s checks, %s failures\n' "$n" "$fails"
 [[ "$fails" -eq 0 ]] || exit 1

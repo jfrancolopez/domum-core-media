@@ -248,8 +248,29 @@ for ip in "$LAN_IP" "$TS_IP"; do
 done
 c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:3001/)"
 [[ "$c" == 000 ]] && ok "not bound on 127.0.0.1" || bad "bound on 127.0.0.1 ($c)"
+# The Traefik router IS intentional as of d0270f3 -- Aurral is reachable at
+# https://aurral.<domain> through the FILE provider. This used to assert a 404,
+# which was correct only while no router existed; keeping it would have required
+# the deliberate feature to look like a defect.
+#
+# What that assertion was really protecting is the ISOLATION, and that is what
+# is asserted now. The router must NOT have been achieved by attaching Aurral's
+# proxy to domum-proxy: AURRAL-EGRESS matches `-i aurral0`, so traffic leaving
+# through a domum-proxy interface would never enter the chain and rule 3 would
+# silently stop applying. The file provider routes to the LAN address instead,
+# which joins no network.
 c="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 --resolve aurral.ladomum.com:443:127.0.0.1 https://aurral.ladomum.com/)"
-[[ "$c" == 404 ]] && ok "no Traefik route (404)" || bad "Traefik answered $c for aurral"
+case "$c" in
+  200|302) ok "Traefik serves the aurral router ($c)" ;;
+  404)     bad "Traefik has NO route for aurral (404) -- the file-provider router is missing" ;;
+  *)       bad "Traefik answered $c for aurral" ;;
+esac
+pnets="$(docker inspect -f '{{range $n,$v := .NetworkSettings.Networks}}{{$n}} {{end}}' "$P" 2>/dev/null)"
+case "$pnets" in
+  *domum-proxy*) bad "the proxy is attached to domum-proxy -- this VOIDS the aurral0 egress policy: $pnets" ;;
+  "")            bad "could not read the proxy's networks; the isolation claim is UNVERIFIED" ;;
+  *)             ok "the router joins no production network (proxy nets: $pnets)" ;;
+esac
 pp="$(docker port "$P" 2>/dev/null)"
 wild="$(grep -c -E '0\.0\.0\.0|\[::\]' <<< "$pp")"
 [[ "$wild" -eq 0 ]] && ok "published only on LAN + Tailscale" || bad "published on a wildcard: $pp"

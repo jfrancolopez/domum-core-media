@@ -9,6 +9,105 @@ belongs in `docs/`, never here. If a section here grows large, move it to
 
 ---
 
+## 0. Operating model — autonomous execution
+
+**Established 2026-11-25 by the operator, and it SUPERSEDES the conflicting
+instructions elsewhere in this file.** Where a rule below disagrees with §5's
+deployment-plan pause, §8's branch-and-PR workflow, or §11's approval gates,
+this section wins; where it is silent, those sections still bind. The data
+safeguards in §2, §3, §4, §6, §7 and §15 are NOT relaxed by any of it.
+
+**The objective is to finish the project, not to expand its development
+process.** The reason this section exists is that procedural overhead had
+started to cost more than it protected: Immich, data protection, backups and
+disaster recovery have had extensive development and validation, and the
+remaining work is maintenance and backlog completion.
+
+### Continue without asking
+
+- Work independently. Do not request approval for routine technical decisions.
+- **Do not stop after a task, a commit, a passing test or a green CI run.**
+  Select the next actionable backlog item and execute it.
+- Continuing is the DEFAULT. Never ask whether to continue.
+- Never re-request approval for work already approved.
+- Make implementation decisions from existing architecture and conventions.
+- Continue until every independently actionable item is done or genuinely
+  blocked.
+
+### Git: direct commits to `main` are authorized
+
+```
+inspect → reproduce → develop → test → focused commit → push to main → CI
+→ monitor asynchronously → controlled production deployment when appropriate
+```
+
+- Commit and push logical, tested changes **directly to `main`** for features,
+  fixes, documentation, maintenance tooling, monitoring and tests.
+- Do not open a branch and PR for every correction. A PR is **optional** and is
+  reserved for genuinely high-risk or complex architectural change where
+  isolation buys something.
+- **Never force-push `main`.** That prohibition is unchanged.
+- Run the relevant local tests, `shellcheck` and the audits before pushing.
+- Monitor CI asynchronously; keep working while it runs. If it fails, diagnose
+  and fix before deploying anything affected.
+- **Never deploy a revision merely because it is on `main`.** Pushing is not
+  deploying; §5's production boundary still applies to the host.
+
+### Backlog
+
+`backlog/QUEUE.md` is the ONE authoritative backlog. States:
+
+`READY` · `IN PROGRESS` · `COMPLETED` · `BLOCKED` · `OPERATOR ACTION REQUIRED`
+· `DEFERRED`
+
+Prioritise by operational impact, reliability, security, usefulness and effort,
+then work through `READY` automatically. A blocked item records: what is
+blocked, why, what is already done, the exact action that unblocks it, and
+whether anything depends on it — then move to the next independent item.
+
+**Do not create additional backlogs, planning layers, tracking systems or
+documentation files** to manage this.
+
+### Operator interaction
+
+Privileged commands and genuine decisions are COLLECTED into a consolidated
+operator action queue, and where practical into ONE reviewed, idempotent
+maintenance script. A failure in one operation blocks that operation and its
+dependents — not unrelated work.
+
+Interrupt immediately ONLY for: an active production outage needing the
+operator; a credible risk of data loss; a security incident or unintended
+public exposure; an irreversible operation needing authorization; or a decision
+that materially changes project direction and cannot reasonably be inferred.
+
+Everything else is handled autonomously or queued.
+
+**When root is unavailable, prepare the operator action and continue with other
+work.** Never modify sudoers, never grant yourself privilege, and never use
+Docker to work around a host privilege restriction (§10).
+
+### Engineering discipline
+
+- Fix root causes; do not stack workarounds.
+- Prefer simple, maintainable implementations and reuse existing tooling.
+- No speculative features or unnecessary abstractions.
+- A targeted investigation beats another broad audit.
+- **Verify actual implementation details before generating commands.** Check
+  the installed binary, the real argument order, the real revision.
+- Distinguish measured facts from assumptions, and say which is which.
+- **Never invent a CLI subcommand, flag or capability.**
+- Never call a backup recoverable until the recovery procedure has been tested.
+- Preserve working functionality.
+
+### Reporting
+
+Concise. No long report after every task. At meaningful milestones only, give
+one consolidated summary: completed tasks, commits pushed, test and CI status,
+production status, remaining actionable backlog, blocked items, and the
+consolidated operator actions.
+
+---
+
 ## 1. Workspaces and fixed paths
 
 | Purpose | Path |
@@ -820,6 +919,10 @@ Until that audit is complete, a production-changing deployment must:
 - use narrow installation where appropriate;
 - be verified in production afterwards.
 
+**Routine, reversible maintenance inside an already approved scope does not
+need repeated approval** (§0). What still does: a production change that is
+irreversible, that risks data, or that has not been approved in any form.
+
 **Stop at the actual risk boundary and present the deployment plan** for any
 production change that requires root or could affect running services.
 
@@ -1531,11 +1634,15 @@ promote a tier because another tier was proven. See
 ## 8. Git and development workflow
 
 ```
-inspect → reproduce → develop → test → focused commit → push branch → PR → CI
-→ review → merge → controlled production deployment when appropriate → verify
+inspect → reproduce → develop → test → focused commit → push to main → CI
+→ monitor asynchronously → controlled production deployment when appropriate
 ```
 
-- **Never push directly to `main`.** Prefer focused branches and commits.
+- **Direct commits to `main` are authorized** (§0, 2026-11-25). The former
+  "never push directly to main" rule is withdrawn. Branches and PRs remain
+  available and are reserved for genuinely high-risk or architectural change.
+  **Never force-push `main`** — that is unchanged, and the squash-merge and
+  stacked-branch hazards below still apply whenever a PR IS used.
 - `git` and `gh` are authenticated on this server — use them directly. Do not
   ask the operator to perform routine GitHub operations from another machine.
 - **Never discard another agent's uncommitted work.** Before changing an
@@ -1747,6 +1854,11 @@ access measures in SEC-04 and SEC-05).
 - large unrelated redesign with production impact
 
 Do **not** manufacture approval gates for ordinary coding work.
+
+**Nor for work already approved.** Per §0, routine reversible maintenance
+within an approved scope proceeds without re-asking, and development on `main`
+needs no approval at all. The list above is about the host and the data, not
+about writing code.
 
 ---
 
