@@ -64,6 +64,39 @@ general.
 any of its three chains is missing, and `AURRAL-EGRESS-DROP` is the new chain
 that stage 6 installs.
 
+### Every remaining row is operator-gated — measured 2026-11-26
+
+With the maintenance above prepared, **no row in this queue is actionable by an
+agent on this host.** Each remaining one is gated by something privilege cannot
+supply from here, and the gate is named rather than left as "blocked":
+
+| row | gate | kind |
+|---|---|---|
+| P1.7 | activate a production backup target | operator **decision** |
+| P1.8 | a real quiesced run stops services — downtime | operator **decision** |
+| P1.16 | `chmod 600` on calibre-web's Fernet key. Reclassified 2026-11-06: blocked by INSTRUCTION, not privilege — this account owns the file | operator **decision** |
+| P1.24 | install + enable `domum-media-state-capture.timer` | operator **privilege** |
+| P3.5 | upgrade production applications | operator **decision** |
+| P4.7 | `/dev/loop-control` is `root:disk` and this account is not in `disk`; a disposable btrfs filesystem cannot be mounted | operator **privilege**, one group |
+| P5.2 | take a pack to a machine holding the age private key and decrypt it. **The single highest remaining risk** | operator **off-host** |
+| P5.3 | a fresh-host restore needs another machine | **hardware** |
+| P5.5 | a whole-tier Immich restore: ~130 GiB plus a rebuilt instance | **hardware** |
+| P5.6 | `verify-snapshot-coverage` calls `need_root` | operator **privilege**, read-only and free |
+
+**P6.25 — the never-executed function list — is `DEFERRED`, with the reason
+measured rather than asserted.** 510 functions, 193 unreferenced by name, **81
+never executed** by instrumentation (the name-grep over-reported every time it
+was used: 11→3, 11→1, 193→81 — report the instrumented figure). Of the 58 that
+remain after the closures, measured with comments stripped: **52 touch nothing**
+(pure computation or printing), **6 make a network call** and are all
+diagnostics (`doctor_*`, the readiness probes, `configure_cmd`), and **1 writes
+a file** (`render_traefik_dynamic`, read and found sound). **None deletes,
+recreates a container, writes a credential, or gates a recovery operation** —
+everything that did is now driven by a test, and those closures found real
+defects each time. Writing tests for 52 pure functions is the speculative work
+CLAUDE.md §0 says to avoid; the row stays with its list on disk so the decision
+is recorded rather than re-derived.
+
 **The earlier "8 of 31 checks failed" is explained and retired.** That was the
 OLD `validate.sh` (5,256 B, pre-fast-forward) asserting that Aurral had no
 internet egress — which the current design deliberately grants — plus the stale
