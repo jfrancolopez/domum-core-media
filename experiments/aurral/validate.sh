@@ -297,10 +297,28 @@ else
 fi
 
 echo "== 7. production untouched"
-running="$(docker ps --format '{{.Names}}' | grep -v -x -E "$A|$P" | sort | tr '\n' ' ')"
-printf '  production containers: %s\n' "$running"
-nc="$(wc -w <<< "$running")"
-[[ "$nc" -eq 11 ]] && ok "11 production containers running" || bad "$nc production containers running"
+# NOT a hardcoded count. `-eq 11` was an absolute assertion about production
+# state, which CLAUDE.md forbids for exactly the reason it broke: #199 added
+# docker-socket-proxy as a legitimate 12th managed container and a correct
+# production state started reading as a failure. The intent here is "the Aurral
+# experiment did not disturb production", and that is expressed by requiring
+# every container of the production compose project to be RUNNING and none
+# UNHEALTHY, with the count printed rather than asserted. A stopped production
+# container still fails this; adding a service does not.
+prod="$(docker ps -a --filter 'label=com.docker.compose.project=domum-media' \
+        --format '{{.Names}} {{.State}}' | sort)"
+nc="$(grep -c . <<< "$prod" || true)"
+printf '  production containers (%s): %s\n' "$nc" "$(awk '{printf "%s ", $1}' <<< "$prod")"
+if (( nc == 0 )); then
+  bad "no container carries the production compose project label; this check had no subject"
+else
+  # Health is NOT re-checked here: the next check already asks it across every
+  # container, which is broader. Two findings with identical text make the host
+  # look twice as bad as it is.
+  notrunning="$(awk '$2!="running"{printf "%s(%s) ", $1, $2}' <<< "$prod")"
+  [[ -z "$notrunning" ]] && ok "every production container is running ($nc)" \
+                         || bad "production containers NOT running: $notrunning"
+fi
 unhealthy="$(docker ps --filter health=unhealthy --format '{{.Names}}' | tr '\n' ' ')"
 [[ -z "$unhealthy" ]] && ok "no unhealthy production container" || bad "unhealthy: $unhealthy"
 
