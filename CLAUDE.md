@@ -9531,6 +9531,59 @@ whatever is live-mounted, reviewed or not.
 
 ---
 
+**A REORDERING IS NOT A RULE CHANGE, AND A BASELINE GOES STALE WHEN A
+LEGITIMATE CHANGE LANDS.** Production, 2026-11-25: `preflight.sh` reported v4
+DRIFT with 9 additions and 9 removals, which reads as a lost production rule --
+the one thing that check exists to find. Measured, the two sets were
+**identical**: the same nine Docker per-container `PREROUTING` guards in a
+different ORDER, every address belonging to a live container. Docker emits one
+guard per container and re-emits them in container-start order, so recreating
+the stack shuffles them.
+
+`ORDER-ONLY` (exit 4) is its own verdict. It stays **non-zero and prints the
+rules**, because within a chain order IS semantics in general, so it must never
+read as MATCH -- and a removal alongside a shuffle is still DRIFT, which the
+mutation pins by SWAPPING a rule rather than deleting one: a pure removal has
+`o_add == 0`, so even the weakened comparison refuses it and the mutant would
+survive for the wrong reason.
+
+**Then the SAME check reported DRIFT again and was RIGHT.** After #199 the
+drift was 10 removals and 13 additions: nothing lost, and **three genuinely new
+rules** -- Docker's own for `domum-traefik-docker` (its own private /16,
+`internal=true`), two of them the `DOCKER-INTERNAL` drops that MAKE it
+internal. So the classifier refused to call real additions a reorder, which is
+the whole point of separating the two verdicts.
+
+The remedy for a stale baseline is to REFRESH it, never to ignore the drift and
+never to weaken the check: preserve the original as `*.superseded-<timestamp>`
+(the `do_adopt_repo` pattern), write the refreshed one filtered of the
+experiment's own rules, and let **preflight itself** verify the result --
+restoring the originals if the verdict is not clean. Overwriting
+`/root/iptables-before-aurral.txt` in place would make the check report MATCH
+and destroy the only record of the pre-Aurral state.
+
+**AND THE ABSOLUTE-COUNT ASSERTION STRUCK FOR THE THIRD TIME.**
+`validate.sh` asserted `[[ "$nc" -eq 11 ]]` production containers. #199 added
+`docker-socket-proxy` as a legitimate twelfth, so a correct production state
+began reporting FAIL -- the stale-topology-invariant family, after the
+deployment script's `calibre-web:unprotected` and the storage invariant that
+aborted a correct deployment. The intent was "the experiment did not disturb
+production", so that is what is asserted now: every container carrying the
+production compose project label must be RUNNING, with the count **printed
+rather than asserted**. A stopped container still fails it; adding a service
+does not. An empty label set is reported as having had no subject rather than
+passing vacuously.
+
+**Three more `cmd | grep -q` instances, all three written by me in the session
+that fixed the other two.** `grep -cE … | grep -qx 0` reports failure precisely
+when the filter is CLEAN, because `grep -c` exits 1 on a zero count --
+measured, and it would have died claiming the experiment's rules survived when
+none did. `git show …:.gitignore | grep -qFx` would read a `.gitignore` that
+DOES cover a path as not covering it, refusing valid input, and it worked only
+because `.gitignore` fits the pipe buffer. Capture first, every time.
+
+---
+
 ## 15. Known open safety defects
 
 Documented here because they constrain what is safe to do. Remove an entry when
